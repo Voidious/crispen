@@ -162,3 +162,20 @@ y = 2
 
 def test_preserves_surrounding():
     assert _apply(BEFORE_SURROUNDED) == AFTER_SURROUNDED
+
+
+# ---------------------------------------------------------------------------
+# Non-Not unary operator is skipped
+# ---------------------------------------------------------------------------
+
+BITWISE_NOT = """\
+if ~x:
+    a()
+else:
+    b()
+"""
+
+
+def test_bitwise_not_skipped():
+    result = _apply(BITWISE_NOT)
+    assert result == BITWISE_NOT

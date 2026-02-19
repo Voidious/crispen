@@ -66,6 +66,27 @@ def test_parse_no_additions():
     assert result == {}
 
 
+def test_non_consecutive_lines_two_ranges():
+    # Source has 1 context line; target adds lines 1-2, keeps line 3 as context,
+    # then adds lines 4-5. The range merger should split into [(1,2), (4,5)].
+    diff = """\
+--- a/foo.py
++++ b/foo.py
+@@ -3,1 +1,5 @@
++line1
++line2
+ context_line
++line4
++line5
+"""
+    result = parse_diff(diff)
+    assert "foo.py" in result
+    ranges = result["foo.py"]
+    assert len(ranges) == 2
+    assert ranges[0] == (1, 2)
+    assert ranges[1] == (4, 5)
+
+
 def test_consecutive_lines_merged():
     diff = """\
 --- a/foo.py
