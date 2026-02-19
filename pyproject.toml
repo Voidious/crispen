@@ -1,11 +1,18 @@
 [project]
 name = "crispen"
 version = "0.1.0"
-description = "Add your description here"
+description = "Automated refactoring tool for Python code diffs"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "libcst>=1.8.6",
+    "unidiff>=0.7.5",
+]
+
+[project.scripts]
+crispen = "crispen.cli:main"
 
 [dependency-groups]
 dev = [
     "pre-commit>=4.5.1",
+    "pytest>=9.0.2",
 ]
