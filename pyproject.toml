@@ -11,6 +11,9 @@ dependencies = [
 [project.scripts]
 crispen = "crispen.cli:main"
 
+[tool.uv]
+package = true
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.5.1",
