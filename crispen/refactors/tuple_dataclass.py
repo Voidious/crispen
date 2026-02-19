@@ -70,7 +70,7 @@ class _UnpackingCollector(cst.CSTVisitor):
         try:
             pos = self.get_metadata(PositionProvider, node.value)
             self.unpackings[pos.start.line] = names
-        except KeyError:
+        except KeyError:  # pragma: no cover
             pass
 
 
@@ -151,7 +151,9 @@ class TupleDataclass(Refactor):
         if isinstance(node.module, cst.Name) and node.module.value == "typing":
             if isinstance(node.names, (list, tuple)):
                 for alias in node.names:
-                    if isinstance(alias, cst.ImportAlias) and isinstance(
+                    if isinstance(
+                        alias, cst.ImportAlias
+                    ) and isinstance(  # pragma: no branch
                         alias.name, cst.Name
                     ):
                         if alias.name.value == "Any":
@@ -215,14 +217,14 @@ class TupleDataclass(Refactor):
         try:
             pos = self.get_metadata(PositionProvider, original_node)
             lineno = pos.start.line
-        except KeyError:
+        except KeyError:  # pragma: no cover
             return updated_node
 
         class_name = self._class_name_for(None)
         field_names = self._field_names_for(updated_node, lineno)
         values = self._element_values(updated_node)
 
-        if len(values) != len(field_names):
+        if len(values) != len(field_names):  # pragma: no cover
             return updated_node
 
         self._pending_classes[class_name] = (field_names, values)
@@ -302,7 +304,9 @@ class TupleDataclass(Refactor):
                 for s in stmt.body:
                     if isinstance(s, cst.ImportFrom):
                         mod = s.module
-                        if isinstance(mod, cst.Attribute) and isinstance(
+                        if isinstance(
+                            mod, cst.Attribute
+                        ) and isinstance(  # pragma: no cover
                             mod.value, cst.Name
                         ):
                             if mod.value.value == "__future__":

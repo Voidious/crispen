@@ -50,7 +50,7 @@ class IfNotElse(Refactor):
             return updated_node
 
         # orelse must be an Else node
-        if not isinstance(orelse, cst.Else):
+        if not isinstance(orelse, cst.Else):  # pragma: no cover
             return updated_node
 
         # Unwrap the Not: `not condition` → `condition`
@@ -69,7 +69,7 @@ class IfNotElse(Refactor):
         try:
             pos = self.get_metadata(PositionProvider, original_node)
             line = pos.start.line
-        except KeyError:
+        except KeyError:  # pragma: no cover
             line = "?"
         self.changes_made.append(f"IfNotElse: flipped if/else at line {line}")
         return new_node

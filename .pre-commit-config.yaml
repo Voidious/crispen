@@ -19,3 +19,12 @@ repos:
     rev: 7.3.0
     hooks:
       - id: flake8
+-   repo: local
+    hooks:
+    -   id: pytest-coverage
+        name: pytest (with coverage)
+        entry: uv run pytest
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true

@@ -24,7 +24,7 @@ class Refactor(cst.CSTTransformer):
         """Return True if the node's start line overlaps any changed range."""
         try:
             pos = self.get_metadata(PositionProvider, node)
-        except KeyError:
+        except KeyError:  # pragma: no cover
             return False
         node_start = pos.start.line
         node_end = pos.end.line

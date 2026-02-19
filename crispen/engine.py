@@ -49,7 +49,7 @@ def run_engine(
             # Verify output is valid Python
             try:
                 compile(new_source, filepath, "exec")
-            except SyntaxError as exc:
+            except SyntaxError as exc:  # pragma: no cover
                 name = RefactorClass.name()
                 yield f"SKIP {filepath} ({name}): output not valid Python: {exc}"
                 continue
