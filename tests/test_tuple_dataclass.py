@@ -76,6 +76,35 @@ def test_small_tuple_no_change():
     assert _changes(BEFORE_SMALL) == []
 
 
+# ---------------------------------------------------------------------------
+# Field name inference from variable names
+# ---------------------------------------------------------------------------
+
+BEFORE_NAMED_VARS = """\
+def silly():
+    age = 1
+    shoes = 2
+    pants = 3
+    return (age, shoes, pants)
+"""
+
+
+def test_field_names_inferred_from_variables():
+    result = _apply(BEFORE_NAMED_VARS)
+    assert "age: Any" in result
+    assert "shoes: Any" in result
+    assert "pants: Any" in result
+    assert "age = age" in result or "age=age" in result
+
+
+def test_field_names_fallback_for_literals():
+    # When elements are literals, fall back to field_0, field_1, ...
+    result = _apply("x = (1, 2, 3)\n")
+    assert "field_0" in result
+    assert "field_1" in result
+    assert "field_2" in result
+
+
 BEFORE_STARRED = "result = (*a, 1, 2, 3)\n"
 
 

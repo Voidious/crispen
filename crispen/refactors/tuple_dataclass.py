@@ -181,6 +181,15 @@ class TupleDataclass(Refactor):
             names = self._unpackings[lineno]
             if len(names) == len(tuple_node.elements):
                 return names
+        # Infer names from variable names in the tuple itself
+        names = []
+        for el in tuple_node.elements:
+            if isinstance(el, cst.Element) and isinstance(el.value, cst.Name):
+                names.append(el.value.value)
+            else:
+                names.append(None)
+        if all(n is not None for n in names):
+            return names
         return [f"field_{i}" for i in range(len(tuple_node.elements))]
 
     def _is_safe_tuple(self, node: cst.Tuple) -> bool:
