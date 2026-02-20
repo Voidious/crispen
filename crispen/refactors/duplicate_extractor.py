@@ -304,7 +304,7 @@ def _llm_veto(client: anthropic.Anthropic, group: List[_SeqInfo]) -> Tuple[bool,
     for block in response.content:
         if block.type == "tool_use" and block.name == "evaluate_duplicate":
             inp = block.input
-            return inp["is_valid_duplicate"], inp["reason"]
+            return inp["is_valid_duplicate"], inp.get("reason", "")
     return False, "no tool response"  # pragma: no cover
 
 
