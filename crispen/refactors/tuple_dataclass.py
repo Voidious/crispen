@@ -218,6 +218,10 @@ class TupleDataclass(Refactor):
         if not self._is_safe_tuple(updated_node):
             return updated_node
 
+        scope = self._current_scope_name()
+        if scope is None or not scope.startswith("_"):
+            return updated_node
+
         try:
             pos = self.get_metadata(PositionProvider, original_node)
             lineno = pos.start.line
@@ -287,7 +291,7 @@ class TupleDataclass(Refactor):
         # Inject dataclass definitions before the first function/class def
         # that isn't an import statement, but after all imports
         insert_pos = 0
-        for i, stmt in enumerate(new_body):
+        for i, stmt in enumerate(new_body):  # pragma: no branch
             if isinstance(stmt, (cst.SimpleStatementLine,)):
                 # imports and simple assignments
                 insert_pos = i + 1

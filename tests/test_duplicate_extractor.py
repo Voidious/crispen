@@ -12,6 +12,7 @@ from crispen.refactors.duplicate_extractor import (
     _SeqInfo,
     _SequenceCollector,
     _apply_edits,
+    _filter_maximal_groups,
     _find_duplicate_groups,
     _find_insertion_point,
     _has_def,
@@ -305,10 +306,60 @@ def test_find_duplicate_groups_caps_at_max_groups():
     sequences = []
     for i in range(6):
         fp = f"fp{i}"
-        sequences.append(_SeqInfo([], 1, 3, "<module>", "", fp))
-        sequences.append(_SeqInfo([], 5 + i * 10, 7 + i * 10, "<module>", "", fp))
-    groups = _find_duplicate_groups(sequences, [(1, 3)], max_groups=3)
+        # Place each group in a disjoint band of 20 lines so _filter_maximal_groups
+        # keeps all 6 (none overlap), and the max_groups=3 cap is what limits output.
+        sequences.append(_SeqInfo([], i * 20 + 1, i * 20 + 3, "<module>", "", fp))
+        sequences.append(_SeqInfo([], i * 20 + 10, i * 20 + 12, "<module>", "", fp))
+    # Diff range covers all sequences so the diff-overlap filter passes for all.
+    groups = _find_duplicate_groups(sequences, [(1, 130)], max_groups=3)
     assert len(groups) == 3
+
+
+# ---------------------------------------------------------------------------
+# _filter_maximal_groups
+# ---------------------------------------------------------------------------
+
+
+def test_filter_maximal_groups_empty():
+    assert _filter_maximal_groups([]) == []
+
+
+def test_filter_maximal_groups_single_group():
+    s1 = _SeqInfo([], 1, 10, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 20, 29, "<module>", "", "fp1")
+    group = [s1, s2]
+    result = _filter_maximal_groups([group])
+    assert result == [group]
+
+
+def test_filter_maximal_groups_removes_subsumed():
+    # Large group spans lines 1-10; small group spans 1-5 (subset).
+    # Only the large group should be kept.
+    s_large_a = _SeqInfo([], 1, 10, "<module>", "", "fp_large")
+    s_large_b = _SeqInfo([], 20, 29, "<module>", "", "fp_large")
+    large_group = [s_large_a, s_large_b]
+
+    s_small_a = _SeqInfo([], 1, 5, "<module>", "", "fp_small")
+    s_small_b = _SeqInfo([], 20, 24, "<module>", "", "fp_small")
+    small_group = [s_small_a, s_small_b]
+
+    result = _filter_maximal_groups([small_group, large_group])
+    assert len(result) == 1
+    assert result[0] is large_group
+
+
+def test_filter_maximal_groups_keeps_non_overlapping():
+    # Two groups with completely disjoint line ranges — both should be kept.
+    s1a = _SeqInfo([], 1, 5, "<module>", "", "fp1")
+    s1b = _SeqInfo([], 30, 34, "<module>", "", "fp1")
+    group1 = [s1a, s1b]
+
+    s2a = _SeqInfo([], 10, 14, "<module>", "", "fp2")
+    s2b = _SeqInfo([], 40, 44, "<module>", "", "fp2")
+    group2 = [s2a, s2b]
+
+    result = _filter_maximal_groups([group1, group2])
+    assert len(result) == 2
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,8 @@ def parse_diff(diff_text: str) -> Dict[str, List[Tuple[int, int]]]:
 
     for patched_file in patch:
         path = patched_file.path
+        if not path.endswith(".py"):
+            continue
         ranges: List[Tuple[int, int]] = []
 
         for hunk in patched_file:

@@ -87,6 +87,19 @@ def test_non_consecutive_lines_two_ranges():
     assert ranges[1] == (4, 5)
 
 
+def test_non_python_files_excluded():
+    diff = """\
+--- a/config.json
++++ b/config.json
+@@ -1,2 +1,3 @@
+ {
++"key": "value",
+ }
+"""
+    result = parse_diff(diff)
+    assert result == {}
+
+
 def test_consecutive_lines_merged():
     diff = """\
 --- a/foo.py
