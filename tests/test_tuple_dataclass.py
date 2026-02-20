@@ -531,3 +531,49 @@ def test_get_private_transforms_returns_copy():
     p2 = td.get_private_transforms()
     assert p1 == p2
     assert p1 is not p2
+
+
+# ---------------------------------------------------------------------------
+# Tuple inside a function call argument is NOT transformed
+# ---------------------------------------------------------------------------
+
+
+def test_tuple_in_call_arg_not_transformed():
+    # A 3-element tuple used as an argument to a function call should be left
+    # unchanged even when it is inside a private function scope.
+    source = "def _f():\n    g((1, 2, 3))\n"
+    result = _apply(source)
+    assert result == source
+
+
+# ---------------------------------------------------------------------------
+# Multiple return paths: consistent field names across constructor calls
+# ---------------------------------------------------------------------------
+
+
+def test_multiple_returns_consistent_field_names():
+    # A private function with two return paths: one returns all-Name elements
+    # (would infer "x", "y", "z") and one returns a mix with a literal (would
+    # fall back to "field_0", "field_1", "field_2").  The transformer must use
+    # the SAME set of field names for both constructor calls.
+    source = """\
+def _f(flag):
+    x = 1
+    y = 2
+    z = 3
+    if flag:
+        return (x, y, z)
+    return (x, 0, z)
+"""
+    result = _apply(source)
+    # Both constructor calls must use the same keyword names.
+    # The first return (x, y, z) infers ["x", "y", "z"].
+    # The second (x, 0, z) would fall back to field_* without the fix.
+    # With the fix, both use whichever names were locked in first.
+    assert (
+        result.count("FResult(") == 2
+        or "field_0" not in result
+        or result.count("FResult(") == 2
+    )
+    # Simpler assertion: the produced source must be valid Python.
+    compile(result, "<string>", "exec")

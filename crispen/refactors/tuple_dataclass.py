@@ -135,6 +135,9 @@ class TupleDataclass(Refactor):
         # Track enclosing function/class names for naming
         self._scope_stack: List[Optional[str]] = []
 
+        # Counter to detect tuples inside function call arguments
+        self._in_call_arg: int = 0
+
     # ------------------------------------------------------------------
     # Collect context before transforms
     # ------------------------------------------------------------------
@@ -179,6 +182,14 @@ class TupleDataclass(Refactor):
                         if alias.name.value == "Any":
                             self._has_any_import = True
         return None
+
+    def visit_Arg(self, node: cst.Arg) -> Optional[bool]:
+        self._in_call_arg += 1
+        return None
+
+    def leave_Arg(self, original_node: cst.Arg, updated_node: cst.Arg) -> cst.Arg:
+        self._in_call_arg -= 1
+        return updated_node
 
     # ------------------------------------------------------------------
     # Core: detect and schedule tuple replacements
@@ -229,6 +240,8 @@ class TupleDataclass(Refactor):
     ) -> cst.BaseExpression:
         if len(updated_node.elements) < self.min_size:
             return updated_node
+        if self._in_call_arg > 0:
+            return updated_node
         if not self._in_changed_range(original_node):
             return updated_node
         if not self._is_safe_tuple(updated_node):
@@ -257,7 +270,15 @@ class TupleDataclass(Refactor):
             )
             if scope not in self.approved_public_funcs:
                 return updated_node
+
+        # Reuse field names from a prior return path of the same function so
+        # all constructor calls use a consistent set of keyword arguments.
+        if class_name in self._pending_classes:
+            field_names = self._pending_classes[class_name][0]
         else:
+            self._pending_classes[class_name] = (field_names, values)
+
+        if not is_public:
             self._private_transforms[scope] = TransformInfo(
                 func_name=scope,
                 dataclass_name=class_name,
@@ -266,8 +287,6 @@ class TupleDataclass(Refactor):
 
         if len(values) != len(field_names):  # pragma: no cover
             return updated_node
-
-        self._pending_classes[class_name] = (field_names, values)
         self._tuple_replacements[id(original_node)] = (class_name, field_names)
 
         # Build replacement call: ClassName(field=val, ...)

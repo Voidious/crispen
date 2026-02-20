@@ -704,9 +704,8 @@ def test_find_outside_callers_excludes_venv_dirs(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _make_service_pkg(root):
-    """Helper: return a tmp_path containing a package with a private function
-    and a caller of it, both in one file."""
+def _make_phase1_pkg(root):
+    """Helper: return a tmp_path containing a package for Phase 1 tests."""
     pkg = root / "mypkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("", encoding="utf-8")
