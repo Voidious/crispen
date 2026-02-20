@@ -1,6 +1,7 @@
 """Load files, apply refactors, verify, and write back."""
 
 import os
+import threading
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Set, Tuple
 
@@ -15,6 +16,9 @@ from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
 
 # Single-file refactors applied in order before TupleDataclass.
 _REFACTORS = [IfNotElse, DuplicateExtractor]
+
+# Hard wall-clock limit for libcst scope analysis per file (seconds).
+_SCOPE_ANALYSIS_TIMEOUT = 30
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +123,25 @@ class _CallerFinder(cst.CSTVisitor):
                 self.found.add(qn.name)
 
 
+def _visit_with_timeout(wrapper, finder, timeout: float) -> bool:
+    """Run wrapper.visit(finder) in a daemon thread with a wall-clock timeout.
+
+    Returns True if the call completed within *timeout* seconds, False if it
+    timed out (libcst scope analysis can hang on large files).
+    """
+    done = threading.Event()
+
+    def _target():
+        try:
+            wrapper.visit(finder)
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    return done.wait(timeout=timeout)
+
+
 def _find_outside_callers(
     repo_root: str,
     target_qnames: Set[str],
@@ -147,7 +170,10 @@ def _find_outside_callers(
         try:
             wrapper = manager.get_metadata_wrapper_for_path(rel_path)
             finder = _CallerFinder(target_qnames)
-            wrapper.visit(finder)
+            if not _visit_with_timeout(wrapper, finder, _SCOPE_ANALYSIS_TIMEOUT):
+                # Scope analysis timed out: conservatively block all transforms.
+                found_outside.update(target_qnames)
+                continue
             found_outside.update(finder.found)
         except Exception:
             continue
