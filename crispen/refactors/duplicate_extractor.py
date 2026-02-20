@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import textwrap
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -20,6 +21,42 @@ from .base import Refactor
 _MODEL = "claude-sonnet-4-6"
 _MIN_WEIGHT = 3
 _MAX_SEQ_LEN = 8
+_API_HARD_TIMEOUT = 90  # seconds — hard wall-clock limit per LLM call
+
+
+# ---------------------------------------------------------------------------
+# Hard-timeout helper
+# ---------------------------------------------------------------------------
+
+
+class _ApiTimeout(Exception):
+    """Raised when an LLM API call exceeds the hard per-call timeout."""
+
+
+def _run_with_timeout(func, timeout, *args, **kwargs):
+    """Run *func* in a daemon thread; raise _ApiTimeout if it doesn't finish.
+
+    This enforces a hard wall-clock limit that is not affected by OS-level
+    blocking (e.g. DNS resolution) which application-layer timeouts cannot
+    interrupt.
+    """
+    result: list = [None]
+    exc: list = [None]
+
+    def target():
+        try:
+            result[0] = func(*args, **kwargs)
+        except BaseException as e:
+            exc[0] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        raise _ApiTimeout(f"API call exceeded {timeout}s hard limit")
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +550,17 @@ class DuplicateExtractor(Refactor):
                     file=sys.stderr,
                     flush=True,
                 )
-            is_valid, reason = _llm_veto(client, group)
+            try:
+                is_valid, reason = _run_with_timeout(
+                    _llm_veto, _API_HARD_TIMEOUT, client, group
+                )
+            except _ApiTimeout:
+                print(
+                    "crispen: DuplicateExtractor: API call timed out, skipping group",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
             if self.verbose:
                 status = "ACCEPTED" if is_valid else "VETOED"
                 print(
@@ -524,7 +571,17 @@ class DuplicateExtractor(Refactor):
             if not is_valid:
                 continue
 
-            extraction = _llm_extract(client, group, source)
+            try:
+                extraction = _run_with_timeout(
+                    _llm_extract, _API_HARD_TIMEOUT, client, group, source
+                )
+            except _ApiTimeout:
+                print(
+                    "crispen: DuplicateExtractor: API call timed out, skipping group",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
             if extraction is None:
                 continue  # pragma: no cover
 
