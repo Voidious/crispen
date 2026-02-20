@@ -493,10 +493,7 @@ def test_collector_scope_tracking():
 def test_no_source_no_analysis():
     de = DuplicateExtractor([(1, 5)])
     assert de._new_source is None
-    # leave_Module returns updated_node unchanged
-    tree = cst.parse_module("a = 1\n")
-    result = de.leave_Module(tree, tree)
-    assert result is tree
+    assert de.get_rewritten_source() is None
 
 
 # ---------------------------------------------------------------------------
@@ -742,11 +739,7 @@ def test_successful_extraction_module_level(monkeypatch, tmp_path):
     assert "_helper" in de._new_source
     assert len(de.changes_made) == 1
     assert "'_helper'" in de.changes_made[0]
-
-    # leave_Module should return the new parsed module
-    wrapper_tree = cst.parse_module(source)
-    result = de.leave_Module(wrapper_tree, wrapper_tree)
-    assert result.code == de._new_source
+    assert de.get_rewritten_source() == de._new_source
 
 
 # ---------------------------------------------------------------------------

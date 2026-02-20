@@ -39,3 +39,8 @@ def test_get_changes_after_append():
     r = Refactor([(1, 10)])
     r.changes_made.append("something happened")
     assert list(r.get_changes()) == ["something happened"]
+
+
+def test_get_rewritten_source_returns_none():
+    r = Refactor([(1, 10)])
+    assert r.get_rewritten_source() is None

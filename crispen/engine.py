@@ -49,7 +49,8 @@ def run_engine(
                 yield f"SKIP {filepath} ({name}): transform error: {exc}"
                 continue
 
-            new_source = new_tree.code
+            rewritten = transformer.get_rewritten_source()
+            new_source = rewritten if rewritten is not None else new_tree.code
             if new_source == current_source:
                 continue
 

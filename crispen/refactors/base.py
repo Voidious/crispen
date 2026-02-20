@@ -1,6 +1,6 @@
 """Abstract base class for CST-based refactors."""
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import libcst as cst
 from libcst.metadata import PositionProvider
@@ -52,3 +52,11 @@ class Refactor(cst.CSTTransformer):
 
     def get_changes(self) -> Sequence[str]:
         return self.changes_made
+
+    def get_rewritten_source(self) -> Optional[str]:
+        """Return the fully rewritten source if this refactor used text-level edits.
+
+        Returns None when the rewrite was applied via CST transformation (the default).
+        The engine prefers this over new_tree.code when non-None.
+        """
+        return None

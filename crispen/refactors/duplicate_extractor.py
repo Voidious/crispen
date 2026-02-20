@@ -530,12 +530,5 @@ class DuplicateExtractor(Refactor):
         if edits:
             self._new_source = _apply_edits(source, edits)
 
-    def leave_Module(
-        self, original_node: cst.Module, updated_node: cst.Module
-    ) -> cst.Module:
-        if self._new_source is None:
-            return updated_node
-        try:
-            return cst.parse_module(self._new_source)
-        except cst.ParserSyntaxError:  # pragma: no cover
-            return updated_node
+    def get_rewritten_source(self) -> Optional[str]:
+        return self._new_source
