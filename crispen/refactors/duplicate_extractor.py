@@ -470,6 +470,7 @@ class DuplicateExtractor(Refactor):
 
         client = anthropic.Anthropic(api_key=api_key)
         edits: List[Tuple[int, int, str]] = []
+        pending_changes: List[str] = []
 
         for group in groups:
             if self.verbose:
@@ -510,10 +511,12 @@ class DuplicateExtractor(Refactor):
 
             first_seq = min(group, key=lambda s: s.start_line)
             if placement.startswith("staticmethod:"):
+                # Insert inside the class body, one line after "class Foo:".
                 scope = placement.split(":", 1)[1]
+                insert_pos = _find_insertion_point(source, scope) + 1
             else:
                 scope = first_seq.scope
-            insert_pos = _find_insertion_point(source, scope)
+                insert_pos = _find_insertion_point(source, scope)
             edits.append((insert_pos, insert_pos, helper_source + "\n\n"))
 
             func_name = extraction["function_name"]
@@ -522,13 +525,25 @@ class DuplicateExtractor(Refactor):
                     f"crispen: DuplicateExtractor: extracting '{func_name}'",
                     file=sys.stderr,
                 )
-            self.changes_made.append(
+            pending_changes.append(
                 f"DuplicateExtractor: extracted '{func_name}' "
                 f"from {len(group)} duplicate blocks"
             )
 
         if edits:
-            self._new_source = _apply_edits(source, edits)
+            candidate = _apply_edits(source, edits)
+            try:
+                compile(candidate, "<rewritten>", "exec")
+            except SyntaxError as exc:
+                if self.verbose:
+                    print(
+                        f"crispen: DuplicateExtractor: skipping — "
+                        f"assembled output not valid Python: {exc}",
+                        file=sys.stderr,
+                    )
+            else:
+                self._new_source = candidate
+                self.changes_made.extend(pending_changes)
 
     def get_rewritten_source(self) -> Optional[str]:
         return self._new_source
