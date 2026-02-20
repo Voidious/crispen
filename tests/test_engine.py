@@ -1,3 +1,6 @@
+from typing import Any
+from dataclasses import dataclass
+
 """Tests for the engine module."""
 
 import textwrap
@@ -20,6 +23,13 @@ from crispen.engine import (
 )
 from crispen.errors import CrispenAPIError
 from crispen.refactors.base import Refactor
+
+
+@dataclass
+class MakeServicePkgResult:
+    pkg: Any
+    service: Any
+    changed: Any
 
 
 def _run(changed):
@@ -72,6 +82,14 @@ def test_applies_refactor_and_writes(tmp_path):
     assert "if x:" in f.read_text(encoding="utf-8")
 
 
+def _run_with_refactor(tmp_path, refactor_cls):
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    with patch("crispen.engine._REFACTORS", [refactor_cls]):
+        msgs = _run({str(f): [(1, 1)]})
+    return f, msgs
+
+
 def test_rewritten_source_used_when_available(tmp_path):
     """get_rewritten_source() is preferred over new_tree.code when non-None."""
     rewritten = "x = 999  # rewritten\n"
@@ -87,10 +105,7 @@ def test_rewritten_source_used_when_available(tmp_path):
         def get_changes(self):
             return ["Rewriter: rewrote the file"]
 
-    f = tmp_path / "code.py"
-    f.write_text("x = 1\n", encoding="utf-8")
-    with patch("crispen.engine._REFACTORS", [_RewritingRefactor]):
-        msgs = _run({str(f): [(1, 1)]})
+    f, msgs = _run_with_refactor(tmp_path, _RewritingRefactor)
     assert any("Rewriter" in m for m in msgs)
     assert f.read_text(encoding="utf-8") == rewritten
 
@@ -124,10 +139,7 @@ class _RaisingTransformer(Refactor):
 
 
 def test_skip_transform_error(tmp_path):
-    f = tmp_path / "code.py"
-    f.write_text("x = 1\n", encoding="utf-8")
-    with patch("crispen.engine._REFACTORS", [_RaisingTransformer]):
-        msgs = _run({str(f): [(1, 1)]})
+    f, msgs = _run_with_refactor(tmp_path, _RaisingTransformer)
     assert any("transform error" in m for m in msgs)
 
 
@@ -288,11 +300,17 @@ def test_find_outside_callers_no_outside_py_files(tmp_path):
     assert result == set()
 
 
+def _make_package(directory):
+    """Create a Python package directory with an ``__init__.py`` and return the
+    path to a ``service.py`` file inside it (not yet created)."""
+    directory.mkdir()
+    (directory / "__init__.py").write_text("")
+    return directory / "service.py"
+
+
 def test_find_outside_callers_finds_caller(tmp_path):
     pkg = tmp_path / "mypkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("")
-    service = pkg / "service.py"
+    service = _make_package(pkg)
     service.write_text("def get_user():\n    return (1, 2, 3)\n")
     outside = tmp_path / "outside.py"
     outside.write_text("from mypkg.service import get_user\nget_user()\n")
@@ -323,13 +341,18 @@ def _make_pkg(root, name):
     return pkg
 
 
-def test_cross_file_transforms_public_func_and_caller(tmp_path):
+def _make_service_file(tmp_path):
     pkg = _make_pkg(tmp_path, "mypkg")
 
     service = pkg / "service.py"
     service.write_text(
         "def get_user():\n    return (name, age, score)\n", encoding="utf-8"
     )
+    return pkg, service
+
+
+def test_cross_file_transforms_public_func_and_caller(tmp_path):
+    pkg, service = _make_service_file(tmp_path)
 
     api = pkg / "api.py"
     api.write_text(
@@ -360,12 +383,7 @@ def test_cross_file_transforms_public_func_and_caller(tmp_path):
 
 
 def test_cross_file_skips_when_outside_caller_exists(tmp_path):
-    pkg = _make_pkg(tmp_path, "mypkg")
-
-    service = pkg / "service.py"
-    service.write_text(
-        "def get_user():\n    return (name, age, score)\n", encoding="utf-8"
-    )
+    pkg, service = _make_service_file(tmp_path)
 
     # This file is NOT in the diff but calls get_user.
     outside = pkg / "outside.py"
@@ -544,10 +562,7 @@ def test_cross_file_one_approved_one_blocked(tmp_path):
 
 def test_cross_file_caller_updater_file_not_under_repo_root(tmp_path):
     subdir = tmp_path / "repo"
-    subdir.mkdir()
-    (subdir / "__init__.py").write_text("")
-
-    inside = subdir / "service.py"
+    inside = _make_package(subdir)
     inside.write_text("def approved():\n    return (1, 2, 3)\n", encoding="utf-8")
 
     # This file is in the diff but outside repo_root (subdir).
@@ -564,13 +579,19 @@ def test_cross_file_caller_updater_file_not_under_repo_root(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_cross_file_caller_updater_parse_error(tmp_path):
+def _make_service_pkg(tmp_path):
     pkg = _make_pkg(tmp_path, "mypkg")
 
     service = pkg / "service.py"
     service.write_text("def approved():\n    return (1, 2, 3)\n", encoding="utf-8")
 
     changed = {str(service): [(1, 2)]}
+    return MakeServicePkgResult(pkg=pkg, service=service, changed=changed)
+
+
+def test_cross_file_caller_updater_parse_error(tmp_path):
+    _result = _make_service_pkg(tmp_path)
+    changed = _result.changed
 
     original_parse = cst.parse_module
 
@@ -594,12 +615,8 @@ def test_cross_file_caller_updater_parse_error(tmp_path):
 
 
 def test_cross_file_caller_updater_raises(tmp_path):
-    pkg = _make_pkg(tmp_path, "mypkg")
-
-    service = pkg / "service.py"
-    service.write_text("def approved():\n    return (1, 2, 3)\n", encoding="utf-8")
-
-    changed = {str(service): [(1, 2)]}
+    _result = _make_service_pkg(tmp_path)
+    changed = _result.changed
 
     with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
         # Should not crash; the exception is caught.
@@ -712,8 +729,7 @@ def _make_phase1_pkg(root):
     return pkg
 
 
-def test_phase1_private_caller_updated(tmp_path):
-    """Private function callers in the same file are updated after Phase 1."""
+def _write_make_result_source(tmp_path):
     source = textwrap.dedent(
         """\
         def _make_result():
@@ -725,6 +741,12 @@ def test_phase1_private_caller_updated(tmp_path):
     )
     f = tmp_path / "code.py"
     f.write_text(source, encoding="utf-8")
+    return f
+
+
+def test_phase1_private_caller_updated(tmp_path):
+    """Private function callers in the same file are updated after Phase 1."""
+    f = _write_make_result_source(tmp_path)
     msgs = _run({str(f): [(1, 100)]})
     result = f.read_text(encoding="utf-8")
     assert "_ = _make_result()" in result
@@ -743,17 +765,7 @@ def test_phase1_private_no_callers_no_caller_updater_msg(tmp_path):
 
 def test_phase1_private_caller_updater_exception_ignored(tmp_path):
     """If CallerUpdater raises during Phase 1, the engine continues gracefully."""
-    source = textwrap.dedent(
-        """\
-        def _make_result():
-            return (1, 2, 3)
-
-        def use_it():
-            a, b, c = _make_result()
-        """
-    )
-    f = tmp_path / "code.py"
-    f.write_text(source, encoding="utf-8")
+    f = _write_make_result_source(tmp_path)
     with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
         msgs = _run({str(f): [(1, 100)]})
     # TupleDataclass still ran successfully
