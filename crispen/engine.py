@@ -2,6 +2,7 @@
 
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Set, Tuple
 
@@ -17,8 +18,8 @@ from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
 # Single-file refactors applied in order before TupleDataclass.
 _REFACTORS = [IfNotElse, DuplicateExtractor]
 
-# Hard wall-clock limit for libcst scope analysis per file (seconds).
-_SCOPE_ANALYSIS_TIMEOUT = 30
+# Total wall-clock budget for all files in _find_outside_callers (seconds).
+_SCOPE_ANALYSIS_TIMEOUT = 10
 
 
 # ---------------------------------------------------------------------------
@@ -166,14 +167,20 @@ def _find_outside_callers(
         return set(target_qnames)
 
     found_outside: Set[str] = set()
+    deadline = time.monotonic() + _SCOPE_ANALYSIS_TIMEOUT
     for rel_path in rel_paths:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Total budget exhausted: conservatively block all remaining.
+            found_outside.update(target_qnames)
+            break
         try:
             wrapper = manager.get_metadata_wrapper_for_path(rel_path)
             finder = _CallerFinder(target_qnames)
-            if not _visit_with_timeout(wrapper, finder, _SCOPE_ANALYSIS_TIMEOUT):
-                # Scope analysis timed out: conservatively block all transforms.
+            if not _visit_with_timeout(wrapper, finder, remaining):
+                # This file timed out: conservatively block all transforms.
                 found_outside.update(target_qnames)
-                continue
+                break
             found_outside.update(finder.found)
         except Exception:
             continue
