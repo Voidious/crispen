@@ -89,7 +89,7 @@ class _ASTNormalizer(ast.NodeTransformer):
 def _normalize_source(source: str) -> str:
     """Return a normalized fingerprint of source code."""
     try:
-        tree = ast.parse(source)
+        tree = ast.parse(textwrap.dedent(source))
     except SyntaxError:
         return source
     normalizer = _ASTNormalizer()

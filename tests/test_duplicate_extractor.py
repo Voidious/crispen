@@ -230,6 +230,14 @@ def test_normalize_source_free_variables_match():
     assert _normalize_source(src_a) == _normalize_source(src_b)
 
 
+def test_normalize_source_indented_blocks_match():
+    # Source collected from inside a function is indented; dedent must happen
+    # before ast.parse so that structurally identical blocks still match.
+    src_a = "    p = a * 2\n    if p > 100:\n        p += 1\n"
+    src_b = "    q = b * 2\n    if q > 100:\n        q += 1\n"
+    assert _normalize_source(src_a) == _normalize_source(src_b)
+
+
 # ---------------------------------------------------------------------------
 # _overlaps_diff
 # ---------------------------------------------------------------------------
@@ -501,17 +509,17 @@ def test_no_duplicates_no_llm_calls(monkeypatch):
     source = textwrap.dedent(
         """\
         def foo():
-            x = unique_a(data)
-            y = unique_b(x)
-            z = unique_c(y)
+            x = a + b
+            y = x * 2
 
         def bar():
-            p = different_a(info)
-            q = different_b(p)
-            r = different_c(q)
+            if condition:
+                result = value
+            else:
+                result = other
         """
     )
-    # No duplicates → no API calls → no key required either
+    # Structurally different blocks → no duplicate group → no API calls needed
     de = DuplicateExtractor([(6, 9)], source=source)
     assert de._new_source is None
 
