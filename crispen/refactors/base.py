@@ -15,7 +15,7 @@ class Refactor(cst.CSTTransformer):
 
     METADATA_DEPENDENCIES = (PositionProvider,)
 
-    def __init__(self, changed_ranges: List[Tuple[int, int]]) -> None:
+    def __init__(self, changed_ranges: List[Tuple[int, int]], source: str = "") -> None:
         super().__init__()
         self.changed_ranges = changed_ranges
         self.changes_made: List[str] = []

@@ -4,6 +4,7 @@ import sys
 
 from .diff_parser import parse_diff
 from .engine import run_engine
+from .errors import CrispenAPIError
 
 
 def main() -> None:
@@ -16,5 +17,9 @@ def main() -> None:
     if not changed:
         return
 
-    for message in run_engine(changed):
-        print(message)
+    try:
+        for message in run_engine(changed):
+            print(message)
+    except CrispenAPIError as exc:
+        print(f"crispen: {exc}", file=sys.stderr)
+        sys.exit(1)

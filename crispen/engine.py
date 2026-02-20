@@ -6,10 +6,12 @@ from typing import Dict, Generator, List, Tuple
 import libcst as cst
 from libcst.metadata import MetadataWrapper
 
+from .errors import CrispenAPIError
+from .refactors.duplicate_extractor import DuplicateExtractor
 from .refactors.if_not_else import IfNotElse
 from .refactors.tuple_dataclass import TupleDataclass
 
-_REFACTORS = [IfNotElse, TupleDataclass]
+_REFACTORS = [IfNotElse, TupleDataclass, DuplicateExtractor]
 
 
 def run_engine(
@@ -34,9 +36,11 @@ def run_engine(
                 break
 
             wrapper = MetadataWrapper(current_tree)
-            transformer = RefactorClass(ranges)
             try:
+                transformer = RefactorClass(ranges, source=current_source)
                 new_tree = wrapper.visit(transformer)
+            except CrispenAPIError:
+                raise
             except Exception as exc:
                 name = RefactorClass.name()
                 yield f"SKIP {filepath} ({name}): transform error: {exc}"

@@ -87,9 +87,9 @@ class TupleDataclass(Refactor):
     """
 
     def __init__(
-        self, changed_ranges: List[Tuple[int, int]], min_size: int = 3
+        self, changed_ranges: List[Tuple[int, int]], min_size: int = 3, source: str = ""
     ) -> None:
-        super().__init__(changed_ranges)
+        super().__init__(changed_ranges, source=source)
         self.min_size = min_size
 
         # State populated during the first visit pass
