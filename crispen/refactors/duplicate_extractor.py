@@ -488,6 +488,7 @@ class DuplicateExtractor(Refactor):
             print(
                 f"crispen: DuplicateExtractor: found {len(groups)} duplicate group(s)",
                 file=sys.stderr,
+                flush=True,
             )
 
         api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -497,7 +498,7 @@ class DuplicateExtractor(Refactor):
                 "Commit blocked. To skip all hooks: git commit --no-verify"
             )
 
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(api_key=api_key, timeout=60.0)
         edits: List[Tuple[int, int, str]] = []
         pending_changes: List[str] = []
 
@@ -510,6 +511,7 @@ class DuplicateExtractor(Refactor):
                     f"crispen: DuplicateExtractor: veto check — "
                     f"scope '{group[0].scope}': {ranges_str}",
                     file=sys.stderr,
+                    flush=True,
                 )
             is_valid, reason = _llm_veto(client, group)
             if self.verbose:
@@ -517,6 +519,7 @@ class DuplicateExtractor(Refactor):
                 print(
                     f"crispen: DuplicateExtractor:   → {status}: {reason}",
                     file=sys.stderr,
+                    flush=True,
                 )
             if not is_valid:
                 continue
@@ -553,6 +556,7 @@ class DuplicateExtractor(Refactor):
                 print(
                     f"crispen: DuplicateExtractor: extracting '{func_name}'",
                     file=sys.stderr,
+                    flush=True,
                 )
             pending_changes.append(
                 f"DuplicateExtractor: extracted '{func_name}' "
@@ -569,6 +573,7 @@ class DuplicateExtractor(Refactor):
                         f"crispen: DuplicateExtractor: skipping — "
                         f"assembled output not valid Python: {exc}",
                         file=sys.stderr,
+                        flush=True,
                     )
             else:
                 self._new_source = candidate
