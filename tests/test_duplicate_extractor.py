@@ -166,12 +166,11 @@ def test_has_def_with_classdef():
 def test_normalize_source_normalizes_vars():
     src = "result = compute(data)\noutput = transform(result)\n"
     norm = _normalize_source(src)
-    # Variable names should be replaced
+    # All names (both assigned and free) are replaced with positional placeholders
     assert "result" not in norm
     assert "output" not in norm
-    # Function names and literals should be preserved
-    assert "compute" in norm
-    assert "transform" in norm
+    assert "compute" not in norm
+    assert "data" not in norm
 
 
 def test_normalize_source_same_fingerprint():
@@ -181,8 +180,9 @@ def test_normalize_source_same_fingerprint():
 
 
 def test_normalize_source_different_ops():
-    src_a = "x = sorted(data)\n"
-    src_b = "x = reversed(data)\n"
+    # Structurally different code (different number of statements) should differ
+    src_a = "x = a + b\n"
+    src_b = "x = a + b\ny = x * 2\n"
     assert _normalize_source(src_a) != _normalize_source(src_b)
 
 
@@ -200,10 +200,11 @@ def test_normalize_source_load_context_replaced():
 
 
 def test_normalize_source_load_not_in_map():
-    # A Name in Load context that was never stored is kept as-is
-    src = "y = some_global + 1\n"
-    norm = _normalize_source(src)
-    assert "some_global" in norm
+    # Free variables (Load context, never stored) are also normalized,
+    # so two blocks with different free variable names get the same fingerprint.
+    src_a = "y = a + 1\n"
+    src_b = "z = b + 1\n"
+    assert _normalize_source(src_a) == _normalize_source(src_b)
 
 
 def test_normalize_source_repeated_store():
@@ -212,6 +213,21 @@ def test_normalize_source_repeated_store():
     norm = _normalize_source(src)
     # Both assignments normalize to the same placeholder
     assert norm.count("_v0") == 2
+
+
+def test_normalize_source_del_context():
+    # Del context falls through to return node unchanged
+    src = "del x\n"
+    norm = _normalize_source(src)
+    assert "x" in norm
+
+
+def test_normalize_source_free_variables_match():
+    # Blocks differing only in free variable names should get the same fingerprint.
+    # This is the core case: `p = a * 2; if p > 100: p += 1` vs the same with q/b.
+    src_a = "p = a * 2\nif p > 100:\n    p += 1\n"
+    src_b = "q = b * 2\nif q > 100:\n    q += 1\n"
+    assert _normalize_source(src_a) == _normalize_source(src_b)
 
 
 # ---------------------------------------------------------------------------

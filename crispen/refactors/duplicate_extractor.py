@@ -81,10 +81,8 @@ class _ASTNormalizer(ast.NodeTransformer):
         return self._map[name]
 
     def visit_Name(self, node: ast.Name) -> ast.Name:
-        if isinstance(node.ctx, ast.Store):
+        if isinstance(node.ctx, (ast.Store, ast.Load)):
             return ast.Name(id=self._placeholder(node.id), ctx=node.ctx)
-        if isinstance(node.ctx, ast.Load) and node.id in self._map:
-            return ast.Name(id=self._map[node.id], ctx=node.ctx)
         return node
 
 
