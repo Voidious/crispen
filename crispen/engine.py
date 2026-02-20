@@ -16,6 +16,7 @@ _REFACTORS = [IfNotElse, TupleDataclass, DuplicateExtractor]
 
 def run_engine(
     changed: Dict[str, List[Tuple[int, int]]],
+    verbose: bool = True,
 ) -> Generator[str, None, None]:
     """Apply all refactors to changed files and yield summary messages."""
     for filepath, ranges in changed.items():
@@ -37,7 +38,9 @@ def run_engine(
 
             wrapper = MetadataWrapper(current_tree)
             try:
-                transformer = RefactorClass(ranges, source=current_source)
+                transformer = RefactorClass(
+                    ranges, source=current_source, verbose=verbose
+                )
                 new_tree = wrapper.visit(transformer)
             except CrispenAPIError:
                 raise

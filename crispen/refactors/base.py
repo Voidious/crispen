@@ -15,10 +15,16 @@ class Refactor(cst.CSTTransformer):
 
     METADATA_DEPENDENCIES = (PositionProvider,)
 
-    def __init__(self, changed_ranges: List[Tuple[int, int]], source: str = "") -> None:
+    def __init__(
+        self,
+        changed_ranges: List[Tuple[int, int]],
+        source: str = "",
+        verbose: bool = True,
+    ) -> None:
         super().__init__()
         self.changed_ranges = changed_ranges
         self.changes_made: List[str] = []
+        self.verbose = verbose
 
     def _in_changed_range(self, node: cst.CSTNode) -> bool:
         """Return True if the node's start line overlaps any changed range."""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import sys
 import textwrap
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -429,8 +430,13 @@ def _find_insertion_point(source: str, scope: str) -> int:
 class DuplicateExtractor(Refactor):
     """Detect and extract duplicate code blocks into helper functions via LLM."""
 
-    def __init__(self, changed_ranges: List[Tuple[int, int]], source: str = "") -> None:
-        super().__init__(changed_ranges, source=source)
+    def __init__(
+        self,
+        changed_ranges: List[Tuple[int, int]],
+        source: str = "",
+        verbose: bool = True,
+    ) -> None:
+        super().__init__(changed_ranges, source=source, verbose=verbose)
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -449,6 +455,12 @@ class DuplicateExtractor(Refactor):
         if not groups:
             return
 
+        if self.verbose:
+            print(
+                f"crispen: DuplicateExtractor: found {len(groups)} duplicate group(s)",
+                file=sys.stderr,
+            )
+
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise CrispenAPIError(
@@ -460,7 +472,22 @@ class DuplicateExtractor(Refactor):
         edits: List[Tuple[int, int, str]] = []
 
         for group in groups:
-            is_valid, _reason = _llm_veto(client, group)
+            if self.verbose:
+                ranges_str = ", ".join(
+                    f"lines {s.start_line}-{s.end_line}" for s in group
+                )
+                print(
+                    f"crispen: DuplicateExtractor: veto check — "
+                    f"scope '{group[0].scope}': {ranges_str}",
+                    file=sys.stderr,
+                )
+            is_valid, reason = _llm_veto(client, group)
+            if self.verbose:
+                status = "ACCEPTED" if is_valid else "VETOED"
+                print(
+                    f"crispen: DuplicateExtractor:   → {status}: {reason}",
+                    file=sys.stderr,
+                )
             if not is_valid:
                 continue
 
@@ -490,6 +517,11 @@ class DuplicateExtractor(Refactor):
             edits.append((insert_pos, insert_pos, helper_source + "\n\n"))
 
             func_name = extraction["function_name"]
+            if self.verbose:
+                print(
+                    f"crispen: DuplicateExtractor: extracting '{func_name}'",
+                    file=sys.stderr,
+                )
             self.changes_made.append(
                 f"DuplicateExtractor: extracted '{func_name}' "
                 f"from {len(group)} duplicate blocks"
