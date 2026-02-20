@@ -796,7 +796,30 @@ def test_verify_fails_skipped(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_successful_extraction_module_level(monkeypatch, tmp_path):
+def _setup_mock_client_module_level(mock_anthropic, helper: str) -> None:
+    """Configure *mock_anthropic* with a client that returns a veto-then-extract
+    response pair.
+    """
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    mock_client.messages.create.side_effect = [
+        _make_veto_response(True, "same logic"),
+        _make_extract_response(
+            {
+                "function_name": "_helper",
+                "placement": "module_level",
+                "helper_source": helper,
+                "call_site_replacements": [
+                    "    _helper(data)\n",
+                    "    _helper(data)\n",
+                ],
+            }
+        ),
+    ]
+
+
+def _make_source_and_helper(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     source = textwrap.dedent(
         """\
@@ -814,24 +837,14 @@ def test_successful_extraction_module_level(monkeypatch, tmp_path):
         """
     )
     helper = "def _helper(data):\n    pass\n"
+    return source, helper
+
+
+def test_successful_extraction_module_level(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source, helper = _make_source_and_helper(monkeypatch)
     with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": helper,
-                    "call_site_replacements": [
-                        "    _helper(data)\n",
-                        "    _helper(data)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_mock_client_module_level(mock_anthropic, helper)
 
         de = DuplicateExtractor([(9, 11)], source=source)
 
@@ -904,19 +917,29 @@ def _make_seq_info(start: int, end: int, src: str = "") -> _SeqInfo:
     )
 
 
-def test_llm_veto_skips_non_matching_blocks(monkeypatch):
-    from crispen.refactors.duplicate_extractor import _llm_veto
+def _make_mock_response(client, non_matching, matching):
+    response = MagicMock()
+    response.content = [non_matching, matching]
+    client.messages.create.return_value = response
 
+
+def _make_matching_blocks():
+    """Return a (client, non_matching, matching) triple used by LLM block tests."""
     client = MagicMock()
     non_matching = MagicMock()
     non_matching.type = "text"  # not tool_use → if condition False
     matching = MagicMock()
     matching.type = "tool_use"
+    return client, non_matching, matching
+
+
+def test_llm_veto_skips_non_matching_blocks(monkeypatch):
+    from crispen.refactors.duplicate_extractor import _llm_veto
+
+    client, non_matching, matching = _make_matching_blocks()
     matching.name = "evaluate_duplicate"
     matching.input = {"is_valid_duplicate": True, "reason": "same"}
-    response = MagicMock()
-    response.content = [non_matching, matching]
-    client.messages.create.return_value = response
+    _make_mock_response(client, non_matching, matching)
 
     group = [_make_seq_info(1, 3), _make_seq_info(5, 7)]
     is_valid, reason = _llm_veto(client, group)
@@ -926,11 +949,7 @@ def test_llm_veto_skips_non_matching_blocks(monkeypatch):
 def test_llm_extract_skips_non_matching_blocks(monkeypatch):
     from crispen.refactors.duplicate_extractor import _llm_extract
 
-    client = MagicMock()
-    non_matching = MagicMock()
-    non_matching.type = "text"  # not tool_use → if condition False
-    matching = MagicMock()
-    matching.type = "tool_use"
+    client, non_matching, matching = _make_matching_blocks()
     matching.name = "extract_helper"
     matching.input = {
         "function_name": "helper",
@@ -938,9 +957,7 @@ def test_llm_extract_skips_non_matching_blocks(monkeypatch):
         "helper_source": "def helper(): pass\n",
         "call_site_replacements": ["helper()\n"],
     }
-    response = MagicMock()
-    response.content = [non_matching, matching]
-    client.messages.create.return_value = response
+    _make_mock_response(client, non_matching, matching)
 
     group = [_make_seq_info(1, 3)]
     result = _llm_extract(client, group, "a = 1\n")
@@ -953,40 +970,9 @@ def test_llm_extract_skips_non_matching_blocks(monkeypatch):
 def test_verbose_false_suppresses_stderr(monkeypatch):
     # verbose=False must take all four if-self.verbose False branches without printing.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    source = textwrap.dedent(
-        """\
-        import os
-
-        def foo():
-            x = compute(data)
-            y = transform(x)
-            z = finalize(y)
-
-        def bar():
-            x = compute(data)
-            y = transform(x)
-            z = finalize(y)
-        """
-    )
-    helper = "def _helper(data):\n    pass\n"
+    source, helper = _make_source_and_helper(monkeypatch)
     with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": helper,
-                    "call_site_replacements": [
-                        "    _helper(data)\n",
-                        "    _helper(data)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_mock_client_module_level(mock_anthropic, helper)
 
         de = DuplicateExtractor([(9, 11)], source=source, verbose=False)
 
