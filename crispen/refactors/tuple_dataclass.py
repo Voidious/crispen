@@ -138,6 +138,9 @@ class TupleDataclass(Refactor):
         # Counter to detect tuples inside function call arguments
         self._in_call_arg: int = 0
 
+        # Counter to detect tuples inside return statements
+        self._in_return: int = 0
+
     # ------------------------------------------------------------------
     # Collect context before transforms
     # ------------------------------------------------------------------
@@ -191,6 +194,16 @@ class TupleDataclass(Refactor):
         self._in_call_arg -= 1
         return updated_node
 
+    def visit_Return(self, node: cst.Return) -> Optional[bool]:
+        self._in_return += 1
+        return None
+
+    def leave_Return(
+        self, original_node: cst.Return, updated_node: cst.Return
+    ) -> cst.BaseStatement:
+        self._in_return -= 1
+        return updated_node
+
     # ------------------------------------------------------------------
     # Core: detect and schedule tuple replacements
     # ------------------------------------------------------------------
@@ -239,6 +252,8 @@ class TupleDataclass(Refactor):
         self, original_node: cst.Tuple, updated_node: cst.Tuple
     ) -> cst.BaseExpression:
         if len(updated_node.elements) < self.min_size:
+            return updated_node
+        if self._in_return == 0:
             return updated_node
         if self._in_call_arg > 0:
             return updated_node

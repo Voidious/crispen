@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Generator, List, Optional, Set, Tuple
+from typing import Dict, Generator, List, NamedTuple, Optional, Set, Tuple
 
 import libcst as cst
 from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvider
@@ -205,18 +205,28 @@ def _find_outside_callers(
 # ---------------------------------------------------------------------------
 
 
+class _ApplyResult(NamedTuple):
+    """Return type of _apply_tuple_dataclass."""
+
+    source: str
+    msgs: List[str]
+    td: Optional[TupleDataclass]
+
+
 def _apply_tuple_dataclass(
     filepath: str,
     ranges: List[Tuple[int, int]],
     source: str,
     verbose: bool,
     approved_public_funcs: Set[str],
-) -> Tuple[str, List[str], Optional[TupleDataclass]]:
+) -> "_ApplyResult":
     """Run TupleDataclass on *source*. Returns (new_source, messages, transformer)."""
     try:
         tree = cst.parse_module(source)
     except cst.ParserSyntaxError as exc:
-        return source, [f"SKIP {filepath} (TupleDataclass): parse error: {exc}"], None
+        return _ApplyResult(
+            source, [f"SKIP {filepath} (TupleDataclass): parse error: {exc}"], None
+        )
 
     wrapper = MetadataWrapper(tree)
     try:
@@ -230,7 +240,7 @@ def _apply_tuple_dataclass(
     except CrispenAPIError:
         raise
     except Exception as exc:
-        return (
+        return _ApplyResult(
             source,
             [f"SKIP {filepath} (TupleDataclass): transform error: {exc}"],
             None,
@@ -238,19 +248,19 @@ def _apply_tuple_dataclass(
 
     new_source = td.get_rewritten_source() or new_tree.code
     if new_source == source:
-        return source, [], td
+        return _ApplyResult(source, [], td)
 
     try:
         compile(new_source, filepath, "exec")
     except SyntaxError as exc:  # pragma: no cover
-        return (
+        return _ApplyResult(
             source,
             [f"SKIP {filepath} (TupleDataclass): output not valid Python: {exc}"],
             td,
         )
 
     msgs = [f"{filepath}: {m}" for m in td.get_changes()]
-    return new_source, msgs, td
+    return _ApplyResult(new_source, msgs, td)
 
 
 # ---------------------------------------------------------------------------

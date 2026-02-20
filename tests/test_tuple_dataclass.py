@@ -41,7 +41,7 @@ def _changes(source: str, ranges=None, min_size: int = 3) -> list:
 BEFORE_SIMPLE = "result = (1, 2, 3)\n"
 
 # Private-function tuple — the positive case for all "happy path" tests.
-BEFORE_SIMPLE_PRIVATE = "def _f():\n    result = (1, 2, 3)\n"
+BEFORE_SIMPLE_PRIVATE = "def _f():\n    return (1, 2, 3)\n"
 
 
 def _assert_default_field_names(result: str) -> None:
@@ -146,7 +146,7 @@ def test_field_names_inferred_from_variables():
 
 def test_field_names_fallback_for_literals():
     # When elements are literals, fall back to field_0, field_1, ...
-    result = _apply("def _f():\n    x = (1, 2, 3)\n")
+    result = _apply("def _f():\n    return (1, 2, 3)\n")
     _assert_default_field_names(result)
 
 
@@ -164,14 +164,14 @@ def test_starred_skipped():
 
 
 def test_min_size_two():
-    source = "def _f():\n    x = (1, 2)\n"
+    source = "def _f():\n    return (1, 2)\n"
     result = _apply(source, min_size=2)
     assert "field_0" in result
     assert "field_1" in result
 
 
 def test_min_size_four_skips_three():
-    source = "def _f():\n    x = (1, 2, 3)\n"
+    source = "def _f():\n    return (1, 2, 3)\n"
     result = _apply(source, min_size=4)
     assert result == source
 
@@ -206,7 +206,7 @@ from dataclasses import dataclass
 from typing import Any
 
 def _f():
-    result = (1, 2, 3)
+    return (1, 2, 3)
 """
 
 
@@ -239,7 +239,7 @@ def test_tuple_in_private_method_uses_method_scope_name():
 
 
 def test_attribute_import_not_treated_as_dataclass():
-    source = "from os.path import join\ndef _f():\n    result = (1, 2, 3)\n"
+    source = "from os.path import join\ndef _f():\n    return (1, 2, 3)\n"
     result = _apply(source)
     # Transform still happens; the os.path import is just ignored by the tracker
     assert "from dataclasses import dataclass" in result
@@ -251,7 +251,7 @@ def test_attribute_import_not_treated_as_dataclass():
 
 
 def test_star_import_from_typing():
-    source = "from typing import *\ndef _f():\n    result = (1, 2, 3)\n"
+    source = "from typing import *\ndef _f():\n    return (1, 2, 3)\n"
     result = _apply(source)
     assert "@dataclass" in result
 
@@ -262,7 +262,7 @@ def test_star_import_from_typing():
 
 
 def test_non_any_typing_import_still_adds_any():
-    source = "from typing import List\ndef _f():\n    result = (1, 2, 3)\n"
+    source = "from typing import List\ndef _f():\n    return (1, 2, 3)\n"
     result = _apply(source)
     assert "from typing import Any" in result
 
@@ -271,7 +271,7 @@ def test_non_import_statement_in_module_does_not_crash():
     # A module-level assignment (not an import) followed by a private function.
     # Exercises the `not isinstance(s, ImportFrom)` branch inside leave_Module's
     # import-insertion loop (branch 313->312 in coverage).
-    source = "X = 42\ndef _f():\n    result = (1, 2, 3)\n"
+    source = "X = 42\ndef _f():\n    return (1, 2, 3)\n"
     result = _apply(source)
     assert "@dataclass" in result
     assert "from dataclasses import dataclass" in result
@@ -285,7 +285,7 @@ BEFORE_FUTURE = """\
 from __future__ import annotations
 
 def _f():
-    result = (1, 2, 3)
+    return (1, 2, 3)
 """
 
 
@@ -424,21 +424,23 @@ def public_func():
 """
 
 
-def test_public_function_candidate_recorded():
+def _make_td_for_public_func_3() -> TupleDataclass:
+    """Run TupleDataclass on BEFORE_PUBLIC_FUNC_3 and return the transformer."""
     tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
     td = TupleDataclass([(1, 100)])
     MetadataWrapper(tree).visit(td)
-    candidates = td.get_candidate_public_transforms()
+    return td
+
+
+def test_public_function_candidate_recorded():
+    candidates = _make_td_for_public_func_3().get_candidate_public_transforms()
     assert "public_func" in candidates
     assert candidates["public_func"].func_name == "public_func"
     assert candidates["public_func"].dataclass_name == "PublicFuncResult"
 
 
 def test_public_function_candidate_has_correct_type():
-    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
-    td = TupleDataclass([(1, 100)])
-    MetadataWrapper(tree).visit(td)
-    candidates = td.get_candidate_public_transforms()
+    candidates = _make_td_for_public_func_3().get_candidate_public_transforms()
     assert isinstance(candidates["public_func"], TransformInfo)
 
 
@@ -464,9 +466,7 @@ def test_unapproved_public_function_not_transformed():
 
 
 def test_get_candidate_public_transforms_returns_copy():
-    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
-    td = TupleDataclass([(1, 100)])
-    MetadataWrapper(tree).visit(td)
+    td = _make_td_for_public_func_3()
     c1 = td.get_candidate_public_transforms()
     c2 = td.get_candidate_public_transforms()
     assert c1 == c2
@@ -503,12 +503,17 @@ def _f():
 # ---------------------------------------------------------------------------
 
 
-def test_private_function_in_get_private_transforms():
-    # _snake_to_pascal("_private") → "Private" → class name "PrivateResult"
-    source = "def _private():\n    return (1, 2, 3)\n"
+def _make_private_td(source: str = "def _private():\n    return (1, 2, 3)\n"):
+    """Parse *source*, run TupleDataclass over it, and return the transformer."""
     tree = cst.parse_module(source)
     td = TupleDataclass([(1, 100)])
     MetadataWrapper(tree).visit(td)
+    return td
+
+
+def test_private_function_in_get_private_transforms():
+    # _snake_to_pascal("_private") → "Private" → class name "PrivateResult"
+    td = _make_private_td()
     private = td.get_private_transforms()
     assert "_private" in private
     assert private["_private"].func_name == "_private"
@@ -516,17 +521,11 @@ def test_private_function_in_get_private_transforms():
 
 
 def test_public_function_not_in_get_private_transforms():
-    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
-    td = TupleDataclass([(1, 100)])
-    MetadataWrapper(tree).visit(td)
-    assert td.get_private_transforms() == {}
+    assert _make_td_for_public_func_3().get_private_transforms() == {}
 
 
 def test_get_private_transforms_returns_copy():
-    source = "def _private():\n    return (1, 2, 3)\n"
-    tree = cst.parse_module(source)
-    td = TupleDataclass([(1, 100)])
-    MetadataWrapper(tree).visit(td)
+    td = _make_private_td()
     p1 = td.get_private_transforms()
     p2 = td.get_private_transforms()
     assert p1 == p2
@@ -538,10 +537,16 @@ def test_get_private_transforms_returns_copy():
 # ---------------------------------------------------------------------------
 
 
+def test_tuple_in_non_return_not_transformed():
+    # A 3-element tuple in an assignment (not a return) is left unchanged.
+    source = "def _f():\n    x = (1, 2, 3)\n"
+    result = _apply(source)
+    assert result == source
+
+
 def test_tuple_in_call_arg_not_transformed():
-    # A 3-element tuple used as an argument to a function call should be left
-    # unchanged even when it is inside a private function scope.
-    source = "def _f():\n    g((1, 2, 3))\n"
+    # A 3-element tuple inside a return-statement call argument is left unchanged.
+    source = "def _f():\n    return g((1, 2, 3))\n"
     result = _apply(source)
     assert result == source
 
@@ -549,6 +554,63 @@ def test_tuple_in_call_arg_not_transformed():
 # ---------------------------------------------------------------------------
 # Multiple return paths: consistent field names across constructor calls
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# New branch-coverage tests for the _in_return guard
+# ---------------------------------------------------------------------------
+
+
+def test_starred_tuple_in_return_skipped():
+    # A starred tuple inside a return statement must not be transformed.
+    # Exercises _is_safe_tuple returning False (lines 245, 263).
+    source = "def _f():\n    return (*a, 1, 2)\n"
+    result = _apply(source, min_size=3)
+    assert result == source
+
+
+def test_return_tuple_outside_range_skipped():
+    # A return-statement tuple that falls outside the changed range is skipped.
+    # Exercises the _in_changed_range guard (line 261).
+    source = "def _f():\n    return (1, 2, 3)\n"
+    # Line 2 is outside the changed range [50, 100].
+    result = _apply(source, ranges=[(50, 100)])
+    assert result == source
+
+
+class _NoScopePushTransformer(TupleDataclass):
+    """Override visit/leave_FunctionDef to avoid pushing to _scope_stack.
+
+    This simulates the (normally unreachable) case where leave_Tuple is called
+    while _in_return > 0 but _current_scope_name() returns None, exercising
+    branch 213->212 and line 267.
+    """
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
+        return None  # do NOT push to _scope_stack
+
+    def leave_FunctionDef(
+        self,
+        original_node: cst.FunctionDef,
+        updated_node: cst.FunctionDef,
+    ) -> cst.BaseStatement:
+        return updated_node  # do NOT pop _scope_stack
+
+
+def test_scope_none_in_return_does_not_transform():
+    """Defensive guard: scope is None even inside a return statement.
+
+    _NoScopePushTransformer leaves _scope_stack as [None] (set by visit_Module)
+    throughout traversal.  When leave_Tuple is reached inside `return (1,2,3)`,
+    _current_scope_name iterates over [None], hits the None entry (branch
+    213->212), exhausts the iterator, returns None, and leave_Tuple returns the
+    tuple unchanged (line 267).
+    """
+    source = "def _f():\n    return (1, 2, 3)\n"
+    tree = cst.parse_module(source)
+    td = _NoScopePushTransformer([(1, 100)])
+    result = MetadataWrapper(tree).visit(td).code
+    assert result == source
 
 
 def test_multiple_returns_consistent_field_names():
