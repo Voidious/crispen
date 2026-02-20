@@ -340,3 +340,43 @@ def test_tmp_name_crispen_result_used_in_expansion():
     result = _apply(source)
     assert "_crispen_result = get_user()" in result
     assert "a = _crispen_result.name" in result
+
+
+# ---------------------------------------------------------------------------
+# local_transforms: expand same-file private function calls (no import needed)
+# ---------------------------------------------------------------------------
+
+
+def test_local_transforms_expands_without_import():
+    """local_transforms pre-populates _local_transforms for same-file private funcs."""
+    source = "a, b, c = _make_result()\n"
+    local = {
+        "_make_result": TransformInfo(
+            func_name="_make_result",
+            dataclass_name="MakeResultResult",
+            field_names=["field_0", "field_1", "field_2"],
+        )
+    }
+    tree = cst.parse_module(source)
+    wrapper = MetadataWrapper(tree)
+    cu = CallerUpdater(
+        [(1, 100)],
+        transforms={},
+        local_transforms=local,
+        source=source,
+    )
+    result = wrapper.visit(cu).code
+    assert "_ = _make_result()" in result
+    assert "a = _.field_0" in result
+    assert "b = _.field_1" in result
+    assert "c = _.field_2" in result
+
+
+def test_local_transforms_none_leaves_local_transforms_empty():
+    """Passing local_transforms=None leaves _local_transforms empty."""
+    source = "a, b, c = _make_result()\n"
+    tree = cst.parse_module(source)
+    wrapper = MetadataWrapper(tree)
+    cu = CallerUpdater([(1, 100)], transforms={}, source=source)
+    wrapper.visit(cu)
+    assert cu._local_transforms == {}

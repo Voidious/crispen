@@ -8,6 +8,7 @@ import libcst as cst
 import pytest
 
 from crispen.engine import (
+    _EXCLUDED_DIR_NAMES,
     _apply_tuple_dataclass,
     _build_alias_map,
     _compute_qname,
@@ -678,3 +679,83 @@ def test_find_outside_callers_deadline_expired(tmp_path):
     with patch("crispen.engine._SCOPE_ANALYSIS_TIMEOUT", -1):
         result = _find_outside_callers(str(tmp_path), {"some.func"}, set())
     assert result == {"some.func"}
+
+
+# ---------------------------------------------------------------------------
+# _find_outside_callers: excluded directory names are not scanned
+# ---------------------------------------------------------------------------
+
+
+def test_find_outside_callers_excludes_venv_dirs(tmp_path):
+    """Files inside excluded directories (.venv, __pycache__, etc.) are skipped."""
+    for dirname in _EXCLUDED_DIR_NAMES:
+        excluded = tmp_path / dirname / "lib"
+        excluded.mkdir(parents=True, exist_ok=True)
+        (excluded / "pkg.py").write_text(
+            "from mypkg.service import get_user\nget_user()\n"
+        )
+    # Even though each excluded dir has a caller, none should be counted.
+    result = _find_outside_callers(str(tmp_path), {"mypkg.service.get_user"}, set())
+    assert "mypkg.service.get_user" not in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 private-function caller updates
+# ---------------------------------------------------------------------------
+
+
+def _make_service_pkg(root):
+    """Helper: return a tmp_path containing a package with a private function
+    and a caller of it, both in one file."""
+    pkg = root / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    return pkg
+
+
+def test_phase1_private_caller_updated(tmp_path):
+    """Private function callers in the same file are updated after Phase 1."""
+    source = textwrap.dedent(
+        """\
+        def _make_result():
+            return (1, 2, 3)
+
+        def use_it():
+            a, b, c = _make_result()
+        """
+    )
+    f = tmp_path / "code.py"
+    f.write_text(source, encoding="utf-8")
+    msgs = _run({str(f): [(1, 100)]})
+    result = f.read_text(encoding="utf-8")
+    assert "_ = _make_result()" in result
+    assert any("CallerUpdater" in m for m in msgs)
+
+
+def test_phase1_private_no_callers_no_caller_updater_msg(tmp_path):
+    """Private transform with no callers produces no CallerUpdater message."""
+    source = "def _make_result():\n    return (1, 2, 3)\n"
+    f = tmp_path / "code.py"
+    f.write_text(source, encoding="utf-8")
+    msgs = _run({str(f): [(1, 100)]})
+    assert any("TupleDataclass" in m for m in msgs)
+    assert not any("CallerUpdater" in m for m in msgs)
+
+
+def test_phase1_private_caller_updater_exception_ignored(tmp_path):
+    """If CallerUpdater raises during Phase 1, the engine continues gracefully."""
+    source = textwrap.dedent(
+        """\
+        def _make_result():
+            return (1, 2, 3)
+
+        def use_it():
+            a, b, c = _make_result()
+        """
+    )
+    f = tmp_path / "code.py"
+    f.write_text(source, encoding="utf-8")
+    with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
+        msgs = _run({str(f): [(1, 100)]})
+    # TupleDataclass still ran successfully
+    assert any("TupleDataclass" in m for m in msgs)

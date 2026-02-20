@@ -496,3 +496,38 @@ def _f():
 """
     result = _apply(source)
     assert result.count("class FResult") == 1
+
+
+# ---------------------------------------------------------------------------
+# get_private_transforms
+# ---------------------------------------------------------------------------
+
+
+def test_private_function_in_get_private_transforms():
+    # _snake_to_pascal("_private") → "Private" → class name "PrivateResult"
+    source = "def _private():\n    return (1, 2, 3)\n"
+    tree = cst.parse_module(source)
+    td = TupleDataclass([(1, 100)])
+    MetadataWrapper(tree).visit(td)
+    private = td.get_private_transforms()
+    assert "_private" in private
+    assert private["_private"].func_name == "_private"
+    assert private["_private"].dataclass_name == "PrivateResult"
+
+
+def test_public_function_not_in_get_private_transforms():
+    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
+    td = TupleDataclass([(1, 100)])
+    MetadataWrapper(tree).visit(td)
+    assert td.get_private_transforms() == {}
+
+
+def test_get_private_transforms_returns_copy():
+    source = "def _private():\n    return (1, 2, 3)\n"
+    tree = cst.parse_module(source)
+    td = TupleDataclass([(1, 100)])
+    MetadataWrapper(tree).visit(td)
+    p1 = td.get_private_transforms()
+    p2 = td.get_private_transforms()
+    assert p1 == p2
+    assert p1 is not p2

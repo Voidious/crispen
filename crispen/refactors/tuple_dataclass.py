@@ -112,6 +112,9 @@ class TupleDataclass(Refactor):
         # Public function candidates discovered (whether or not transformed)
         self._candidate_public_transforms: Dict[str, TransformInfo] = {}
 
+        # Private function transforms actually applied
+        self._private_transforms: Dict[str, TransformInfo] = {}
+
         # Dataclasses to inject: list of (class_name, field_names, values)
         # Keyed by class name to avoid duplicates
         self._pending_classes: Dict[str, Tuple[List[str], List[cst.BaseExpression]]] = (
@@ -254,6 +257,12 @@ class TupleDataclass(Refactor):
             )
             if scope not in self.approved_public_funcs:
                 return updated_node
+        else:
+            self._private_transforms[scope] = TransformInfo(
+                func_name=scope,
+                dataclass_name=class_name,
+                field_names=field_names,
+            )
 
         if len(values) != len(field_names):  # pragma: no cover
             return updated_node
@@ -283,6 +292,10 @@ class TupleDataclass(Refactor):
             f"TupleDataclass: replaced {n}-tuple with {class_name} at line {lineno}"
         )
         return cst.Call(func=cst.Name(class_name), args=args_with_comma)
+
+    def get_private_transforms(self) -> Dict[str, "TransformInfo"]:
+        """Return private functions whose tuples were actually transformed."""
+        return dict(self._private_transforms)
 
     def get_candidate_public_transforms(self) -> Dict[str, "TransformInfo"]:
         """Return public functions whose tuples were candidates for transformation.

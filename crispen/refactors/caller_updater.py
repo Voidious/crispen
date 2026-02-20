@@ -83,6 +83,7 @@ class CallerUpdater(Refactor):
         file_module: str = "",
         source: str = "",
         verbose: bool = True,
+        local_transforms: Optional[Dict[str, TransformInfo]] = None,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self.source = source
@@ -91,6 +92,8 @@ class CallerUpdater(Refactor):
         self.file_module = file_module
         # Maps local name (as used in this file) → TransformInfo
         self._local_transforms: Dict[str, TransformInfo] = {}
+        if local_transforms:
+            self._local_transforms.update(local_transforms)
 
     @classmethod
     def name(cls) -> str:

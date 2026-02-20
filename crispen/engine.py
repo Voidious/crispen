@@ -18,6 +18,11 @@ from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
 # Single-file refactors applied in order before TupleDataclass.
 _REFACTORS = [IfNotElse, DuplicateExtractor]
 
+# Directory names excluded from the outside-caller scan (e.g. virtual environments).
+_EXCLUDED_DIR_NAMES = frozenset(
+    {".venv", "venv", "env", ".tox", "__pycache__", "node_modules"}
+)
+
 # Total wall-clock budget for all files in _find_outside_callers (seconds).
 _SCOPE_ANALYSIS_TIMEOUT = 10
 
@@ -152,8 +157,15 @@ def _find_outside_callers(
     if not target_qnames:
         return set()
 
+    repo_root_path = Path(repo_root)
     outside_py = [
-        p for p in Path(repo_root).rglob("*.py") if str(p.resolve()) not in diff_files
+        p
+        for p in repo_root_path.rglob("*.py")
+        if str(p.resolve()) not in diff_files
+        and not any(
+            part in _EXCLUDED_DIR_NAMES
+            for part in p.relative_to(repo_root_path).parts[:-1]
+        )
     ]
     if not outside_py:
         return set()
@@ -320,6 +332,31 @@ def run_engine(
             file_msgs.extend(msgs)
             if td is not None:
                 candidates = td.get_candidate_public_transforms()
+                # Run CallerUpdater for private function callers in this file.
+                private_transforms = td.get_private_transforms()
+                if private_transforms:
+                    try:
+                        cu_tree = cst.parse_module(current_source)
+                        cu_wrapper = MetadataWrapper(cu_tree)
+                        cu = CallerUpdater(
+                            ranges,
+                            transforms={},
+                            local_transforms=private_transforms,
+                            source=current_source,
+                            verbose=verbose,
+                        )
+                        cu_new_source = cu_wrapper.visit(cu).code
+                    except Exception:
+                        cu_new_source = current_source
+                    if cu_new_source != current_source:
+                        try:
+                            compile(cu_new_source, filepath, "exec")
+                        except SyntaxError:  # pragma: no cover
+                            pass
+                        else:
+                            for msg in cu.get_changes():
+                                file_msgs.append(f"{filepath}: {msg}")
+                            current_source = cu_new_source
 
         per_file[filepath] = {
             "original": original_source,
