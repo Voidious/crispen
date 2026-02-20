@@ -4,6 +4,7 @@ import libcst as cst
 from libcst.metadata import MetadataWrapper
 
 from crispen.refactors.tuple_dataclass import (
+    TransformInfo,
     TupleDataclass,
     _UnpackingCollector,
     _int_val,
@@ -411,3 +412,87 @@ def test_unpacking_collector_skips_complex_elements():
     collector = _UnpackingCollector()
     MetadataWrapper(tree).visit(collector)
     assert collector.unpackings == {}
+
+
+# ---------------------------------------------------------------------------
+# approved_public_funcs — candidates and transformation
+# ---------------------------------------------------------------------------
+
+BEFORE_PUBLIC_FUNC_3 = """\
+def public_func():
+    return (1, 2, 3)
+"""
+
+
+def test_public_function_candidate_recorded():
+    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
+    td = TupleDataclass([(1, 100)])
+    MetadataWrapper(tree).visit(td)
+    candidates = td.get_candidate_public_transforms()
+    assert "public_func" in candidates
+    assert candidates["public_func"].func_name == "public_func"
+    assert candidates["public_func"].dataclass_name == "PublicFuncResult"
+
+
+def test_public_function_candidate_has_correct_type():
+    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
+    td = TupleDataclass([(1, 100)])
+    MetadataWrapper(tree).visit(td)
+    candidates = td.get_candidate_public_transforms()
+    assert isinstance(candidates["public_func"], TransformInfo)
+
+
+def test_private_function_not_in_candidates():
+    source = "def _private():\n    return (1, 2, 3)\n"
+    tree = cst.parse_module(source)
+    td = TupleDataclass([(1, 100)])
+    MetadataWrapper(tree).visit(td)
+    assert td.get_candidate_public_transforms() == {}
+
+
+def test_approved_public_function_is_transformed():
+    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
+    td = TupleDataclass([(1, 100)], approved_public_funcs={"public_func"})
+    result = MetadataWrapper(tree).visit(td).code
+    assert "PublicFuncResult(" in result
+    assert "@dataclass" in result
+
+
+def test_unapproved_public_function_not_transformed():
+    result = _apply(BEFORE_PUBLIC_FUNC_3)
+    assert result == BEFORE_PUBLIC_FUNC_3
+
+
+def test_get_candidate_public_transforms_returns_copy():
+    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
+    td = TupleDataclass([(1, 100)])
+    MetadataWrapper(tree).visit(td)
+    c1 = td.get_candidate_public_transforms()
+    c2 = td.get_candidate_public_transforms()
+    assert c1 == c2
+    assert c1 is not c2  # each call returns a new dict
+
+
+# ---------------------------------------------------------------------------
+# leave_Module: no duplicate class if one already exists in source
+# ---------------------------------------------------------------------------
+
+
+def test_no_duplicate_class_if_already_in_source():
+    # Source already has the class that TupleDataclass would inject.
+    # The duplicate-check branch (339->338) prevents a second injection.
+    source = """\
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass
+class FResult:
+    field_0: Any
+    field_1: Any
+    field_2: Any
+
+def _f():
+    return (1, 2, 3)
+"""
+    result = _apply(source)
+    assert result.count("class FResult") == 1

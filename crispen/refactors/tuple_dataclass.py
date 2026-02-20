@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 import libcst as cst
 from libcst.metadata import PositionProvider
@@ -37,6 +37,14 @@ def _int_val(node: cst.BaseExpression) -> Optional[int]:
 
 def _snake_to_pascal(name: str) -> str:
     return "".join(part.capitalize() for part in name.split("_") if part)
+
+
+class TransformInfo(NamedTuple):
+    """Record of a tuple→dataclass transformation applied to a function."""
+
+    func_name: str
+    dataclass_name: str
+    field_names: List[str]
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +100,17 @@ class TupleDataclass(Refactor):
         min_size: int = 3,
         source: str = "",
         verbose: bool = True,
+        approved_public_funcs: Optional[Set[str]] = None,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self.min_size = min_size
+        self.approved_public_funcs: Set[str] = set(approved_public_funcs or [])
 
         # State populated during the first visit pass
         self._unpackings: Dict[int, List[str]] = {}
+
+        # Public function candidates discovered (whether or not transformed)
+        self._candidate_public_transforms: Dict[str, TransformInfo] = {}
 
         # Dataclasses to inject: list of (class_name, field_names, values)
         # Keyed by class name to avoid duplicates
@@ -219,8 +232,9 @@ class TupleDataclass(Refactor):
             return updated_node
 
         scope = self._current_scope_name()
-        if scope is None or not scope.startswith("_"):
+        if scope is None:
             return updated_node
+        is_public = not scope.startswith("_")
 
         try:
             pos = self.get_metadata(PositionProvider, original_node)
@@ -231,6 +245,15 @@ class TupleDataclass(Refactor):
         class_name = self._class_name_for(None)
         field_names = self._field_names_for(updated_node, lineno)
         values = self._element_values(updated_node)
+
+        if is_public:
+            self._candidate_public_transforms[scope] = TransformInfo(
+                func_name=scope,
+                dataclass_name=class_name,
+                field_names=field_names,
+            )
+            if scope not in self.approved_public_funcs:
+                return updated_node
 
         if len(values) != len(field_names):  # pragma: no cover
             return updated_node
@@ -260,6 +283,14 @@ class TupleDataclass(Refactor):
             f"TupleDataclass: replaced {n}-tuple with {class_name} at line {lineno}"
         )
         return cst.Call(func=cst.Name(class_name), args=args_with_comma)
+
+    def get_candidate_public_transforms(self) -> Dict[str, "TransformInfo"]:
+        """Return public functions whose tuples were candidates for transformation.
+
+        These are public functions in the changed range with large-enough tuples.
+        They may or may not have been transformed (depends on approved_public_funcs).
+        """
+        return dict(self._candidate_public_transforms)
 
     # ------------------------------------------------------------------
     # Inject dataclass definitions and imports at module level
@@ -298,9 +329,15 @@ class TupleDataclass(Refactor):
             else:
                 break
 
+        existing_class_names = {
+            stmt.name.value
+            for stmt in new_body
+            if isinstance(stmt, cst.ClassDef) and isinstance(stmt.name, cst.Name)
+        }
         class_stmts = []
         for class_name, (field_names, _values) in self._pending_classes.items():
-            class_stmts.append(self._build_dataclass(class_name, field_names))
+            if class_name not in existing_class_names:
+                class_stmts.append(self._build_dataclass(class_name, field_names))
 
         for i, cls_stmt in enumerate(reversed(class_stmts)):
             new_body.insert(insert_pos, cls_stmt)
