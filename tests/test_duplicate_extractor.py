@@ -1026,6 +1026,30 @@ def test_wrong_replacement_count_skipped(monkeypatch):
     assert de._new_source is None
 
 
+def test_wrong_replacement_count_skipped_verbose_false(monkeypatch):
+    # verbose=False covers the False branch of the new if-self.verbose guard.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_extract_response(
+                {
+                    "function_name": "helper",
+                    "placement": "module_level",
+                    "helper_source": "def helper():\n    pass\n",
+                    "call_site_replacements": ["helper()\n"],  # should be 2
+                }
+            ),
+        ]
+
+        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
+
+    assert de._new_source is None
+
+
 # ---------------------------------------------------------------------------
 # DuplicateExtractor — escaping variables passed to extraction prompt
 # ---------------------------------------------------------------------------
@@ -1106,15 +1130,15 @@ def _make_invalid_assembled_extractor(monkeypatch, verbose=True):
 
 
 def test_invalid_assembled_source_skipped(monkeypatch):
-    # Individual components pass _verify_extraction but the assembled file is
-    # invalid Python (e.g. the LLM produced malformed replacements in context).
+    # Individual components pass _verify_extraction but the per-group assembled
+    # edit is invalid Python — the group is skipped without poisoning others.
     de = _make_invalid_assembled_extractor(monkeypatch)
     assert de._new_source is None
     assert de.changes_made == []
 
 
 def test_invalid_assembled_source_skipped_verbose_false(monkeypatch):
-    # verbose=False: the compile-failure warning is suppressed (covers False branch).
+    # verbose=False: per-group compile-failure log suppressed (covers False branch).
     de = _make_invalid_assembled_extractor(monkeypatch, verbose=False)
     assert de._new_source is None
 
@@ -1146,6 +1170,33 @@ def test_verify_fails_skipped(monkeypatch):
         ]
 
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE)
+
+    assert de._new_source is None
+
+
+def test_verify_fails_skipped_verbose_false(monkeypatch):
+    # verbose=False covers the False branch of the new if-self.verbose guard.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_extract_response(
+                {
+                    "function_name": "helper",
+                    "placement": "module_level",
+                    "helper_source": "def helper(x:\n    pass\n",  # unclosed paren
+                    "call_site_replacements": [
+                        "helper(data)\n",
+                        "helper(data)\n",
+                    ],
+                }
+            ),
+        ]
+
+        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
 
     assert de._new_source is None
 

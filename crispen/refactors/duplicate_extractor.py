@@ -1041,15 +1041,57 @@ class DuplicateExtractor(Refactor):
             helper_source = extraction["helper_source"]
             call_replacements = extraction["call_site_replacements"]
             placement = extraction.get("placement", "module_level")
+            func_name = extraction["function_name"]
 
             if len(call_replacements) != len(group):
+                if self.verbose:
+                    print(
+                        f"crispen: DuplicateExtractor: extraction FAILED — "
+                        f"wrong call_site_replacements count "
+                        f"(expected {len(group)}, got {len(call_replacements)})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    print(
+                        f"crispen: DuplicateExtractor:   helper_source: "
+                        f"{helper_source!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    print(
+                        f"crispen: DuplicateExtractor:   call_site_replacements: "
+                        f"{call_replacements!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 continue
 
             if not _verify_extraction(helper_source, call_replacements):
+                if self.verbose:
+                    print(
+                        "crispen: DuplicateExtractor: extraction FAILED — "
+                        "invalid helper or replacement syntax",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    print(
+                        f"crispen: DuplicateExtractor:   helper_source: "
+                        f"{helper_source!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    print(
+                        f"crispen: DuplicateExtractor:   call_site_replacements: "
+                        f"{call_replacements!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 continue
 
+            # Build this group's edits.
+            group_edits: List[Tuple[int, int, str]] = []
             for seq, replacement in zip(group, call_replacements):
-                edits.append((seq.start_line - 1, seq.end_line, replacement))
+                group_edits.append((seq.start_line - 1, seq.end_line, replacement))
 
             first_seq = min(group, key=lambda s: s.start_line)
             if placement.startswith("staticmethod:"):
@@ -1059,9 +1101,36 @@ class DuplicateExtractor(Refactor):
             else:
                 scope = first_seq.scope
                 insert_pos = _find_insertion_point(source, scope)
-            edits.append((insert_pos, insert_pos, helper_source + "\n\n"))
+            group_edits.append((insert_pos, insert_pos, helper_source + "\n\n"))
 
-            func_name = extraction["function_name"]
+            # Compile this group's edits independently so one bad extraction
+            # doesn't discard valid ones for the same file.
+            candidate = _apply_edits(source, group_edits)
+            try:
+                compile(candidate, "<rewritten>", "exec")
+            except SyntaxError as exc:
+                if self.verbose:
+                    print(
+                        f"crispen: DuplicateExtractor: extraction FAILED — "
+                        f"assembled edit not valid Python: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    print(
+                        f"crispen: DuplicateExtractor:   helper_source: "
+                        f"{helper_source!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    print(
+                        f"crispen: DuplicateExtractor:   call_site_replacements: "
+                        f"{call_replacements!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+
+            edits.extend(group_edits)
             if self.verbose:
                 print(
                     f"crispen: DuplicateExtractor: extracting '{func_name}'",
@@ -1073,22 +1142,10 @@ class DuplicateExtractor(Refactor):
                 f"from {len(group)} duplicate blocks"
             )
 
-        # 18. Apply edits, compile, write.
+        # 18. Apply all accepted edits and write.
         if edits:
-            candidate = _apply_edits(source, edits)
-            try:
-                compile(candidate, "<rewritten>", "exec")
-            except SyntaxError as exc:
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: skipping — "
-                        f"assembled output not valid Python: {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            else:
-                self._new_source = candidate
-                self.changes_made.extend(pending_changes)
+            self._new_source = _apply_edits(source, edits)
+            self.changes_made.extend(pending_changes)
 
     def get_rewritten_source(self) -> Optional[str]:
         return self._new_source
