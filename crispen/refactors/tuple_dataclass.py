@@ -356,6 +356,7 @@ class TupleDataclass(Refactor):
             decorators=[cst.Decorator(decorator=cst.Name("dataclass"))],
             name=cst.Name(class_name),
             body=cst.IndentedBlock(body=fields),
+            leading_lines=(cst.EmptyLine(), cst.EmptyLine()),
         )
 
     def leave_Module(
@@ -388,6 +389,14 @@ class TupleDataclass(Refactor):
 
         for i, cls_stmt in enumerate(reversed(class_stmts)):
             new_body.insert(insert_pos, cls_stmt)
+
+        # Ensure 2 blank lines between the last inserted class and the next stmt.
+        following_idx = insert_pos + len(class_stmts)
+        if class_stmts and following_idx < len(new_body):
+            following = new_body[following_idx]
+            new_body[following_idx] = following.with_changes(
+                leading_lines=(cst.EmptyLine(), cst.EmptyLine())
+            )
 
         # Inject imports at the very top (after any __future__ imports)
         import_insert_pos = 0

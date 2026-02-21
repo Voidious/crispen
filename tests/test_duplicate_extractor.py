@@ -10,6 +10,7 @@ from libcst.metadata import MetadataWrapper
 from crispen.errors import CrispenAPIError
 from crispen.refactors.duplicate_extractor import (
     _ApiTimeout,
+    _build_helper_insertion,
     _extract_defined_names,
     _FunctionCollector,
     _FunctionInfo,
@@ -688,6 +689,119 @@ def test_find_insertion_point_function_not_found():
     source = "a = 1\n"
     # Falls back to 0
     assert _find_insertion_point(source, "missing_func") == 0
+
+
+# ---------------------------------------------------------------------------
+# _build_helper_insertion
+# ---------------------------------------------------------------------------
+
+
+def test_build_helper_insertion_absorbs_blank_before_function():
+    # Blank line between import and def is absorbed; 2 blank lines ensured.
+    source = "import os\n\ndef foo():\n    pass\n"
+    lines = source.splitlines(keepends=True)
+    helper = "def _helper():\n    pass\n"
+    start, end, text = _build_helper_insertion(lines, 2, helper, "module_level")
+    # Blank line at index 1 is before insert_pos=2, so before_blanks=1 → start=1.
+    assert start == 1
+    assert end == 2  # no blanks after insert_pos (def foo starts there)
+    assert text.startswith("\n\n")
+    assert text.endswith("\n\n")
+    assert "def _helper():" in text
+
+
+def test_build_helper_insertion_no_surrounding_blanks():
+    # No blanks to absorb → pure insertion with 2 blank lines each side.
+    source = "import os\ndef foo():\n    pass\n"
+    lines = source.splitlines(keepends=True)
+    helper = "def _helper():\n    pass\n"
+    start, end, text = _build_helper_insertion(lines, 1, helper, "module_level")
+    assert start == 1
+    assert end == 1  # pure insertion
+    assert text.startswith("\n\n")
+    assert text.endswith("\n\n")
+
+
+def test_build_helper_insertion_staticmethod_uses_one_blank():
+    # Staticmethod placement: 1 blank line before and after.
+    source = "class Foo:\n    def bar(self):\n        pass\n"
+    lines = source.splitlines(keepends=True)
+    helper = "    @staticmethod\n    def _h():\n        pass\n"
+    start, end, text = _build_helper_insertion(lines, 1, helper, "staticmethod:Foo")
+    assert start == 1
+    assert end == 1  # no blanks to absorb
+    assert text.startswith("\n")
+    assert not text.startswith("\n\n")
+    assert text.endswith("\n\n")  # clean + 1 trailing blank = \n + \n
+
+
+def test_build_helper_insertion_absorbs_blank_at_insert_pos():
+    # When insert_pos itself is a blank line, after_blanks counts it.
+    source = "import os\n\ndef foo():\n    pass\n"
+    lines = source.splitlines(keepends=True)
+    helper = "def _helper():\n    pass\n"
+    # insert_pos=1 lands on the blank line: after_blanks=1, end=2.
+    start, end, text = _build_helper_insertion(lines, 1, helper, "module_level")
+    assert start == 1
+    assert end == 2
+    assert text.startswith("\n\n")
+    assert text.endswith("\n\n")
+
+
+def test_build_helper_insertion_strips_extra_newlines_from_helper():
+    # If the LLM returns a helper with leading/trailing blank lines, they are stripped.
+    source = "import os\ndef foo():\n    pass\n"
+    lines = source.splitlines(keepends=True)
+    helper = "\n\ndef _helper():\n    pass\n\n\n"
+    start, end, text = _build_helper_insertion(lines, 1, helper, "module_level")
+    assert text.startswith("\n\n")
+    assert text.endswith("\n\n")
+    assert "\n\n\n\ndef _helper" not in text  # no extra leading blanks inside text
+
+
+def test_successful_extraction_has_two_blank_lines(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        import os
+
+        def foo():
+            x = compute(data)
+            y = transform(x)
+            z = finalize(y)
+
+        def bar():
+            x = compute(data)
+            y = transform(x)
+            z = finalize(y)
+        """
+    )
+    helper = "def _helper(data):\n    pass\n"
+    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+        ]
+        de = DuplicateExtractor([(9, 11)], source=source)
+
+    assert de._new_source is not None
+    # Exactly 2 blank lines before and after the inserted helper.
+    assert "\n\n\ndef _helper" in de._new_source
+    assert "\n\n\n\ndef _helper" not in de._new_source
+    assert "def _helper(data):\n    pass\n\n\ndef foo" in de._new_source
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,20 @@ def test_simple_tuple_class_defined():
     assert "field_0: Any" in result
 
 
+def test_dataclass_preceded_by_two_blank_lines():
+    result = _apply(BEFORE_SIMPLE_PRIVATE)
+    # Exactly 2 blank lines before @dataclass (3 newlines: end-of-import + 2 blanks).
+    assert "\n\n\n@dataclass" in result
+    assert "\n\n\n\n@dataclass" not in result
+
+
+def test_function_after_dataclass_preceded_by_two_blank_lines():
+    result = _apply(BEFORE_SIMPLE_PRIVATE)
+    # Exactly 2 blank lines before the original function after the class.
+    assert "\n\n\ndef _f" in result
+    assert "\n\n\n\ndef _f" not in result
+
+
 def test_reports_change():
     changes = _changes(BEFORE_SIMPLE_PRIVATE)
     assert len(changes) == 1
