@@ -10,6 +10,7 @@ from libcst.metadata import MetadataWrapper
 from crispen.errors import CrispenAPIError
 from crispen.refactors.duplicate_extractor import (
     _ApiTimeout,
+    _extract_defined_names,
     _FunctionCollector,
     _FunctionInfo,
     _SeqInfo,
@@ -482,6 +483,31 @@ def test_names_assigned_in_no_assign():
 
 def test_names_assigned_in_syntax_error():
     assert _names_assigned_in("def (\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _extract_defined_names
+# ---------------------------------------------------------------------------
+
+
+def test_extract_defined_names_basic():
+    source = textwrap.dedent(
+        """\
+        def foo():
+            pass
+
+        async def bar():
+            pass
+
+        class Baz:
+            pass
+        """
+    )
+    assert _extract_defined_names(source) == {"foo", "bar", "Baz"}
+
+
+def test_extract_defined_names_syntax_error():
+    assert _extract_defined_names("def (\n") == set()
 
 
 # ---------------------------------------------------------------------------
@@ -2089,3 +2115,90 @@ def test_func_match_then_dup_extract(monkeypatch):
     assert de._new_source is not None
     # One func-match change + one dup-extract change
     assert len(de.changes_made) == 2
+
+
+# ---------------------------------------------------------------------------
+# DuplicateExtractor — name collision guard
+# ---------------------------------------------------------------------------
+
+# Source that already defines _helper AND has duplicate blocks.
+_COLLISION_SOURCE = textwrap.dedent(
+    """\
+    def _helper(x):
+        return x
+
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+
+    def bar():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_COLLISION_RANGES = [(9, 11)]  # overlaps bar's body
+
+
+def test_extraction_name_collision_skipped(monkeypatch, capsys):
+    # LLM returns function_name="_helper", which is already defined → skipped.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": "def _helper(x, y):\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper(data, x)\n",
+                        "    _helper(data, x)\n",
+                    ],
+                }
+            ),
+        ]
+        de = DuplicateExtractor(
+            _COLLISION_RANGES, source=_COLLISION_SOURCE, verbose=True
+        )
+
+    assert de._new_source is None
+    assert de.changes_made == []
+    err = capsys.readouterr().err
+    assert "name collision" in err
+    assert "_helper" in err
+
+
+def test_extraction_name_collision_silent(monkeypatch, capsys):
+    # Same collision, verbose=False → no stderr output.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": "def _helper(x, y):\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper(data, x)\n",
+                        "    _helper(data, x)\n",
+                    ],
+                }
+            ),
+        ]
+        de = DuplicateExtractor(
+            _COLLISION_RANGES, source=_COLLISION_SOURCE, verbose=False
+        )
+
+    assert de._new_source is None
+    assert de.changes_made == []
+    err = capsys.readouterr().err
+    assert "name collision" not in err

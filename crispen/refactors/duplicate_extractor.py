@@ -514,6 +514,7 @@ def _llm_extract(
     group: List[_SeqInfo],
     full_source: str,
     escaping_vars: frozenset = frozenset(),
+    used_names: frozenset = frozenset(),
 ) -> Optional[dict]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
@@ -531,6 +532,14 @@ def _llm_extract(
             f"variables. At call sites where the return value is needed, capture it; "
             f"at call sites where it is not needed, discard the return value."
         )
+    used_names_note = ""
+    if used_names:
+        names_str = ", ".join(sorted(used_names))
+        used_names_note = (
+            f"\n\nThe following function names are already defined in this file "
+            f"or reserved by a previous extraction: {names_str}. "
+            f"Do not use any of these names for the helper function."
+        )
     prompt = (
         "Extract the following duplicate code blocks from this Python file into a "
         f"helper function.\n\nFile source:\n```python\n{snippet}\n```\n\n"
@@ -544,6 +553,7 @@ def _llm_extract(
         "assignments are moved into the helper, those variables may no longer be "
         "defined in the calling scope at that point."
         f"{escaping_note}"
+        f"{used_names_note}"
     )
     try:
         response = client.messages.create(
@@ -824,6 +834,19 @@ def _find_escaping_vars(group: List[_SeqInfo], source_lines: List[str]) -> set:
     return escaping
 
 
+def _extract_defined_names(source: str) -> set:
+    """Return all function and class names defined anywhere in *source*."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
 # ---------------------------------------------------------------------------
 # Text editing
 # ---------------------------------------------------------------------------
@@ -1055,6 +1078,7 @@ class DuplicateExtractor(Refactor):
             )
 
         # 17. Duplicate group extraction pass.
+        used_names = _extract_defined_names(source)
         for group in groups:
             # Compute escaping vars algorithmically before any LLM call so the
             # extraction prompt can instruct the LLM to return them.
@@ -1098,6 +1122,7 @@ class DuplicateExtractor(Refactor):
                     group,
                     source,
                     escaping_vars,
+                    used_names=frozenset(used_names),
                 )
             except _ApiTimeout:
                 print(
@@ -1113,6 +1138,16 @@ class DuplicateExtractor(Refactor):
             call_replacements = extraction["call_site_replacements"]
             placement = extraction.get("placement", "module_level")
             func_name = extraction["function_name"]
+
+            if func_name in used_names:
+                if self.verbose:
+                    print(
+                        f"crispen: DuplicateExtractor: extraction FAILED — "
+                        f"name collision: '{func_name}' is already defined",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
 
             if len(call_replacements) != len(group):
                 if self.verbose:
@@ -1214,6 +1249,7 @@ class DuplicateExtractor(Refactor):
                 continue
 
             edits.extend(group_edits)
+            used_names.add(func_name)
             if self.verbose:
                 print(
                     f"crispen: DuplicateExtractor: extracting '{func_name}'",
