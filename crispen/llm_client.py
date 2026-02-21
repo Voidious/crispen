@@ -11,7 +11,7 @@ import openai
 
 from .errors import CrispenAPIError
 
-_MOONSHOT_BASE_URL = "https://api.moonshot.cn/v1"
+_MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
 
 _PROVIDER_ENV_VARS = {
     "anthropic": "ANTHROPIC_API_KEY",
