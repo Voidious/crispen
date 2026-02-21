@@ -23,12 +23,14 @@ from crispen.refactors.duplicate_extractor import (
     _generate_no_arg_call,
     _has_def,
     _find_escaping_vars,
+    _has_param_overwritten_before_read,
     _llm_generate_call,
     _llm_veto_func_match,
     _names_assigned_in,
     _node_weight,
     _normalize_source,
     _overlaps_diff,
+    _pyflakes_new_undefined_names,
     _run_with_timeout,
     _sequence_weight,
     _verify_extraction,
@@ -400,6 +402,61 @@ def test_verify_extraction_invalid_replacement():
 def test_verify_extraction_no_helper_source():
     # Exercises the helper_source is None branch (skips helper compile check).
     assert _verify_extraction(None, ["result = f()\n"]) is True
+
+
+def test_verify_extraction_fails_on_param_overwrite():
+    # Helper where the parameter is immediately overwritten before being read.
+    helper = "def setup(mock_obj):\n    mock_obj = object()\n    return mock_obj\n"
+    assert _verify_extraction(helper, ["x = setup(y)\n"]) is False
+
+
+# ---------------------------------------------------------------------------
+# _has_param_overwritten_before_read
+# ---------------------------------------------------------------------------
+
+
+def test_has_param_overwritten_before_read_false_when_param_is_read():
+    # Parameter is read before (or without) being reassigned — should return False.
+    helper = "def fn(x):\n    return x + 1\n"
+    assert _has_param_overwritten_before_read(helper) is False
+
+
+def test_has_param_overwritten_before_read_true_when_immediately_overwritten():
+    # Parameter is assigned on the first statement without being read — True.
+    helper = "def setup(client):\n    client = object()\n    return client\n"
+    assert _has_param_overwritten_before_read(helper) is True
+
+
+def test_has_param_overwritten_before_read_false_for_conditional_default():
+    # The ``if x is None: x = default`` pattern reads before writing — False.
+    helper = "def fn(x=None):\n    if x is None:\n        x = []\n    return x\n"
+    assert _has_param_overwritten_before_read(helper) is False
+
+
+def test_has_param_overwritten_before_read_vararg_and_kwarg():
+    # Covers the vararg/kwarg branches — neither is overwritten here.
+    helper = "def fn(*args, **kwargs):\n    return args, kwargs\n"
+    assert _has_param_overwritten_before_read(helper) is False
+
+
+# ---------------------------------------------------------------------------
+# _pyflakes_new_undefined_names
+# ---------------------------------------------------------------------------
+
+
+def test_pyflakes_new_undefined_names_returns_empty_when_no_new_issues():
+    # Names undefined in both original and candidate → no NEW issues.
+    original = "def foo():\n    return bar()\n"
+    candidate = "def _h():\n    pass\n\ndef foo():\n    return bar()\n"
+    assert _pyflakes_new_undefined_names(original, candidate) == set()
+
+
+def test_pyflakes_new_undefined_names_detects_introduced_name():
+    # candidate introduces a reference to an unassigned name not in original.
+    original = "def foo():\n    x = 1\n    return x\n"
+    # candidate removes the assignment, leaving x undefined at the call site
+    candidate = "def _h():\n    x = 1\n\ndef foo():\n    _h(x)\n    return x\n"
+    assert "x" in _pyflakes_new_undefined_names(original, candidate)
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1197,57 @@ def test_invalid_assembled_source_skipped(monkeypatch):
 def test_invalid_assembled_source_skipped_verbose_false(monkeypatch):
     # verbose=False: per-group compile-failure log suppressed (covers False branch).
     de = _make_invalid_assembled_extractor(monkeypatch, verbose=False)
+    assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# DuplicateExtractor — pyflakes new-undefined-names check
+# ---------------------------------------------------------------------------
+
+
+def _make_pyflakes_check_extractor(monkeypatch, verbose=True):
+    """Helper: extraction that passes compile() but pyflakes finds a new undefined
+    name."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with (
+        patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic,
+        patch(
+            "crispen.refactors.duplicate_extractor._pyflakes_new_undefined_names",
+            return_value={"mock_client"},
+        ),
+    ):
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": "def _helper(x):\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+        ]
+        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+
+
+def test_pyflakes_check_skips_group_verbose(monkeypatch, capsys):
+    # Pyflakes finds a new undefined name → group is skipped (verbose path).
+    de = _make_pyflakes_check_extractor(monkeypatch, verbose=True)
+    assert de._new_source is None
+    assert (
+        "undefined name(s) introduced by edit: mock_client" in capsys.readouterr().err
+    )
+
+
+def test_pyflakes_check_skips_group_verbose_false(monkeypatch):
+    # verbose=False: pyflakes failure is silent.
+    de = _make_pyflakes_check_extractor(monkeypatch, verbose=False)
     assert de._new_source is None
 
 
