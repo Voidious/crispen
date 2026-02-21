@@ -444,7 +444,11 @@ _EXTRACT_TOOL: dict = {
                 "items": {"type": "string"},
                 "description": (
                     "Replacement source for each duplicate block, "
-                    "in the same order as the input blocks"
+                    "in the same order as the input blocks. "
+                    "Each replacement must preserve the original block's "
+                    "leading indentation and end with a trailing newline. "
+                    "Cover only the exact lines of the specified block — "
+                    "do not include any code from before or after the block."
                 ),
             },
         },
@@ -547,6 +551,10 @@ def _llm_extract(
         "Place the helper immediately before the enclosing function of its first use. "
         "If both call sites are inside the same class, use a @staticmethod. "
         "Return complete, valid Python for the helper and each call site replacement. "
+        "Each call site replacement must start with the same leading indentation as "
+        "the block it replaces, end with a trailing newline, and cover only the exact "
+        "lines of the duplicate block — do not include any code from before or after "
+        "the block. "
         "Double-check that only required parameters are passed to the helper — do not "
         "include an unused parameter, or one that is overwritten before being read. "
         "Be mindful of the code being removed from the call site: if variable "
@@ -664,13 +672,32 @@ def _llm_generate_call(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_replacement_indentation(seq: _SeqInfo, replacement: str) -> str:
+    """Re-indent *replacement* to match the original block's leading whitespace.
+
+    The LLM sometimes returns replacements at column 0.  This function
+    re-indents them to match the indentation of the corresponding original
+    block, so the assembled edit remains valid Python.
+    """
+    orig_lines = [ln for ln in seq.source.splitlines() if ln.strip()]
+    if not orig_lines:
+        return replacement
+    first = orig_lines[0]
+    expected_indent = first[: len(first) - len(first.lstrip())]
+    dedented = textwrap.dedent(replacement)
+    if not expected_indent:
+        return dedented
+    return textwrap.indent(dedented, expected_indent)
+
+
 def _verify_extraction(
     helper_source: Optional[str], call_replacements: List[str]
 ) -> bool:
     """Verify the extraction produces syntactically valid Python.
 
-    Replacements are dedented before checking since they may be
-    indented for their original context inside a function body.
+    Replacements are dedented and then wrapped in a dummy function before
+    compilation so that ``return`` / ``yield`` statements — which are legal
+    inside a function body — do not cause false SyntaxError rejections.
     Pass helper_source=None to skip the helper compilation check (used when
     replacing with an existing function rather than a newly extracted one).
     """
@@ -683,7 +710,9 @@ def _verify_extraction(
             return False
     for replacement in call_replacements:
         try:
-            compile(textwrap.dedent(replacement), "<replacement>", "exec")
+            dedented = textwrap.dedent(replacement)
+            wrapped = "def _check():\n" + textwrap.indent(dedented, "    ")
+            compile(wrapped, "<replacement>", "exec")
         except SyntaxError:
             return False
     return True
@@ -1207,6 +1236,14 @@ class DuplicateExtractor(Refactor):
                         flush=True,
                     )
                 continue
+
+            # Normalize each replacement's indentation to match its original block.
+            # The LLM sometimes returns replacements at column 0; this re-indents
+            # them so the assembled edit is valid Python.
+            call_replacements = [
+                _normalize_replacement_indentation(seq, r)
+                for seq, r in zip(group, call_replacements)
+            ]
 
             if not _verify_extraction(helper_source, call_replacements):
                 if self.verbose:
