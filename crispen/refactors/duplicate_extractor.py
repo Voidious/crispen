@@ -888,6 +888,16 @@ def _build_helper_insertion(
     return (start, end, text)
 
 
+def _ensure_trailing_newline(text: str) -> list[str]:
+    """Split *text* into lines (keepends=True) and ensure the last line ends with a
+    newline.
+    """
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    return lines
+
+
 def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
     """Apply (start_0, end_0, text) edits bottom-to-top.
 
@@ -895,9 +905,7 @@ def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
     An insertion before line N uses start_0 == end_0 == N.
     Overlapping replacement ranges are skipped.
     """
-    lines = source.splitlines(keepends=True)
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
+    lines = _ensure_trailing_newline(source)
 
     applied: List[Tuple[int, int]] = []
     for start, end, text in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
@@ -906,9 +914,7 @@ def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
             if any(a_start < end and a_end > start for a_start, a_end in applied):
                 continue
             applied.append((start, end))
-        new_lines = text.splitlines(keepends=True)
-        if new_lines and not new_lines[-1].endswith("\n"):
-            new_lines[-1] += "\n"
+        new_lines = _ensure_trailing_newline(text)
         lines[start:end] = new_lines
 
     return "".join(lines)
