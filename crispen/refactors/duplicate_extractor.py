@@ -300,6 +300,14 @@ class _FunctionCollector(cst.CSTVisitor):
 # ---------------------------------------------------------------------------
 
 
+def _parse_source_or_none(source: str):
+    """Parse *source* as Python AST; return the tree or ``None`` on SyntaxError."""
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return None
+
+
 def _collect_called_names(source: str) -> set:
     """Return a set of all names called (as functions) in *source*.
 
@@ -307,9 +315,8 @@ def _collect_called_names(source: str) -> set:
     called name: func.id for ast.Name callees, func.attr for ast.Attribute
     callees.  On SyntaxError, returns an empty set.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_source_or_none(source)
+    if tree is None:
         return set()
     names: set = set()
     for node in ast.walk(tree):
@@ -480,19 +487,10 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
-def _llm_veto(client: anthropic.Anthropic, group: List[_SeqInfo]) -> Tuple[bool, str]:
-    blocks_text = "\n\n".join(
-        f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
-        f"```python\n{s.source.rstrip()}\n```"
-        for i, s in enumerate(group)
-    )
-    prompt = (
-        f"Here are {len(group)} structurally similar code blocks from the same "
-        f"Python file:\n\n{blocks_text}\n\n"
-        "Do these blocks represent the same semantic operation such that extracting "
-        "a shared helper function would improve clarity? Or are they coincidentally "
-        "similar but conceptually distinct?"
-    )
+def _llm_call_evaluate_duplicate(
+    client: anthropic.Anthropic, prompt: str
+) -> tuple[bool, str]:
+    """Call the LLM evaluate_duplicate tool and return (is_valid_duplicate, reason)."""
     try:
         response = client.messages.create(
             model=_MODEL,
@@ -511,6 +509,22 @@ def _llm_veto(client: anthropic.Anthropic, group: List[_SeqInfo]) -> Tuple[bool,
             inp = block.input
             return inp["is_valid_duplicate"], inp.get("reason", "")
     return False, "no tool response"  # pragma: no cover
+
+
+def _llm_veto(client: anthropic.Anthropic, group: List[_SeqInfo]) -> Tuple[bool, str]:
+    blocks_text = "\n\n".join(
+        f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
+        f"```python\n{s.source.rstrip()}\n```"
+        for i, s in enumerate(group)
+    )
+    prompt = (
+        f"Here are {len(group)} structurally similar code blocks from the same "
+        f"Python file:\n\n{blocks_text}\n\n"
+        "Do these blocks represent the same semantic operation such that extracting "
+        "a shared helper function would improve clarity? Or are they coincidentally "
+        "similar but conceptually distinct?"
+    )
+    return _llm_call_evaluate_duplicate(client, prompt)
 
 
 def _llm_extract(
@@ -602,24 +616,7 @@ def _llm_veto_func_match(
         "body, such that it could be replaced by a call to the function? "
         "Use the evaluate_duplicate tool to answer."
     )
-    try:
-        response = client.messages.create(
-            model=_MODEL,
-            max_tokens=256,
-            tools=[_VETO_TOOL],
-            tool_choice={"type": "tool", "name": "evaluate_duplicate"},
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as exc:
-        raise CrispenAPIError(
-            f"DuplicateExtractor: Anthropic API error: {exc}\n"
-            "Commit blocked. To skip all hooks: git commit --no-verify"
-        ) from exc
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "evaluate_duplicate":
-            inp = block.input
-            return inp["is_valid_duplicate"], inp.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+    return _llm_call_evaluate_duplicate(client, prompt)
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
@@ -865,9 +862,8 @@ def _find_escaping_vars(group: List[_SeqInfo], source_lines: List[str]) -> set:
 
 def _extract_defined_names(source: str) -> set:
     """Return all function and class names defined anywhere in *source*."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_source_or_none(source)
+    if tree is None:
         return set()
     return {
         node.name
@@ -917,6 +913,14 @@ def _build_helper_insertion(
     return (start, end, text)
 
 
+def _ensure_trailing_newline(text: str) -> list:
+    """Split *text* into lines and ensure the last line ends with a newline."""
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    return lines
+
+
 def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
     """Apply (start_0, end_0, text) edits bottom-to-top.
 
@@ -924,9 +928,7 @@ def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
     An insertion before line N uses start_0 == end_0 == N.
     Overlapping replacement ranges are skipped.
     """
-    lines = source.splitlines(keepends=True)
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
+    lines = _ensure_trailing_newline(source)
 
     applied: List[Tuple[int, int]] = []
     for start, end, text in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
@@ -935,9 +937,7 @@ def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
             if any(a_start < end and a_end > start for a_start, a_end in applied):
                 continue
             applied.append((start, end))
-        new_lines = text.splitlines(keepends=True)
-        if new_lines and not new_lines[-1].endswith("\n"):
-            new_lines[-1] += "\n"
+        new_lines = _ensure_trailing_newline(text)
         lines[start:end] = new_lines
 
     return "".join(lines)

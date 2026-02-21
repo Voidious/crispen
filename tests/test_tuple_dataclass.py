@@ -14,22 +14,23 @@ from crispen.refactors.tuple_dataclass import (
 )
 
 
-def _apply(source: str, ranges=None, min_size: int = 3) -> str:
+def _build_transformer(source: str, ranges, min_size: int):
     if ranges is None:
         ranges = [(1, 100)]
     tree = cst.parse_module(source)
     wrapper = MetadataWrapper(tree)
     transformer = TupleDataclass(ranges, min_size=min_size, source=source)
+    return transformer, wrapper
+
+
+def _apply(source: str, ranges=None, min_size: int = 3) -> str:
+    transformer, wrapper = _build_transformer(source, ranges, min_size)
     new_tree = wrapper.visit(transformer)
     return new_tree.code
 
 
 def _changes(source: str, ranges=None, min_size: int = 3) -> list:
-    if ranges is None:
-        ranges = [(1, 100)]
-    tree = cst.parse_module(source)
-    wrapper = MetadataWrapper(tree)
-    transformer = TupleDataclass(ranges, min_size=min_size, source=source)
+    transformer, wrapper = _build_transformer(source, ranges, min_size)
     wrapper.visit(transformer)
     return transformer.changes_made
 
@@ -405,28 +406,26 @@ def test_unpacking_collector_finds_tuple_target():
     assert list(collector.unpackings.values())[0] == ["a", "b", "c"]
 
 
-def test_unpacking_collector_skips_multiple_targets():
-    source = "a = b = some_func()\n"
+def _assert_collector_skips(source: str) -> None:
     tree = cst.parse_module(source)
     collector = _UnpackingCollector()
     MetadataWrapper(tree).visit(collector)
     assert collector.unpackings == {}
+
+
+def test_unpacking_collector_skips_multiple_targets():
+    source = "a = b = some_func()\n"
+    _assert_collector_skips(source)
 
 
 def test_unpacking_collector_skips_non_tuple_target():
     source = "a = some_func()\n"
-    tree = cst.parse_module(source)
-    collector = _UnpackingCollector()
-    MetadataWrapper(tree).visit(collector)
-    assert collector.unpackings == {}
+    _assert_collector_skips(source)
 
 
 def test_unpacking_collector_skips_complex_elements():
     source = "a, b[0] = some_func()\n"
-    tree = cst.parse_module(source)
-    collector = _UnpackingCollector()
-    MetadataWrapper(tree).visit(collector)
-    assert collector.unpackings == {}
+    _assert_collector_skips(source)
 
 
 # ---------------------------------------------------------------------------
@@ -439,12 +438,16 @@ def public_func():
 """
 
 
-def _make_td_for_public_func_3() -> TupleDataclass:
-    """Run TupleDataclass on BEFORE_PUBLIC_FUNC_3 and return the transformer."""
-    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
+def _build_td_from_source(source: str) -> TupleDataclass:
+    tree = cst.parse_module(source)
     td = TupleDataclass([(1, 100)])
     MetadataWrapper(tree).visit(td)
     return td
+
+
+def _make_td_for_public_func_3() -> TupleDataclass:
+    """Run TupleDataclass on BEFORE_PUBLIC_FUNC_3 and return the transformer."""
+    return _build_td_from_source(BEFORE_PUBLIC_FUNC_3)
 
 
 def test_public_function_candidate_recorded():
@@ -520,10 +523,7 @@ def _f():
 
 def _make_private_td(source: str = "def _private():\n    return (1, 2, 3)\n"):
     """Parse *source*, run TupleDataclass over it, and return the transformer."""
-    tree = cst.parse_module(source)
-    td = TupleDataclass([(1, 100)])
-    MetadataWrapper(tree).visit(td)
-    return td
+    return _build_td_from_source(source)
 
 
 def test_private_function_in_get_private_transforms():
