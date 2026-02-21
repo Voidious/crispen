@@ -309,10 +309,10 @@ class TupleDataclass(Refactor):
             return updated_node
         is_public = not scope.startswith("_")
 
-        # For private functions, only transform when every in-file caller uses
-        # tuple unpacking on the return value.  This prevents broken code when
-        # a caller passes the result to another function or appends it to a list.
-        if not is_public and not _all_callers_unpack(self._source, scope):
+        # Only transform when every in-file caller uses tuple unpacking on the
+        # return value.  This prevents broken code when a caller stores or passes
+        # the result without unpacking (e.g. lst.append(func()) or x = func()).
+        if not _all_callers_unpack(self._source, scope):
             return updated_node
 
         try:

@@ -678,6 +678,20 @@ result = _f()
     assert result == source
 
 
+def test_public_function_non_unpacking_caller_not_candidate():
+    """Public function with a non-unpacking caller is not recorded as a candidate."""
+    source = """\
+def public_func():
+    return (1, 2, 3)
+
+result = public_func()
+"""
+    tree = cst.parse_module(source)
+    td = TupleDataclass([(1, 100)], source=source)
+    MetadataWrapper(tree).visit(td)
+    assert td.get_candidate_public_transforms() == {}
+
+
 def test_private_function_all_unpacking_callers_transformed():
     """Return tuple IS transformed when every caller uses tuple unpacking."""
     source = """\
