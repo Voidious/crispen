@@ -442,7 +442,7 @@ def public_func():
 def _make_td_for_public_func_3() -> TupleDataclass:
     """Run TupleDataclass on BEFORE_PUBLIC_FUNC_3 and return the transformer."""
     tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
-    td = TupleDataclass([(1, 100)])
+    td = TupleDataclass([(1, 100)], min_size=3)
     MetadataWrapper(tree).visit(td)
     return td
 
@@ -469,7 +469,7 @@ def test_private_function_not_in_candidates():
 
 def test_approved_public_function_is_transformed():
     tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
-    td = TupleDataclass([(1, 100)], approved_public_funcs={"public_func"})
+    td = TupleDataclass([(1, 100)], approved_public_funcs={"public_func"}, min_size=3)
     result = MetadataWrapper(tree).visit(td).code
     assert "PublicFuncResult(" in result
     assert "@dataclass" in result
@@ -521,7 +521,7 @@ def _f():
 def _make_private_td(source: str = "def _private():\n    return (1, 2, 3)\n"):
     """Parse *source*, run TupleDataclass over it, and return the transformer."""
     tree = cst.parse_module(source)
-    td = TupleDataclass([(1, 100)])
+    td = TupleDataclass([(1, 100)], min_size=3)
     MetadataWrapper(tree).visit(td)
     return td
 
@@ -623,7 +623,7 @@ def test_scope_none_in_return_does_not_transform():
     """
     source = "def _f():\n    return (1, 2, 3)\n"
     tree = cst.parse_module(source)
-    td = _NoScopePushTransformer([(1, 100)])
+    td = _NoScopePushTransformer([(1, 100)], min_size=3)
     result = MetadataWrapper(tree).visit(td).code
     assert result == source
 
@@ -730,3 +730,77 @@ def _f(flag):
     )
     # Simpler assertion: the produced source must be valid Python.
     compile(result, "<string>", "exec")
+
+
+# ---------------------------------------------------------------------------
+# Default min_size is now 4
+# ---------------------------------------------------------------------------
+
+
+def test_default_min_size_is_4_skips_3_tuple():
+    """With the default min_size=4, a 3-element tuple is NOT transformed."""
+    source = "def _f():\n    return (1, 2, 3)\n"
+    tree = cst.parse_module(source)
+    from libcst.metadata import MetadataWrapper
+
+    wrapper = MetadataWrapper(tree)
+    td = TupleDataclass([(1, 2)], source=source)  # no min_size → default 4
+    wrapper.visit(td)
+    assert td.changes_made == []
+
+
+def test_default_min_size_is_4_transforms_4_tuple():
+    """With the default min_size=4, a 4-element tuple IS transformed."""
+    source = "def _f():\n    return (1, 2, 3, 4)\n"
+    tree = cst.parse_module(source)
+    from libcst.metadata import MetadataWrapper
+
+    wrapper = MetadataWrapper(tree)
+    td = TupleDataclass([(1, 2)], source=source)  # no min_size → default 4
+    wrapper.visit(td)
+    assert td.changes_made != []
+
+
+# ---------------------------------------------------------------------------
+# blocked_scopes
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_scopes_prevents_private_transform():
+    """A private function in blocked_scopes is not transformed."""
+    source = "def _f():\n    return (1, 2, 3)\n"
+    result = _apply(source, min_size=3)
+    # Without blocking it IS transformed
+    assert "@dataclass" in result
+
+    # With blocking, no transformation
+    tree = cst.parse_module(source)
+    from libcst.metadata import MetadataWrapper
+
+    wrapper = MetadataWrapper(tree)
+    td = TupleDataclass([(1, 2)], source=source, min_size=3, blocked_scopes={"_f"})
+    new_tree = wrapper.visit(td)
+    assert new_tree.code == source
+    assert td.changes_made == []
+
+
+def test_blocked_scopes_does_not_affect_public_functions():
+    """blocked_scopes only gates private functions; public functions are unaffected."""
+    source = "def _f():\n    return (1, 2, 3)\ndef g():\n    return (1, 2, 3)\n"
+    tree = cst.parse_module(source)
+    from libcst.metadata import MetadataWrapper
+
+    wrapper = MetadataWrapper(tree)
+    # Block _f but not g. g is public so it won't be transformed in the
+    # private pass anyway (it becomes a candidate), but _f should be blocked.
+    td = TupleDataclass(
+        [(1, 4)],
+        source=source,
+        min_size=3,
+        blocked_scopes={"_f"},
+    )
+    wrapper.visit(td)
+    # _f is blocked → no private_transforms
+    assert "_f" not in td.get_private_transforms()
+    # g is public → candidate
+    assert "g" in td.get_candidate_public_transforms()

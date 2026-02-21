@@ -1,6 +1,6 @@
 [project]
 name = "crispen"
-version = "0.2.0"
+version = "0.3.0"
 description = "Automated refactoring tool for Python code diffs"
 requires-python = ">=3.12"
 dependencies = [
@@ -22,6 +22,14 @@ dev = [
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
 ]
+
+[tool.crispen]
+min_duplicate_weight = 3
+max_duplicate_seq_len = 8
+min_tuple_size = 4
+model = "claude-sonnet-4-6"
+helper_docstrings = false
+update_diff_file_callers = true
 
 [tool.pytest.ini_options]
 addopts = "--cov=crispen --cov-branch --cov-fail-under=100"

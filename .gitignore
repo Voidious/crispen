@@ -119,3 +119,6 @@ dmypy.json
 .vscode/
 .roo/
 .kilocode/
+
+# Local crispen config override (not committed)
+.crispen.toml

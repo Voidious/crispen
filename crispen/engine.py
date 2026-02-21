@@ -1,5 +1,6 @@
 """Load files, apply refactors, verify, and write back."""
 
+import ast
 import os
 import threading
 import time
@@ -9,6 +10,7 @@ from typing import Dict, Generator, List, NamedTuple, Optional, Set, Tuple
 import libcst as cst
 from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvider
 
+from .config import CrispenConfig, load_config
 from .errors import CrispenAPIError
 from .refactors.caller_updater import CallerUpdater
 from .refactors.duplicate_extractor import DuplicateExtractor
@@ -25,6 +27,50 @@ _EXCLUDED_DIR_NAMES = frozenset(
 
 # Total wall-clock budget for all files in _find_outside_callers (seconds).
 _SCOPE_ANALYSIS_TIMEOUT = 10
+
+
+# ---------------------------------------------------------------------------
+# update_diff_file_callers helpers
+# ---------------------------------------------------------------------------
+
+
+def _has_callers_outside_ranges(
+    source: str, func_name: str, ranges: List[Tuple[int, int]]
+) -> bool:
+    """Return True if func_name is called at any line outside the given ranges."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == func_name
+        ):
+            line = node.lineno
+            if not any(start <= line <= end for start, end in ranges):
+                return True
+    return False
+
+
+def _blocked_private_scopes(source: str, ranges: List[Tuple[int, int]]) -> Set[str]:
+    """Return names of private functions that have callers outside the diff ranges."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    blocked: Set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id.startswith("_")
+        ):
+            line = node.lineno
+            if not any(start <= line <= end for start, end in ranges):
+                blocked.add(node.func.id)
+    return blocked
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +265,8 @@ def _apply_tuple_dataclass(
     source: str,
     verbose: bool,
     approved_public_funcs: Set[str],
+    min_size: int = 4,
+    blocked_scopes: Optional[Set[str]] = None,
 ) -> "_ApplyResult":
     """Run TupleDataclass on *source*. Returns (new_source, messages, transformer)."""
     try:
@@ -235,6 +283,8 @@ def _apply_tuple_dataclass(
             source=source,
             verbose=verbose,
             approved_public_funcs=approved_public_funcs,
+            min_size=min_size,
+            blocked_scopes=blocked_scopes,
         )
         new_tree = wrapper.visit(td)
     except CrispenAPIError:
@@ -272,8 +322,11 @@ def run_engine(
     changed: Dict[str, List[Tuple[int, int]]],
     verbose: bool = True,
     _repo_root: Optional[str] = None,
+    config: Optional[CrispenConfig] = None,
 ) -> Generator[str, None, None]:
     """Apply all refactors to changed files and yield summary messages."""
+    if config is None:
+        config = load_config()
 
     # ------------------------------------------------------------------ #
     # Phase 1 — single-file refactors + TupleDataclass (private only)     #
@@ -303,9 +356,20 @@ def run_engine(
 
             wrapper = MetadataWrapper(current_tree)
             try:
-                transformer = RefactorClass(
-                    ranges, source=current_source, verbose=verbose
-                )
+                if RefactorClass is DuplicateExtractor:
+                    transformer = DuplicateExtractor(
+                        ranges,
+                        source=current_source,
+                        verbose=verbose,
+                        min_weight=config.min_duplicate_weight,
+                        max_seq_len=config.max_duplicate_seq_len,
+                        model=config.model,
+                        helper_docstrings=config.helper_docstrings,
+                    )
+                else:
+                    transformer = RefactorClass(
+                        ranges, source=current_source, verbose=verbose
+                    )
                 new_tree = wrapper.visit(transformer)
             except CrispenAPIError:
                 raise
@@ -335,8 +399,17 @@ def run_engine(
         # Apply TupleDataclass — private functions only in this pass.
         candidates: Dict[str, TransformInfo] = {}
         if not had_parse_error:
+            blocked: Set[str] = set()
+            if not config.update_diff_file_callers:
+                blocked = _blocked_private_scopes(current_source, ranges)
             new_source, msgs, td = _apply_tuple_dataclass(
-                filepath, ranges, current_source, verbose, approved_public_funcs=set()
+                filepath,
+                ranges,
+                current_source,
+                verbose,
+                approved_public_funcs=set(),
+                min_size=config.min_tuple_size,
+                blocked_scopes=blocked,
             )
             current_source = new_source
             file_msgs.extend(msgs)
@@ -404,6 +477,21 @@ def run_engine(
             outside_canonical = {
                 alias_map[q] for q in outside_callers if q in alias_map
             }
+
+            # When update_diff_file_callers is disabled, also block functions
+            # that have callers within diff files but outside the diff ranges.
+            if not config.update_diff_file_callers:
+                for qname in list(canonical_qnames - outside_canonical):
+                    info, _ = all_candidates[qname]
+                    for caller_state in per_file.values():
+                        if _has_callers_outside_ranges(
+                            caller_state["source"],
+                            info.func_name,
+                            caller_state["ranges"],
+                        ):
+                            outside_canonical.add(qname)
+                            break
+
             approved_canonical = canonical_qnames - outside_canonical
 
             for qname in canonical_qnames - approved_canonical:
@@ -436,6 +524,7 @@ def run_engine(
                         state["source"],
                         verbose,
                         approved_public_funcs=funcs,
+                        min_size=config.min_tuple_size,
                     )
                     state["source"] = new_source
                     state["msgs"].extend(msgs)

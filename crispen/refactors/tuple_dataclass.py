@@ -138,15 +138,17 @@ class TupleDataclass(Refactor):
     def __init__(
         self,
         changed_ranges: List[Tuple[int, int]],
-        min_size: int = 3,
+        min_size: int = 4,
         source: str = "",
         verbose: bool = True,
         approved_public_funcs: Optional[Set[str]] = None,
+        blocked_scopes: Optional[Set[str]] = None,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self.min_size = min_size
         self._source = source
         self.approved_public_funcs: Set[str] = set(approved_public_funcs or [])
+        self._blocked_scopes: Set[str] = set(blocked_scopes or [])
 
         # State populated during the first visit pass
         self._unpackings: Dict[int, List[str]] = {}
@@ -308,6 +310,9 @@ class TupleDataclass(Refactor):
         if scope is None:
             return updated_node
         is_public = not scope.startswith("_")
+
+        if not is_public and scope in self._blocked_scopes:
+            return updated_node
 
         # Only transform when every in-file caller uses tuple unpacking on the
         # return value.  This prevents broken code when a caller stores or passes

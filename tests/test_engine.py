@@ -7,14 +7,17 @@ from unittest.mock import patch
 import libcst as cst
 import pytest
 
+from crispen.config import CrispenConfig
 from crispen.engine import (
     _EXCLUDED_DIR_NAMES,
     _apply_tuple_dataclass,
+    _blocked_private_scopes,
     _build_alias_map,
     _compute_qname,
     _file_to_module,
     _find_outside_callers,
     _find_repo_root,
+    _has_callers_outside_ranges,
     _visit_with_timeout,
     run_engine,
 )
@@ -23,7 +26,7 @@ from crispen.refactors.base import Refactor
 
 
 def _run(changed):
-    return list(run_engine(changed))
+    return list(run_engine(changed, config=CrispenConfig(min_tuple_size=3)))
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +343,13 @@ def test_cross_file_transforms_public_func_and_caller(tmp_path):
     )
 
     changed = {str(service): [(1, 2)], str(api): [(1, 4)]}
-    msgs = list(run_engine(changed, _repo_root=str(tmp_path)))
+    msgs = list(
+        run_engine(
+            changed,
+            _repo_root=str(tmp_path),
+            config=CrispenConfig(min_tuple_size=3),
+        )
+    )
 
     assert any("TupleDataclass" in m for m in msgs)
     assert any("CallerUpdater" in m for m in msgs)
@@ -375,7 +384,13 @@ def test_cross_file_skips_when_outside_caller_exists(tmp_path):
     )
 
     changed = {str(service): [(1, 2)]}
-    msgs = list(run_engine(changed, _repo_root=str(tmp_path)))
+    msgs = list(
+        run_engine(
+            changed,
+            _repo_root=str(tmp_path),
+            config=CrispenConfig(min_tuple_size=3),
+        )
+    )
 
     assert any("callers exist outside the diff" in m for m in msgs)
     assert "return (name, age, score)" in service.read_text(encoding="utf-8")
@@ -490,7 +505,13 @@ def test_cross_file_file_not_under_repo_root(tmp_path):
     f = tmp_path / "code.py"
     f.write_text("def public_func():\n    return (1, 2, 3)\n", encoding="utf-8")
     # _compute_qname raises ValueError → all_candidates stays empty → 317->406 branch.
-    msgs = list(run_engine({str(f): [(1, 2)]}, _repo_root=str(repo_root)))
+    msgs = list(
+        run_engine(
+            {str(f): [(1, 2)]},
+            _repo_root=str(repo_root),
+            config=CrispenConfig(min_tuple_size=3),
+        )
+    )
     assert not any("callers" in m for m in msgs)
 
 
@@ -527,7 +548,11 @@ def test_cross_file_one_approved_one_blocked(tmp_path):
     )
 
     changed = {str(a): [(1, 2)], str(b): [(1, 2)]}
-    msgs = list(run_engine(changed, _repo_root=str(tmp_path)))
+    msgs = list(
+        run_engine(
+            changed, _repo_root=str(tmp_path), config=CrispenConfig(min_tuple_size=3)
+        )
+    )
 
     # blocked_func is skipped; its identity entry in alias_map hits the 349->348 branch.
     assert any(
@@ -556,7 +581,11 @@ def test_cross_file_caller_updater_file_not_under_repo_root(tmp_path):
 
     changed = {str(inside): [(1, 2)], str(outside_code): [(1, 1)]}
     # No crash; outside_code.py's _file_to_module raises ValueError → continue.
-    list(run_engine(changed, _repo_root=str(subdir)))
+    list(
+        run_engine(
+            changed, _repo_root=str(subdir), config=CrispenConfig(min_tuple_size=3)
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +614,13 @@ def test_cross_file_caller_updater_parse_error(tmp_path):
 
     with patch("crispen.engine.cst.parse_module", patched_parse):
         # Should not crash; CallerUpdater pass silently continues.
-        list(run_engine(changed, _repo_root=str(tmp_path)))
+        list(
+            run_engine(
+                changed,
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(min_tuple_size=3),
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +638,13 @@ def test_cross_file_caller_updater_raises(tmp_path):
 
     with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
         # Should not crash; the exception is caught.
-        list(run_engine(changed, _repo_root=str(tmp_path)))
+        list(
+            run_engine(
+                changed,
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(min_tuple_size=3),
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -631,7 +672,11 @@ def test_cross_file_init_alias_detected_as_outside_caller(tmp_path):
     )
 
     changed = {str(service): [(1, 2)]}
-    msgs = list(run_engine(changed, _repo_root=str(tmp_path)))
+    msgs = list(
+        run_engine(
+            changed, _repo_root=str(tmp_path), config=CrispenConfig(min_tuple_size=3)
+        )
+    )
 
     assert any("callers exist outside the diff" in m for m in msgs)
 
@@ -758,3 +803,190 @@ def test_phase1_private_caller_updater_exception_ignored(tmp_path):
         msgs = _run({str(f): [(1, 100)]})
     # TupleDataclass still ran successfully
     assert any("TupleDataclass" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# _has_callers_outside_ranges
+# ---------------------------------------------------------------------------
+
+
+def test_has_callers_outside_ranges_found():
+    source = "def f(): pass\nf()\n"  # call on line 2, range is only line 1
+    assert _has_callers_outside_ranges(source, "f", [(1, 1)]) is True
+
+
+def test_has_callers_outside_ranges_not_found():
+    source = "def f(): pass\nf()\n"  # call on line 2, range covers line 2
+    assert _has_callers_outside_ranges(source, "f", [(1, 2)]) is False
+
+
+def test_has_callers_outside_ranges_syntax_error():
+    assert _has_callers_outside_ranges("def f(:", "f", [(1, 1)]) is False
+
+
+# ---------------------------------------------------------------------------
+# _blocked_private_scopes
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_private_scopes_finds_outside_callers():
+    # _helper called at line 3, diff range only covers line 1
+    source = "def _helper(): pass\n\n_helper()\n"
+    blocked = _blocked_private_scopes(source, [(1, 1)])
+    assert "_helper" in blocked
+
+
+def test_blocked_private_scopes_ignores_in_range_callers():
+    # _helper called at line 3, diff range covers line 3
+    source = "def _helper(): pass\n\n_helper()\n"
+    blocked = _blocked_private_scopes(source, [(1, 3)])
+    assert "_helper" not in blocked
+
+
+def test_blocked_private_scopes_syntax_error():
+    blocked = _blocked_private_scopes("def f(:", [(1, 1)])
+    assert blocked == set()
+
+
+def test_blocked_private_scopes_ignores_public():
+    # Public functions (no leading _) should not appear in blocked set
+    source = "def helper(): pass\n\nhelper()\n"
+    blocked = _blocked_private_scopes(source, [(1, 1)])
+    assert "helper" not in blocked
+
+
+# ---------------------------------------------------------------------------
+# run_engine: config parameter
+# ---------------------------------------------------------------------------
+
+
+def test_run_engine_accepts_explicit_config(tmp_path):
+    """run_engine works when config is provided explicitly."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    config = CrispenConfig()
+    msgs = list(run_engine({str(f): [(1, 1)]}, config=config))
+    assert msgs == []
+
+
+def test_run_engine_config_none_loads_default(tmp_path):
+    """run_engine with config=None (default) loads config from disk."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    # config=None triggers load_config() internally
+    msgs = list(run_engine({str(f): [(1, 1)]}, config=None))
+    assert msgs == []
+
+
+# ---------------------------------------------------------------------------
+# update_diff_file_callers=False: private function blocked by outside callers
+# ---------------------------------------------------------------------------
+
+
+def test_update_diff_file_callers_false_blocks_private_with_outside_caller(tmp_path):
+    """Private function with a caller outside diff ranges is NOT transformed."""
+    source = textwrap.dedent(
+        """\
+        def _make_result():
+            return (a, b, c)
+
+        def use_in_diff():
+            x, y, z = _make_result()
+
+        def use_outside_diff():
+            p, q, r = _make_result()
+        """
+    )
+    f = tmp_path / "code.py"
+    f.write_text(source, encoding="utf-8")
+    config = CrispenConfig(min_tuple_size=3, update_diff_file_callers=False)
+    # Diff only covers the function definition and use_in_diff
+    msgs = list(run_engine({str(f): [(1, 5)]}, config=config))
+    # Should NOT have been transformed (outside callers exist)
+    assert not any("TupleDataclass" in m for m in msgs)
+    assert "return (a, b, c)" in f.read_text(encoding="utf-8")
+
+
+def test_update_diff_file_callers_false_allows_private_with_only_diff_callers(
+    tmp_path,
+):
+    """Private function with all callers inside diff is transformed."""
+    source = textwrap.dedent(
+        """\
+        def _make_result():
+            return (a, b, c)
+
+        def use_in_diff():
+            x, y, z = _make_result()
+        """
+    )
+    f = tmp_path / "code.py"
+    f.write_text(source, encoding="utf-8")
+    config = CrispenConfig(min_tuple_size=3, update_diff_file_callers=False)
+    msgs = list(run_engine({str(f): [(1, 5)]}, config=config))
+    # Only diff caller exists → transformation should proceed
+    assert any("TupleDataclass" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# update_diff_file_callers=False: public function blocked by diff-file outside callers
+# ---------------------------------------------------------------------------
+
+
+def test_update_diff_file_callers_false_blocks_public_with_diff_file_outside_caller(
+    tmp_path,
+):
+    """Public function with callers outside diff in diff file is skipped."""
+    pkg = _make_pkg(tmp_path, "mypkg")
+
+    service = pkg / "service.py"
+    service.write_text(
+        "def get_user():\n    return (name, age, score)\n", encoding="utf-8"
+    )
+
+    api = pkg / "api.py"
+    api.write_text(
+        "from mypkg.service import get_user\n"
+        "def in_diff():\n"
+        "    a, b, c = get_user()\n"
+        "def not_in_diff():\n"
+        "    x, y, z = get_user()\n",
+        encoding="utf-8",
+    )
+
+    # api.py diff only covers lines 1-3 (in_diff function)
+    changed = {str(service): [(1, 2)], str(api): [(1, 3)]}
+    config = CrispenConfig(min_tuple_size=3, update_diff_file_callers=False)
+    msgs = list(run_engine(changed, _repo_root=str(tmp_path), config=config))
+
+    # get_user has a caller outside the diff (not_in_diff at lines 4-5)
+    assert any("callers exist outside the diff" in m for m in msgs)
+
+
+def test_update_diff_file_callers_false_allows_public_with_all_callers_in_diff(
+    tmp_path,
+):
+    """Public function with all callers inside diff (no diff-file outside callers)."""
+    pkg = _make_pkg(tmp_path, "mypkg")
+
+    service = pkg / "service.py"
+    service.write_text(
+        "def get_user():\n    return (name, age, score)\n", encoding="utf-8"
+    )
+
+    api = pkg / "api.py"
+    api.write_text(
+        "from mypkg.service import get_user\n"
+        "def main():\n"
+        "    a, b, c = get_user()\n",
+        encoding="utf-8",
+    )
+
+    changed = {str(service): [(1, 2)], str(api): [(1, 3)]}
+    config = CrispenConfig(min_tuple_size=3, update_diff_file_callers=False)
+    msgs = list(run_engine(changed, _repo_root=str(tmp_path), config=config))
+
+    # All callers within diff → transformation should proceed even with
+    # update_diff_file_callers=False (no callers outside diff ranges)
+    assert any("TupleDataclass" in m for m in msgs)
+    assert any("CallerUpdater" in m for m in msgs)

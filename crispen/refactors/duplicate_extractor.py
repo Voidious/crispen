@@ -25,6 +25,43 @@ _API_HARD_TIMEOUT = 90  # seconds — hard wall-clock limit per LLM call
 
 
 # ---------------------------------------------------------------------------
+# Docstring stripping
+# ---------------------------------------------------------------------------
+
+
+def _strip_helper_docstring(helper_source: str) -> str:
+    """Remove the docstring from helper_source if the first function has one."""
+    try:
+        tree = cst.parse_module(textwrap.dedent(helper_source))
+    except cst.ParserSyntaxError:
+        return helper_source
+
+    if not tree.body or not isinstance(tree.body[0], cst.FunctionDef):
+        return helper_source
+
+    func = tree.body[0]
+    body = func.body
+    if not isinstance(body, cst.IndentedBlock) or not body.body:  # pragma: no cover
+        return helper_source
+
+    first = body.body[0]
+    if not (
+        isinstance(first, cst.SimpleStatementLine)
+        and len(first.body) == 1
+        and isinstance(first.body[0], cst.Expr)
+        and isinstance(first.body[0].value, (cst.SimpleString, cst.ConcatenatedString))
+    ):
+        return helper_source
+
+    rest = list(body.body[1:])
+    if not rest:
+        return helper_source
+
+    new_func = func.with_changes(body=body.with_changes(body=rest))
+    return tree.with_changes(body=[new_func] + list(tree.body[1:])).code
+
+
+# ---------------------------------------------------------------------------
 # Hard-timeout helper
 # ---------------------------------------------------------------------------
 
@@ -170,12 +207,16 @@ class _SequenceCollector(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (PositionProvider,)
 
     def __init__(
-        self, source_lines: List[str], max_seq_len: int = _MAX_SEQ_LEN
+        self,
+        source_lines: List[str],
+        max_seq_len: int = _MAX_SEQ_LEN,
+        min_weight: int = _MIN_WEIGHT,
     ) -> None:
         self.sequences: List[_SeqInfo] = []
         self._scope_stack: List[str] = ["<module>"]
         self._source_lines = source_lines
         self._max_seq_len = max_seq_len
+        self._min_weight = min_weight
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> Optional[bool]:
         self._scope_stack.append(node.name.value)
@@ -211,7 +252,7 @@ class _SequenceCollector(cst.CSTVisitor):
                 ]
                 if _has_def(window):
                     continue
-                if _sequence_weight(window) < _MIN_WEIGHT:
+                if _sequence_weight(window) < self._min_weight:
                     continue
                 start_line = stmt_info[start_i][1]
                 end_line = stmt_info[end_i - 1][2]
@@ -480,7 +521,11 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
-def _llm_veto(client: anthropic.Anthropic, group: List[_SeqInfo]) -> Tuple[bool, str]:
+def _llm_veto(
+    client: anthropic.Anthropic,
+    group: List[_SeqInfo],
+    model: str = _MODEL,
+) -> Tuple[bool, str]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
         f"```python\n{s.source.rstrip()}\n```"
@@ -495,7 +540,7 @@ def _llm_veto(client: anthropic.Anthropic, group: List[_SeqInfo]) -> Tuple[bool,
     )
     try:
         response = client.messages.create(
-            model=_MODEL,
+            model=model,
             max_tokens=256,
             tools=[_VETO_TOOL],
             tool_choice={"type": "tool", "name": "evaluate_duplicate"},
@@ -519,6 +564,8 @@ def _llm_extract(
     full_source: str,
     escaping_vars: frozenset = frozenset(),
     used_names: frozenset = frozenset(),
+    model: str = _MODEL,
+    helper_docstrings: bool = True,
 ) -> Optional[dict]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
@@ -544,6 +591,11 @@ def _llm_extract(
             f"or reserved by a previous extraction: {names_str}. "
             f"Do not use any of these names for the helper function."
         )
+    docstring_note = (
+        ""
+        if helper_docstrings
+        else "\n\nDo not include a docstring in the helper function."
+    )
     prompt = (
         "Extract the following duplicate code blocks from this Python file into a "
         f"helper function.\n\nFile source:\n```python\n{snippet}\n```\n\n"
@@ -562,10 +614,11 @@ def _llm_extract(
         "defined in the calling scope at that point."
         f"{escaping_note}"
         f"{used_names_note}"
+        f"{docstring_note}"
     )
     try:
         response = client.messages.create(
-            model=_MODEL,
+            model=model,
             max_tokens=1024,
             tools=[_EXTRACT_TOOL],
             tool_choice={"type": "tool", "name": "extract_helper"},
@@ -587,6 +640,7 @@ def _llm_veto_func_match(
     seq: _SeqInfo,
     func: _FunctionInfo,
     full_source: str,
+    model: str = _MODEL,
 ) -> Tuple[bool, str]:
     """Ask the LLM whether *seq* performs the same operation as *func*'s body."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -604,7 +658,7 @@ def _llm_veto_func_match(
     )
     try:
         response = client.messages.create(
-            model=_MODEL,
+            model=model,
             max_tokens=256,
             tools=[_VETO_TOOL],
             tool_choice={"type": "tool", "name": "evaluate_duplicate"},
@@ -634,6 +688,7 @@ def _llm_generate_call(
     seq: _SeqInfo,
     func: _FunctionInfo,
     full_source: str,
+    model: str = _MODEL,
 ) -> Optional[str]:
     """Ask the LLM to generate a call expression replacing *seq* with *func*."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -650,7 +705,7 @@ def _llm_generate_call(
     )
     try:
         response = client.messages.create(
-            model=_MODEL,
+            model=model,
             max_tokens=256,
             tools=[_CALL_GEN_TOOL],
             tool_choice={"type": "tool", "name": "generate_call"},
@@ -978,8 +1033,16 @@ class DuplicateExtractor(Refactor):
         changed_ranges: List[Tuple[int, int]],
         source: str = "",
         verbose: bool = True,
+        min_weight: int = _MIN_WEIGHT,
+        max_seq_len: int = _MAX_SEQ_LEN,
+        model: str = _MODEL,
+        helper_docstrings: bool = False,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
+        self._min_weight = min_weight
+        self._base_max_seq_len = max_seq_len
+        self._model = model
+        self._helper_docstrings = helper_docstrings
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -1006,11 +1069,13 @@ class DuplicateExtractor(Refactor):
         # 6. Compute max sequence length to capture full function bodies.
         max_seq_len = max(
             max(f.body_stmt_count for f in all_functions) if all_functions else 0,
-            _MAX_SEQ_LEN,
+            self._base_max_seq_len,
         )
 
         # 7. Collect sequences.
-        collector = _SequenceCollector(source_lines, max_seq_len=max_seq_len)
+        collector = _SequenceCollector(
+            source_lines, max_seq_len=max_seq_len, min_weight=self._min_weight
+        )
         MetadataWrapper(tree).visit(collector)
 
         # 8. Preliminary duplicate groups.
@@ -1067,6 +1132,7 @@ class DuplicateExtractor(Refactor):
                         seq,
                         func,
                         source,
+                        self._model,
                     )
                 except _ApiTimeout:
                     print(
@@ -1095,6 +1161,7 @@ class DuplicateExtractor(Refactor):
                             seq,
                             func,
                             source,
+                            self._model,
                         )
                     except _ApiTimeout:
                         print(
@@ -1160,7 +1227,7 @@ class DuplicateExtractor(Refactor):
                 )
             try:
                 is_valid, reason = _run_with_timeout(
-                    _llm_veto, _API_HARD_TIMEOUT, client, group
+                    _llm_veto, _API_HARD_TIMEOUT, client, group, self._model
                 )
             except _ApiTimeout:
                 print(
@@ -1188,6 +1255,8 @@ class DuplicateExtractor(Refactor):
                     source,
                     escaping_vars,
                     used_names=frozenset(used_names),
+                    model=self._model,
+                    helper_docstrings=self._helper_docstrings,
                 )
             except _ApiTimeout:
                 print(
@@ -1200,6 +1269,8 @@ class DuplicateExtractor(Refactor):
                 continue  # pragma: no cover
 
             helper_source = extraction["helper_source"]
+            if not self._helper_docstrings:
+                helper_source = _strip_helper_docstring(helper_source)
             call_replacements = extraction["call_site_replacements"]
             placement = extraction.get("placement", "module_level")
             func_name = extraction["function_name"]
