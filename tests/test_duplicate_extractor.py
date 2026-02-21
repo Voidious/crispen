@@ -11,6 +11,7 @@ from crispen.errors import CrispenAPIError
 from crispen.refactors.duplicate_extractor import (
     _ApiTimeout,
     _build_helper_insertion,
+    _collect_attribute_names,
     _extract_defined_names,
     _FunctionCollector,
     _FunctionInfo,
@@ -25,6 +26,7 @@ from crispen.refactors.duplicate_extractor import (
     _generate_no_arg_call,
     _has_def,
     _find_escaping_vars,
+    _has_mutable_literal_is_check,
     _has_param_overwritten_before_read,
     _llm_generate_call,
     _llm_veto_func_match,
@@ -429,6 +431,83 @@ def test_verify_extraction_allows_multiline_return_replacement():
         "    tree = helper(source)\n    if tree is None:\n        return set()\n"
     ]
     assert _verify_extraction(helper, replacements) is True
+
+
+# ---------------------------------------------------------------------------
+# _has_mutable_literal_is_check
+# ---------------------------------------------------------------------------
+
+
+def test_has_mutable_literal_is_check_set_constructor():
+    assert _has_mutable_literal_is_check("if x is set(): pass") is True
+
+
+def test_has_mutable_literal_is_check_list_constructor():
+    assert _has_mutable_literal_is_check("if x is list(): pass") is True
+
+
+def test_has_mutable_literal_is_check_dict_constructor():
+    assert _has_mutable_literal_is_check("if x is dict(): pass") is True
+
+
+def test_has_mutable_literal_is_check_list_literal():
+    assert _has_mutable_literal_is_check("if x is []: pass") is True
+
+
+def test_has_mutable_literal_is_check_dict_literal():
+    assert _has_mutable_literal_is_check("if x is {}: pass") is True
+
+
+def test_has_mutable_literal_is_check_isnot():
+    assert _has_mutable_literal_is_check("if x is not set(): pass") is True
+
+
+def test_has_mutable_literal_is_check_none_is_fine():
+    assert _has_mutable_literal_is_check("if x is None: pass") is False
+
+
+def test_has_mutable_literal_is_check_isinstance_is_fine():
+    assert _has_mutable_literal_is_check("if isinstance(x, set): pass") is False
+
+
+def test_has_mutable_literal_is_check_equality_is_fine():
+    # == comparison with set() is valid; only identity (`is`) is wrong
+    assert _has_mutable_literal_is_check("if x == set(): pass") is False
+
+
+def test_has_mutable_literal_is_check_syntax_error():
+    assert _has_mutable_literal_is_check("def f(x:") is False
+
+
+def test_verify_extraction_rejects_mutable_is_in_helper():
+    helper = "def h(x):\n    if x is set(): return True\n    return False\n"
+    assert _verify_extraction(helper, ["h(a)\n"]) is False
+
+
+def test_verify_extraction_rejects_mutable_is_in_replacement():
+    helper = "def h(x):\n    return x\n"
+    assert _verify_extraction(helper, ["if r is set(): pass\n"]) is False
+
+
+# ---------------------------------------------------------------------------
+# _collect_attribute_names
+# ---------------------------------------------------------------------------
+
+
+def test_collect_attribute_names_basic():
+    assert _collect_attribute_names("x.foo()\ny.bar") == {"foo", "bar"}
+
+
+def test_collect_attribute_names_nested():
+    assert "baz" in _collect_attribute_names("a.b.baz()")
+
+
+def test_collect_attribute_names_syntax_error():
+    assert _collect_attribute_names("def f(x:") == set()
+
+
+def test_collect_attribute_names_no_attrs():
+    assert _collect_attribute_names("x = 1 + 2") == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1523,6 +1602,44 @@ def test_verify_fails_skipped_verbose_false(monkeypatch):
     assert de._new_source is None
 
 
+def _make_new_attr_extractor(monkeypatch, verbose=True):
+    """Helper: LLM returns a helper that calls a method not in the original source."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_extract_response(
+                {
+                    "function_name": "helper",
+                    "placement": "module_level",
+                    # helper calls .invented_method() — not present in _DUP_SOURCE
+                    "helper_source": (
+                        "def helper(data):\n" "    data.invented_method()\n"
+                    ),
+                    "call_site_replacements": [
+                        "helper(data)\n",
+                        "helper(data)\n",
+                    ],
+                }
+            ),
+        ]
+        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+
+
+def test_new_attribute_check_skips_group_verbose(monkeypatch, capsys):
+    de = _make_new_attr_extractor(monkeypatch, verbose=True)
+    assert de._new_source is None
+    assert "new attribute access" in capsys.readouterr().err
+
+
+def test_new_attribute_check_skips_group_verbose_false(monkeypatch):
+    de = _make_new_attr_extractor(monkeypatch, verbose=False)
+    assert de._new_source is None
+
+
 # ---------------------------------------------------------------------------
 # DuplicateExtractor — successful extraction at module level
 # ---------------------------------------------------------------------------
@@ -1735,6 +1852,7 @@ def test_engine_propagates_api_error(tmp_path, monkeypatch):
     f = tmp_path / "code.py"
     f.write_text(_DUP_SOURCE, encoding="utf-8")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
 
     with pytest.raises(CrispenAPIError):
         list(run_engine({str(f): _DUP_RANGES}))
@@ -1750,6 +1868,7 @@ def test_cli_exits_on_api_error(tmp_path, monkeypatch):
     from crispen.cli import main
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
 
     # Write file so engine can read it
     f = tmp_path / "dup.py"

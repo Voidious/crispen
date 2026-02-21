@@ -726,6 +726,46 @@ def _normalize_replacement_indentation(seq: _SeqInfo, replacement: str) -> str:
     return textwrap.indent(dedented, expected_indent)
 
 
+_MUTABLE_CONSTRUCTORS = frozenset({"set", "list", "dict", "frozenset", "bytearray"})
+
+
+def _has_mutable_literal_is_check(source: str) -> bool:
+    """Return True if *source* contains identity checks against mutable literals.
+
+    Patterns like ``x is set()``, ``x is []``, or ``x is {}`` are always
+    False in Python because each literal creates a new object at runtime.
+    Such patterns are a common LLM mistake when using a ``set()`` sentinel.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        for op, comp in zip(node.ops, node.comparators):
+            if not isinstance(op, (ast.Is, ast.IsNot)):
+                continue
+            if isinstance(comp, (ast.List, ast.Set, ast.Dict, ast.Tuple)):
+                return True
+            if (
+                isinstance(comp, ast.Call)
+                and isinstance(comp.func, ast.Name)
+                and comp.func.id in _MUTABLE_CONSTRUCTORS
+            ):
+                return True
+    return False
+
+
+def _collect_attribute_names(source: str) -> set:
+    """Return all attribute names (dot-access names) anywhere in *source*."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+
+
 def _verify_extraction(
     helper_source: Optional[str], call_replacements: List[str]
 ) -> bool:
@@ -744,12 +784,16 @@ def _verify_extraction(
             return False
         if _has_param_overwritten_before_read(helper_source):
             return False
+        if _has_mutable_literal_is_check(helper_source):
+            return False
     for replacement in call_replacements:
         try:
             dedented = textwrap.dedent(replacement)
             wrapped = "def _check():\n" + textwrap.indent(dedented, "    ")
             compile(wrapped, "<replacement>", "exec")
         except SyntaxError:
+            return False
+        if _has_mutable_literal_is_check(replacement):
             return False
     return True
 
@@ -1318,6 +1362,20 @@ class DuplicateExtractor(Refactor):
                     print(
                         f"crispen: DuplicateExtractor:   call_site_replacements: "
                         f"{call_replacements!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+
+            new_attrs = _collect_attribute_names(
+                helper_source
+            ) - _collect_attribute_names(source)
+            if new_attrs:
+                if self.verbose:
+                    print(
+                        f"crispen: DuplicateExtractor: extraction FAILED — "
+                        f"helper introduces new attribute access(es) not in original: "
+                        f"{', '.join(sorted(new_attrs))}",
                         file=sys.stderr,
                         flush=True,
                     )
