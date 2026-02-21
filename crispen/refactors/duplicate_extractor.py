@@ -151,6 +151,16 @@ class _SeqInfo:
     fingerprint: str
 
 
+@dataclass
+class _FunctionInfo:
+    name: str
+    source: str  # raw source of complete function definition
+    scope: str  # "<module>" or enclosing class name
+    body_source: str  # raw source of the function body (indented)
+    body_stmt_count: int  # number of top-level statements in the body
+    params: List[str]  # positional parameter names (empty → no-arg function)
+
+
 # ---------------------------------------------------------------------------
 # Sequence collector
 # ---------------------------------------------------------------------------
@@ -159,10 +169,13 @@ class _SeqInfo:
 class _SequenceCollector(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (PositionProvider,)
 
-    def __init__(self, source_lines: List[str]) -> None:
+    def __init__(
+        self, source_lines: List[str], max_seq_len: int = _MAX_SEQ_LEN
+    ) -> None:
         self.sequences: List[_SeqInfo] = []
         self._scope_stack: List[str] = ["<module>"]
         self._source_lines = source_lines
+        self._max_seq_len = max_seq_len
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> Optional[bool]:
         self._scope_stack.append(node.name.value)
@@ -190,7 +203,9 @@ class _SequenceCollector(cst.CSTVisitor):
         n = len(stmt_info)
         scope = self._scope_stack[-1]
         for start_i in range(n):
-            for end_i in range(start_i + 1, min(start_i + _MAX_SEQ_LEN + 1, n + 1)):
+            for end_i in range(
+                start_i + 1, min(start_i + self._max_seq_len + 1, n + 1)
+            ):
                 window: List[cst.BaseStatement] = [
                     s[0] for s in stmt_info[start_i:end_i]
                 ]
@@ -219,6 +234,108 @@ class _SequenceCollector(cst.CSTVisitor):
     def visit_IndentedBlock(self, node: cst.IndentedBlock) -> Optional[bool]:
         self._process_body(node.body)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Function collector
+# ---------------------------------------------------------------------------
+
+
+class _FunctionCollector(cst.CSTVisitor):
+    METADATA_DEPENDENCIES = (PositionProvider,)
+
+    def __init__(self, source_lines: List[str]) -> None:
+        self.functions: List[_FunctionInfo] = []
+        self._scope_stack: List[str] = ["<module>"]
+        self._scope_kind_stack: List[str] = ["module"]
+        self._source_lines = source_lines
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> Optional[bool]:
+        parent_kind = self._scope_kind_stack[-1]
+        if parent_kind in ("module", "class"):
+            try:
+                pos = self.get_metadata(PositionProvider, node)
+                func_source = "".join(
+                    self._source_lines[pos.start.line - 1 : pos.end.line]
+                )
+                body_pos = self.get_metadata(PositionProvider, node.body)
+                body_source = "".join(
+                    self._source_lines[body_pos.start.line - 1 : body_pos.end.line]
+                )
+            except KeyError:  # pragma: no cover
+                func_source = ""
+                body_source = ""
+            body_stmt_count = len(node.body.body)
+            params = [p.name.value for p in node.params.params]
+            self.functions.append(
+                _FunctionInfo(
+                    name=node.name.value,
+                    source=func_source,
+                    scope=self._scope_stack[-1],
+                    body_source=body_source,
+                    body_stmt_count=body_stmt_count,
+                    params=params,
+                )
+            )
+        self._scope_stack.append(node.name.value)
+        self._scope_kind_stack.append("function")
+        return None
+
+    def leave_FunctionDef(self, node: cst.FunctionDef) -> None:
+        self._scope_stack.pop()
+        self._scope_kind_stack.pop()
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> Optional[bool]:
+        self._scope_stack.append(node.name.value)
+        self._scope_kind_stack.append("class")
+        return None
+
+    def leave_ClassDef(self, node: cst.ClassDef) -> None:
+        self._scope_stack.pop()
+        self._scope_kind_stack.pop()
+
+
+# ---------------------------------------------------------------------------
+# Function body fingerprint helpers
+# ---------------------------------------------------------------------------
+
+
+def _collect_called_names(source: str) -> set:
+    """Return a set of all names called (as functions) in *source*.
+
+    Uses ast.parse + ast.walk to find all ast.Call nodes.  Returns the
+    called name: func.id for ast.Name callees, func.attr for ast.Attribute
+    callees.  On SyntaxError, returns an empty set.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                names.add(node.func.attr)
+    return names
+
+
+def _build_function_body_fps(
+    all_functions: List[_FunctionInfo],
+    called_names: set,
+) -> Dict[str, _FunctionInfo]:
+    """Map normalized body fingerprint → _FunctionInfo for called functions.
+
+    Only functions whose name appears in *called_names* are indexed, since
+    only those could be the target of a "replace with existing function" edit.
+    """
+    fps: Dict[str, _FunctionInfo] = {}
+    for func in all_functions:
+        if func.name in called_names:
+            fp = _normalize_source(func.body_source)
+            fps[fp] = func
+    return fps
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +457,24 @@ _EXTRACT_TOOL: dict = {
     },
 }
 
+_CALL_GEN_TOOL: dict = {
+    "name": "generate_call",
+    "description": "Generate a call to an existing function that replaces a code block",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "replacement": {
+                "type": "string",
+                "description": (
+                    "Complete replacement source "
+                    "(including indentation and trailing newline)"
+                ),
+            }
+        },
+        "required": ["replacement"],
+    },
+}
+
 
 def _llm_veto(client: anthropic.Anthropic, group: List[_SeqInfo]) -> Tuple[bool, str]:
     blocks_text = "\n\n".join(
@@ -412,21 +547,111 @@ def _llm_extract(
     return None  # pragma: no cover
 
 
+def _llm_veto_func_match(
+    client: anthropic.Anthropic,
+    seq: _SeqInfo,
+    func: _FunctionInfo,
+    full_source: str,
+) -> Tuple[bool, str]:
+    """Ask the LLM whether *seq* performs the same operation as *func*'s body."""
+    snippet = full_source[:4000] if len(full_source) > 4000 else full_source
+    prompt = (
+        "A code block in a Python file may be replaceable by a call to an existing "
+        "function.\n\n"
+        f"Code block (scope: {seq.scope}, lines {seq.start_line}-{seq.end_line}):\n"
+        f"```python\n{seq.source.rstrip()}\n```\n\n"
+        f"Existing function '{func.name}':\n"
+        f"```python\n{func.source.rstrip()}\n```\n\n"
+        f"File source:\n```python\n{snippet}\n```\n\n"
+        "Does this code block perform the same semantic operation as the function "
+        "body, such that it could be replaced by a call to the function? "
+        "Use the evaluate_duplicate tool to answer."
+    )
+    try:
+        response = client.messages.create(
+            model=_MODEL,
+            max_tokens=256,
+            tools=[_VETO_TOOL],
+            tool_choice={"type": "tool", "name": "evaluate_duplicate"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except anthropic.APIError as exc:
+        raise CrispenAPIError(
+            f"DuplicateExtractor: Anthropic API error: {exc}\n"
+            "Commit blocked. To skip all hooks: git commit --no-verify"
+        ) from exc
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "evaluate_duplicate":
+            inp = block.input
+            return inp["is_valid_duplicate"], inp.get("reason", "")
+    return False, "no tool response"  # pragma: no cover
+
+
+def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
+    """Algorithmically generate a no-argument call to *func*, preserving indentation."""
+    first_line = seq.source.splitlines()[0]
+    indent = first_line[: len(first_line) - len(first_line.lstrip())]
+    return indent + func.name + "()\n"
+
+
+def _llm_generate_call(
+    client: anthropic.Anthropic,
+    seq: _SeqInfo,
+    func: _FunctionInfo,
+    full_source: str,
+) -> Optional[str]:
+    """Ask the LLM to generate a call expression replacing *seq* with *func*."""
+    snippet = full_source[:4000] if len(full_source) > 4000 else full_source
+    prompt = (
+        f"Replace this code block with a call to the existing function"
+        f" '{func.name}'.\n\n"
+        f"Code block (scope: {seq.scope}, lines {seq.start_line}-{seq.end_line}):\n"
+        f"```python\n{seq.source.rstrip()}\n```\n\n"
+        f"Function '{func.name}':\n"
+        f"```python\n{func.source.rstrip()}\n```\n\n"
+        f"File source:\n```python\n{snippet}\n```\n\n"
+        "Generate a replacement that preserves the original indentation and ends "
+        "with a newline. Pass the replacement to the generate_call tool."
+    )
+    try:
+        response = client.messages.create(
+            model=_MODEL,
+            max_tokens=256,
+            tools=[_CALL_GEN_TOOL],
+            tool_choice={"type": "tool", "name": "generate_call"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except anthropic.APIError as exc:
+        raise CrispenAPIError(
+            f"DuplicateExtractor: Anthropic API error: {exc}\n"
+            "Commit blocked. To skip all hooks: git commit --no-verify"
+        ) from exc
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "generate_call":
+            return block.input["replacement"]
+    return None  # pragma: no cover
+
+
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
 
 
-def _verify_extraction(helper_source: str, call_replacements: List[str]) -> bool:
+def _verify_extraction(
+    helper_source: Optional[str], call_replacements: List[str]
+) -> bool:
     """Verify the extraction produces syntactically valid Python.
 
     Replacements are dedented before checking since they may be
     indented for their original context inside a function body.
+    Pass helper_source=None to skip the helper compilation check (used when
+    replacing with an existing function rather than a newly extracted one).
     """
-    try:
-        compile(textwrap.dedent(helper_source), "<helper>", "exec")
-    except SyntaxError:
-        return False
+    if helper_source is not None:
+        try:
+            compile(textwrap.dedent(helper_source), "<helper>", "exec")
+        except SyntaxError:
+            return False
     for replacement in call_replacements:
         try:
             compile(textwrap.dedent(replacement), "<replacement>", "exec")
@@ -508,26 +733,50 @@ class DuplicateExtractor(Refactor):
             self._analyze(source)
 
     def _analyze(self, source: str) -> None:
+        # 1. Parse tree; early-return on syntax error.
         try:
             tree = cst.parse_module(source)
         except cst.ParserSyntaxError:
             return
 
+        # 2. Source lines.
         source_lines = source.splitlines(keepends=True)
-        collector = _SequenceCollector(source_lines)
+
+        # 3. Collect functions.
+        func_collector = _FunctionCollector(source_lines)
+        MetadataWrapper(tree).visit(func_collector)
+        all_functions = func_collector.functions
+
+        # 4-5. Build function body fingerprint map (only for called functions).
+        called_names = _collect_called_names(source)
+        func_body_fps = _build_function_body_fps(all_functions, called_names)
+
+        # 6. Compute max sequence length to capture full function bodies.
+        max_seq_len = max(
+            max(f.body_stmt_count for f in all_functions) if all_functions else 0,
+            _MAX_SEQ_LEN,
+        )
+
+        # 7. Collect sequences.
+        collector = _SequenceCollector(source_lines, max_seq_len=max_seq_len)
         MetadataWrapper(tree).visit(collector)
 
+        # 8. Preliminary duplicate groups.
         groups = _find_duplicate_groups(collector.sequences, self.changed_ranges)
-        if not groups:
+
+        # 9. Check whether any sequence can be replaced with an existing function.
+        has_func_matches = func_body_fps and any(
+            _overlaps_diff(seq, self.changed_ranges)
+            and seq.fingerprint in func_body_fps
+            and func_body_fps[seq.fingerprint].name != seq.scope
+            for seq in collector.sequences
+        )
+
+        # 10. Early exit — nothing to do.
+        if not has_func_matches and not groups:
             return
 
-        if self.verbose:
-            print(
-                f"crispen: DuplicateExtractor: found {len(groups)} duplicate group(s)",
-                file=sys.stderr,
-                flush=True,
-            )
-
+        # 12. Create API client.
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise CrispenAPIError(
@@ -538,7 +787,110 @@ class DuplicateExtractor(Refactor):
         client = anthropic.Anthropic(api_key=api_key, timeout=60.0)
         edits: List[Tuple[int, int, str]] = []
         pending_changes: List[str] = []
+        matched_line_ranges: set = set()
 
+        # 14. Function body match pass.
+        if func_body_fps:
+            for seq in collector.sequences:
+                if not _overlaps_diff(seq, self.changed_ranges):
+                    continue
+                if seq.fingerprint not in func_body_fps:
+                    continue
+                func = func_body_fps[seq.fingerprint]
+                if func.name == seq.scope:
+                    continue
+                if self.verbose:
+                    print(
+                        f"crispen: DuplicateExtractor: func-match check — "
+                        f"scope '{seq.scope}': lines {seq.start_line}-{seq.end_line}"
+                        f" → '{func.name}'",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                try:
+                    is_valid, reason = _run_with_timeout(
+                        _llm_veto_func_match,
+                        _API_HARD_TIMEOUT,
+                        client,
+                        seq,
+                        func,
+                        source,
+                    )
+                except _ApiTimeout:
+                    print(
+                        "crispen: DuplicateExtractor:   → func-match veto timed out",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                if self.verbose:
+                    status = "ACCEPTED" if is_valid else "VETOED"
+                    print(
+                        f"crispen: DuplicateExtractor:   → {status}: {reason}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                if not is_valid:
+                    continue
+                if func.scope == "<module>" and not func.params:
+                    replacement = _generate_no_arg_call(seq, func)
+                else:
+                    try:
+                        replacement = _run_with_timeout(
+                            _llm_generate_call,
+                            _API_HARD_TIMEOUT,
+                            client,
+                            seq,
+                            func,
+                            source,
+                        )
+                    except _ApiTimeout:
+                        print(
+                            "crispen: DuplicateExtractor:"
+                            "   → call generation timed out",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    if replacement is None:
+                        continue  # pragma: no cover
+                if not _verify_extraction(None, [replacement]):
+                    continue
+                if self.verbose:
+                    print(
+                        f"crispen: DuplicateExtractor:   → replacing '{seq.scope}'"
+                        f" with '{func.name}()'",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                edits.append((seq.start_line - 1, seq.end_line, replacement))
+                matched_line_ranges.add((seq.start_line, seq.end_line))
+                pending_changes.append(
+                    f"DuplicateExtractor: replaced '{seq.scope}' body"
+                    f" with call to '{func.name}'"
+                )
+
+        # 15. Recompute duplicate groups excluding matched sequences.
+        if matched_line_ranges:
+            remaining = [
+                s
+                for s in collector.sequences
+                if not any(
+                    s.start_line <= r_end and s.end_line >= r_start
+                    for r_start, r_end in matched_line_ranges
+                )
+            ]
+            groups = _find_duplicate_groups(remaining, self.changed_ranges)
+
+        # 16. Log group count.
+        if groups and self.verbose:
+            print(
+                f"crispen: DuplicateExtractor: found {len(groups)} duplicate group(s)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        # 17. Duplicate group extraction pass (unchanged logic).
         for group in groups:
             if self.verbose:
                 ranges_str = ", ".join(
@@ -620,6 +972,7 @@ class DuplicateExtractor(Refactor):
                 f"from {len(group)} duplicate blocks"
             )
 
+        # 18. Apply edits, compile, write.
         if edits:
             candidate = _apply_edits(source, edits)
             try:
