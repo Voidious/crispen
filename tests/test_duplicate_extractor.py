@@ -22,8 +22,10 @@ from crispen.refactors.duplicate_extractor import (
     _find_insertion_point,
     _generate_no_arg_call,
     _has_def,
+    _find_escaping_vars,
     _llm_generate_call,
     _llm_veto_func_match,
+    _names_assigned_in,
     _node_weight,
     _normalize_source,
     _overlaps_diff,
@@ -401,6 +403,133 @@ def test_verify_extraction_no_helper_source():
 
 
 # ---------------------------------------------------------------------------
+# _names_assigned_in
+# ---------------------------------------------------------------------------
+
+
+def test_names_assigned_in_simple():
+    assert _names_assigned_in("x = 1\n") == {"x"}
+
+
+def test_names_assigned_in_tuple_unpack():
+    assert _names_assigned_in("x, y = f()\n") == {"x", "y"}
+
+
+def test_names_assigned_in_augassign():
+    assert _names_assigned_in("x += 1\n") == {"x"}
+
+
+def test_names_assigned_in_no_assign():
+    assert _names_assigned_in("f()\n") == set()
+
+
+def test_names_assigned_in_syntax_error():
+    assert _names_assigned_in("def (\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _find_escaping_vars
+# ---------------------------------------------------------------------------
+
+
+def _make_esc_seq(start: int, end: int) -> _SeqInfo:
+    """Create a _SeqInfo for escaping-vars tests."""
+    return _SeqInfo(
+        stmts=[],
+        start_line=start,
+        end_line=end,
+        scope="foo",
+        source="",
+        fingerprint="",
+    )
+
+
+def test_find_escaping_vars_no_assignments():
+    # Block has no assignments → skip (branch A), returns empty set.
+    source_lines = [
+        "def foo():\n",
+        "    compute()\n",
+        "    transform()\n",
+        "    use_result()\n",
+    ]
+    seq = _make_esc_seq(2, 3)
+    assert _find_escaping_vars([seq], source_lines) == set()
+
+
+def test_find_escaping_vars_nothing_after_block():
+    # Block is the last thing in scope → after_lines empty (branch D), returns set().
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",
+        "    y = transform(x)\n",
+        "    z = finalize(y)\n",
+    ]
+    seq = _make_esc_seq(2, 4)
+    assert _find_escaping_vars([seq], source_lines) == set()
+
+
+def test_find_escaping_vars_escapes():
+    # Block assigns z; z is used after the block → {"z"}.
+    # Also covers: blank line (branch B) and lower-indent stop (branch C).
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",
+        "    y = transform(x)\n",
+        "    z = finalize(y)\n",  # block ends line 4
+        "\n",  # blank → branch B
+        "    assert z == 42\n",  # same indent, uses z
+        "\n",
+        "def bar():\n",  # indent 0 < 4 → branch C (stop)
+        "    pass\n",
+    ]
+    seq = _make_esc_seq(2, 4)
+    assert _find_escaping_vars([seq], source_lines) == {"z"}
+
+
+def test_find_escaping_vars_no_escape():
+    # Block assigns x/y/z; none referenced after the block → set().
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",
+        "    y = transform(x)\n",
+        "    z = finalize(y)\n",
+        "    print('done')\n",  # uses 'print', not x/y/z
+    ]
+    seq = _make_esc_seq(2, 4)
+    assert _find_escaping_vars([seq], source_lines) == set()
+
+
+def test_find_escaping_vars_syntax_error_after():
+    # After source is invalid Python → SyntaxError branch: continue, returns set().
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",
+        "    y = transform(x)\n",
+        "    z = finalize(y)\n",
+        "    def bar(x\n",  # unclosed paren at same indent
+    ]
+    seq = _make_esc_seq(2, 4)
+    assert _find_escaping_vars([seq], source_lines) == set()
+
+
+def test_find_escaping_vars_module_level_stops_at_def():
+    # Module-level block (indent 0): a non-def/class line is included,
+    # then a def line stops the scan (break via re.match).
+    source_lines = [
+        "x = compute()\n",
+        "y = transform(x)\n",
+        "z = finalize(y)\n",  # block ends line 3
+        "CONSTANT = 42\n",  # module-level non-def → appended (False branch of re.match)
+        "def foo(z):\n",  # module-level def → stop
+        "    return z\n",
+    ]
+    seq = _make_esc_seq(1, 3)
+    # CONSTANT is in after_lines; not in assigned → set().
+    # z inside def foo(z) is not scanned (stopped before that def).
+    assert _find_escaping_vars([seq], source_lines) == set()
+
+
+# ---------------------------------------------------------------------------
 # _apply_edits
 # ---------------------------------------------------------------------------
 
@@ -759,6 +888,24 @@ _DUP_SOURCE = textwrap.dedent(
 )
 _DUP_RANGES = [(7, 9)]  # overlaps bar's body
 
+# Source where foo's duplicate block assigns z, and foo uses z after the block.
+# _has_escaping_vars should detect this and skip the extraction.
+_ESC_SOURCE = textwrap.dedent(
+    """\
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+        assert z == expected
+
+    def bar():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_ESC_RANGES = [(8, 10)]  # overlaps bar's body
+
 
 def test_missing_api_key_raises(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -877,6 +1024,50 @@ def test_wrong_replacement_count_skipped(monkeypatch):
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE)
 
     assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# DuplicateExtractor — escaping variables passed to extraction prompt
+# ---------------------------------------------------------------------------
+
+
+def test_escaping_vars_passed_to_extract(monkeypatch):
+    # foo's block assigns z; foo uses z after the block.
+    # _find_escaping_vars returns {"z"}, which is passed to _llm_extract.
+    # The extraction prompt must contain the note instructing the LLM to return z.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    helper_src = (
+        "def _helper(data):\n"
+        "    x = compute(data)\n"
+        "    y = transform(x)\n"
+        "    z = finalize(y)\n"
+        "    return z\n"
+    )
+    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper_src,
+                    "call_site_replacements": [
+                        "    z = _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+        ]
+        de = DuplicateExtractor(_ESC_RANGES, source=_ESC_SOURCE)
+
+    # The extraction prompt must include the escaping-variable note.
+    extract_call = mock_client.messages.create.call_args_list[1]
+    extract_prompt = extract_call.kwargs["messages"][0]["content"]
+    assert "immediately follows the block" in extract_prompt
+    assert de._new_source is not None
 
 
 # ---------------------------------------------------------------------------

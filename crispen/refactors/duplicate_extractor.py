@@ -513,6 +513,7 @@ def _llm_extract(
     client: anthropic.Anthropic,
     group: List[_SeqInfo],
     full_source: str,
+    escaping_vars: frozenset = frozenset(),
 ) -> Optional[dict]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
@@ -520,6 +521,16 @@ def _llm_extract(
         for i, s in enumerate(group)
     )
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
+    escaping_note = ""
+    if escaping_vars:
+        vars_str = ", ".join(sorted(escaping_vars))
+        escaping_note = (
+            f"\n\nThe following variables are assigned within the duplicate block "
+            f"and referenced by code that immediately follows the block at one or "
+            f"more call sites: {vars_str}. The helper function must return these "
+            f"variables. At call sites where the return value is needed, capture it; "
+            f"at call sites where it is not needed, discard the return value."
+        )
     prompt = (
         "Extract the following duplicate code blocks from this Python file into a "
         f"helper function.\n\nFile source:\n```python\n{snippet}\n```\n\n"
@@ -527,6 +538,7 @@ def _llm_extract(
         "Place the helper immediately before the enclosing function of its first use. "
         "If both call sites are inside the same class, use a @staticmethod. "
         "Return complete, valid Python for the helper and each call site replacement."
+        f"{escaping_note}"
     )
     try:
         response = client.messages.create(
@@ -658,6 +670,87 @@ def _verify_extraction(
         except SyntaxError:
             return False
     return True
+
+
+def _names_assigned_in(block_source: str) -> set:
+    """Return names assigned at the top level of block_source.
+
+    Covers bare ``x = ...`` (ast.Assign) and augmented ``x += ...``
+    (ast.AugAssign) statements only; other assignment forms are ignored.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(block_source))
+    except SyntaxError:
+        return set()
+    names: set = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                for n in ast.walk(target):
+                    if isinstance(n, ast.Name):
+                        names.add(n.id)
+        elif isinstance(node, ast.AugAssign):
+            for n in ast.walk(node.target):
+                if isinstance(n, ast.Name):
+                    names.add(n.id)
+    return names
+
+
+def _find_escaping_vars(group: List[_SeqInfo], source_lines: List[str]) -> set:
+    """Return names assigned in any group sequence that are referenced after it.
+
+    A variable "escapes" when the block assigns it and subsequent code in the
+    same scope (at the same or deeper indentation level) references it.
+    The helper must return these variables so callers that need them can
+    capture the return value.
+    """
+    escaping: set = set()
+    for seq in group:
+        block_src = "".join(source_lines[seq.start_line - 1 : seq.end_line])
+        assigned = _names_assigned_in(block_src)
+        if not assigned:
+            continue
+
+        # Infer the block's indentation level from its first non-empty line.
+        first_line = next(
+            (
+                ln
+                for ln in source_lines[seq.start_line - 1 : seq.end_line]
+                if ln.strip()
+            ),
+            "",
+        )
+        block_indent = len(first_line) - len(first_line.lstrip())
+
+        # Collect lines that follow the block within the same scope.
+        # For indented blocks: stop when indentation falls below block_indent.
+        # For module-level (indent 0): stop at the next def/class statement.
+        after_lines: List[str] = []
+        for line in source_lines[seq.end_line :]:
+            if not line.strip():
+                after_lines.append(line)
+                continue
+            line_indent = len(line) - len(line.lstrip())
+            if block_indent == 0:
+                if re.match(r"def |class ", line):
+                    break
+            elif line_indent < block_indent:
+                break
+            after_lines.append(line)
+
+        if not after_lines:
+            continue
+
+        after_src = "".join(after_lines)
+        try:
+            after_tree = ast.parse(textwrap.dedent(after_src))
+        except SyntaxError:
+            continue
+
+        used_after = {n.id for n in ast.walk(after_tree) if isinstance(n, ast.Name)}
+        escaping |= assigned & used_after
+
+    return escaping
 
 
 # ---------------------------------------------------------------------------
@@ -890,8 +983,11 @@ class DuplicateExtractor(Refactor):
                 flush=True,
             )
 
-        # 17. Duplicate group extraction pass (unchanged logic).
+        # 17. Duplicate group extraction pass.
         for group in groups:
+            # Compute escaping vars algorithmically before any LLM call so the
+            # extraction prompt can instruct the LLM to return them.
+            escaping_vars = frozenset(_find_escaping_vars(group, source_lines))
             if self.verbose:
                 ranges_str = ", ".join(
                     f"lines {s.start_line}-{s.end_line}" for s in group
@@ -925,7 +1021,12 @@ class DuplicateExtractor(Refactor):
 
             try:
                 extraction = _run_with_timeout(
-                    _llm_extract, _API_HARD_TIMEOUT, client, group, source
+                    _llm_extract,
+                    _API_HARD_TIMEOUT,
+                    client,
+                    group,
+                    source,
+                    escaping_vars,
                 )
             except _ApiTimeout:
                 print(
