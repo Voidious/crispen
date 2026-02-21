@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import os
 import re
 import sys
 import textwrap
@@ -11,11 +10,10 @@ import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import anthropic
 import libcst as cst
 from libcst.metadata import MetadataWrapper, PositionProvider
 
-from ..errors import CrispenAPIError
+from .. import llm_client as _llm_client
 from .base import Refactor
 
 _MODEL = "claude-sonnet-4-6"
@@ -522,9 +520,10 @@ _CALL_GEN_TOOL: dict = {
 
 
 def _llm_veto(
-    client: anthropic.Anthropic,
+    client,
     group: List[_SeqInfo],
     model: str = _MODEL,
+    provider: str = "anthropic",
 ) -> Tuple[bool, str]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
@@ -538,34 +537,30 @@ def _llm_veto(
         "a shared helper function would improve clarity? Or are they coincidentally "
         "similar but conceptually distinct?"
     )
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=256,
-            tools=[_VETO_TOOL],
-            tool_choice={"type": "tool", "name": "evaluate_duplicate"},
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as exc:
-        raise CrispenAPIError(
-            f"DuplicateExtractor: Anthropic API error: {exc}\n"
-            "Commit blocked. To skip all hooks: git commit --no-verify"
-        ) from exc
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "evaluate_duplicate":
-            inp = block.input
-            return inp["is_valid_duplicate"], inp.get("reason", "")
+    result = _llm_client.call_with_tool(
+        client,
+        provider,
+        model,
+        256,
+        _VETO_TOOL,
+        "evaluate_duplicate",
+        [{"role": "user", "content": prompt}],
+        caller="DuplicateExtractor",
+    )
+    if result is not None:
+        return result["is_valid_duplicate"], result.get("reason", "")
     return False, "no tool response"  # pragma: no cover
 
 
 def _llm_extract(
-    client: anthropic.Anthropic,
+    client,
     group: List[_SeqInfo],
     full_source: str,
     escaping_vars: frozenset = frozenset(),
     used_names: frozenset = frozenset(),
     model: str = _MODEL,
     helper_docstrings: bool = True,
+    provider: str = "anthropic",
 ) -> Optional[dict]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
@@ -616,31 +611,25 @@ def _llm_extract(
         f"{used_names_note}"
         f"{docstring_note}"
     )
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            tools=[_EXTRACT_TOOL],
-            tool_choice={"type": "tool", "name": "extract_helper"},
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as exc:
-        raise CrispenAPIError(
-            f"DuplicateExtractor: Anthropic API error: {exc}\n"
-            "Commit blocked. To skip all hooks: git commit --no-verify"
-        ) from exc
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "extract_helper":
-            return block.input
-    return None  # pragma: no cover
+    return _llm_client.call_with_tool(
+        client,
+        provider,
+        model,
+        1024,
+        _EXTRACT_TOOL,
+        "extract_helper",
+        [{"role": "user", "content": prompt}],
+        caller="DuplicateExtractor",
+    )
 
 
 def _llm_veto_func_match(
-    client: anthropic.Anthropic,
+    client,
     seq: _SeqInfo,
     func: _FunctionInfo,
     full_source: str,
     model: str = _MODEL,
+    provider: str = "anthropic",
 ) -> Tuple[bool, str]:
     """Ask the LLM whether *seq* performs the same operation as *func*'s body."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -656,23 +645,18 @@ def _llm_veto_func_match(
         "body, such that it could be replaced by a call to the function? "
         "Use the evaluate_duplicate tool to answer."
     )
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=256,
-            tools=[_VETO_TOOL],
-            tool_choice={"type": "tool", "name": "evaluate_duplicate"},
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as exc:
-        raise CrispenAPIError(
-            f"DuplicateExtractor: Anthropic API error: {exc}\n"
-            "Commit blocked. To skip all hooks: git commit --no-verify"
-        ) from exc
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "evaluate_duplicate":
-            inp = block.input
-            return inp["is_valid_duplicate"], inp.get("reason", "")
+    result = _llm_client.call_with_tool(
+        client,
+        provider,
+        model,
+        256,
+        _VETO_TOOL,
+        "evaluate_duplicate",
+        [{"role": "user", "content": prompt}],
+        caller="DuplicateExtractor",
+    )
+    if result is not None:
+        return result["is_valid_duplicate"], result.get("reason", "")
     return False, "no tool response"  # pragma: no cover
 
 
@@ -684,11 +668,12 @@ def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
 
 
 def _llm_generate_call(
-    client: anthropic.Anthropic,
+    client,
     seq: _SeqInfo,
     func: _FunctionInfo,
     full_source: str,
     model: str = _MODEL,
+    provider: str = "anthropic",
 ) -> Optional[str]:
     """Ask the LLM to generate a call expression replacing *seq* with *func*."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -703,22 +688,18 @@ def _llm_generate_call(
         "Generate a replacement that preserves the original indentation and ends "
         "with a newline. Pass the replacement to the generate_call tool."
     )
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=256,
-            tools=[_CALL_GEN_TOOL],
-            tool_choice={"type": "tool", "name": "generate_call"},
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as exc:
-        raise CrispenAPIError(
-            f"DuplicateExtractor: Anthropic API error: {exc}\n"
-            "Commit blocked. To skip all hooks: git commit --no-verify"
-        ) from exc
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "generate_call":
-            return block.input["replacement"]
+    result = _llm_client.call_with_tool(
+        client,
+        provider,
+        model,
+        256,
+        _CALL_GEN_TOOL,
+        "generate_call",
+        [{"role": "user", "content": prompt}],
+        caller="DuplicateExtractor",
+    )
+    if result is not None:
+        return result["replacement"]
     return None  # pragma: no cover
 
 
@@ -1037,12 +1018,14 @@ class DuplicateExtractor(Refactor):
         max_seq_len: int = _MAX_SEQ_LEN,
         model: str = _MODEL,
         helper_docstrings: bool = False,
+        provider: str = "anthropic",
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self._min_weight = min_weight
         self._base_max_seq_len = max_seq_len
         self._model = model
         self._helper_docstrings = helper_docstrings
+        self._provider = provider
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -1094,14 +1077,8 @@ class DuplicateExtractor(Refactor):
             return
 
         # 12. Create API client.
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise CrispenAPIError(
-                "DuplicateExtractor: ANTHROPIC_API_KEY is not set.\n"
-                "Commit blocked. To skip all hooks: git commit --no-verify"
-            )
-
-        client = anthropic.Anthropic(api_key=api_key, timeout=60.0)
+        api_key = _llm_client.get_api_key(self._provider, caller="DuplicateExtractor")
+        client = _llm_client.make_client(self._provider, api_key, timeout=60.0)
         edits: List[Tuple[int, int, str]] = []
         pending_changes: List[str] = []
         matched_line_ranges: set = set()
@@ -1133,6 +1110,7 @@ class DuplicateExtractor(Refactor):
                         func,
                         source,
                         self._model,
+                        self._provider,
                     )
                 except _ApiTimeout:
                     print(
@@ -1162,6 +1140,7 @@ class DuplicateExtractor(Refactor):
                             func,
                             source,
                             self._model,
+                            self._provider,
                         )
                     except _ApiTimeout:
                         print(
@@ -1227,7 +1206,12 @@ class DuplicateExtractor(Refactor):
                 )
             try:
                 is_valid, reason = _run_with_timeout(
-                    _llm_veto, _API_HARD_TIMEOUT, client, group, self._model
+                    _llm_veto,
+                    _API_HARD_TIMEOUT,
+                    client,
+                    group,
+                    self._model,
+                    self._provider,
                 )
             except _ApiTimeout:
                 print(
@@ -1257,6 +1241,7 @@ class DuplicateExtractor(Refactor):
                     used_names=frozenset(used_names),
                     model=self._model,
                     helper_docstrings=self._helper_docstrings,
+                    provider=self._provider,
                 )
             except _ApiTimeout:
                 print(

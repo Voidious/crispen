@@ -851,7 +851,7 @@ def test_successful_extraction_has_two_blank_lines(monkeypatch):
         """
     )
     helper = "def _helper(data):\n    pass\n"
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1211,7 +1211,7 @@ def _make_extract_response(data: dict) -> MagicMock:
 
 def test_api_error_in_veto_raises(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1223,7 +1223,7 @@ def test_api_error_in_veto_raises(monkeypatch):
 
 def test_api_error_in_extract_raises(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1244,7 +1244,7 @@ def test_api_error_in_extract_raises(monkeypatch):
 
 def test_parse_error_in_analyze(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"):
+    with patch("crispen.llm_client.anthropic.Anthropic"):
         # Invalid Python: _analyze should return silently
         de = DuplicateExtractor([(1, 1)], source="def f(: pass")
     assert de._new_source is None
@@ -1257,7 +1257,7 @@ def test_parse_error_in_analyze(monkeypatch):
 
 def test_veto_rejects_no_changes(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1276,7 +1276,7 @@ def test_veto_rejects_no_changes(monkeypatch):
 
 def test_wrong_replacement_count_skipped(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1300,7 +1300,7 @@ def test_wrong_replacement_count_skipped(monkeypatch):
 def test_wrong_replacement_count_skipped_verbose_false(monkeypatch):
     # verbose=False covers the False branch of the new if-self.verbose guard.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1338,7 +1338,7 @@ def test_escaping_vars_passed_to_extract(monkeypatch):
         "    z = finalize(y)\n"
         "    return z\n"
     )
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1374,7 +1374,7 @@ def _make_invalid_assembled_extractor(monkeypatch, verbose=True):
     """Helper: DuplicateExtractor where _apply_edits returns invalid Python."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic,
+        patch("crispen.llm_client.anthropic") as mock_anthropic,
         patch(
             "crispen.refactors.duplicate_extractor._apply_edits",
             return_value="def f(:\n    pass\n",  # invalid Python
@@ -1424,7 +1424,7 @@ def _make_pyflakes_check_extractor(monkeypatch, verbose=True):
     name."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic,
+        patch("crispen.llm_client.anthropic") as mock_anthropic,
         patch(
             "crispen.refactors.duplicate_extractor._pyflakes_new_undefined_names",
             return_value={"mock_client"},
@@ -1472,7 +1472,7 @@ def test_pyflakes_check_skips_group_verbose_false(monkeypatch):
 
 def test_verify_fails_skipped(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1499,7 +1499,7 @@ def test_verify_fails_skipped(monkeypatch):
 def test_verify_fails_skipped_verbose_false(monkeypatch):
     # verbose=False covers the False branch of the new if-self.verbose guard.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1546,7 +1546,7 @@ def test_successful_extraction_module_level(monkeypatch, tmp_path):
         """
     )
     helper = "def _helper(data):\n    pass\n"
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1596,7 +1596,7 @@ def test_staticmethod_placement(monkeypatch):
         """
     )
     helper = "    @staticmethod\n    def _helper(data):\n        pass\n"
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1701,7 +1701,7 @@ def test_verbose_false_suppresses_stderr(monkeypatch):
         """
     )
     helper = "def _helper(data):\n    pass\n"
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -1797,7 +1797,7 @@ def test_run_with_timeout_fires_on_slow_func():
 def test_veto_timeout_skips_group(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             side_effect=_ApiTimeout("veto timed out"),
@@ -1825,7 +1825,7 @@ def test_extract_timeout_skips_group(monkeypatch):
         return result
 
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             side_effect=_mock_run,
@@ -1888,7 +1888,7 @@ def test_llm_veto_func_match_rejected():
 
 
 def test_llm_veto_func_match_api_error():
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_anthropic.APIError = Exception
         client = MagicMock()
         client.messages.create.side_effect = Exception("api error")
@@ -1997,7 +1997,7 @@ def test_llm_generate_call_success():
 
 
 def test_llm_generate_call_api_error():
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_anthropic.APIError = Exception
         client = MagicMock()
         client.messages.create.side_effect = Exception("api error")
@@ -2132,7 +2132,7 @@ def test_func_match_no_arg_replaces_body(monkeypatch):
     """No-param module-level function: algorithmic replacement, no call-gen LLM."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             return_value=(True, "same operation"),
@@ -2149,7 +2149,7 @@ def test_func_match_verbose_false(monkeypatch):
     """verbose=False covers all False branches of new if-self.verbose guards."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             return_value=(True, "same operation"),
@@ -2165,7 +2165,7 @@ def test_func_match_veto_rejects(monkeypatch):
     """Veto rejects func match → no replacement."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             return_value=(False, "different"),
@@ -2181,7 +2181,7 @@ def test_func_match_veto_timeout(monkeypatch):
     """Veto times out → seq skipped; subsequent dup group also times out."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             side_effect=_ApiTimeout("timed out"),
@@ -2204,7 +2204,7 @@ def test_func_match_verify_fails(monkeypatch):
         return side_effects.pop(0)
 
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             side_effect=_mock_run,
@@ -2229,7 +2229,7 @@ def test_func_match_param_call_gen_success(monkeypatch):
         return side_effects.pop(0)
 
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             side_effect=_mock_run,
@@ -2258,7 +2258,7 @@ def test_func_match_param_call_gen_timeout(monkeypatch):
         return result
 
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             side_effect=_mock_run,
@@ -2290,7 +2290,7 @@ def test_func_match_then_dup_extract(monkeypatch):
         return side_effects.pop(0)
 
     with (
-        patch("crispen.refactors.duplicate_extractor.anthropic.Anthropic"),
+        patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
             side_effect=_mock_run,
@@ -2332,7 +2332,7 @@ _COLLISION_RANGES = [(9, 11)]  # overlaps bar's body
 def test_extraction_name_collision_skipped(monkeypatch, capsys):
     # LLM returns function_name="_helper", which is already defined → skipped.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -2364,7 +2364,7 @@ def test_extraction_name_collision_skipped(monkeypatch, capsys):
 def test_extraction_name_collision_silent(monkeypatch, capsys):
     # Same collision, verbose=False → no stderr output.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -2458,7 +2458,7 @@ def test_duplicate_extractor_helper_docstrings_false_strips_docstring(
 ):
     """When helper_docstrings=False, the LLM-returned docstring is stripped."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -2493,7 +2493,7 @@ def test_duplicate_extractor_helper_docstrings_true_keeps_docstring(
 ):
     """When helper_docstrings=True, the LLM-returned docstring is preserved."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
@@ -2531,7 +2531,7 @@ def test_duplicate_extractor_helper_docstrings_true_keeps_docstring(
 def test_duplicate_extractor_custom_model_used(monkeypatch):
     """Custom model string is passed to the Anthropic API."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception

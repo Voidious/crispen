@@ -365,6 +365,7 @@ def run_engine(
                         max_seq_len=config.max_duplicate_seq_len,
                         model=config.model,
                         helper_docstrings=config.helper_docstrings,
+                        provider=config.provider,
                     )
                 else:
                     transformer = RefactorClass(

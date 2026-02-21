@@ -20,7 +20,9 @@ class CrispenConfig:
     # TupleDataclass: minimum tuple element count to trigger replacement
     min_tuple_size: int = 4
 
-    # LLM model to use for all Anthropic API calls
+    # LLM provider to use: "anthropic" (default) or "moonshot"
+    provider: str = "anthropic"
+    # LLM model to use for all API calls
     model: str = "claude-sonnet-4-6"
     # Whether to generate docstrings in extracted helper functions
     helper_docstrings: bool = False
