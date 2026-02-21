@@ -1206,7 +1206,28 @@ def test_verify_fails_skipped_verbose_false(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_successful_extraction_module_level(monkeypatch, tmp_path):
+def _setup_mock_anthropic_client(mock_anthropic, helper: str) -> None:
+    """Configure a mock Anthropic client with a veto + extract response pair."""
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    mock_client.messages.create.side_effect = [
+        _make_veto_response(True, "same logic"),
+        _make_extract_response(
+            {
+                "function_name": "_helper",
+                "placement": "module_level",
+                "helper_source": helper,
+                "call_site_replacements": [
+                    "    _helper(data)\n",
+                    "    _helper(data)\n",
+                ],
+            }
+        ),
+    ]
+
+
+def _make_standard_source_and_helper(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     source = textwrap.dedent(
         """\
@@ -1224,24 +1245,13 @@ def test_successful_extraction_module_level(monkeypatch, tmp_path):
         """
     )
     helper = "def _helper(data):\n    pass\n"
+    return source, helper
+
+
+def test_successful_extraction_module_level(monkeypatch, tmp_path):
+    source, helper = _make_standard_source_and_helper(monkeypatch)
     with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": helper,
-                    "call_site_replacements": [
-                        "    _helper(data)\n",
-                        "    _helper(data)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_mock_anthropic_client(mock_anthropic, helper)
 
         de = DuplicateExtractor([(9, 11)], source=source)
 
@@ -1362,41 +1372,9 @@ def test_llm_extract_skips_non_matching_blocks(monkeypatch):
 # engine integration: CrispenAPIError propagates
 def test_verbose_false_suppresses_stderr(monkeypatch):
     # verbose=False must take all four if-self.verbose False branches without printing.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    source = textwrap.dedent(
-        """\
-        import os
-
-        def foo():
-            x = compute(data)
-            y = transform(x)
-            z = finalize(y)
-
-        def bar():
-            x = compute(data)
-            y = transform(x)
-            z = finalize(y)
-        """
-    )
-    helper = "def _helper(data):\n    pass\n"
+    source, helper = _make_standard_source_and_helper(monkeypatch)
     with patch("crispen.refactors.duplicate_extractor.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": helper,
-                    "call_site_replacements": [
-                        "    _helper(data)\n",
-                        "    _helper(data)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_mock_anthropic_client(mock_anthropic, helper)
 
         de = DuplicateExtractor([(9, 11)], source=source, verbose=False)
 
@@ -1528,11 +1506,7 @@ def _make_veto_func_match_response(is_valid: bool, reason: str = "test") -> Magi
     return resp
 
 
-def test_llm_veto_func_match_accepted():
-    client = MagicMock()
-    client.messages.create.return_value = _make_veto_func_match_response(
-        True, "same op"
-    )
+def _make_veto_call_and_assert_valid(client, source: str) -> str:
     seq = _make_seq_info(7, 9, "    x = 1\n")
     func = _FunctionInfo(
         name="fn",
@@ -1542,8 +1516,17 @@ def test_llm_veto_func_match_accepted():
         body_stmt_count=1,
         params=[],
     )
-    is_valid, reason = _llm_veto_func_match(client, seq, func, "source")
+    is_valid, reason = _llm_veto_func_match(client, seq, func, source)
     assert is_valid is True
+    return reason
+
+
+def test_llm_veto_func_match_accepted():
+    client = MagicMock()
+    client.messages.create.return_value = _make_veto_func_match_response(
+        True, "same op"
+    )
+    reason = _make_veto_call_and_assert_valid(client, "source")
     assert reason == "same op"
 
 
@@ -1595,17 +1578,7 @@ def test_llm_veto_func_match_skips_non_matching_blocks():
     response = MagicMock()
     response.content = [non_matching, matching]
     client.messages.create.return_value = response
-    seq = _make_seq_info(7, 9, "    x = 1\n")
-    func = _FunctionInfo(
-        name="fn",
-        source="def fn(): pass\n",
-        scope="<module>",
-        body_source="    pass\n",
-        body_stmt_count=1,
-        params=[],
-    )
-    is_valid, reason = _llm_veto_func_match(client, seq, func, "source")
-    assert is_valid is True
+    _make_veto_call_and_assert_valid(client, "source")
 
 
 # ---------------------------------------------------------------------------
