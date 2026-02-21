@@ -178,9 +178,6 @@ class CallerUpdater(Refactor):
         if transform is None:
             return updated_node
 
-        if not self._in_changed_range(original_node):
-            return updated_node
-
         # Collect unpacking variable names
         names = []
         for el in target.elements:

@@ -242,14 +242,16 @@ def test_multi_stmt_line_not_expanded():
 
 
 # ---------------------------------------------------------------------------
-# Outside the changed range
+# Outside the changed range — callers in diffed files are always updated
 # ---------------------------------------------------------------------------
 
 
-def test_outside_range_not_expanded():
+def test_outside_range_still_expanded():
+    # CallerUpdater updates all callers in the file, not just those in diff ranges.
     source = "from mypkg.service import get_user\n" "a, b, c = get_user()\n"
     result = _apply(source, ranges=[(50, 100)])
-    assert "_crispen_r" not in result
+    assert "_ = get_user()" in result
+    assert "a = _.name" in result
 
 
 # ---------------------------------------------------------------------------
