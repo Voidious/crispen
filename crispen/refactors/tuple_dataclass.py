@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 import libcst as cst
@@ -37,6 +38,46 @@ def _int_val(node: cst.BaseExpression) -> Optional[int]:
 
 def _snake_to_pascal(name: str) -> str:
     return "".join(part.capitalize() for part in name.split("_") if part)
+
+
+def _all_callers_unpack(source: str, func_name: str) -> bool:
+    """Return True if every call to *func_name* in *source* is a tuple-unpacking.
+
+    A "tuple-unpacking" call is one that is the direct RHS of a single-target
+    assignment whose target is an ``ast.Tuple``:  ``a, b = func_name(...)``.
+
+    Returns True when there are no calls to *func_name* at all (vacuously true),
+    and False if *source* cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+
+    # Collect ids of Call nodes that ARE used in tuple-unpacking assignments.
+    unpacking_call_ids: set = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Tuple)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == func_name
+        ):
+            unpacking_call_ids.add(id(node.value))
+
+    # Any call to func_name NOT in the unpacking set is a non-unpacking usage.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == func_name
+            and id(node) not in unpacking_call_ids
+        ):
+            return False
+
+    return True
 
 
 class TransformInfo(NamedTuple):
@@ -104,6 +145,7 @@ class TupleDataclass(Refactor):
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self.min_size = min_size
+        self._source = source
         self.approved_public_funcs: Set[str] = set(approved_public_funcs or [])
 
         # State populated during the first visit pass
@@ -266,6 +308,12 @@ class TupleDataclass(Refactor):
         if scope is None:
             return updated_node
         is_public = not scope.startswith("_")
+
+        # For private functions, only transform when every in-file caller uses
+        # tuple unpacking on the return value.  This prevents broken code when
+        # a caller passes the result to another function or appends it to a list.
+        if not is_public and not _all_callers_unpack(self._source, scope):
+            return updated_node
 
         try:
             pos = self.get_metadata(PositionProvider, original_node)

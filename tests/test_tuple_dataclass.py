@@ -7,6 +7,7 @@ from crispen.refactors.tuple_dataclass import (
     TransformInfo,
     TupleDataclass,
     _UnpackingCollector,
+    _all_callers_unpack,
     _int_val,
     _is_variable_index,
     _name_str,
@@ -18,7 +19,7 @@ def _apply(source: str, ranges=None, min_size: int = 3) -> str:
         ranges = [(1, 100)]
     tree = cst.parse_module(source)
     wrapper = MetadataWrapper(tree)
-    transformer = TupleDataclass(ranges, min_size=min_size)
+    transformer = TupleDataclass(ranges, min_size=min_size, source=source)
     new_tree = wrapper.visit(transformer)
     return new_tree.code
 
@@ -28,7 +29,7 @@ def _changes(source: str, ranges=None, min_size: int = 3) -> list:
         ranges = [(1, 100)]
     tree = cst.parse_module(source)
     wrapper = MetadataWrapper(tree)
-    transformer = TupleDataclass(ranges, min_size=min_size)
+    transformer = TupleDataclass(ranges, min_size=min_size, source=source)
     wrapper.visit(transformer)
     return transformer.changes_made
 
@@ -625,6 +626,68 @@ def test_scope_none_in_return_does_not_transform():
     td = _NoScopePushTransformer([(1, 100)])
     result = MetadataWrapper(tree).visit(td).code
     assert result == source
+
+
+# ---------------------------------------------------------------------------
+# _all_callers_unpack unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_all_callers_unpack_syntax_error():
+    # Unparseable source → conservatively returns False.
+    assert _all_callers_unpack("def (invalid:", "foo") is False
+
+
+def test_all_callers_unpack_no_calls():
+    # No calls to the function at all → vacuously True.
+    assert _all_callers_unpack("x = 1\n", "foo") is True
+
+
+def test_all_callers_unpack_all_unpacking():
+    # Every call is in a tuple-unpacking assignment → True.
+    source = "a, b = foo()\nc, d = foo()\n"
+    assert _all_callers_unpack(source, "foo") is True
+
+
+def test_all_callers_unpack_non_unpacking_call():
+    # Call assigned to a plain name (not a tuple) → False.
+    source = "x = foo()\n"
+    assert _all_callers_unpack(source, "foo") is False
+
+
+def test_all_callers_unpack_call_in_expression():
+    # Call used as a function argument (not in any assignment) → False.
+    source = "bar(foo())\n"
+    assert _all_callers_unpack(source, "foo") is False
+
+
+# ---------------------------------------------------------------------------
+# Guard: private function with non-unpacking caller is not transformed
+# ---------------------------------------------------------------------------
+
+
+def test_private_function_non_unpacking_caller_skipped():
+    """Return tuple not transformed when caller doesn't unpack the result."""
+    source = """\
+def _f():
+    return (1, 2, 3)
+
+result = _f()
+"""
+    result = _apply(source)
+    assert result == source
+
+
+def test_private_function_all_unpacking_callers_transformed():
+    """Return tuple IS transformed when every caller uses tuple unpacking."""
+    source = """\
+def _f():
+    return (1, 2, 3)
+
+a, b, c = _f()
+"""
+    result = _apply(source)
+    assert "@dataclass" in result
 
 
 def test_multiple_returns_consistent_field_names():
