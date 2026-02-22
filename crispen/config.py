@@ -27,6 +27,11 @@ class CrispenConfig:
     # Whether to generate docstrings in extracted helper functions
     helper_docstrings: bool = False
 
+    # FunctionSplitter: maximum function body lines (excluding docstring)
+    max_function_length: int = 75
+    # FunctionSplitter: maximum McCabe cyclomatic complexity
+    max_complexity: int = 10
+
     # Whether to update callers in diff files even if outside the diff ranges.
     # When False and unreachable callers exist, the transformation is skipped.
     update_diff_file_callers: bool = True

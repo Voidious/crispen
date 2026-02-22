@@ -14,11 +14,12 @@ from .config import CrispenConfig, load_config
 from .errors import CrispenAPIError
 from .refactors.caller_updater import CallerUpdater
 from .refactors.duplicate_extractor import DuplicateExtractor
+from .refactors.function_splitter import FunctionSplitter
 from .refactors.if_not_else import IfNotElse
 from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
 
 # Single-file refactors applied in order before TupleDataclass.
-_REFACTORS = [IfNotElse, DuplicateExtractor]
+_REFACTORS = [IfNotElse, DuplicateExtractor, FunctionSplitter]
 
 # Directory names excluded from the outside-caller scan (e.g. virtual environments).
 _EXCLUDED_DIR_NAMES = frozenset(
@@ -366,6 +367,17 @@ def run_engine(
                         model=config.model,
                         helper_docstrings=config.helper_docstrings,
                         provider=config.provider,
+                    )
+                elif RefactorClass is FunctionSplitter:
+                    transformer = FunctionSplitter(
+                        ranges,
+                        source=current_source,
+                        verbose=verbose,
+                        max_lines=config.max_function_length,
+                        max_complexity=config.max_complexity,
+                        model=config.model,
+                        provider=config.provider,
+                        helper_docstrings=config.helper_docstrings,
                     )
                 else:
                     transformer = RefactorClass(
