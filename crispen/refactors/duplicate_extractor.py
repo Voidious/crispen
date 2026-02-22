@@ -1254,15 +1254,20 @@ def _find_insertion_point(source: str, scope: str) -> int:
             if method_indent > 0:
                 # The def is inside a class body.  Walk backwards to find the
                 # enclosing class definition and insert before that instead.
+                # If the first lower-indent non-blank line is NOT a class
+                # definition (i.e. the def is a nested function inside a
+                # regular function), stop immediately so we don't mis-identify
+                # an unrelated class above the outer function as the enclosing
+                # class.
                 for j in range(i - 1, -1, -1):
                     prev = source_lines[j]
                     if not prev.strip():
                         continue
                     prev_indent = len(prev) - len(prev.lstrip())
-                    if prev_indent < method_indent and re.match(
-                        r"\s*class\s+\w+", prev
-                    ):
-                        return j
+                    if prev_indent < method_indent:
+                        if re.match(r"\s*class\s+\w+", prev):
+                            return j
+                        break  # nested function — fall through to decorator walk
             # Walk backwards over any preceding decorator lines (including
             # multi-line decorator arguments) so the helper is inserted
             # before the decorator block, not between decorators and the def.
