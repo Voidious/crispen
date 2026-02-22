@@ -174,6 +174,20 @@ def _has_yield(func_node: cst.FunctionDef) -> bool:
     return _walk(func_node.body)
 
 
+def _has_nested_funcdef(node: cst.FunctionDef) -> bool:
+    """Return True if node's body contains a top-level nested FunctionDef.
+
+    Functions with nested def statements create closures.  The existing
+    split-point guard in ``_find_valid_splits`` already restricts splits to
+    before the first nested def, but that still allows a split where the
+    *entire* nested-def block ends up in the extracted tail.  The resulting
+    helper is itself oversized and closure-entangled, triggering a recursive
+    cascade of further splits.  Skipping such functions entirely—consistent
+    with the async and generator exclusions—avoids the cascade.
+    """
+    return any(isinstance(stmt, cst.FunctionDef) for stmt in node.body.body)
+
+
 # ---------------------------------------------------------------------------
 # Metric helpers
 # ---------------------------------------------------------------------------
@@ -718,7 +732,11 @@ class _FunctionCollector(cst.CSTVisitor):
         parent_kind = self._scope_kind_stack[-1]
         if parent_kind in ("module", "class"):
             # Only collect top-level functions and class methods
-            if node.asynchronous is None and not _has_yield(node):
+            if (
+                node.asynchronous is None
+                and not _has_yield(node)
+                and not _has_nested_funcdef(node)
+            ):
                 pos = self.get_metadata(PositionProvider, node)
                 class_name = self._class_stack[-1] if self._class_stack else None
                 indent = " " * pos.start.column

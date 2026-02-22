@@ -23,6 +23,7 @@ from crispen.refactors.function_splitter import (
     _func_in_changed_range,
     _generate_call,
     _generate_helper_source,
+    _has_nested_funcdef,
     _has_new_undefined_names,
     _has_yield,
     _head_effective_lines,
@@ -1006,6 +1007,45 @@ def test_has_yield_nested_not_counted():
 
 
 # ---------------------------------------------------------------------------
+# _has_nested_funcdef
+# ---------------------------------------------------------------------------
+
+
+def test_has_nested_funcdef_with_nested():
+    src = textwrap.dedent(
+        """\
+        def outer():
+            x = 1
+            def inner():
+                return x
+            return inner
+    """
+    )
+    func = cst.parse_module(src).body[0]
+    assert _has_nested_funcdef(func) is True
+
+
+def test_has_nested_funcdef_without_nested():
+    src = "def foo():\n    x = 1\n    return x\n"
+    func = cst.parse_module(src).body[0]
+    assert _has_nested_funcdef(func) is False
+
+
+def test_has_nested_funcdef_first_stmt():
+    # Nested funcdef is the very first statement in the body
+    src = textwrap.dedent(
+        """\
+        def outer():
+            def inner():
+                pass
+            return inner()
+    """
+    )
+    func = cst.parse_module(src).body[0]
+    assert _has_nested_funcdef(func) is True
+
+
+# ---------------------------------------------------------------------------
 # _run_with_timeout
 # ---------------------------------------------------------------------------
 
@@ -1123,7 +1163,8 @@ def test_function_collector_skips_generator():
 
 
 def test_function_collector_skips_nested_functions():
-    # Only module-level and class methods are collected
+    # Functions with nested funcdefs are skipped entirely; inner functions
+    # (inside a function scope) are also skipped by the scope-kind guard.
     src = textwrap.dedent(
         """\
         def outer():
@@ -1136,9 +1177,8 @@ def test_function_collector_skips_nested_functions():
     wrapper = MetadataWrapper(tree)
     collector = _FunctionCollector()
     wrapper.visit(collector)
-    # Only outer is collected (inner is nested inside outer)
-    assert len(collector.functions) == 1
-    assert collector.functions[0].node.name.value == "outer"
+    # outer has a nested funcdef → skipped; inner is in a function scope → skipped
+    assert len(collector.functions) == 0
 
 
 def test_function_collector_captures_params():
@@ -1358,6 +1398,27 @@ def test_function_splitter_over_complexity_limit(mock_anthropic):
     assert result is not None
     compile(result, "<test>", "exec")
     assert "_handle_tail" in result
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_nested_funcdef_not_split(mock_anthropic):
+    # A long function containing a nested funcdef should never be split,
+    # even if it far exceeds the line limit.  Splitting across a closure
+    # boundary produces cascading re-splits and semantically fragile helpers.
+    lines = ["def func_with_closure():\n"]
+    for i in range(80):
+        lines.append(f"    a{i} = {i}\n")
+    lines.append("    def inner():\n")
+    lines.append("        return 0\n")
+    lines.append("    return inner()\n")
+    src = "".join(lines)
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=10
+        )
+
+    assert splitter.get_rewritten_source() is None
 
 
 @patch("crispen.llm_client.anthropic")
