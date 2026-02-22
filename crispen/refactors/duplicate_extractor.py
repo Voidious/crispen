@@ -766,6 +766,27 @@ def _collect_attribute_names(source: str) -> set:
     return {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
 
 
+def _has_call_to(func_name: str, source: str) -> bool:
+    """Return True if func_name is called anywhere in source.
+
+    Checks both direct calls (``func_name(...)``) and attribute calls
+    (``obj.func_name(...)``), covering both module-level helpers and
+    staticmethod calls.  Returns False if source cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == func_name:
+            return True
+        if isinstance(node.func, ast.Attribute) and node.func.attr == func_name:
+            return True
+    return False
+
+
 def _verify_extraction(
     helper_source: Optional[str], call_replacements: List[str]
 ) -> bool:
@@ -1130,6 +1151,10 @@ class DuplicateExtractor(Refactor):
         client = _llm_client.make_client(self._provider, api_key, timeout=60.0)
         edits: List[Tuple[int, int, str]] = []
         pending_changes: List[str] = []
+        # Extraction groups tracked separately so the final combined check can
+        # drop any whose call-site edits were silently overridden by overlapping
+        # edits from another group or the func-match pass.
+        extraction_groups: List[Tuple[str, List[Tuple[int, int, str]], str]] = []
         matched_line_ranges: set = set()
 
         # 14. Function body match pass.
@@ -1432,6 +1457,19 @@ class DuplicateExtractor(Refactor):
                     )
                 continue
 
+            # Verify the extracted function is actually called in the per-group
+            # candidate.  If the LLM returned call replacements that reference a
+            # different name (or none at all), reject this group early.
+            if not _has_call_to(func_name, candidate):
+                if self.verbose:
+                    print(
+                        f"crispen: DuplicateExtractor: extraction FAILED — "
+                        f"'{func_name}' not called in candidate output",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+
             undef = _pyflakes_new_undefined_names(source, candidate)
             if undef:
                 if self.verbose:
@@ -1444,7 +1482,6 @@ class DuplicateExtractor(Refactor):
                     )
                 continue
 
-            edits.extend(group_edits)
             used_names.add(func_name)
             if self.verbose:
                 print(
@@ -1452,15 +1489,58 @@ class DuplicateExtractor(Refactor):
                     file=sys.stderr,
                     flush=True,
                 )
-            pending_changes.append(
-                f"DuplicateExtractor: extracted '{func_name}' "
-                f"from {len(group)} duplicate blocks"
+            extraction_groups.append(
+                (
+                    func_name,
+                    group_edits,
+                    f"DuplicateExtractor: extracted '{func_name}' "
+                    f"from {len(group)} duplicate blocks",
+                )
             )
 
-        # 18. Apply all accepted edits and write.
-        if edits:
-            self._new_source = _apply_edits(source, edits)
-            self.changes_made.extend(pending_changes)
+        # 18. Combine all accepted edits, verify all extracted functions are
+        # actually called in the combined output, then write.
+        all_edits = list(edits)
+        for _, g_edits, _ in extraction_groups:
+            all_edits.extend(g_edits)
+
+        if all_edits:
+            combined = _apply_edits(source, all_edits)
+
+            # Drop any extraction group whose extracted function is not called
+            # in the combined output.  This happens when call-site edits are
+            # silently skipped by the overlap detector because they conflict
+            # with edits from another group or from the func-match pass.
+            uncalled = {
+                name
+                for name, _, _ in extraction_groups
+                if not _has_call_to(name, combined)
+            }
+            if uncalled:
+                for name in sorted(uncalled):
+                    if self.verbose:
+                        print(
+                            f"crispen: DuplicateExtractor: extraction DROPPED — "
+                            f"'{name}' not called in combined output "
+                            f"(call-site edits overridden by overlapping edits)",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                extraction_groups = [
+                    (n, g, m) for n, g, m in extraction_groups if n not in uncalled
+                ]
+                all_edits = list(edits)
+                for _, g_edits, _ in extraction_groups:
+                    all_edits.extend(g_edits)
+                combined = _apply_edits(source, all_edits)
+
+            all_pending = list(pending_changes)
+            for _, _, msg in extraction_groups:
+                all_pending.append(msg)
+
+            if all_edits:
+                self._new_source = combined
+                self.changes_made.extend(all_pending)
 
     def get_rewritten_source(self) -> Optional[str]:
         return self._new_source

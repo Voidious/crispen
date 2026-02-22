@@ -24,6 +24,7 @@ from crispen.refactors.duplicate_extractor import (
     _find_duplicate_groups,
     _find_insertion_point,
     _generate_no_arg_call,
+    _has_call_to,
     _has_def,
     _find_escaping_vars,
     _has_mutable_literal_is_check,
@@ -515,6 +516,27 @@ def test_collect_attribute_names_syntax_error():
 
 def test_collect_attribute_names_no_attrs():
     assert _collect_attribute_names("x = 1 + 2") == set()
+
+
+# ---------------------------------------------------------------------------
+# _has_call_to
+# ---------------------------------------------------------------------------
+
+
+def test_has_call_to_direct_call():
+    assert _has_call_to("foo", "foo()\n") is True
+
+
+def test_has_call_to_attribute_call():
+    assert _has_call_to("foo", "obj.foo()\n") is True
+
+
+def test_has_call_to_missing():
+    assert _has_call_to("foo", "bar()\n") is False
+
+
+def test_has_call_to_syntax_error():
+    assert _has_call_to("foo", "def f(x:") is False
 
 
 # ---------------------------------------------------------------------------
@@ -1645,6 +1667,194 @@ def test_new_attribute_check_skips_group_verbose(monkeypatch, capsys):
 def test_new_attribute_check_skips_group_verbose_false(monkeypatch):
     de = _make_new_attr_extractor(monkeypatch, verbose=False)
     assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# DuplicateExtractor — per-group call check
+# ---------------------------------------------------------------------------
+
+
+def _make_no_call_extractor(monkeypatch, verbose=True):
+    """Helper: LLM returns call replacements that don't call the helper function."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": "def _helper(data):\n    pass\n",
+                    # Call replacements don't reference _helper at all.
+                    "call_site_replacements": [
+                        "    pass\n",
+                        "    pass\n",
+                    ],
+                }
+            ),
+        ]
+        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+
+
+def test_no_call_check_skips_group_verbose(monkeypatch, capsys):
+    de = _make_no_call_extractor(monkeypatch, verbose=True)
+    assert de._new_source is None
+    assert "not called in candidate output" in capsys.readouterr().err
+
+
+def test_no_call_check_skips_group_verbose_false(monkeypatch):
+    de = _make_no_call_extractor(monkeypatch, verbose=False)
+    assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# DuplicateExtractor — final combined call check
+# ---------------------------------------------------------------------------
+
+
+def _make_uncalled_in_combined_extractor(monkeypatch, verbose=True):
+    """Simulate: per-group call check passes, but combined output lacks the call.
+
+    Achieved by patching _has_call_to: returns True for the per-group check
+    (first call) and False for the final combined check (second call).
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with (
+        patch("crispen.llm_client.anthropic") as mock_anthropic,
+        patch(
+            "crispen.refactors.duplicate_extractor._has_call_to",
+            side_effect=[True, False],
+        ),
+    ):
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": "def _helper(data):\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+        ]
+        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+
+
+def test_uncalled_in_combined_drops_group_verbose(monkeypatch, capsys):
+    de = _make_uncalled_in_combined_extractor(monkeypatch, verbose=True)
+    assert de._new_source is None
+    assert "DROPPED" in capsys.readouterr().err
+
+
+def test_uncalled_in_combined_drops_group_verbose_false(monkeypatch):
+    de = _make_uncalled_in_combined_extractor(monkeypatch, verbose=False)
+    assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# DuplicateExtractor — two groups, one dropped in combined check (line 1533)
+# ---------------------------------------------------------------------------
+
+# Source with two structurally distinct duplicate pairs so _find_duplicate_groups
+# returns two separate groups.  The groups differ in argument count so that
+# _ASTNormalizer produces different fingerprints for each group:
+#   group 1 (foo/bar): 3-stmt bodies using 2-argument calls → fingerprint A
+#   group 2 (baz/qux): 3-stmt bodies using 3-argument calls → fingerprint B
+_TWO_PAIR_SOURCE = textwrap.dedent(
+    """\
+    import os
+
+    def foo():
+        x = compute(data, config)
+        y = transform(x, scale)
+        z = finalize(y, mode)
+
+    def bar():
+        x = compute(data, config)
+        y = transform(x, scale)
+        z = finalize(y, mode)
+
+    def baz():
+        a = process(item, key, idx)
+        b = convert(a, fmt, enc)
+        c = export(b, path, opts)
+
+    def qux():
+        a = process(item, key, idx)
+        b = convert(a, fmt, enc)
+        c = export(b, path, opts)
+    """
+)
+_TWO_PAIR_RANGES = [(4, 21)]  # overlaps all duplicate sequences
+
+
+def _make_two_group_drop_extractor(monkeypatch, verbose=True):
+    """Two extraction groups; the combined check drops one, exercising line 1533.
+
+    _has_call_to is patched with side_effect=[True, True, True, False]:
+    - calls 1-2: per-group checks for each group → both pass
+    - call 3: combined check for first group → kept
+    - call 4: combined check for second group → dropped
+    After the drop, extraction_groups still has one entry, so the inner
+    ``for _, g_edits, _ in extraction_groups`` loop runs once (line 1533).
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with (
+        patch("crispen.llm_client.anthropic") as mock_anthropic,
+        patch(
+            "crispen.refactors.duplicate_extractor._has_call_to",
+            side_effect=[True, True, True, False],
+        ),
+    ):
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        # Four LLM calls: veto+extract for each of the two groups in processing order.
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper1",
+                    "placement": "module_level",
+                    "helper_source": "def _helper1():\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper1()\n",
+                        "    _helper1()\n",
+                    ],
+                }
+            ),
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper2",
+                    "placement": "module_level",
+                    "helper_source": "def _helper2():\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper2()\n",
+                        "    _helper2()\n",
+                    ],
+                }
+            ),
+        ]
+        return DuplicateExtractor(
+            _TWO_PAIR_RANGES, source=_TWO_PAIR_SOURCE, verbose=verbose
+        )
+
+
+def test_two_groups_one_dropped_combined_check(monkeypatch, capsys):
+    """One of two groups is dropped by the combined call check; the other is kept."""
+    de = _make_two_group_drop_extractor(monkeypatch, verbose=True)
+    assert de._new_source is not None
+    assert "DROPPED" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
