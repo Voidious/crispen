@@ -350,6 +350,23 @@ def _find_free_vars(tail_source: str) -> List[str]:
         if isinstance(node, ast.DictComp):
             _collect_comp(node.generators, [node.key, node.value], defined)
             return
+        if isinstance(node, ast.Lambda):
+            local = set(defined)
+            args = node.args
+            for arg in args.posonlyargs + args.args + args.kwonlyargs:
+                local.add(arg.arg)
+            if args.vararg:
+                local.add(args.vararg.arg)
+            if args.kwarg:
+                local.add(args.kwarg.arg)
+            # Default values are evaluated in the enclosing (outer) scope.
+            for default in args.defaults:
+                _collect_loads(default, defined)
+            for kw_default in args.kw_defaults:
+                if kw_default is not None:
+                    _collect_loads(kw_default, defined)
+            _collect_loads(node.body, local)
+            return
         for child in ast.iter_child_nodes(node):
             _collect_loads(child, defined)
 
@@ -417,7 +434,16 @@ def _find_valid_splits(
     has_doc = _is_docstring_stmt(body_stmts[0])
     candidates: List[int] = []
 
-    for i in range(len(body_stmts) - 1, 0, -1):
+    # Restrict split point to before the first nested function def in the body.
+    # Splitting across a closure boundary would produce NameErrors at runtime:
+    # nested functions defined in HEAD can reference names only available in TAIL.
+    upper = len(body_stmts) - 1
+    for k, stmt in enumerate(body_stmts):
+        if isinstance(stmt, cst.FunctionDef):
+            upper = k
+            break
+
+    for i in range(upper, 0, -1):
         head_lines = _head_effective_lines(body_stmts, i, positions, has_doc)
         if head_lines > max_lines:
             continue
@@ -572,6 +598,47 @@ def _extract_func_source(func_info: _FuncInfo, source_lines: List[str]) -> str:
     """Return dedented source of the function (including decorators)."""
     raw = "".join(source_lines[func_info.start_line - 1 : func_info.end_line])
     return textwrap.dedent(raw)
+
+
+# ---------------------------------------------------------------------------
+# Pyflakes safety check
+# ---------------------------------------------------------------------------
+
+
+def _has_new_undefined_names(before_src: str, after_src: str) -> bool:
+    """Return True if after_src introduces UndefinedName warnings not in before_src.
+
+    Compares pyflakes output before and after a transformation.  Only newly
+    introduced ``UndefinedName`` warnings (F821) count; pre-existing issues in
+    the original source are ignored to avoid false positives.
+    """
+    import pyflakes.api
+    import pyflakes.messages
+
+    class _Collector:
+        def __init__(self) -> None:
+            self.names: set = set()
+
+        def unexpectedError(self, filename, msg) -> None:  # pragma: no cover
+            pass
+
+        def syntaxError(
+            self, filename, msg, lineno, offset, text
+        ) -> None:  # pragma: no cover
+            pass
+
+        def flake(self, msg) -> None:
+            if isinstance(msg, pyflakes.messages.UndefinedName):
+                self.names.add(msg.message_args[0])
+
+    try:
+        before = _Collector()
+        pyflakes.api.check(before_src, "<before>", reporter=before)
+        after = _Collector()
+        pyflakes.api.check(after_src, "<after>", reporter=after)
+        return bool(after.names - before.names)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -773,11 +840,15 @@ class FunctionSplitter(Refactor):
                 result_lines[start - 1 : end] = [replacement]
             new_source = "".join(result_lines)
 
-            # 5. Verify
+            # 5. Verify syntax
             try:
                 compile(new_source, "<string>", "exec")
             except SyntaxError:
                 break  # bail, don't apply bad output
+
+            # 6. Verify no new undefined names (catches NameError-producing splits)
+            if _has_new_undefined_names(current, new_source):
+                break
 
             for task in tasks:
                 fi = task.func_info

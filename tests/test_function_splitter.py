@@ -23,6 +23,7 @@ from crispen.refactors.function_splitter import (
     _func_in_changed_range,
     _generate_call,
     _generate_helper_source,
+    _has_new_undefined_names,
     _has_yield,
     _head_effective_lines,
     _is_docstring_stmt,
@@ -528,6 +529,46 @@ def test_find_free_vars_bare_except():
     assert "risky" in result
 
 
+def test_find_free_vars_lambda_param_not_free():
+    # lambda parameter must not appear as a free variable
+    src = "result = sorted(tasks, key=lambda t: t.name)\n"
+    result = _find_free_vars(src)
+    assert "t" not in result
+    assert "tasks" in result
+
+
+def test_find_free_vars_lambda_vararg_not_free():
+    # *args in lambda body — args is the vararg, not free
+    src = "f = lambda *args: list(args)\n"
+    result = _find_free_vars(src)
+    assert "args" not in result
+
+
+def test_find_free_vars_lambda_kwarg_not_free():
+    # **kw in lambda body — kw is the kwarg, not free
+    src = "f = lambda **kw: kw\n"
+    result = _find_free_vars(src)
+    assert "kw" not in result
+
+
+def test_find_free_vars_lambda_default_outer_scope():
+    # Default values are evaluated in the enclosing scope, not the lambda scope.
+    src = "f = lambda x=outer_val: x\n"
+    result = _find_free_vars(src)
+    assert "outer_val" in result  # evaluated in outer scope → free
+    assert "x" not in result  # lambda param → not free
+
+
+def test_find_free_vars_lambda_kw_default_none_entry():
+    # keyword-only param without a default: kw_defaults has a None entry
+    # lambda *, x, y=outer_val: x+y → kw_defaults=[None, outer_val_node]
+    src = "f = lambda *, x, y=outer_val: x + y\n"
+    result = _find_free_vars(src)
+    assert "x" not in result  # kwonly param → not free
+    assert "y" not in result  # kwonly param → not free
+    assert "outer_val" in result  # kw_default evaluated in outer scope → free
+
+
 # ---------------------------------------------------------------------------
 # _stmts_source
 # ---------------------------------------------------------------------------
@@ -662,6 +703,30 @@ def test_find_valid_splits_complexity_filter():
         stmts, positions, lines, max_lines=1000, max_complexity=2
     )
     assert result == [1]
+
+
+def test_find_valid_splits_nested_funcdef_restricts_upper():
+    # First nested funcdef at index 2 → valid splits only at indices ≤ 2.
+    src = textwrap.dedent(
+        """\
+        def outer():
+            a = 1
+            b = 2
+            def inner():
+                pass
+            c = 3
+            d = 4
+    """
+    )
+    stmts, positions, lines = _parse_func(src)
+    # body_stmts: [a=1, b=2, def inner, c=3, d=4]
+    # First nested funcdef at index 2 → upper=2 → range(2, 0, -1) = [2, 1]
+    result = _find_valid_splits(
+        stmts, positions, lines, max_lines=1000, max_complexity=1000
+    )
+    assert all(i <= 2 for i in result)
+    assert 3 not in result
+    assert 4 not in result
 
 
 # ---------------------------------------------------------------------------
@@ -1468,6 +1533,60 @@ def test_find_free_vars_del_context():
     src = "del my_var\n"
     result = _find_free_vars(src)
     assert "my_var" not in result
+
+
+# ---------------------------------------------------------------------------
+# _has_new_undefined_names
+# ---------------------------------------------------------------------------
+
+
+def test_has_new_undefined_names_no_new():
+    """No new undefined names → returns False."""
+    before = "x = 1\ny = x + 1\n"
+    after = "x = 1\ny = x + 1\nz = y + 1\n"
+    assert _has_new_undefined_names(before, after) is False
+
+
+def test_has_new_undefined_names_introduced():
+    """After introduces an undefined name that before didn't have → returns True."""
+    before = "x = 1\n"
+    after = "x = undefined_var\n"
+    assert _has_new_undefined_names(before, after) is True
+
+
+def test_has_new_undefined_names_non_undefined_warning():
+    """Non-UndefinedName pyflakes warning (e.g. UnusedImport) → returns False."""
+    # An unused import produces an UnusedImport warning, not UndefinedName.
+    # This exercises the isinstance() False branch inside _Collector.flake.
+    before = ""
+    after = "import os\n"
+    assert _has_new_undefined_names(before, after) is False
+
+
+def test_has_new_undefined_names_exception():
+    """If pyflakes raises an unexpected exception, returns False (safe default)."""
+    with patch("pyflakes.api.check", side_effect=RuntimeError("boom")):
+        assert _has_new_undefined_names("x = 1\n", "y = 1\n") is False
+
+
+@patch(
+    "crispen.refactors.function_splitter._has_new_undefined_names", return_value=True
+)
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_pyflakes_rejects_output(mock_anthropic, mock_has_undef):
+    """If pyflakes detects new undefined names in output, the split is not applied."""
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["helper"])
+    )
+    src = _make_long_func(80, "foo")
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=50
+        )
+
+    # Pyflakes check returned True → split not applied
+    assert splitter.get_rewritten_source() is None
 
 
 # ---------------------------------------------------------------------------
