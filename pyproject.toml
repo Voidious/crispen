@@ -1,6 +1,6 @@
 [project]
 name = "crispen"
-version = "0.4.2"
+version = "0.4.3"
 description = "Automated refactoring tool for Python code diffs"
 requires-python = ">=3.12"
 dependencies = [

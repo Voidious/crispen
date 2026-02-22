@@ -463,20 +463,32 @@ def _choose_best_split(
     source_lines: List[str],
     positions: Dict,
     orig_params: List[str],
-) -> Tuple[int, List[str]]:
-    """Choose split with fewest free variables; ties broken by latest split."""
+) -> Optional[Tuple[int, List[str]]]:
+    """Choose split with fewest free variables; ties broken by latest split.
+
+    Returns None if every candidate requires passing ``self`` as a plain
+    parameter to a static helper (semantically incorrect for methods).
+    """
     best_idx: Optional[int] = None
     best_params: List[str] = []
+
+    # A method should never be split such that self is passed as a plain
+    # argument to a @staticmethod helper — that is semantically wrong.
+    is_method = bool(orig_params) and orig_params[0] == "self"
 
     for split_idx in valid_splits:
         tail_stmts = body_stmts[split_idx:]
         tail_src = _stmts_source(tail_stmts, source_lines, positions)
         free = _find_free_vars(tail_src)
+        if is_method and "self" in free:
+            continue  # skip: tail needs instance state
         if best_idx is None or len(free) < len(best_params):
             best_idx = split_idx
             best_params = free
 
-    return (best_idx if best_idx is not None else valid_splits[0], best_params)
+    if best_idx is None:
+        return None
+    return (best_idx, best_params)
 
 
 # ---------------------------------------------------------------------------
@@ -769,13 +781,16 @@ class FunctionSplitter(Refactor):
                 )
                 if not valid_splits:
                     continue
-                split_idx, params = _choose_best_split(
+                best = _choose_best_split(
                     body_stmts,
                     valid_splits,
                     source_lines,
                     positions,
                     func_info.original_params,
                 )
+                if best is None:
+                    continue
+                split_idx, params = best
                 tail_stmts = body_stmts[split_idx:]
                 tail_raw = _stmts_source(tail_stmts, source_lines, positions)
                 tasks.append(
@@ -802,6 +817,19 @@ class FunctionSplitter(Refactor):
 
             for task, name in zip(tasks, names):
                 task.helper_name = name
+
+            # Drop tasks whose helper name collides with an existing function
+            # definition.  In Python, two defs with the same name keep only the
+            # last, so a collision would cause a TypeError at every call site
+            # that was written for the earlier (now-overridden) signature.
+            existing_func_names = {
+                node.name
+                for node in ast.walk(ast.parse(current))
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            tasks = [t for t in tasks if f"_{t.helper_name}" not in existing_func_names]
+            if not tasks:
+                break
 
             # 4. Build text edits (process bottom-up by start_line)
             tasks.sort(key=lambda t: t.func_info.start_line, reverse=True)

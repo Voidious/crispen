@@ -800,6 +800,22 @@ def test_choose_best_split_single_candidate():
     assert split_idx == 1
 
 
+def test_choose_best_split_all_skipped_returns_none():
+    # Every valid tail requires self → all candidates skipped → None returned
+    src = textwrap.dedent(
+        """\
+        class Foo:
+            def method(self, x):
+                a = 1
+                b = self.value + a
+        """
+    )
+    stmts, positions, lines = _parse_func(src)
+    # split_idx=1: tail=[b = self.value + a] → free includes "self" → skipped
+    result = _choose_best_split(stmts, [1], lines, positions, ["self", "x"])
+    assert result is None
+
+
 # ---------------------------------------------------------------------------
 # _generate_helper_source
 # ---------------------------------------------------------------------------
@@ -1605,3 +1621,34 @@ def test_engine_includes_function_splitter_no_op(tmp_path):
     msgs = list(run_engine({str(py_file): [(1, 2)]}, verbose=False, config=config))
     # No split needed — no messages expected (or just no errors)
     assert all("FunctionSplitter" not in m for m in msgs)
+
+
+def test_function_splitter_method_with_self_in_tail_not_split():
+    """A method where every tail candidate needs self is never split."""
+    lines = ["class Foo:\n", "    def method(self):\n"]
+    for i in range(40):
+        lines.append(f"        a{i} = self.val + {i}\n")
+    lines.append("        return 0\n")
+    src = "".join(lines)
+    # max_lines=20 forces a split attempt, but every tail uses self → no split
+    splitter = FunctionSplitter([(1, 1000)], source=src, verbose=False, max_lines=20)
+    assert splitter.get_rewritten_source() is None
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_skips_name_collision(mock_anthropic):
+    """Helper name colliding with an existing function causes the task to be dropped."""
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["helper"])  # would produce _helper
+    )
+    # _helper already exists; the LLM would name the extracted helper "helper"
+    existing = "def _helper():\n    pass\n\n\n"
+    src = existing + _make_long_func(80)
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=50
+        )
+
+    # collision detected → task dropped → no rewrite
+    assert splitter.get_rewritten_source() is None
