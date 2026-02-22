@@ -339,6 +339,13 @@ class _FunctionCollector(cst.CSTVisitor):
 # ---------------------------------------------------------------------------
 
 
+def _parse_or_empty_set(source: str):
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return set()
+
+
 def _collect_called_names(source: str) -> set:
     """Return a set of all names called (as functions) in *source*.
 
@@ -346,9 +353,8 @@ def _collect_called_names(source: str) -> set:
     called name: func.id for ast.Name callees, func.attr for ast.Attribute
     callees.  On SyntaxError, returns an empty set.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_or_empty_set(source)
+    if tree == set():
         return set()
     names: set = set()
     for node in ast.walk(tree):
@@ -519,6 +525,22 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
+def _call_llm_veto_tool(client, provider, model, prompt):
+    result = _llm_client.call_with_tool(
+        client,
+        provider,
+        model,
+        256,
+        _VETO_TOOL,
+        "evaluate_duplicate",
+        [{"role": "user", "content": prompt}],
+        caller="DuplicateExtractor",
+    )
+    if result is not None:
+        return result["is_valid_duplicate"], result.get("reason", "")
+    return False, "no tool response"  # pragma: no cover
+
+
 def _llm_veto(
     client,
     group: List[_SeqInfo],
@@ -537,19 +559,7 @@ def _llm_veto(
         "a shared helper function would improve clarity? Or are they coincidentally "
         "similar but conceptually distinct?"
     )
-    result = _llm_client.call_with_tool(
-        client,
-        provider,
-        model,
-        256,
-        _VETO_TOOL,
-        "evaluate_duplicate",
-        [{"role": "user", "content": prompt}],
-        caller="DuplicateExtractor",
-    )
-    if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+    return _call_llm_veto_tool(client, provider, model, prompt)
 
 
 def _llm_extract(
@@ -628,6 +638,10 @@ def _llm_extract(
         f"{used_names_note}"
         f"{docstring_note}"
     )
+    return _call_llm_with_extraction_tool(client, model, prompt, provider)
+
+
+def _call_llm_with_extraction_tool(client, model, prompt, provider):
     return _llm_client.call_with_tool(
         client,
         provider,
@@ -662,19 +676,7 @@ def _llm_veto_func_match(
         "body, such that it could be replaced by a call to the function? "
         "Use the evaluate_duplicate tool to answer."
     )
-    result = _llm_client.call_with_tool(
-        client,
-        provider,
-        model,
-        256,
-        _VETO_TOOL,
-        "evaluate_duplicate",
-        [{"role": "user", "content": prompt}],
-        caller="DuplicateExtractor",
-    )
-    if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+    return _call_llm_veto_tool(client, provider, model, prompt)
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
@@ -746,6 +748,13 @@ def _normalize_replacement_indentation(seq: _SeqInfo, replacement: str) -> str:
 _MUTABLE_CONSTRUCTORS = frozenset({"set", "list", "dict", "frozenset", "bytearray"})
 
 
+def _try_parse_ast(source: str) -> Optional[ast.AST]:
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return None
+
+
 def _has_mutable_literal_is_check(source: str) -> bool:
     """Return True if *source* contains identity checks against mutable literals.
 
@@ -753,9 +762,8 @@ def _has_mutable_literal_is_check(source: str) -> bool:
     False in Python because each literal creates a new object at runtime.
     Such patterns are a common LLM mistake when using a ``set()`` sentinel.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _try_parse_ast(source)
+    if tree is None:
         return False
     for node in ast.walk(tree):
         if not isinstance(node, ast.Compare):
@@ -776,9 +784,8 @@ def _has_mutable_literal_is_check(source: str) -> bool:
 
 def _collect_attribute_names(source: str) -> set:
     """Return all attribute names (dot-access names) anywhere in *source*."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_or_empty_set(source)
+    if tree == set():
         return set()
     return {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
 
@@ -792,9 +799,8 @@ def _collect_called_attr_names(source: str) -> set:
     so the new-method-call check does not produce false positives for
     standard-library type references.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_or_empty_set(source)
+    if tree == set():
         return set()
     return {
         node.func.attr
@@ -810,9 +816,8 @@ def _has_call_to(func_name: str, source: str) -> bool:
     (``obj.func_name(...)``), covering both module-level helpers and
     staticmethod calls.  Returns False if source cannot be parsed.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _try_parse_ast(source)
+    if tree is None:
         return False
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -1003,6 +1008,17 @@ def _replacement_steals_post_block_line(
     return False
 
 
+def _collect_import_names(node, target_set):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name.split(".")[0]
+            target_set.add(name)
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            target_set.add(name)
+
+
 def _helper_imports_local_name(helper_source: str, original_source: str) -> bool:
     """Return True if helper_source imports a name that is only a local in original.
 
@@ -1017,34 +1033,19 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
 
     helper_imports: set = set()
     for node in ast.walk(helper_tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                helper_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                helper_imports.add(name)
+        _collect_import_names(node, helper_imports)
 
     if not helper_imports:
         return False
 
-    try:
-        orig_tree = ast.parse(original_source)
-    except SyntaxError:
+    orig_tree = _try_parse_ast(original_source)
+    if orig_tree is None:
         return False
 
     # Names already imported at the top level of the original file.
     orig_top_imports: set = set()
     for node in orig_tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                orig_top_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                orig_top_imports.add(name)
+        _collect_import_names(node, orig_top_imports)
 
     new_helper_imports = helper_imports - orig_top_imports
     if not new_helper_imports:
@@ -1147,9 +1148,8 @@ def _find_escaping_vars(group: List[_SeqInfo], source_lines: List[str]) -> set:
 
 def _extract_defined_names(source: str) -> set:
     """Return all function and class names defined anywhere in *source*."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_or_empty_set(source)
+    if tree == set():
         return set()
     return {
         node.name
@@ -1295,6 +1295,20 @@ def _find_insertion_point(source: str, scope: str) -> int:
 
 
 class DuplicateExtractor(Refactor):
+
+    @staticmethod
+    def _log_validation_and_continue(
+        verbose: bool, is_valid: bool, reason: str
+    ) -> bool:
+        if verbose:
+            status = "ACCEPTED" if is_valid else "VETOED"
+            print(
+                f"crispen: DuplicateExtractor:   → {status}: {reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return is_valid
+
     """Detect and extract duplicate code blocks into helper functions via LLM."""
 
     def __init__(
@@ -1411,14 +1425,9 @@ class DuplicateExtractor(Refactor):
                         flush=True,
                     )
                     continue
-                if self.verbose:
-                    status = "ACCEPTED" if is_valid else "VETOED"
-                    print(
-                        f"crispen: DuplicateExtractor:   → {status}: {reason}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                if not is_valid:
+                if not self._log_validation_and_continue(
+                    self.verbose, is_valid, reason
+                ):
                     continue
                 if func.scope == "<module>" and not func.params:
                     replacement = _generate_no_arg_call(seq, func)
@@ -1512,14 +1521,7 @@ class DuplicateExtractor(Refactor):
                     flush=True,
                 )
                 continue
-            if self.verbose:
-                status = "ACCEPTED" if is_valid else "VETOED"
-                print(
-                    f"crispen: DuplicateExtractor:   → {status}: {reason}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            if not is_valid:
+            if not self._log_validation_and_continue(self.verbose, is_valid, reason):
                 continue
 
             try:
