@@ -374,7 +374,6 @@ def run_engine(
                         source=current_source,
                         verbose=verbose,
                         max_lines=config.max_function_length,
-                        max_complexity=config.max_complexity,
                         model=config.model,
                         provider=config.provider,
                         helper_docstrings=config.helper_docstrings,

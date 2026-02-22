@@ -1,4 +1,4 @@
-"""Refactor: split functions exceeding line-count or complexity limits."""
+"""Refactor: split functions exceeding the line-count limit."""
 
 from __future__ import annotations
 
@@ -227,40 +227,6 @@ def _count_body_lines(func_source: str) -> int:
     return last_stmt.end_lineno - first_stmt.lineno + 1
 
 
-def _cyclomatic_complexity(func_source: str) -> int:
-    """Return McCabe cyclomatic complexity of the body in func_source."""
-    try:
-        tree = ast.parse(func_source)
-    except SyntaxError:
-        return 1
-
-    # Use function body if present, otherwise module body
-    body: list = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            body = node.body
-            break
-    if not body:
-        body = tree.body
-
-    complexity = 1
-    stack = list(body)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue  # skip nested definitions
-        if isinstance(node, (ast.If, ast.IfExp)):
-            complexity += 1
-        elif isinstance(node, (ast.For, ast.While)):
-            complexity += 1
-        elif isinstance(node, ast.ExceptHandler):
-            complexity += 1
-        for child in ast.iter_child_nodes(node):
-            stack.append(child)
-
-    return complexity
-
-
 def _find_free_vars(tail_source: str) -> List[str]:
     """Return sorted free variables of tail_source (excluding builtins).
 
@@ -469,9 +435,7 @@ def _head_effective_lines(
 def _find_valid_splits(
     body_stmts: list,
     positions: Dict,
-    source_lines: List[str],
     max_lines: int,
-    max_complexity: int,
 ) -> List[int]:
     """Return valid split indices (latest first, max _MAX_SPLIT_CANDIDATES)."""
     if not body_stmts:
@@ -491,9 +455,6 @@ def _find_valid_splits(
     for i in range(upper, 0, -1):
         head_lines = _head_effective_lines(body_stmts, i, positions, has_doc)
         if head_lines > max_lines:
-            continue
-        head_src = _stmts_source(body_stmts[:i], source_lines, positions)
-        if _cyclomatic_complexity(head_src) > max_complexity:
             continue
         candidates.append(i)
         if len(candidates) >= _MAX_SPLIT_CANDIDATES:
@@ -768,7 +729,7 @@ class _FunctionCollector(cst.CSTVisitor):
 
 
 class FunctionSplitter(Refactor):
-    """Split functions exceeding line-count or cyclomatic-complexity limits."""
+    """Split functions that exceed the line-count limit."""
 
     def __init__(
         self,
@@ -776,14 +737,12 @@ class FunctionSplitter(Refactor):
         source: str = "",
         verbose: bool = True,
         max_lines: int = 75,
-        max_complexity: int = 10,
         model: str = _MODEL,
         provider: str = "anthropic",
         helper_docstrings: bool = False,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self._max_lines = max_lines
-        self._max_complexity = max_complexity
         self._model = model
         self._provider = provider
         self._helper_docstrings = helper_docstrings
@@ -820,8 +779,7 @@ class FunctionSplitter(Refactor):
                     continue
                 func_source = _extract_func_source(func_info, source_lines)
                 body_lines = _count_body_lines(func_source)
-                complexity = _cyclomatic_complexity(func_source)
-                if body_lines <= self._max_lines and complexity <= self._max_complexity:
+                if body_lines <= self._max_lines:
                     continue
                 body_stmts = list(func_info.node.body.body)
                 if len(body_stmts) < 2:
@@ -829,9 +787,7 @@ class FunctionSplitter(Refactor):
                 valid_splits = _find_valid_splits(
                     body_stmts,
                     positions,
-                    source_lines,
                     self._max_lines,
-                    self._max_complexity,
                 )
                 if not valid_splits:
                     continue

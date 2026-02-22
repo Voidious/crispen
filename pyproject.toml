@@ -1,6 +1,6 @@
 [project]
 name = "crispen"
-version = "0.4.6"
+version = "0.4.7"
 description = "Automated refactoring tool for Python code diffs"
 requires-python = ">=3.12"
 dependencies = [
@@ -30,6 +30,7 @@ max_duplicate_seq_len = 8
 min_tuple_size = 4
 provider = "anthropic"
 model = "claude-sonnet-4-6"
+max_function_length = 75
 helper_docstrings = false
 update_diff_file_callers = true
 

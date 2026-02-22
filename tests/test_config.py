@@ -111,6 +111,7 @@ def test_load_config_all_options(tmp_path):
         "max_duplicate_seq_len = 10\n"
         "min_tuple_size = 6\n"
         "model = 'claude-opus-4-6'\n"
+        "max_function_length = 100\n"
         "helper_docstrings = true\n"
         "update_diff_file_callers = false\n",
         encoding="utf-8",
@@ -120,5 +121,6 @@ def test_load_config_all_options(tmp_path):
     assert cfg.max_duplicate_seq_len == 10
     assert cfg.min_tuple_size == 6
     assert cfg.model == "claude-opus-4-6"
+    assert cfg.max_function_length == 100
     assert cfg.helper_docstrings is True
     assert cfg.update_diff_file_callers is False

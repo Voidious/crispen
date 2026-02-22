@@ -16,7 +16,6 @@ from crispen.refactors.function_splitter import (
     _SplitTask,
     _choose_best_split,
     _count_body_lines,
-    _cyclomatic_complexity,
     _extract_func_source,
     _find_free_vars,
     _find_valid_splits,
@@ -126,6 +125,13 @@ def test_is_docstring_two_stmts_on_line():
     assert _is_docstring_stmt(stmt) is False
 
 
+def test_is_docstring_compound_stmt():
+    # A compound statement (If) is not a SimpleStatementLine
+    src = "def f():\n    if True:\n        pass\n"
+    stmt = cst.parse_module(src).body[0].body.body[0]
+    assert _is_docstring_stmt(stmt) is False
+
+
 # ---------------------------------------------------------------------------
 # _count_body_lines
 # ---------------------------------------------------------------------------
@@ -162,92 +168,6 @@ def test_count_body_lines_parse_error():
 def test_count_body_lines_no_funcdef():
     # Module-level code, no function
     assert _count_body_lines("x = 1\n") == 0
-
-
-# ---------------------------------------------------------------------------
-# _cyclomatic_complexity
-# ---------------------------------------------------------------------------
-
-
-def test_cyclomatic_flat():
-    src = "def foo():\n    x = 1\n    return x\n"
-    assert _cyclomatic_complexity(src) == 1
-
-
-def test_cyclomatic_if_elif():
-    src = textwrap.dedent(
-        """\
-        def foo(x):
-            if x > 0:
-                return 1
-            elif x < 0:
-                return -1
-            return 0
-    """
-    )
-    # base=1, if=+1, elif is nested If=+1 → 3
-    assert _cyclomatic_complexity(src) == 3
-
-
-def test_cyclomatic_for_while():
-    src = textwrap.dedent(
-        """\
-        def foo(items):
-            for i in items:
-                pass
-            while True:
-                break
-    """
-    )
-    # base=1, for=+1, while=+1 → 3
-    assert _cyclomatic_complexity(src) == 3
-
-
-def test_cyclomatic_try_except():
-    src = textwrap.dedent(
-        """\
-        def foo():
-            try:
-                x = 1
-            except ValueError:
-                pass
-            except TypeError:
-                pass
-    """
-    )
-    # base=1, ExceptHandler x2 = +2 → 3
-    assert _cyclomatic_complexity(src) == 3
-
-
-def test_cyclomatic_ternary():
-    src = "def foo(x):\n    y = 1 if x else 0\n"
-    # base=1, IfExp=+1 → 2
-    assert _cyclomatic_complexity(src) == 2
-
-
-def test_cyclomatic_nested_functions_excluded():
-    src = textwrap.dedent(
-        """\
-        def foo():
-            def inner():
-                if True:
-                    pass
-            return inner
-    """
-    )
-    # base=1; inner's if is NOT counted → 1
-    assert _cyclomatic_complexity(src) == 1
-
-
-def test_cyclomatic_parse_error():
-    assert _cyclomatic_complexity("def f(\n  !!") == 1
-
-
-def test_cyclomatic_no_funcdef_uses_module_body():
-    # When there's no function, use module body
-    src = "if True:\n    pass\n"
-    # base=1, If=+1 → 2
-    assert _cyclomatic_complexity(src) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -637,10 +557,8 @@ def test_head_effective_lines_only_docstring_in_head():
 def test_find_valid_splits_all_valid():
     src = "def foo():\n    a = 1\n    b = 2\n    c = 3\n    d = 4\n"
     stmts, positions, lines = _parse_func(src)
-    # With very loose limits, all splits should be valid
-    result = _find_valid_splits(
-        stmts, positions, lines, max_lines=1000, max_complexity=1000
-    )
+    # With a very loose limit, all splits should be valid
+    result = _find_valid_splits(stmts, positions, max_lines=1000)
     assert len(result) > 0
     # Ordered latest first
     assert result == sorted(result, reverse=True)
@@ -650,9 +568,7 @@ def test_find_valid_splits_none_valid():
     # max_lines=1 means even a 1-stmt head (+ return call = 2 lines) is invalid
     src = "def foo():\n    a = 1\n    b = 2\n    c = 3\n"
     stmts, positions, lines = _parse_func(src)
-    result = _find_valid_splits(
-        stmts, positions, lines, max_lines=1, max_complexity=1000
-    )
+    result = _find_valid_splits(stmts, positions, max_lines=1)
     assert result == []
 
 
@@ -660,9 +576,7 @@ def test_find_valid_splits_stops_at_max_candidates():
     # 7 statements → iterates from 6 down, stops after 5 valid candidates
     src = "def foo():\n" + "".join(f"    a{i} = {i}\n" for i in range(7))
     stmts, positions, lines = _parse_func(src)
-    result = _find_valid_splits(
-        stmts, positions, lines, max_lines=1000, max_complexity=1000
-    )
+    result = _find_valid_splits(stmts, positions, max_lines=1000)
     assert len(result) == 5
 
 
@@ -670,41 +584,14 @@ def test_find_valid_splits_fewer_than_max():
     # 4 statements → at most 3 valid splits (indices 3, 2, 1)
     src = "def foo():\n    a = 1\n    b = 2\n    c = 3\n    d = 4\n"
     stmts, positions, lines = _parse_func(src)
-    result = _find_valid_splits(
-        stmts, positions, lines, max_lines=1000, max_complexity=1000
-    )
+    result = _find_valid_splits(stmts, positions, max_lines=1000)
     assert 1 <= len(result) <= 3
 
 
 def test_find_valid_splits_empty_body():
     # Should not crash with an empty list (though normally not called)
-    stmts = []
-    result = _find_valid_splits(stmts, {}, [], max_lines=1000, max_complexity=1000)
+    result = _find_valid_splits([], {}, max_lines=1000)
     assert result == []
-
-
-def test_find_valid_splits_complexity_filter():
-    # A head with high complexity is filtered out; only the simple head passes
-    # Source: simple stmt first, then complex nested-if block, then trivial last stmt
-    src = textwrap.dedent(
-        """\
-        def foo(x):
-            y = 1
-            if x > 0:
-                if x > 1:
-                    if x > 2:
-                        pass
-            z = 2
-    """
-    )
-    stmts, positions, lines = _parse_func(src)
-    # stmts = [y=1, if_block, z=2]
-    # i=2: head=[y=1, if_block], complexity of nested ifs > 2 → filtered
-    # i=1: head=[y=1], complexity=1 ≤ 2 → valid
-    result = _find_valid_splits(
-        stmts, positions, lines, max_lines=1000, max_complexity=2
-    )
-    assert result == [1]
 
 
 def test_find_valid_splits_nested_funcdef_restricts_upper():
@@ -723,9 +610,7 @@ def test_find_valid_splits_nested_funcdef_restricts_upper():
     stmts, positions, lines = _parse_func(src)
     # body_stmts: [a=1, b=2, def inner, c=3, d=4]
     # First nested funcdef at index 2 → upper=2 → range(2, 0, -1) = [2, 1]
-    result = _find_valid_splits(
-        stmts, positions, lines, max_lines=1000, max_complexity=1000
-    )
+    result = _find_valid_splits(stmts, positions, max_lines=1000)
     assert all(i <= 2 for i in result)
     assert 3 not in result
     assert 4 not in result
@@ -1362,7 +1247,6 @@ def test_function_splitter_over_line_limit(mock_anthropic):
             source=src,
             verbose=False,
             max_lines=50,
-            max_complexity=1000,
         )
 
     result = splitter.get_rewritten_source()
@@ -1371,33 +1255,6 @@ def test_function_splitter_over_line_limit(mock_anthropic):
     assert "_process_tail" in result
     assert "return _process_tail(" in result
     assert len(splitter.changes_made) >= 1
-
-
-@patch("crispen.llm_client.anthropic")
-def test_function_splitter_over_complexity_limit(mock_anthropic):
-    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
-        _make_mock_response(["handle_tail"])
-    )
-    # Build a function with high cyclomatic complexity
-    lines = ["def complex_func(x):\n"]
-    for i in range(15):
-        lines.append(f"    if x > {i}:\n        pass\n")
-    lines.append("    return 0\n")
-    src = "".join(lines)
-
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)],
-            source=src,
-            verbose=False,
-            max_lines=1000,  # no line limit
-            max_complexity=5,
-        )
-
-    result = splitter.get_rewritten_source()
-    assert result is not None
-    compile(result, "<test>", "exec")
-    assert "_handle_tail" in result
 
 
 @patch("crispen.llm_client.anthropic")
@@ -1470,7 +1327,7 @@ def test_function_splitter_llm_fallback_on_api_error(mock_anthropic):
 
         os.environ.pop("ANTHROPIC_API_KEY", None)
         splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=30, max_complexity=1000
+            [(1, 1000)], source=src, verbose=False, max_lines=30
         )
 
     result = splitter.get_rewritten_source()
@@ -1499,7 +1356,6 @@ def test_function_splitter_recursive_split(mock_anthropic):
             source=src,
             verbose=False,
             max_lines=5,
-            max_complexity=1000,
         )
 
     result = splitter.get_rewritten_source()
@@ -1515,10 +1371,7 @@ def test_function_splitter_syntax_error_in_output_is_skipped(mock_anthropic):
     # We simulate this by making _generate_call return something invalid
     # Instead, test the path via a function with 1-stmt body (no valid split)
     src = "def foo():\n    x = 1\n"  # only 1 stmt → can't split
-    splitter = FunctionSplitter(
-        [(1, 10)], source=src, verbose=False, max_lines=0, max_complexity=0
-    )
-    # Either no valid splits found OR already under limit (0 means everything is over)
+    splitter = FunctionSplitter([(1, 10)], source=src, verbose=False, max_lines=0)
     # body lines=1 > 0=max_lines → tries to split but len(body_stmts)=1 < 2 → skip
     assert splitter.get_rewritten_source() is None
 
@@ -1530,9 +1383,7 @@ def test_function_splitter_no_valid_split_skipped(mock_anthropic):
     src = _make_long_func(5, "foo")
 
     with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=1, max_complexity=1000
-        )
+        splitter = FunctionSplitter([(1, 1000)], source=src, verbose=False, max_lines=1)
 
     assert splitter.get_rewritten_source() is None
 
@@ -1575,7 +1426,6 @@ def test_function_splitter_class_method(mock_anthropic):
             source=src,
             verbose=False,
             max_lines=50,
-            max_complexity=1000,
         )
 
     result = splitter.get_rewritten_source()
@@ -1744,7 +1594,7 @@ def test_engine_includes_function_splitter_no_op(tmp_path):
 
     py_file = tmp_path / "sample.py"
     py_file.write_text("def foo():\n    return 1\n")
-    config = CrispenConfig(max_function_length=75, max_complexity=10)
+    config = CrispenConfig(max_function_length=75)
     msgs = list(run_engine({str(py_file): [(1, 2)]}, verbose=False, config=config))
     # No split needed — no messages expected (or just no errors)
     assert all("FunctionSplitter" not in m for m in msgs)
