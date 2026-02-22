@@ -778,22 +778,27 @@ def _verify_extraction(
     replacing with an existing function rather than a newly extracted one).
     """
     if helper_source is not None:
+        dedented_helper = textwrap.dedent(helper_source)
         try:
-            compile(textwrap.dedent(helper_source), "<helper>", "exec")
+            compile(dedented_helper, "<helper>", "exec")
         except SyntaxError:
             return False
         if _has_param_overwritten_before_read(helper_source):
             return False
-        if _has_mutable_literal_is_check(helper_source):
+        # Dedent before checking: helper may be indented (e.g. staticmethod).
+        # compile() already confirmed it's valid Python, so ast.parse will succeed.
+        if _has_mutable_literal_is_check(dedented_helper):
             return False
     for replacement in call_replacements:
+        dedented = textwrap.dedent(replacement)
+        wrapped = "def _check():\n" + textwrap.indent(dedented, "    ")
         try:
-            dedented = textwrap.dedent(replacement)
-            wrapped = "def _check():\n" + textwrap.indent(dedented, "    ")
             compile(wrapped, "<replacement>", "exec")
         except SyntaxError:
             return False
-        if _has_mutable_literal_is_check(replacement):
+        # Check the wrapped form so that indented/return-containing replacements
+        # parse successfully and give a definitive True/False answer.
+        if _has_mutable_literal_is_check(wrapped):
             return False
     return True
 
@@ -1368,7 +1373,7 @@ class DuplicateExtractor(Refactor):
                 continue
 
             new_attrs = _collect_attribute_names(
-                helper_source
+                textwrap.dedent(helper_source)
             ) - _collect_attribute_names(source)
             if new_attrs:
                 if self.verbose:

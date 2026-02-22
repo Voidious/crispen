@@ -489,6 +489,13 @@ def test_verify_extraction_rejects_mutable_is_in_replacement():
     assert _verify_extraction(helper, ["if r is set(): pass\n"]) is False
 
 
+def test_verify_extraction_rejects_indented_mutable_is_in_replacement():
+    # Indented replacements (function-body code) are wrapped before checking,
+    # so `is set()` is caught even when ast.parse would fail on raw indented text.
+    helper = "def h(x):\n    return x\n"
+    assert _verify_extraction(helper, ["    if r is set(): pass\n"]) is False
+
+
 # ---------------------------------------------------------------------------
 # _collect_attribute_names
 # ---------------------------------------------------------------------------
