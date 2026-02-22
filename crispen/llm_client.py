@@ -76,7 +76,7 @@ def call_with_tool(
                 tools=[openai_tool],
                 tool_choice={"type": "function", "function": {"name": tool_name}},
                 messages=messages,
-                extra_body={"enable_thinking": False},
+                extra_body={"thinking": {"type": "disabled"}},
             )
         except openai.APIError as exc:
             raise CrispenAPIError(

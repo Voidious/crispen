@@ -159,7 +159,7 @@ def test_call_with_tool_moonshot_success():
         )
     assert result == {"is_valid_duplicate": True, "reason": "same"}
     call_kwargs = client.chat.completions.create.call_args[1]
-    assert call_kwargs["extra_body"] == {"enable_thinking": False}
+    assert call_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
     assert call_kwargs["tool_choice"] == {
         "type": "function",
         "function": {"name": "evaluate_duplicate"},
