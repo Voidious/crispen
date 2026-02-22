@@ -915,6 +915,115 @@ def _pyflakes_new_undefined_names(original: str, candidate: str) -> set:
     return after.names - before.names
 
 
+def _seq_ends_with_return(seq: _SeqInfo) -> bool:
+    """Return True if the last top-level statement is a non-None return.
+
+    Detects the case where the LLM includes a ``return`` statement inside the
+    duplicate block but the generated replacement omits it, producing a
+    function that silently returns ``None`` instead of the original value.
+
+    Bare ``return`` and ``return None`` are excluded: both are semantically
+    equivalent to falling off the end of a function, so dropping them in a
+    replacement causes no behavioral change.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(seq.source))
+    except SyntaxError:
+        return False
+    if not tree.body:
+        return False
+    last = tree.body[-1]
+    if not isinstance(last, ast.Return):
+        return False
+    # Bare `return` and `return None` are equivalent to implicit None return.
+    if last.value is None:
+        return False
+    if isinstance(last.value, ast.Constant) and last.value.value is None:
+        return False
+    return True
+
+
+def _replacement_contains_return(replacement: str) -> bool:
+    """Return True if *replacement* contains any return statement.
+
+    Wraps the replacement in a dummy function before parsing so that
+    ``return`` statements — which are legal inside a function body — do not
+    cause false SyntaxError rejections.
+    """
+    try:
+        wrapped = "def _check():\n" + textwrap.indent(
+            textwrap.dedent(replacement), "    "
+        )
+        tree = ast.parse(wrapped)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Return):
+            return True
+    return False
+
+
+def _helper_imports_local_name(helper_source: str, original_source: str) -> bool:
+    """Return True if helper_source imports a name that is only a local in original.
+
+    Detects the LLM mistake of writing ``import X`` in the helper when ``X``
+    was a function parameter or other local name in the original file, not an
+    importable module.  Such imports fail at runtime with ModuleNotFoundError.
+    """
+    try:
+        helper_tree = ast.parse(textwrap.dedent(helper_source))
+    except SyntaxError:
+        return False
+
+    helper_imports: set = set()
+    for node in ast.walk(helper_tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name.split(".")[0]
+                helper_imports.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name
+                helper_imports.add(name)
+
+    if not helper_imports:
+        return False
+
+    try:
+        orig_tree = ast.parse(original_source)
+    except SyntaxError:
+        return False
+
+    # Names already imported at the top level of the original file.
+    orig_top_imports: set = set()
+    for node in orig_tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name.split(".")[0]
+                orig_top_imports.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name
+                orig_top_imports.add(name)
+
+    new_helper_imports = helper_imports - orig_top_imports
+    if not new_helper_imports:
+        return False
+
+    # Parameter names in the original file (potential mock-injected locals).
+    orig_params: set = set()
+    for node in ast.walk(orig_tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
+                orig_params.add(arg.arg)
+            if node.args.vararg:
+                orig_params.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                orig_params.add(node.args.kwarg.arg)
+
+    return bool(new_helper_imports & orig_params)
+
+
 def _names_assigned_in(block_source: str) -> set:
     """Return names assigned at the top level of block_source.
 
@@ -1456,6 +1565,36 @@ class DuplicateExtractor(Refactor):
                     print(
                         f"crispen: DuplicateExtractor:   call_site_replacements: "
                         f"{call_replacements!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+
+            # Guard: if any original block ends with a return statement, the
+            # corresponding replacement must also contain one.  A missing
+            # return silently changes the function's return value to None.
+            if any(
+                _seq_ends_with_return(seq) and not _replacement_contains_return(repl)
+                for seq, repl in zip(group, call_replacements)
+            ):
+                if self.verbose:
+                    print(
+                        "crispen: DuplicateExtractor: extraction FAILED — "
+                        "block ends with return but replacement omits it",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+
+            # Guard: the helper must not import names that are only local
+            # variables or parameters in the original file.  Doing so would
+            # raise ModuleNotFoundError at runtime.
+            if _helper_imports_local_name(helper_source, source):
+                if self.verbose:
+                    print(
+                        "crispen: DuplicateExtractor: extraction FAILED — "
+                        "helper imports a name that is a parameter/local "
+                        "in the original file",
                         file=sys.stderr,
                         flush=True,
                     )

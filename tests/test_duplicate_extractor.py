@@ -40,6 +40,9 @@ from crispen.refactors.duplicate_extractor import (
     _pyflakes_new_undefined_names,
     _run_with_timeout,
     _sequence_weight,
+    _seq_ends_with_return,
+    _replacement_contains_return,
+    _helper_imports_local_name,
     _strip_helper_docstring,
     _verify_extraction,
     DuplicateExtractor,
@@ -3042,3 +3045,272 @@ def test_duplicate_extractor_custom_model_used(monkeypatch):
     # Verify the custom model was passed
     call_kwargs = mock_client.messages.create.call_args_list[0][1]
     assert call_kwargs["model"] == "claude-opus-4-6"
+
+
+# ---------------------------------------------------------------------------
+# _seq_ends_with_return
+# ---------------------------------------------------------------------------
+
+
+def test_seq_ends_with_return_true():
+    assert (
+        _seq_ends_with_return(_make_seq_with_source("    x = 1\n    return x\n"))
+        is True
+    )
+
+
+def test_seq_ends_with_return_false_no_return():
+    assert (
+        _seq_ends_with_return(_make_seq_with_source("    x = 1\n    y = 2\n")) is False
+    )
+
+
+def test_seq_ends_with_return_syntax_error():
+    assert _seq_ends_with_return(_make_seq_with_source("    (\n")) is False
+
+
+def test_seq_ends_with_return_empty_body():
+    # Pure whitespace → ast.parse produces an empty module body.
+    assert _seq_ends_with_return(_make_seq_with_source("   \n")) is False
+
+
+def test_seq_ends_with_return_bare_return():
+    # Bare `return` is equivalent to returning None — not flagged.
+    assert (
+        _seq_ends_with_return(_make_seq_with_source("    x = 1\n    return\n")) is False
+    )
+
+
+def test_seq_ends_with_return_return_none():
+    # Explicit `return None` is also equivalent to implicit None — not flagged.
+    assert (
+        _seq_ends_with_return(_make_seq_with_source("    x = 1\n    return None\n"))
+        is False
+    )
+
+
+# ---------------------------------------------------------------------------
+# _replacement_contains_return
+# ---------------------------------------------------------------------------
+
+
+def test_replacement_contains_return_true():
+    assert _replacement_contains_return("    return x\n") is True
+
+
+def test_replacement_contains_return_false():
+    assert _replacement_contains_return("    _helper()\n") is False
+
+
+def test_replacement_contains_return_syntax_error():
+    # Unclosed paren inside the wrapper → SyntaxError → False.
+    assert _replacement_contains_return("    (\n") is False
+
+
+# ---------------------------------------------------------------------------
+# _helper_imports_local_name
+# ---------------------------------------------------------------------------
+
+
+def test_helper_imports_local_name_true():
+    helper = "def _h():\n    import mock_client\n    mock_client.run()\n"
+    original = "def test(mock_client):\n    mock_client.run()\n"
+    assert _helper_imports_local_name(helper, original) is True
+
+
+def test_helper_imports_local_name_already_imported_in_original():
+    # mock_client is already a top-level import → not a local-only name.
+    helper = "def _h():\n    import mock_client\n    mock_client.run()\n"
+    original = "import mock_client\ndef test(x):\n    mock_client.run()\n"
+    assert _helper_imports_local_name(helper, original) is False
+
+
+def test_helper_imports_local_name_no_imports_in_helper():
+    helper = "def _h():\n    pass\n"
+    original = "def test(mock_client):\n    pass\n"
+    assert _helper_imports_local_name(helper, original) is False
+
+
+def test_helper_imports_local_name_syntax_error_helper():
+    assert _helper_imports_local_name("def (:\n", "def test(x):\n    pass\n") is False
+
+
+def test_helper_imports_local_name_syntax_error_original():
+    assert _helper_imports_local_name("def _h():\n    import x\n", "(:\n") is False
+
+
+def test_helper_imports_local_name_from_import_in_helper():
+    # "from X import Y" in helper: the tracked name is "Y", not "X".
+    # If "Y" is a param in the original, it is flagged.
+    helper = "def _h():\n    from pkg import mock_client\n    mock_client.run()\n"
+    original = "def test(mock_client):\n    mock_client.run()\n"
+    assert _helper_imports_local_name(helper, original) is True
+
+
+def test_helper_imports_local_name_from_import_in_original():
+    # Top-level "from pkg import something" in the original covers the branch
+    # in the orig_top_imports loop and prevents false-positive flagging.
+    helper = "def _h():\n    import something\n    something.run()\n"
+    original = "from pkg import something\ndef test(x):\n    something.run()\n"
+    assert _helper_imports_local_name(helper, original) is False
+
+
+def test_helper_imports_local_name_vararg():
+    # Function with *args: vararg name tracked as potential local.
+    helper = "def _h():\n    import args\n"
+    original = "def test(*args):\n    pass\n"
+    assert _helper_imports_local_name(helper, original) is True
+
+
+def test_helper_imports_local_name_kwarg():
+    # Function with **kwargs: kwarg name tracked as potential local.
+    helper = "def _h():\n    import kwargs\n"
+    original = "def test(**kwargs):\n    pass\n"
+    assert _helper_imports_local_name(helper, original) is True
+
+
+# ---------------------------------------------------------------------------
+# Integration: block-ends-with-return guard
+# ---------------------------------------------------------------------------
+
+_RETURN_BLOCK_SOURCE = textwrap.dedent(
+    """\
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        return y
+
+    def bar():
+        x = compute(data)
+        y = transform(x)
+        return y
+    """
+)
+_RETURN_BLOCK_RANGES = [(7, 9)]  # overlaps bar's body
+
+
+def _make_return_block_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            "helper_source": (
+                "def _helper():\n"
+                "    x = compute(data)\n"
+                "    y = transform(x)\n"
+                "    return y\n"
+            ),
+            # replacement drops the return — this is the bug being guarded
+            "call_site_replacements": [
+                "    _helper()\n",
+                "    _helper()\n",
+            ],
+        }
+    )
+
+
+def test_block_ends_with_return_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when block ends with return but replacement omits it."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_return_block_extract_response(),
+        ]
+        de = DuplicateExtractor(_RETURN_BLOCK_RANGES, source=_RETURN_BLOCK_SOURCE)
+    assert de._new_source is None
+    assert "block ends with return but replacement omits it" in capsys.readouterr().err
+
+
+def test_block_ends_with_return_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_return_block_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _RETURN_BLOCK_RANGES, source=_RETURN_BLOCK_SOURCE, verbose=False
+        )
+    assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# Integration: helper-imports-local-name guard
+# ---------------------------------------------------------------------------
+
+_PARAM_DUP_SOURCE = textwrap.dedent(
+    """\
+    def test_a(mock_client):
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+
+    def test_b(mock_client):
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_PARAM_DUP_RANGES = [(7, 9)]  # overlaps test_b's body
+
+
+def _make_import_local_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            # helper imports mock_client instead of taking it as a parameter
+            "helper_source": (
+                "def _helper():\n"
+                "    import mock_client\n"
+                "    x = compute(data)\n"
+                "    y = transform(x)\n"
+                "    z = finalize(y)\n"
+            ),
+            "call_site_replacements": [
+                "    _helper()\n",
+                "    _helper()\n",
+            ],
+        }
+    )
+
+
+def test_helper_imports_local_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when helper imports a name that is a param in original."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_import_local_extract_response(),
+        ]
+        de = DuplicateExtractor(_PARAM_DUP_RANGES, source=_PARAM_DUP_SOURCE)
+    assert de._new_source is None
+    assert "helper imports a name that is a parameter/local" in capsys.readouterr().err
+
+
+def test_helper_imports_local_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_import_local_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _PARAM_DUP_RANGES, source=_PARAM_DUP_SOURCE, verbose=False
+        )
+    assert de._new_source is None
