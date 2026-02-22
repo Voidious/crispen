@@ -766,6 +766,26 @@ def _collect_attribute_names(source: str) -> set:
     return {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
 
 
+def _collect_called_attr_names(source: str) -> set:
+    """Return attribute names used as method calls in *source*.
+
+    Unlike :func:`_collect_attribute_names`, this only returns names that
+    appear as the attribute of a call expression (i.e. ``obj.method(...)``).
+    Plain attribute reads and type annotations like ``ast.AST`` are ignored,
+    so the new-method-call check does not produce false positives for
+    standard-library type references.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+
 def _has_call_to(func_name: str, source: str) -> bool:
     """Return True if func_name is called anywhere in source.
 
@@ -812,7 +832,14 @@ def _verify_extraction(
             return False
     for replacement in call_replacements:
         dedented = textwrap.dedent(replacement)
-        wrapped = "def _check():\n" + textwrap.indent(dedented, "    ")
+        # Wrap in a dummy function that contains a for loop so that
+        # ``return`` / ``yield`` (valid inside a function body) AND
+        # ``continue`` / ``break`` (valid inside a loop body) do not cause
+        # false SyntaxError rejections.  Replacements are always placed back
+        # inside the caller's original context, which may include a loop.
+        wrapped = "def _check():\n    for _ in []:\n" + textwrap.indent(
+            dedented, "        "
+        )
         try:
             compile(wrapped, "<replacement>", "exec")
         except SyntaxError:
@@ -1397,9 +1424,9 @@ class DuplicateExtractor(Refactor):
                     )
                 continue
 
-            new_attrs = _collect_attribute_names(
+            new_attrs = _collect_called_attr_names(
                 textwrap.dedent(helper_source)
-            ) - _collect_attribute_names(source)
+            ) - _collect_called_attr_names(source)
             if new_attrs:
                 if self.verbose:
                     print(

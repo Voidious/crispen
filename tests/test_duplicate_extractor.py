@@ -12,6 +12,7 @@ from crispen.refactors.duplicate_extractor import (
     _ApiTimeout,
     _build_helper_insertion,
     _collect_attribute_names,
+    _collect_called_attr_names,
     _extract_defined_names,
     _FunctionCollector,
     _FunctionInfo,
@@ -434,6 +435,21 @@ def test_verify_extraction_allows_multiline_return_replacement():
     assert _verify_extraction(helper, replacements) is True
 
 
+def test_verify_extraction_allows_continue_in_replacement():
+    # 'continue' is valid inside a loop body; the dummy wrapper now includes a
+    # for loop so this is not rejected as a SyntaxError.
+    helper = "def helper():\n    pass\n"
+    replacements = ["    if done:\n        continue\n"]
+    assert _verify_extraction(helper, replacements) is True
+
+
+def test_verify_extraction_allows_break_in_replacement():
+    # Same as above but for 'break'.
+    helper = "def helper():\n    pass\n"
+    replacements = ["    if done:\n        break\n"]
+    assert _verify_extraction(helper, replacements) is True
+
+
 # ---------------------------------------------------------------------------
 # _has_mutable_literal_is_check
 # ---------------------------------------------------------------------------
@@ -516,6 +532,36 @@ def test_collect_attribute_names_syntax_error():
 
 def test_collect_attribute_names_no_attrs():
     assert _collect_attribute_names("x = 1 + 2") == set()
+
+
+# ---------------------------------------------------------------------------
+# _collect_called_attr_names
+# ---------------------------------------------------------------------------
+
+
+def test_collect_called_attr_names_method_call():
+    # obj.foo() → "foo" is a called attribute
+    assert _collect_called_attr_names("obj.foo()") == {"foo"}
+
+
+def test_collect_called_attr_names_ignores_plain_access():
+    # obj.bar (not called) → not included
+    assert "bar" not in _collect_called_attr_names("x = obj.bar")
+
+
+def test_collect_called_attr_names_ignores_type_annotation():
+    # ast.AST used as a type annotation is NOT a method call → not flagged
+    assert "AST" not in _collect_called_attr_names(
+        "def f(x) -> Optional[ast.AST]: pass"
+    )
+
+
+def test_collect_called_attr_names_syntax_error():
+    assert _collect_called_attr_names("def f(x:") == set()
+
+
+def test_collect_called_attr_names_no_calls():
+    assert _collect_called_attr_names("x = 1 + 2") == set()
 
 
 # ---------------------------------------------------------------------------
