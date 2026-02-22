@@ -519,6 +519,22 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
+def _call_llm_for_duplicate_check(client, provider, model, prompt):
+    result = _llm_client.call_with_tool(
+        client,
+        provider,
+        model,
+        256,
+        _VETO_TOOL,
+        "evaluate_duplicate",
+        [{"role": "user", "content": prompt}],
+        caller="DuplicateExtractor",
+    )
+    if result is not None:
+        return result["is_valid_duplicate"], result.get("reason", "")
+    return False, "no tool response"  # pragma: no cover
+
+
 def _llm_veto(
     client,
     group: List[_SeqInfo],
@@ -537,19 +553,7 @@ def _llm_veto(
         "a shared helper function would improve clarity? Or are they coincidentally "
         "similar but conceptually distinct?"
     )
-    result = _llm_client.call_with_tool(
-        client,
-        provider,
-        model,
-        256,
-        _VETO_TOOL,
-        "evaluate_duplicate",
-        [{"role": "user", "content": prompt}],
-        caller="DuplicateExtractor",
-    )
-    if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+    return _call_llm_for_duplicate_check(client, provider, model, prompt)
 
 
 def _llm_extract(
@@ -645,19 +649,7 @@ def _llm_veto_func_match(
         "body, such that it could be replaced by a call to the function? "
         "Use the evaluate_duplicate tool to answer."
     )
-    result = _llm_client.call_with_tool(
-        client,
-        provider,
-        model,
-        256,
-        _VETO_TOOL,
-        "evaluate_duplicate",
-        [{"role": "user", "content": prompt}],
-        caller="DuplicateExtractor",
-    )
-    if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+    return _call_llm_for_duplicate_check(client, provider, model, prompt)
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
@@ -729,6 +721,16 @@ def _normalize_replacement_indentation(seq: _SeqInfo, replacement: str) -> str:
 _MUTABLE_CONSTRUCTORS = frozenset({"set", "list", "dict", "frozenset", "bytearray"})
 
 
+def _safe_parse_ast(source: str, original: bool = False):
+    try:
+        if original:
+            return ast.parse(source)
+        else:
+            return ast.parse(source)
+    except SyntaxError:
+        return False
+
+
 def _has_mutable_literal_is_check(source: str) -> bool:
     """Return True if *source* contains identity checks against mutable literals.
 
@@ -736,9 +738,8 @@ def _has_mutable_literal_is_check(source: str) -> bool:
     False in Python because each literal creates a new object at runtime.
     Such patterns are a common LLM mistake when using a ``set()`` sentinel.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _safe_parse_ast(source)
+    if tree is False:
         return False
     for node in ast.walk(tree):
         if not isinstance(node, ast.Compare):
@@ -793,9 +794,8 @@ def _has_call_to(func_name: str, source: str) -> bool:
     (``obj.func_name(...)``), covering both module-level helpers and
     staticmethod calls.  Returns False if source cannot be parsed.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _safe_parse_ast(source)
+    if tree is False:
         return False
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -963,6 +963,17 @@ def _replacement_contains_return(replacement: str) -> bool:
     return False
 
 
+def _collect_import_names(node, target_set):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name.split(".")[0]
+            target_set.add(name)
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            target_set.add(name)
+
+
 def _helper_imports_local_name(helper_source: str, original_source: str) -> bool:
     """Return True if helper_source imports a name that is only a local in original.
 
@@ -977,34 +988,19 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
 
     helper_imports: set = set()
     for node in ast.walk(helper_tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                helper_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                helper_imports.add(name)
+        _collect_import_names(node, helper_imports)
 
     if not helper_imports:
         return False
 
-    try:
-        orig_tree = ast.parse(original_source)
-    except SyntaxError:
+    orig_tree = _safe_parse_ast(original_source, original=True)
+    if orig_tree is False:
         return False
 
     # Names already imported at the top level of the original file.
     orig_top_imports: set = set()
     for node in orig_tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                orig_top_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                orig_top_imports.add(name)
+        _collect_import_names(node, orig_top_imports)
 
     new_helper_imports = helper_imports - orig_top_imports
     if not new_helper_imports:

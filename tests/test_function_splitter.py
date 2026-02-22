@@ -1029,21 +1029,23 @@ def test_function_collector_class_method():
     assert collector.functions[0].indent == "    "
 
 
-def test_function_collector_skips_async():
-    src = "async def foo():\n    pass\n"
+def _collect_functions_from_source(src):
     tree = cst.parse_module(src)
     wrapper = MetadataWrapper(tree)
     collector = _FunctionCollector()
     wrapper.visit(collector)
+    return collector
+
+
+def test_function_collector_skips_async():
+    src = "async def foo():\n    pass\n"
+    collector = _collect_functions_from_source(src)
     assert len(collector.functions) == 0
 
 
 def test_function_collector_skips_generator():
     src = "def gen():\n    yield 1\n"
-    tree = cst.parse_module(src)
-    wrapper = MetadataWrapper(tree)
-    collector = _FunctionCollector()
-    wrapper.visit(collector)
+    collector = _collect_functions_from_source(src)
     assert len(collector.functions) == 0
 
 
@@ -1058,10 +1060,7 @@ def test_function_collector_skips_nested_functions():
             return inner
     """
     )
-    tree = cst.parse_module(src)
-    wrapper = MetadataWrapper(tree)
-    collector = _FunctionCollector()
-    wrapper.visit(collector)
+    collector = _collect_functions_from_source(src)
     # outer has a nested funcdef → skipped; inner is in a function scope → skipped
     assert len(collector.functions) == 0
 
@@ -1106,16 +1105,21 @@ def test_llm_name_helpers_success(mock_anthropic):
     assert result == ["process_tail"]
 
 
+def _run_llm_name_test(mock_response, mock_anthropic, task_name="my_func"):
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = mock_response
+
+    tasks = [_make_task(task_name)]
+    client = mock_anthropic.Anthropic.return_value
+    result = _llm_name_helpers(client, "claude-sonnet-4-6", "anthropic", tasks)
+    return result
+
+
 @patch("crispen.llm_client.anthropic")
 def test_llm_name_helpers_result_none(mock_anthropic):
     # LLM returns no tool use block
     mock_response = MagicMock()
     mock_response.content = []
-    mock_anthropic.Anthropic.return_value.messages.create.return_value = mock_response
-
-    tasks = [_make_task("my_func")]
-    client = mock_anthropic.Anthropic.return_value
-    result = _llm_name_helpers(client, "claude-sonnet-4-6", "anthropic", tasks)
+    result = _run_llm_name_test(mock_response, mock_anthropic)
     # Falls back to "my_func_helper"
     assert result == ["my_func_helper"]
 
@@ -1129,11 +1133,7 @@ def test_llm_name_helpers_no_names_key(mock_anthropic):
     mock_block.input = {"something_else": []}
     mock_response = MagicMock()
     mock_response.content = [mock_block]
-    mock_anthropic.Anthropic.return_value.messages.create.return_value = mock_response
-
-    tasks = [_make_task("my_func")]
-    client = mock_anthropic.Anthropic.return_value
-    result = _llm_name_helpers(client, "claude-sonnet-4-6", "anthropic", tasks)
+    result = _run_llm_name_test(mock_response, mock_anthropic)
     assert result == ["my_func_helper"]
 
 
@@ -1562,6 +1562,15 @@ def test_has_new_undefined_names_exception():
         assert _has_new_undefined_names("x = 1\n", "y = 1\n") is False
 
 
+def _create_splitter_with_test_key(source, ranges=None, max_lines=50, verbose=False):
+    if ranges is None:
+        ranges = [(1, 1000)]
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        return FunctionSplitter(
+            ranges, source=source, verbose=verbose, max_lines=max_lines
+        )
+
+
 @patch(
     "crispen.refactors.function_splitter._has_new_undefined_names", return_value=True
 )
@@ -1573,10 +1582,7 @@ def test_function_splitter_pyflakes_rejects_output(mock_anthropic, mock_has_unde
     )
     src = _make_long_func(80, "foo")
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=50
-        )
+    splitter = _create_splitter_with_test_key(src)
 
     # Pyflakes check returned True → split not applied
     assert splitter.get_rewritten_source() is None
@@ -1622,10 +1628,7 @@ def test_function_splitter_skips_name_collision(mock_anthropic):
     existing = "def _helper():\n    pass\n\n\n"
     src = existing + _make_long_func(80)
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=50
-        )
+    splitter = _create_splitter_with_test_key(src)
 
     # collision detected → task dropped → no rewrite
     assert splitter.get_rewritten_source() is None
