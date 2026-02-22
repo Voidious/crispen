@@ -23,6 +23,37 @@ _MAX_SPLIT_CANDIDATES = 5  # split points tried per function
 _BUILTINS: frozenset = frozenset(dir(builtins))
 
 
+def _module_global_names(source: str) -> set:
+    """Return all names defined at module level in *source*.
+
+    Covers function/class definitions, imports, and simple (annotated)
+    assignments.  Module-level names are always accessible inside helpers
+    without being passed as parameters, so they must be excluded from the
+    helper's param list.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set = set()
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
 # ---------------------------------------------------------------------------
 # Hard-timeout helper
 # ---------------------------------------------------------------------------
@@ -463,11 +494,15 @@ def _choose_best_split(
     source_lines: List[str],
     positions: Dict,
     orig_params: List[str],
+    module_globals: set = frozenset(),
 ) -> Optional[Tuple[int, List[str]]]:
     """Choose split with fewest free variables; ties broken by latest split.
 
     Returns None if every candidate requires passing ``self`` as a plain
     parameter to a static helper (semantically incorrect for methods).
+
+    ``module_globals`` names are excluded from the helper's param list: they
+    are always accessible at module scope without being passed explicitly.
     """
     best_idx: Optional[int] = None
     best_params: List[str] = []
@@ -479,7 +514,7 @@ def _choose_best_split(
     for split_idx in valid_splits:
         tail_stmts = body_stmts[split_idx:]
         tail_src = _stmts_source(tail_stmts, source_lines, positions)
-        free = _find_free_vars(tail_src)
+        free = [v for v in _find_free_vars(tail_src) if v not in module_globals]
         if is_method and "self" in free:
             continue  # skip: tail needs instance state
         if best_idx is None or len(free) < len(best_params):
@@ -760,6 +795,7 @@ class FunctionSplitter(Refactor):
             wrapper.visit(collector)
 
             # 2. For each function in changed ranges: check limits, plan splits
+            module_globals = _module_global_names(current)
             tasks: List[_SplitTask] = []
             for func_info in collector.functions:
                 if not _func_in_changed_range(func_info, self.changed_ranges):
@@ -787,6 +823,7 @@ class FunctionSplitter(Refactor):
                     source_lines,
                     positions,
                     func_info.original_params,
+                    module_globals,
                 )
                 if best is None:
                     continue
