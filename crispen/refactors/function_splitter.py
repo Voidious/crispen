@@ -219,18 +219,20 @@ def _cyclomatic_complexity(func_source: str) -> int:
 def _find_free_vars(tail_source: str) -> List[str]:
     """Return sorted free variables of tail_source (excluding builtins).
 
-    Uses scope-aware analysis so that variables are only considered locally
-    defined when they are unconditionally assigned at the top level of the
-    tail.  Specifically:
+    Uses scope-aware analysis with sequential block tracking so that
+    write-before-read patterns within any nested block do not produce
+    false positives.  Specifically:
 
+    * Statements are walked in order at every nesting level.  A variable
+      assigned before it is read within the same block is not free.
     * ``for``-loop targets, ``with``-statement targets, and
-      ``except``-handler names are locally scoped within their body and
-      are NOT treated as free variables when used there.
+      ``except``-handler names are locally scoped within their body.
     * Augmented assignments (``x += 1``) treat the target as a *load*
       because the current value of the variable must exist beforehand.
-    * Nested/conditional assignments (inside ``if``, ``for``, ``while``,
-      ``try``, ``with``) do NOT count as top-level definitions, so
-      variables that are only conditionally assigned remain free.
+    * Assignments in a ``try`` body propagate to code after the try block
+      (optimistic: if execution reaches past the try, the body completed).
+    * Assignments in ``if``, ``for``, ``while``, and ``with`` bodies do
+      NOT propagate to after those constructs (conditional execution).
     * Does not recurse into nested ``def``/``class`` bodies.
     """
     try:
@@ -251,12 +253,39 @@ def _find_free_vars(tail_source: str) -> List[str]:
             return names
         return set()
 
+    def _update_scope(stmt, defined: set) -> None:
+        """Widen *defined* with names unconditionally defined by *stmt*."""
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                defined |= _target_names(target)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defined.add(stmt.name)
+        elif isinstance(stmt, ast.ClassDef):
+            defined.add(stmt.name)
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            for alias in stmt.names:
+                defined.add(alias.asname if alias.asname else alias.name.split(".")[0])
+        elif (
+            isinstance(stmt, ast.AnnAssign)
+            and stmt.value is not None
+            and isinstance(stmt.target, ast.Name)
+        ):
+            defined.add(stmt.target.id)
+        # AugAssign, For, While, If, Try, With, Delete: NOT added.
+
+    def _walk_block(stmts, defined: set) -> set:
+        """Walk *stmts* sequentially; collect loads; return updated scope."""
+        local = set(defined)
+        for stmt in stmts:
+            _collect_loads(stmt, local)
+            _update_scope(stmt, local)
+        return local
+
     def _collect_loads(node, defined: set) -> None:
         """Recursively collect Name loads not already in *defined*.
 
-        *defined* is the set of names that are definitely locally bound in
-        the current scope at this point.  Does not recurse into nested
-        function/class definitions.
+        *defined* is the set of names definitely locally bound at this
+        point.  Does not recurse into nested function/class definitions.
         """
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             return  # don't recurse into nested scopes
@@ -270,17 +299,34 @@ def _find_free_vars(tail_source: str) -> List[str]:
             # ``x += expr`` reads x before writing — treat target as a load.
             if isinstance(node.target, ast.Name) and node.target.id not in defined:
                 loads.add(node.target.id)
-            # For subscript/attribute targets also recurse to collect their loads.
             _collect_loads(node.target, defined)
             _collect_loads(node.value, defined)
             return
         if isinstance(node, ast.For):
             _collect_loads(node.iter, defined)
             local = defined | _target_names(node.target)
-            for child in node.body:
-                _collect_loads(child, local)
-            for child in node.orelse:
-                _collect_loads(child, defined)
+            _walk_block(node.body, local)
+            _walk_block(node.orelse, defined)
+            return
+        if isinstance(node, ast.While):
+            _collect_loads(node.test, defined)
+            _walk_block(node.body, defined)
+            _walk_block(node.orelse, defined)
+            return
+        if isinstance(node, ast.If):
+            _collect_loads(node.test, defined)
+            _walk_block(node.body, defined)
+            _walk_block(node.orelse, defined)
+            return
+        if isinstance(node, ast.Try):
+            local_try = _walk_block(node.body, defined)
+            # Propagate try-body definitions to the outer scope: if execution
+            # reaches past the try block the try body must have completed.
+            defined |= local_try - defined
+            for handler in node.handlers:
+                _collect_loads(handler, defined)
+            _walk_block(node.orelse, local_try)
+            _walk_block(node.finalbody, defined)
             return
         if isinstance(node, ast.With):
             local = set(defined)
@@ -288,15 +334,15 @@ def _find_free_vars(tail_source: str) -> List[str]:
                 _collect_loads(item.context_expr, defined)
                 if item.optional_vars:
                     local |= _target_names(item.optional_vars)
-            for child in node.body:
-                _collect_loads(child, local)
+            _walk_block(node.body, local)
             return
         if isinstance(node, ast.ExceptHandler):
             local = set(defined)
             if node.name:
                 local.add(node.name)
-            for child in ast.iter_child_nodes(node):
-                _collect_loads(child, local)
+            if node.type is not None:
+                _collect_loads(node.type, defined)
+            _walk_block(node.body, local)
             return
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
             _collect_comp(node.generators, [node.elt], defined)
@@ -318,32 +364,7 @@ def _find_free_vars(tail_source: str) -> List[str]:
         for elt in elts:
             _collect_loads(elt, local)
 
-    # Process top-level statements in order so that unconditional definitions
-    # propagate to later statements.
-    definitely_defined: set = set()
-    for stmt in tree.body:
-        _collect_loads(stmt, definitely_defined)
-        # Only unconditional top-level assignments widen definitely_defined.
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                definitely_defined |= _target_names(target)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            definitely_defined.add(stmt.name)
-        elif isinstance(stmt, ast.ClassDef):
-            definitely_defined.add(stmt.name)
-        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            for alias in stmt.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                definitely_defined.add(name)
-        elif (
-            isinstance(stmt, ast.AnnAssign)
-            and stmt.value is not None
-            and isinstance(stmt.target, ast.Name)
-        ):
-            definitely_defined.add(stmt.target.id)
-        # AugAssign, For, While, If, Try, With, Delete: NOT added to
-        # definitely_defined because they are conditional or read-before-write.
-
+    _walk_block(tree.body, set())
     return sorted(loads - _BUILTINS)
 
 
