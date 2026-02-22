@@ -562,11 +562,23 @@ def _llm_extract(
     helper_docstrings: bool = True,
     provider: str = "anthropic",
 ) -> Optional[dict]:
-    blocks_text = "\n\n".join(
-        f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
-        f"```python\n{s.source.rstrip()}\n```"
-        for i, s in enumerate(group)
-    )
+    src_lines = full_source.splitlines(keepends=True)
+    block_entries = []
+    for i, s in enumerate(group):
+        entry = (
+            f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
+            f"```python\n{s.source.rstrip()}\n```"
+        )
+        next_idx = s.end_line  # 0-based index of the first line after the block
+        if next_idx < len(src_lines):
+            next_line = src_lines[next_idx].rstrip()
+            if next_line.strip():
+                entry += (
+                    f"\nLine immediately after this block"
+                    f" (must NOT appear in the replacement): `{next_line}`"
+                )
+        block_entries.append(entry)
+    blocks_text = "\n\n".join(block_entries)
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
     escaping_note = ""
     if escaping_vars:
@@ -600,7 +612,8 @@ def _llm_extract(
         "Return complete, valid Python for the helper and each call site replacement. "
         "Each call site replacement must start with the same leading indentation as "
         "the block it replaces, end with a trailing newline, and cover only the exact "
-        "lines of the duplicate block — do not include any code from before or after "
+        "lines of the duplicate block — stopping before the 'Line immediately after "
+        "this block' marker shown above. Do not include any code from before or after "
         "the block. "
         "Double-check that only required parameters are passed to the helper — do not "
         "include an unused parameter, or one that is overwritten before being read. "
@@ -963,6 +976,29 @@ def _replacement_contains_return(replacement: str) -> bool:
         return False
     for node in ast.walk(tree):
         if isinstance(node, ast.Return):
+            return True
+    return False
+
+
+def _replacement_steals_post_block_line(
+    group: List[_SeqInfo], call_replacements: List[str], source_lines: List[str]
+) -> bool:
+    """Return True if any replacement's last line duplicates the line after its block.
+
+    The LLM occasionally appends the first statement *after* the replaced block
+    to the end of the replacement text.  When applied, that statement then appears
+    twice in the assembled output: once inside the replacement and once as the
+    original untouched line.
+    """
+    for seq, replacement in zip(group, call_replacements):
+        next_idx = seq.end_line  # 0-based index of the first line after the block
+        if next_idx >= len(source_lines):
+            continue
+        post_block = source_lines[next_idx].strip()
+        if not post_block:
+            continue
+        repl_lines = [ln.strip() for ln in replacement.splitlines() if ln.strip()]
+        if repl_lines and repl_lines[-1] == post_block:
             return True
     return False
 
@@ -1551,6 +1587,21 @@ class DuplicateExtractor(Refactor):
                 _normalize_replacement_indentation(seq, r)
                 for seq, r in zip(group, call_replacements)
             ]
+
+            # Guard: reject if any replacement "steals" the first line after the
+            # block.  The LLM sometimes appends the post-block statement to the
+            # replacement, causing it to appear twice in the assembled output.
+            if _replacement_steals_post_block_line(
+                group, call_replacements, source_lines
+            ):
+                if self.verbose:
+                    print(
+                        "crispen: DuplicateExtractor: extraction FAILED — "
+                        "replacement duplicates the line after the block",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
 
             if not _verify_extraction(helper_source, call_replacements):
                 if self.verbose:
