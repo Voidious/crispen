@@ -74,7 +74,7 @@ def call_with_tool(
                 model=model,
                 max_tokens=max_tokens,
                 tools=[openai_tool],
-                tool_choice="auto",
+                tool_choice="required",
                 messages=messages,
             )
         except openai.APIError as exc:
