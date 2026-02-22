@@ -219,7 +219,19 @@ def _cyclomatic_complexity(func_source: str) -> int:
 def _find_free_vars(tail_source: str) -> List[str]:
     """Return sorted free variables of tail_source (excluding builtins).
 
-    Does not recurse into nested function/class definitions.
+    Uses scope-aware analysis so that variables are only considered locally
+    defined when they are unconditionally assigned at the top level of the
+    tail.  Specifically:
+
+    * ``for``-loop targets, ``with``-statement targets, and
+      ``except``-handler names are locally scoped within their body and
+      are NOT treated as free variables when used there.
+    * Augmented assignments (``x += 1``) treat the target as a *load*
+      because the current value of the variable must exist beforehand.
+    * Nested/conditional assignments (inside ``if``, ``for``, ``while``,
+      ``try``, ``with``) do NOT count as top-level definitions, so
+      variables that are only conditionally assigned remain free.
+    * Does not recurse into nested ``def``/``class`` bodies.
     """
     try:
         tree = ast.parse(tail_source)
@@ -227,30 +239,112 @@ def _find_free_vars(tail_source: str) -> List[str]:
         return []
 
     loads: set = set()
-    stores: set = set()
 
-    def _walk(nodes) -> None:
-        for node in nodes:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                stores.add(node.name)
-                continue  # don't recurse
-            if isinstance(node, ast.ClassDef):
-                stores.add(node.name)
-                continue  # don't recurse
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    name = alias.asname if alias.asname else alias.name.split(".")[0]
-                    stores.add(name)
-                continue
-            if isinstance(node, ast.Name):
-                if isinstance(node.ctx, ast.Load):
-                    loads.add(node.id)
-                else:
-                    stores.add(node.id)
-            _walk(ast.iter_child_nodes(node))
+    def _target_names(target) -> set:
+        """Collect all plain Name identifiers bound by an assignment target."""
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names: set = set()
+            for elt in target.elts:
+                names |= _target_names(elt)
+            return names
+        return set()
 
-    _walk(ast.iter_child_nodes(tree))
-    return sorted(loads - stores - _BUILTINS)
+    def _collect_loads(node, defined: set) -> None:
+        """Recursively collect Name loads not already in *defined*.
+
+        *defined* is the set of names that are definitely locally bound in
+        the current scope at this point.  Does not recurse into nested
+        function/class definitions.
+        """
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return  # don't recurse into nested scopes
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return  # imports only produce stores
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load) and node.id not in defined:
+                loads.add(node.id)
+            return
+        if isinstance(node, ast.AugAssign):
+            # ``x += expr`` reads x before writing — treat target as a load.
+            if isinstance(node.target, ast.Name) and node.target.id not in defined:
+                loads.add(node.target.id)
+            # For subscript/attribute targets also recurse to collect their loads.
+            _collect_loads(node.target, defined)
+            _collect_loads(node.value, defined)
+            return
+        if isinstance(node, ast.For):
+            _collect_loads(node.iter, defined)
+            local = defined | _target_names(node.target)
+            for child in node.body:
+                _collect_loads(child, local)
+            for child in node.orelse:
+                _collect_loads(child, defined)
+            return
+        if isinstance(node, ast.With):
+            local = set(defined)
+            for item in node.items:
+                _collect_loads(item.context_expr, defined)
+                if item.optional_vars:
+                    local |= _target_names(item.optional_vars)
+            for child in node.body:
+                _collect_loads(child, local)
+            return
+        if isinstance(node, ast.ExceptHandler):
+            local = set(defined)
+            if node.name:
+                local.add(node.name)
+            for child in ast.iter_child_nodes(node):
+                _collect_loads(child, local)
+            return
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            _collect_comp(node.generators, [node.elt], defined)
+            return
+        if isinstance(node, ast.DictComp):
+            _collect_comp(node.generators, [node.key, node.value], defined)
+            return
+        for child in ast.iter_child_nodes(node):
+            _collect_loads(child, defined)
+
+    def _collect_comp(generators, elts, defined: set) -> None:
+        """Walk a comprehension's generators then its element expression(s)."""
+        local = set(defined)
+        for gen in generators:
+            _collect_loads(gen.iter, local)
+            local |= _target_names(gen.target)
+            for cond in gen.ifs:
+                _collect_loads(cond, local)
+        for elt in elts:
+            _collect_loads(elt, local)
+
+    # Process top-level statements in order so that unconditional definitions
+    # propagate to later statements.
+    definitely_defined: set = set()
+    for stmt in tree.body:
+        _collect_loads(stmt, definitely_defined)
+        # Only unconditional top-level assignments widen definitely_defined.
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                definitely_defined |= _target_names(target)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            definitely_defined.add(stmt.name)
+        elif isinstance(stmt, ast.ClassDef):
+            definitely_defined.add(stmt.name)
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            for alias in stmt.names:
+                name = alias.asname if alias.asname else alias.name.split(".")[0]
+                definitely_defined.add(name)
+        elif (
+            isinstance(stmt, ast.AnnAssign)
+            and stmt.value is not None
+            and isinstance(stmt.target, ast.Name)
+        ):
+            definitely_defined.add(stmt.target.id)
+        # AugAssign, For, While, If, Try, With, Delete: NOT added to
+        # definitely_defined because they are conditional or read-before-write.
+
+    return sorted(loads - _BUILTINS)
 
 
 # ---------------------------------------------------------------------------
