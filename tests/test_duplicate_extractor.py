@@ -987,7 +987,7 @@ def test_build_helper_insertion_strips_extra_newlines_from_helper():
     assert "\n\n\n\ndef _helper" not in text  # no extra leading blanks inside text
 
 
-def test_successful_extraction_has_two_blank_lines(monkeypatch):
+def _make_standard_extractor_setup(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     source = textwrap.dedent(
         """\
@@ -1005,6 +1005,11 @@ def test_successful_extraction_has_two_blank_lines(monkeypatch):
         """
     )
     helper = "def _helper(data):\n    pass\n"
+    return source, helper
+
+
+def test_successful_extraction_has_two_blank_lines(monkeypatch):
+    source, helper = _make_standard_extractor_setup(monkeypatch)
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
@@ -1344,13 +1349,7 @@ def test_missing_api_key_raises(monkeypatch):
 
 
 def _make_veto_response(is_valid: bool, reason: str = "test") -> MagicMock:
-    block = MagicMock()
-    block.type = "tool_use"
-    block.name = "evaluate_duplicate"
-    block.input = {"is_valid_duplicate": is_valid, "reason": reason}
-    resp = MagicMock()
-    resp.content = [block]
-    return resp
+    return _make_veto_func_match_response(is_valid, reason)
 
 
 def _make_extract_response(data: dict) -> MagicMock:
@@ -1428,23 +1427,27 @@ def test_veto_rejects_no_changes(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _setup_wrong_replacement_count_mock(mock_anthropic):
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    mock_client.messages.create.side_effect = [
+        _make_veto_response(True),
+        _make_extract_response(
+            {
+                "function_name": "helper",
+                "placement": "module_level",
+                "helper_source": "def helper():\n    pass\n",
+                "call_site_replacements": ["helper()\n"],  # should be 2
+            }
+        ),
+    ]
+
+
 def test_wrong_replacement_count_skipped(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True),
-            _make_extract_response(
-                {
-                    "function_name": "helper",
-                    "placement": "module_level",
-                    "helper_source": "def helper():\n    pass\n",
-                    "call_site_replacements": ["helper()\n"],  # should be 2
-                }
-            ),
-        ]
+        _setup_wrong_replacement_count_mock(mock_anthropic)
 
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE)
 
@@ -1455,20 +1458,7 @@ def test_wrong_replacement_count_skipped_verbose_false(monkeypatch):
     # verbose=False covers the False branch of the new if-self.verbose guard.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True),
-            _make_extract_response(
-                {
-                    "function_name": "helper",
-                    "placement": "module_level",
-                    "helper_source": "def helper():\n    pass\n",
-                    "call_site_replacements": ["helper()\n"],  # should be 2
-                }
-            ),
-        ]
+        _setup_wrong_replacement_count_mock(mock_anthropic)
 
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
 
@@ -1524,6 +1514,27 @@ def test_escaping_vars_passed_to_extract(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _configure_mock_anthropic_client(mock_anthropic, verbose):
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    mock_client.messages.create.side_effect = [
+        _make_veto_response(True, "same logic"),
+        _make_extract_response(
+            {
+                "function_name": "_helper",
+                "placement": "module_level",
+                "helper_source": "def _helper(x):\n    pass\n",
+                "call_site_replacements": [
+                    "    _helper(data)\n",
+                    "    _helper(data)\n",
+                ],
+            }
+        ),
+    ]
+    return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+
+
 def _make_invalid_assembled_extractor(monkeypatch, verbose=True):
     """Helper: DuplicateExtractor where _apply_edits returns invalid Python."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
@@ -1534,24 +1545,7 @@ def _make_invalid_assembled_extractor(monkeypatch, verbose=True):
             return_value="def f(:\n    pass\n",  # invalid Python
         ),
     ):
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": "def _helper(x):\n    pass\n",
-                    "call_site_replacements": [
-                        "    _helper(data)\n",
-                        "    _helper(data)\n",
-                    ],
-                }
-            ),
-        ]
-        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+        return _configure_mock_anthropic_client(mock_anthropic, verbose)
 
 
 def test_invalid_assembled_source_skipped(monkeypatch):
@@ -1584,24 +1578,7 @@ def _make_pyflakes_check_extractor(monkeypatch, verbose=True):
             return_value={"mock_client"},
         ),
     ):
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": "def _helper(x):\n    pass\n",
-                    "call_site_replacements": [
-                        "    _helper(data)\n",
-                        "    _helper(data)\n",
-                    ],
-                }
-            ),
-        ]
-        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+        return _configure_mock_anthropic_client(mock_anthropic, verbose)
 
 
 def test_pyflakes_check_skips_group_verbose(monkeypatch, capsys):
@@ -1624,26 +1601,31 @@ def test_pyflakes_check_skips_group_verbose_false(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _setup_mock_client_with_veto_and_extract(mock_anthropic):
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    mock_client.messages.create.side_effect = [
+        _make_veto_response(True),
+        _make_extract_response(
+            {
+                "function_name": "helper",
+                "placement": "module_level",
+                "helper_source": "def helper(x:\n    pass\n",  # unclosed paren
+                "call_site_replacements": [
+                    "helper(data)\n",
+                    "helper(data)\n",
+                ],
+            }
+        ),
+    ]
+    return mock_client
+
+
 def test_verify_fails_skipped(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True),
-            _make_extract_response(
-                {
-                    "function_name": "helper",
-                    "placement": "module_level",
-                    "helper_source": "def helper(x:\n    pass\n",  # unclosed paren
-                    "call_site_replacements": [
-                        "helper(data)\n",
-                        "helper(data)\n",
-                    ],
-                }
-            ),
-        ]
+        mock_client = _setup_mock_client_with_veto_and_extract(mock_anthropic)
 
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE)
 
@@ -1654,23 +1636,7 @@ def test_verify_fails_skipped_verbose_false(monkeypatch):
     # verbose=False covers the False branch of the new if-self.verbose guard.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True),
-            _make_extract_response(
-                {
-                    "function_name": "helper",
-                    "placement": "module_level",
-                    "helper_source": "def helper(x:\n    pass\n",  # unclosed paren
-                    "call_site_replacements": [
-                        "helper(data)\n",
-                        "helper(data)\n",
-                    ],
-                }
-            ),
-        ]
+        mock_client = _setup_mock_client_with_veto_and_extract(mock_anthropic)
 
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
 
@@ -1909,23 +1875,7 @@ def test_two_groups_one_dropped_combined_check(monkeypatch, capsys):
 
 
 def test_successful_extraction_module_level(monkeypatch, tmp_path):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    source = textwrap.dedent(
-        """\
-        import os
-
-        def foo():
-            x = compute(data)
-            y = transform(x)
-            z = finalize(y)
-
-        def bar():
-            x = compute(data)
-            y = transform(x)
-            z = finalize(y)
-        """
-    )
-    helper = "def _helper(data):\n    pass\n"
+    source, helper = _make_standard_extractor_setup(monkeypatch)
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
@@ -2711,27 +2661,32 @@ _COLLISION_SOURCE = textwrap.dedent(
 _COLLISION_RANGES = [(9, 11)]  # overlaps bar's body
 
 
+def _setup_helper_mock_client(mock_anthropic):
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    mock_client.messages.create.side_effect = [
+        _make_veto_response(True, "same logic"),
+        _make_extract_response(
+            {
+                "function_name": "_helper",
+                "placement": "module_level",
+                "helper_source": "def _helper(x, y):\n    pass\n",
+                "call_site_replacements": [
+                    "    _helper(data, x)\n",
+                    "    _helper(data, x)\n",
+                ],
+            }
+        ),
+    ]
+    return mock_client
+
+
 def test_extraction_name_collision_skipped(monkeypatch, capsys):
     # LLM returns function_name="_helper", which is already defined → skipped.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": "def _helper(x, y):\n    pass\n",
-                    "call_site_replacements": [
-                        "    _helper(data, x)\n",
-                        "    _helper(data, x)\n",
-                    ],
-                }
-            ),
-        ]
+        mock_client = _setup_helper_mock_client(mock_anthropic)
         de = DuplicateExtractor(
             _COLLISION_RANGES, source=_COLLISION_SOURCE, verbose=True
         )
@@ -2747,23 +2702,7 @@ def test_extraction_name_collision_silent(monkeypatch, capsys):
     # Same collision, verbose=False → no stderr output.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": "def _helper(x, y):\n    pass\n",
-                    "call_site_replacements": [
-                        "    _helper(data, x)\n",
-                        "    _helper(data, x)\n",
-                    ],
-                }
-            ),
-        ]
+        mock_client = _setup_helper_mock_client(mock_anthropic)
         de = DuplicateExtractor(
             _COLLISION_RANGES, source=_COLLISION_SOURCE, verbose=False
         )
