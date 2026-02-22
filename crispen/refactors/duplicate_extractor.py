@@ -519,6 +519,22 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
+def _call_llm_tool(client, provider, model, prompt):
+    result = _llm_client.call_with_tool(
+        client,
+        provider,
+        model,
+        256,
+        _VETO_TOOL,
+        "evaluate_duplicate",
+        [{"role": "user", "content": prompt}],
+        caller="DuplicateExtractor",
+    )
+    if result is not None:
+        return result["is_valid_duplicate"], result.get("reason", "")
+    return False, "no tool response"  # pragma: no cover
+
+
 def _llm_veto(
     client,
     group: List[_SeqInfo],
@@ -537,19 +553,7 @@ def _llm_veto(
         "a shared helper function would improve clarity? Or are they coincidentally "
         "similar but conceptually distinct?"
     )
-    result = _llm_client.call_with_tool(
-        client,
-        provider,
-        model,
-        256,
-        _VETO_TOOL,
-        "evaluate_duplicate",
-        [{"role": "user", "content": prompt}],
-        caller="DuplicateExtractor",
-    )
-    if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+    return _call_llm_tool(client, provider, model, prompt)
 
 
 def _llm_extract(
@@ -645,19 +649,7 @@ def _llm_veto_func_match(
         "body, such that it could be replaced by a call to the function? "
         "Use the evaluate_duplicate tool to answer."
     )
-    result = _llm_client.call_with_tool(
-        client,
-        provider,
-        model,
-        256,
-        _VETO_TOOL,
-        "evaluate_duplicate",
-        [{"role": "user", "content": prompt}],
-        caller="DuplicateExtractor",
-    )
-    if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+    return _call_llm_tool(client, provider, model, prompt)
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
