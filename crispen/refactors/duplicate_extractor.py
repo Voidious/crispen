@@ -1114,7 +1114,24 @@ def _find_insertion_point(source: str, scope: str) -> int:
                         r"\s*class\s+\w+", prev
                     ):
                         return j
-            return i
+            # Walk backwards over any preceding decorator lines (including
+            # multi-line decorator arguments) so the helper is inserted
+            # before the decorator block, not between decorators and the def.
+            j = i - 1
+            paren_depth = 0
+            while j >= 0:
+                stripped = source_lines[j].strip()
+                if not stripped:
+                    break
+                for ch in stripped:
+                    if ch == ")":
+                        paren_depth += 1
+                    elif ch == "(":
+                        paren_depth -= 1
+                if paren_depth == 0 and not stripped.startswith("@"):
+                    break
+                j -= 1
+            return j + 1
     return 0
 
 

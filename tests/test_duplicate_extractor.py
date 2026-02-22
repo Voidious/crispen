@@ -941,6 +941,36 @@ def test_find_insertion_point_nested_function_no_class():
     assert _find_insertion_point(source, "inner") == 1
 
 
+def test_find_insertion_point_skips_over_decorators():
+    # Helper must be inserted before the decorator block, not between the
+    # decorators and the def they decorate.
+    source = (
+        "import os\n"  # 0
+        "\n"  # 1
+        "@decorator\n"  # 2
+        "def target():\n"  # 3
+        "    pass\n"  # 4
+    )
+    # Without the fix this would return 3 (the def line); with the fix it
+    # should return 2 (the @decorator line).
+    assert _find_insertion_point(source, "target") == 2
+
+
+def test_find_insertion_point_skips_over_multiline_decorator():
+    # Multi-line decorator: @patch(\n    "..."\n) above the def.
+    source = (
+        "import os\n"  # 0
+        "\n"  # 1
+        "@patch(\n"  # 2
+        '    "some.module"\n'  # 3
+        ")\n"  # 4
+        "def target():\n"  # 5
+        "    pass\n"  # 6
+    )
+    # Should return 2 (before the @patch line), not 5 (the def line).
+    assert _find_insertion_point(source, "target") == 2
+
+
 # ---------------------------------------------------------------------------
 # _build_helper_insertion
 # ---------------------------------------------------------------------------
