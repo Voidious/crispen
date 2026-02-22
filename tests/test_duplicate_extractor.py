@@ -1097,7 +1097,7 @@ def test_build_helper_insertion_strips_extra_newlines_from_helper():
     assert "\n\n\n\ndef _helper" not in text  # no extra leading blanks inside text
 
 
-def test_successful_extraction_has_two_blank_lines(monkeypatch):
+def _setup_duplicate_extractor_test(monkeypatch, line_range):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     source = textwrap.dedent(
         """\
@@ -1133,9 +1133,14 @@ def test_successful_extraction_has_two_blank_lines(monkeypatch):
                 }
             ),
         ]
-        de = DuplicateExtractor([(9, 11)], source=source)
+        de = DuplicateExtractor([line_range], source=source)
 
     assert de._new_source is not None
+    return de
+
+
+def test_successful_extraction_has_two_blank_lines(monkeypatch):
+    de = _setup_duplicate_extractor_test(monkeypatch, (9, 11))
     # Exactly 2 blank lines before and after the inserted helper.
     assert "\n\n\ndef _helper" in de._new_source
     assert "\n\n\n\ndef _helper" not in de._new_source
@@ -1522,13 +1527,7 @@ def test_missing_api_key_raises(monkeypatch):
 
 
 def _make_veto_response(is_valid: bool, reason: str = "test") -> MagicMock:
-    block = MagicMock()
-    block.type = "tool_use"
-    block.name = "evaluate_duplicate"
-    block.input = {"is_valid_duplicate": is_valid, "reason": reason}
-    resp = MagicMock()
-    resp.content = [block]
-    return resp
+    return _make_veto_func_match_response(is_valid, reason)
 
 
 def _make_extract_response(data: dict) -> MagicMock:
@@ -1802,26 +1801,31 @@ def test_pyflakes_check_skips_group_verbose_false(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _setup_verify_fails_mock(mock_anthropic):
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    mock_client.messages.create.side_effect = [
+        _make_veto_response(True),
+        _make_extract_response(
+            {
+                "function_name": "helper",
+                "placement": "module_level",
+                "helper_source": "def helper(x:\n    pass\n",  # unclosed paren
+                "call_site_replacements": [
+                    "helper(data)\n",
+                    "helper(data)\n",
+                ],
+            }
+        ),
+    ]
+    return mock_client
+
+
 def test_verify_fails_skipped(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True),
-            _make_extract_response(
-                {
-                    "function_name": "helper",
-                    "placement": "module_level",
-                    "helper_source": "def helper(x:\n    pass\n",  # unclosed paren
-                    "call_site_replacements": [
-                        "helper(data)\n",
-                        "helper(data)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_verify_fails_mock(mock_anthropic)
 
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE)
 
@@ -1832,23 +1836,7 @@ def test_verify_fails_skipped_verbose_false(monkeypatch):
     # verbose=False covers the False branch of the new if-self.verbose guard.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True),
-            _make_extract_response(
-                {
-                    "function_name": "helper",
-                    "placement": "module_level",
-                    "helper_source": "def helper(x:\n    pass\n",  # unclosed paren
-                    "call_site_replacements": [
-                        "helper(data)\n",
-                        "helper(data)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_verify_fails_mock(mock_anthropic)
 
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
 
@@ -1877,32 +1865,37 @@ _POST_STEAL_SOURCE = textwrap.dedent(
 _POST_STEAL_RANGES = [(8, 10)]  # overlaps bar's 3-statement block
 
 
+def _setup_post_steal_mock(mock_anthropic):
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    mock_client.messages.create.side_effect = [
+        _make_veto_response(True),
+        _make_extract_response(
+            {
+                "function_name": "_do_work",
+                "placement": "module_level",
+                "helper_source": (
+                    "def _do_work(data):\n"
+                    "    x = compute(data)\n"
+                    "    y = transform(x)\n"
+                    "    z = finalize(y)\n"
+                ),
+                "call_site_replacements": [
+                    "    _do_work(data)\n    return z\n",  # steals "return z"
+                    "    _do_work(data)\n",
+                ],
+            }
+        ),
+    ]
+    return mock_client
+
+
 def test_replacement_steals_post_block_skipped(monkeypatch):
     """Replacement whose last line matches the post-block line is rejected."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True),
-            _make_extract_response(
-                {
-                    "function_name": "_do_work",
-                    "placement": "module_level",
-                    "helper_source": (
-                        "def _do_work(data):\n"
-                        "    x = compute(data)\n"
-                        "    y = transform(x)\n"
-                        "    z = finalize(y)\n"
-                    ),
-                    "call_site_replacements": [
-                        "    _do_work(data)\n    return z\n",  # steals "return z"
-                        "    _do_work(data)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_post_steal_mock(mock_anthropic)
         de = DuplicateExtractor(_POST_STEAL_RANGES, source=_POST_STEAL_SOURCE)
 
     assert de._new_source is None
@@ -1912,28 +1905,7 @@ def test_replacement_steals_post_block_skipped_verbose_false(monkeypatch):
     """verbose=False covers the False branch of the verbose guard."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True),
-            _make_extract_response(
-                {
-                    "function_name": "_do_work",
-                    "placement": "module_level",
-                    "helper_source": (
-                        "def _do_work(data):\n"
-                        "    x = compute(data)\n"
-                        "    y = transform(x)\n"
-                        "    z = finalize(y)\n"
-                    ),
-                    "call_site_replacements": [
-                        "    _do_work(data)\n    return z\n",  # steals "return z"
-                        "    _do_work(data)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_post_steal_mock(mock_anthropic)
         de = DuplicateExtractor(
             _POST_STEAL_RANGES, source=_POST_STEAL_SOURCE, verbose=False
         )
@@ -2173,45 +2145,7 @@ def test_two_groups_one_dropped_combined_check(monkeypatch, capsys):
 
 
 def test_successful_extraction_module_level(monkeypatch, tmp_path):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    source = textwrap.dedent(
-        """\
-        import os
-
-        def foo():
-            x = compute(data)
-            y = transform(x)
-            z = finalize(y)
-
-        def bar():
-            x = compute(data)
-            y = transform(x)
-            z = finalize(y)
-        """
-    )
-    helper = "def _helper(data):\n    pass\n"
-    with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": helper,
-                    "call_site_replacements": [
-                        "    _helper(data)\n",
-                        "    _helper(data)\n",
-                    ],
-                }
-            ),
-        ]
-
-        de = DuplicateExtractor([(9, 11)], source=source)
-
-    assert de._new_source is not None
+    de = _setup_duplicate_extractor_test(monkeypatch, (9, 11))
     assert "_helper" in de._new_source
     assert len(de.changes_made) == 1
     assert "'_helper'" in de.changes_made[0]
@@ -2975,27 +2909,32 @@ _COLLISION_SOURCE = textwrap.dedent(
 _COLLISION_RANGES = [(9, 11)]  # overlaps bar's body
 
 
+def _setup_name_collision_mocks(mock_anthropic):
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    mock_client.messages.create.side_effect = [
+        _make_veto_response(True, "same logic"),
+        _make_extract_response(
+            {
+                "function_name": "_helper",
+                "placement": "module_level",
+                "helper_source": "def _helper(x, y):\n    pass\n",
+                "call_site_replacements": [
+                    "    _helper(data, x)\n",
+                    "    _helper(data, x)\n",
+                ],
+            }
+        ),
+    ]
+    return mock_client
+
+
 def test_extraction_name_collision_skipped(monkeypatch, capsys):
     # LLM returns function_name="_helper", which is already defined → skipped.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": "def _helper(x, y):\n    pass\n",
-                    "call_site_replacements": [
-                        "    _helper(data, x)\n",
-                        "    _helper(data, x)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_name_collision_mocks(mock_anthropic)
         de = DuplicateExtractor(
             _COLLISION_RANGES, source=_COLLISION_SOURCE, verbose=True
         )
@@ -3011,23 +2950,7 @@ def test_extraction_name_collision_silent(monkeypatch, capsys):
     # Same collision, verbose=False → no stderr output.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
-        mock_client.messages.create.side_effect = [
-            _make_veto_response(True, "same logic"),
-            _make_extract_response(
-                {
-                    "function_name": "_helper",
-                    "placement": "module_level",
-                    "helper_source": "def _helper(x, y):\n    pass\n",
-                    "call_site_replacements": [
-                        "    _helper(data, x)\n",
-                        "    _helper(data, x)\n",
-                    ],
-                }
-            ),
-        ]
+        _setup_name_collision_mocks(mock_anthropic)
         de = DuplicateExtractor(
             _COLLISION_RANGES, source=_COLLISION_SOURCE, verbose=False
         )
