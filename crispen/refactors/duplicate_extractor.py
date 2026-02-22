@@ -1081,6 +1081,13 @@ def _find_insertion_point(source: str, scope: str) -> int:
 
     For module scope, inserts after the last import.
     For a named scope, inserts before the def/class line.
+
+    If the named scope resolves to an indented ``def`` (i.e. a class method),
+    inserting a module-level helper immediately before it would end the class
+    definition prematurely — the remaining class methods would be silently
+    re-parsed as nested functions of the helper, producing valid-syntax but
+    broken code that ``compile()`` does not catch.  In that case we walk
+    backwards to the enclosing class definition and insert before it instead.
     """
     source_lines = source.splitlines()
     if scope == "<module>":
@@ -1094,6 +1101,19 @@ def _find_insertion_point(source: str, scope: str) -> int:
     pattern = re.compile(rf"^\s*(?:def|class)\s+{re.escape(scope)}\s*[\(:]")
     for i, line in enumerate(source_lines):
         if pattern.match(line):
+            method_indent = len(line) - len(line.lstrip())
+            if method_indent > 0:
+                # The def is inside a class body.  Walk backwards to find the
+                # enclosing class definition and insert before that instead.
+                for j in range(i - 1, -1, -1):
+                    prev = source_lines[j]
+                    if not prev.strip():
+                        continue
+                    prev_indent = len(prev) - len(prev.lstrip())
+                    if prev_indent < method_indent and re.match(
+                        r"\s*class\s+\w+", prev
+                    ):
+                        return j
             return i
     return 0
 
