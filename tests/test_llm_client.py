@@ -158,6 +158,12 @@ def test_call_with_tool_moonshot_success():
             _MESSAGES,
         )
     assert result == {"is_valid_duplicate": True, "reason": "same"}
+    call_kwargs = client.chat.completions.create.call_args[1]
+    assert call_kwargs["extra_body"] == {"enable_thinking": False}
+    assert call_kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "evaluate_duplicate"},
+    }
 
 
 def test_call_with_tool_moonshot_api_error():
