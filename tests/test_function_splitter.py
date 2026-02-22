@@ -653,7 +653,7 @@ def test_choose_best_split_fewest_params():
     # So split_idx=1 has 2 free vars [a, ext], split_idx=2 has 2 free vars [a, b]
     # Tie → choose earliest in list = latest split = 2
     valid_splits = [2, 1]  # latest first
-    split_idx, params = _choose_best_split(
+    split_idx, params, _ = _choose_best_split(
         stmts2, valid_splits, lines2, positions2, ["ext"]
     )
     # Both have 2 free vars, tie broken by latest (first in list) = 2
@@ -674,7 +674,7 @@ def test_choose_best_split_fewer_params_wins():
     # split_idx=1: tail=[b=2, c=a+b] → free vars: [a] (1 free var)
     # split_idx=2: tail=[c=a+b] → free vars: [a, b] (2 free vars)
     valid_splits = [2, 1]
-    split_idx, params = _choose_best_split(stmts, valid_splits, lines, positions, [])
+    split_idx, params, _ = _choose_best_split(stmts, valid_splits, lines, positions, [])
     # split_idx=1 has 1 free var (a) vs split_idx=2 has 2 free vars (a, b)
     assert split_idx == 1
     assert params == ["a"]
@@ -683,12 +683,12 @@ def test_choose_best_split_fewer_params_wins():
 def test_choose_best_split_single_candidate():
     src = "def foo():\n    x = 1\n    y = 2\n"
     stmts, positions, lines = _parse_func(src)
-    split_idx, params = _choose_best_split(stmts, [1], lines, positions, [])
+    split_idx, params, _ = _choose_best_split(stmts, [1], lines, positions, [])
     assert split_idx == 1
 
 
-def test_choose_best_split_all_skipped_returns_none():
-    # Every valid tail requires self → all candidates skipped → None returned
+def test_choose_best_split_self_in_tail_returns_instance_method():
+    # Tail requires self → extracted as instance method, not static
     src = textwrap.dedent(
         """\
         class Foo:
@@ -698,8 +698,21 @@ def test_choose_best_split_all_skipped_returns_none():
         """
     )
     stmts, positions, lines = _parse_func(src)
-    # split_idx=1: tail=[b = self.value + a] → free includes "self" → skipped
+    # split_idx=1: tail=[b = self.value + a] → free: [a, self] → instance method
     result = _choose_best_split(stmts, [1], lines, positions, ["self", "x"])
+    assert result is not None
+    split_idx, params, is_instance_method = result
+    assert split_idx == 1
+    assert is_instance_method is True
+    assert "self" not in params  # self is implicit, not in params list
+    assert "a" in params  # a is still a real param
+
+
+def test_choose_best_split_empty_splits_returns_none():
+    # No valid split candidates → None returned
+    src = "def foo():\n    x = 1\n    y = 2\n"
+    stmts, positions, lines = _parse_func(src)
+    result = _choose_best_split(stmts, [], lines, positions, [])
     assert result is None
 
 
@@ -717,7 +730,7 @@ def test_choose_best_split_filters_module_globals():
     # With module_globals={"os"}: "os" is filtered out → params = []
     result = _choose_best_split(stmts, [1], lines, positions, [], module_globals={"os"})
     assert result is not None
-    _, params = result
+    _, params, _ = result
     assert "os" not in params
 
 
@@ -815,6 +828,21 @@ def test_generate_helper_source_with_docstring():
     assert "return 42" in result
 
 
+def test_generate_helper_source_instance_method():
+    result = _generate_helper_source(
+        name="process",
+        params=["a"],
+        tail_source="return self.x + a\n",
+        func_indent="    ",
+        is_static=False,
+        add_docstring=False,
+        is_instance_method=True,
+    )
+    assert "@staticmethod" not in result
+    assert "def _process(self, a):" in result
+    assert "return self.x + a" in result
+
+
 def test_generate_helper_source_indentation_correct():
     result = _generate_helper_source(
         name="helper",
@@ -852,6 +880,16 @@ def test_generate_call_no_params():
 def test_generate_call_class_no_params():
     result = _generate_call("do_work", [], "Foo", "    ")
     assert result == "    return Foo._do_work()"
+
+
+def test_generate_call_instance_method():
+    result = _generate_call("process", ["a", "b"], "MyClass", "    ", True)
+    assert result == "    return self._process(a, b)"
+
+
+def test_generate_call_instance_method_no_params():
+    result = _generate_call("process", [], "MyClass", "    ", True)
+    assert result == "    return self._process()"
 
 
 # ---------------------------------------------------------------------------
@@ -1600,16 +1638,29 @@ def test_engine_includes_function_splitter_no_op(tmp_path):
     assert all("FunctionSplitter" not in m for m in msgs)
 
 
-def test_function_splitter_method_with_self_in_tail_not_split():
-    """A method where every tail candidate needs self is never split."""
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_method_self_needed_uses_instance_method(mock_anthropic):
+    """When every tail needs self, split into a regular instance method helper."""
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["tail_work"])
+    )
     lines = ["class Foo:\n", "    def method(self):\n"]
     for i in range(40):
         lines.append(f"        a{i} = self.val + {i}\n")
     lines.append("        return 0\n")
     src = "".join(lines)
-    # max_lines=20 forces a split attempt, but every tail uses self → no split
-    splitter = FunctionSplitter([(1, 1000)], source=src, verbose=False, max_lines=20)
-    assert splitter.get_rewritten_source() is None
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=20
+        )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    compile(result, "<test>", "exec")
+    assert "@staticmethod" not in result
+    assert "return self._tail_work(" in result
+    assert "def _tail_work(self" in result
 
 
 @patch("crispen.llm_client.anthropic")

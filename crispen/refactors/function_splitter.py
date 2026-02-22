@@ -103,9 +103,10 @@ class _FuncInfo:
 class _SplitTask:
     func_info: _FuncInfo
     split_idx: int  # index into body_stmts where tail begins
-    params: List[str]  # free variables of tail (= helper params)
+    params: List[str]  # free variables of tail (excluding 'self' for instance methods)
     tail_source: str = ""  # dedented tail source, set before LLM call
     helper_name: str = ""  # filled in by LLM
+    is_instance_method: bool = False  # True when helper must be a regular method
 
 
 # ---------------------------------------------------------------------------
@@ -470,20 +471,27 @@ def _choose_best_split(
     positions: Dict,
     orig_params: List[str],
     module_globals: set = frozenset(),
-) -> Optional[Tuple[int, List[str]]]:
+) -> Optional[Tuple[int, List[str], bool]]:
     """Choose split with fewest free variables; ties broken by latest split.
 
-    Returns None if every candidate requires passing ``self`` as a plain
-    parameter to a static helper (semantically incorrect for methods).
+    Returns a 3-tuple ``(split_idx, params, is_instance_method)``.
 
-    ``module_globals`` names are excluded from the helper's param list: they
-    are always accessible at module scope without being passed explicitly.
+    * ``is_instance_method=False`` — the helper can be a ``@staticmethod``
+      (tail does not reference ``self``).
+    * ``is_instance_method=True`` — the tail references ``self``, so the
+      helper must be a regular instance method; ``self`` is excluded from
+      ``params`` because it is the implicit first argument.
+
+    Static splits are preferred over instance-method splits.  Returns
+    ``None`` only when ``valid_splits`` is empty.
+
+    ``module_globals`` names are excluded from the helper's param list.
     """
-    best_idx: Optional[int] = None
-    best_params: List[str] = []
+    best_static_idx: Optional[int] = None
+    best_static_params: List[str] = []
+    best_instance_idx: Optional[int] = None
+    best_instance_params: List[str] = []
 
-    # A method should never be split such that self is passed as a plain
-    # argument to a @staticmethod helper — that is semantically wrong.
     is_method = bool(orig_params) and orig_params[0] == "self"
 
     for split_idx in valid_splits:
@@ -491,14 +499,24 @@ def _choose_best_split(
         tail_src = _stmts_source(tail_stmts, source_lines, positions)
         free = [v for v in _find_free_vars(tail_src) if v not in module_globals]
         if is_method and "self" in free:
-            continue  # skip: tail needs instance state
-        if best_idx is None or len(free) < len(best_params):
-            best_idx = split_idx
-            best_params = free
+            # Tail needs instance state — extract as a regular instance method.
+            params_no_self = [v for v in free if v != "self"]
+            if best_instance_idx is None or len(params_no_self) < len(
+                best_instance_params
+            ):
+                best_instance_idx = split_idx
+                best_instance_params = params_no_self
+        else:
+            if best_static_idx is None or len(free) < len(best_static_params):
+                best_static_idx = split_idx
+                best_static_params = free
 
-    if best_idx is None:
-        return None
-    return (best_idx, best_params)
+    # Prefer static (no self dependency) over instance method.
+    if best_static_idx is not None:
+        return (best_static_idx, best_static_params, False)
+    if best_instance_idx is not None:
+        return (best_instance_idx, best_instance_params, True)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -513,13 +531,15 @@ def _generate_helper_source(
     func_indent: str,
     is_static: bool,
     add_docstring: bool,
+    is_instance_method: bool = False,
 ) -> str:
     """Build the source text for the extracted helper function."""
     body_indent = func_indent + "    "
     parts = []
     if is_static:
         parts.append(func_indent + "@staticmethod\n")
-    parts.append(func_indent + f"def _{name}({', '.join(params)}):\n")
+    all_params = (["self"] + params) if is_instance_method else params
+    parts.append(func_indent + f"def _{name}({', '.join(all_params)}):\n")
     if add_docstring:
         parts.append(body_indent + '"""..."""\n')
     body = textwrap.indent(tail_source.rstrip("\n"), body_indent)
@@ -532,9 +552,12 @@ def _generate_call(
     params: List[str],
     class_name: Optional[str],
     body_indent: str,
+    is_instance_method: bool = False,
 ) -> str:
     """Build the return-call line inserted into the head function."""
     args = ", ".join(params)
+    if is_instance_method:
+        return body_indent + f"return self._{name}({args})"
     if class_name:
         return body_indent + f"return {class_name}._{name}({args})"
     return body_indent + f"return _{name}({args})"
@@ -799,13 +822,17 @@ class FunctionSplitter(Refactor):
                     func_info.original_params,
                     module_globals,
                 )
-                if best is None:
-                    continue
-                split_idx, params = best
+                split_idx, params, is_instance_method = best
                 tail_stmts = body_stmts[split_idx:]
                 tail_raw = _stmts_source(tail_stmts, source_lines, positions)
                 tasks.append(
-                    _SplitTask(func_info, split_idx, params, tail_source=tail_raw)
+                    _SplitTask(
+                        func_info,
+                        split_idx,
+                        params,
+                        tail_source=tail_raw,
+                        is_instance_method=is_instance_method,
+                    )
                 )
 
             if not tasks:
@@ -852,7 +879,11 @@ class FunctionSplitter(Refactor):
                 tail_raw = _stmts_source(tail_stmts, source_lines, positions)
                 body_indent = fi.indent + "    "
                 call_line = _generate_call(
-                    task.helper_name, task.params, fi.class_name, body_indent
+                    task.helper_name,
+                    task.params,
+                    fi.class_name,
+                    body_indent,
+                    task.is_instance_method,
                 )
                 tail_start = positions[tail_stmts[0]].start.line
                 helper_src = _generate_helper_source(
@@ -860,8 +891,9 @@ class FunctionSplitter(Refactor):
                     task.params,
                     tail_raw,
                     fi.indent,
-                    fi.class_name is not None,
+                    fi.class_name is not None and not task.is_instance_method,
                     self._helper_docstrings,
+                    task.is_instance_method,
                 )
                 head_lines = source_lines[fi.start_line - 1 : tail_start - 1]
                 replacement = (
