@@ -999,7 +999,15 @@ def _verify_extraction(
         try:
             compile(wrapped, "<replacement>", "exec")
         except SyntaxError:
-            return False
+            # Retry with async wrapper for replacements that contain `await`
+            async_wrapped = "async def _check():\n    for _ in []:\n" + textwrap.indent(
+                dedented, "        "
+            )
+            try:
+                compile(async_wrapped, "<replacement>", "exec")
+            except SyntaxError:
+                return False
+            wrapped = async_wrapped
         # Check the wrapped form so that indented/return-containing replacements
         # parse successfully and give a definitive True/False answer.
         if _has_mutable_literal_is_check(wrapped):

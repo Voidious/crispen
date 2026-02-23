@@ -455,6 +455,28 @@ def test_verify_extraction_allows_break_in_replacement():
     assert _verify_extraction(helper, replacements) is True
 
 
+def test_verify_extraction_allows_await_in_replacement():
+    # Replacements inside async functions legally contain 'await'; the async
+    # dummy-function wrapper must allow this without triggering a false rejection.
+    helper = "async def helper(x):\n    return await x\n"
+    replacements = ["    result = await helper(coro)\n"]
+    assert _verify_extraction(helper, replacements) is True
+
+
+def test_verify_extraction_allows_async_helper():
+    # async def helpers are valid Python and must compile successfully.
+    helper = "async def helper(client, x):\n    return await client.get(x)\n"
+    replacements = ["    val = await helper(client, url)\n"]
+    assert _verify_extraction(helper, replacements) is True
+
+
+def test_verify_extraction_rejects_invalid_await_replacement():
+    # Replacement with `await` that also has a real syntax error must still fail.
+    helper = "async def helper(x):\n    return await x\n"
+    replacements = ["    result = await helper(coro\n"]  # unclosed paren
+    assert _verify_extraction(helper, replacements) is False
+
+
 # ---------------------------------------------------------------------------
 # _has_mutable_literal_is_check
 # ---------------------------------------------------------------------------
