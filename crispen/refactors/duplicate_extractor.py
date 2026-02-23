@@ -184,6 +184,7 @@ class _SeqInfo:
     scope: str
     source: str
     fingerprint: str
+    class_scope: Optional[str] = None  # enclosing class name, or None if module-level
 
 
 @dataclass
@@ -212,6 +213,7 @@ class _SequenceCollector(cst.CSTVisitor):
     ) -> None:
         self.sequences: List[_SeqInfo] = []
         self._scope_stack: List[str] = ["<module>"]
+        self._class_stack: List[str] = []
         self._source_lines = source_lines
         self._max_seq_len = max_seq_len
         self._min_weight = min_weight
@@ -225,10 +227,12 @@ class _SequenceCollector(cst.CSTVisitor):
 
     def visit_ClassDef(self, node: cst.ClassDef) -> Optional[bool]:
         self._scope_stack.append(node.name.value)
+        self._class_stack.append(node.name.value)
         return None
 
     def leave_ClassDef(self, node: cst.ClassDef) -> None:
         self._scope_stack.pop()
+        self._class_stack.pop()
 
     def _process_body(self, body: Sequence) -> None:
         stmt_info: List[Tuple[cst.BaseStatement, int, int]] = []
@@ -241,6 +245,7 @@ class _SequenceCollector(cst.CSTVisitor):
 
         n = len(stmt_info)
         scope = self._scope_stack[-1]
+        class_scope = self._class_stack[-1] if self._class_stack else None
         for start_i in range(n):
             for end_i in range(
                 start_i + 1, min(start_i + self._max_seq_len + 1, n + 1)
@@ -263,6 +268,7 @@ class _SequenceCollector(cst.CSTVisitor):
                         scope=scope,
                         source=seq_source,
                         fingerprint=_normalize_source(seq_source),
+                        class_scope=class_scope,
                     )
                 )
 
@@ -675,12 +681,22 @@ def _llm_extract(
                 f"\n\nThe previous extraction attempt failed. Please correct these "
                 f"issues:\n{failures_str}"
             )
+    class_scopes = {s.class_scope for s in group}
+    all_same_class = len(class_scopes) == 1 and None not in class_scopes
+    if all_same_class:
+        staticmethod_instruction = (
+            "If all call sites are inside the same class, use a @staticmethod. "
+        )
+    else:
+        staticmethod_instruction = (
+            "Use module_level placement — call sites span different classes or scopes. "
+        )
     prompt = (
         "Extract the following duplicate code blocks from this Python file into a "
         f"helper function.\n\nFile source:\n```python\n{snippet}\n```\n\n"
         f"Duplicate blocks:\n{blocks_text}\n\n"
         "Place the helper immediately before the enclosing function of its first use. "
-        "If both call sites are inside the same class, use a @staticmethod. "
+        f"{staticmethod_instruction}"
         "Return complete, valid Python for the helper and each call site replacement. "
         "Each call site replacement must start with the same leading indentation as "
         "the block it replaces, end with a trailing newline, and cover only the exact "
@@ -1796,6 +1812,23 @@ class DuplicateExtractor(Refactor):
                 _failures: List[str] = []
 
                 # Check 1: name collision
+                # Pre-check: staticmethod placement is invalid when sequences span
+                # multiple class scopes — flag it so the retry loop can correct it.
+                if placement.startswith("staticmethod:"):
+                    group_class_scopes = {s.class_scope for s in group}
+                    if len(group_class_scopes) != 1 or None in group_class_scopes:
+                        _failures.append(
+                            "staticmethod placement is invalid when call sites span "
+                            "multiple classes or scopes; use module_level instead"
+                        )
+                        if self.verbose:
+                            print(
+                                "crispen: DuplicateExtractor: extraction FAILED — "
+                                "staticmethod placement invalid for cross-class group",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
                 if func_name in used_names:
                     _failures.append(
                         f"name collision: '{func_name}' is already defined,"
