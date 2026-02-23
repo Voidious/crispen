@@ -455,8 +455,42 @@ _VETO_TOOL: dict = {
                 ),
             },
             "reason": {"type": "string"},
+            "extraction_notes": {
+                "type": "string",
+                "description": (
+                    "If accepting, note any potential pitfalls the extraction "
+                    "step should watch out for — e.g., tricky variable scoping, "
+                    "mutable arguments, subtle differences in variable names, or "
+                    "return-value handling. Leave empty if none."
+                ),
+            },
         },
         "required": ["is_valid_duplicate", "reason"],
+    },
+}
+
+_VERIFY_TOOL: dict = {
+    "name": "verify_extraction",
+    "description": "Verify that an extracted helper function is semantically correct",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "is_correct": {
+                "type": "boolean",
+                "description": (
+                    "True if the extraction is semantically equivalent to the originals"
+                ),
+            },
+            "issues": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Specific issues found. Empty if correct. Each issue should "
+                    "describe what is wrong and how the extraction should be fixed."
+                ),
+            },
+        },
+        "required": ["is_correct", "issues"],
     },
 }
 
@@ -524,7 +558,7 @@ def _llm_veto(
     group: List[_SeqInfo],
     model: str = _MODEL,
     provider: str = "anthropic",
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, str]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
         f"```python\n{s.source.rstrip()}\n```"
@@ -535,21 +569,29 @@ def _llm_veto(
         f"Python file:\n\n{blocks_text}\n\n"
         "Do these blocks represent the same semantic operation such that extracting "
         "a shared helper function would improve clarity? Or are they coincidentally "
-        "similar but conceptually distinct?"
+        "similar but conceptually distinct?\n\n"
+        "If you accept (is_valid_duplicate=True), also fill in extraction_notes "
+        "with any potential pitfalls the extraction step should watch out for — "
+        "e.g., tricky variable scoping, mutable arguments, subtle differences in "
+        "variable names between blocks, or return-value handling edge cases."
     )
     result = _llm_client.call_with_tool(
         client,
         provider,
         model,
-        256,
+        384,
         _VETO_TOOL,
         "evaluate_duplicate",
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
     )
     if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+        return (
+            result["is_valid_duplicate"],
+            result.get("reason", ""),
+            result.get("extraction_notes", ""),
+        )
+    return False, "no tool response", ""  # pragma: no cover
 
 
 def _llm_extract(
@@ -561,6 +603,9 @@ def _llm_extract(
     model: str = _MODEL,
     helper_docstrings: bool = True,
     provider: str = "anthropic",
+    veto_notes: str = "",
+    prev_failures: List[str] = [],
+    prev_output: Optional[dict] = None,
 ) -> Optional[dict]:
     src_lines = full_source.splitlines(keepends=True)
     block_entries = []
@@ -603,6 +648,33 @@ def _llm_extract(
         if helper_docstrings
         else "\n\nDo not include a docstring in the helper function."
     )
+    veto_notes_note = ""
+    if veto_notes:
+        veto_notes_note = (
+            f"\n\nNotes from code review (watch out for these pitfalls): "
+            f"{veto_notes[:500]}"
+        )
+    failures_note = ""
+    if prev_failures:
+        failures_str = "\n".join(f"- {f}" for f in prev_failures)
+        if prev_output is not None:
+            prior_helper = prev_output.get("helper_source", "")
+            prior_repls = prev_output.get("call_site_replacements", [])
+            repls_text = "\n".join(
+                f"  [{i + 1}] {r!r}" for i, r in enumerate(prior_repls)
+            )
+            failures_note = (
+                f"\n\nThe previous extraction attempt produced:\n\n"
+                f"helper_source:\n```python\n{prior_helper}```\n\n"
+                f"call_site_replacements:\n{repls_text}\n\n"
+                f"But failed verification with these issues:\n{failures_str}\n\n"
+                f"Please correct these issues in your new attempt."
+            )
+        else:
+            failures_note = (
+                f"\n\nThe previous extraction attempt failed. Please correct these "
+                f"issues:\n{failures_str}"
+            )
     prompt = (
         "Extract the following duplicate code blocks from this Python file into a "
         f"helper function.\n\nFile source:\n```python\n{snippet}\n```\n\n"
@@ -627,6 +699,8 @@ def _llm_extract(
         f"{escaping_note}"
         f"{used_names_note}"
         f"{docstring_note}"
+        f"{veto_notes_note}"
+        f"{failures_note}"
     )
     return _llm_client.call_with_tool(
         client,
@@ -647,7 +721,7 @@ def _llm_veto_func_match(
     full_source: str,
     model: str = _MODEL,
     provider: str = "anthropic",
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, str]:
     """Ask the LLM whether *seq* performs the same operation as *func*'s body."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
     prompt = (
@@ -673,8 +747,12 @@ def _llm_veto_func_match(
         caller="DuplicateExtractor",
     )
     if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+        return (
+            result["is_valid_duplicate"],
+            result.get("reason", ""),
+            result.get("extraction_notes", ""),
+        )
+    return False, "no tool response", ""  # pragma: no cover
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
@@ -718,6 +796,67 @@ def _llm_generate_call(
     if result is not None:
         return result["replacement"]
     return None  # pragma: no cover
+
+
+def _llm_verify_extraction(
+    client,
+    group: List[_SeqInfo],
+    helper_source: str,
+    call_replacements: List[str],
+    full_source: str,
+    model: str = _MODEL,
+    provider: str = "anthropic",
+) -> Tuple[bool, List[str]]:
+    """Ask the LLM to verify the extraction is semantically correct.
+
+    Returns ``(is_correct, issues)`` where *issues* is a list of specific
+    problems found.  Returns ``(True, [])`` if the call times out or the LLM
+    cannot respond, so a verification failure never silently blocks commits.
+    """
+    blocks_text = "\n\n".join(
+        f"Original block {i + 1} (scope: {s.scope}, "
+        f"lines {s.start_line}-{s.end_line}):\n"
+        f"```python\n{s.source.rstrip()}\n```"
+        for i, s in enumerate(group)
+    )
+    replacements_text = "\n\n".join(
+        f"Replacement for block {i + 1}:\n```python\n{r.rstrip()}\n```"
+        for i, r in enumerate(call_replacements)
+    )
+    snippet = full_source[:2000] if len(full_source) > 2000 else full_source
+    prompt = (
+        "Verify that the following helper function extraction is semantically "
+        "correct by tracing through the code carefully.\n\n"
+        f"Original duplicate blocks:\n{blocks_text}\n\n"
+        f"Extracted helper:\n```python\n{helper_source.rstrip()}\n```\n\n"
+        f"Call site replacements:\n{replacements_text}\n\n"
+        f"File context (truncated):\n```python\n{snippet}\n```\n\n"
+        "Check each of the following:\n"
+        "1. Every variable read (but not locally assigned) in the original block "
+        "is passed as a parameter to the helper\n"
+        "2. Every variable assigned in the original block and used afterward is "
+        "returned by the helper and captured at the call site\n"
+        "3. No parameter is assigned before it is first read in the helper body\n"
+        "4. If the original block ends with a non-None return, the call site "
+        "replacement also propagates that return value\n"
+        "5. The call site replacements match the original indentation and cover "
+        "exactly the lines of the original block\n"
+        "If correct, set is_correct=True and issues=[]. "
+        "Otherwise set is_correct=False and list each specific issue."
+    )
+    result = _llm_client.call_with_tool(
+        client,
+        provider,
+        model,
+        512,
+        _VERIFY_TOOL,
+        "verify_extraction",
+        [{"role": "user", "content": prompt}],
+        caller="DuplicateExtractor",
+    )
+    if result is None:
+        return True, []  # pragma: no cover
+    return result["is_correct"], result.get("issues", [])
 
 
 # ---------------------------------------------------------------------------
@@ -1383,6 +1522,8 @@ class DuplicateExtractor(Refactor):
         model: str = _MODEL,
         helper_docstrings: bool = False,
         provider: str = "anthropic",
+        extraction_retries: int = 1,
+        llm_verify_retries: int = 1,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self._min_weight = min_weight
@@ -1390,6 +1531,8 @@ class DuplicateExtractor(Refactor):
         self._model = model
         self._helper_docstrings = helper_docstrings
         self._provider = provider
+        self._extraction_retries = extraction_retries
+        self._llm_verify_retries = llm_verify_retries
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -1470,7 +1613,7 @@ class DuplicateExtractor(Refactor):
                         flush=True,
                     )
                 try:
-                    is_valid, reason = _run_with_timeout(
+                    is_valid, reason, _veto_notes = _run_with_timeout(
                         _llm_veto_func_match,
                         _API_HARD_TIMEOUT,
                         client,
@@ -1573,7 +1716,7 @@ class DuplicateExtractor(Refactor):
                     flush=True,
                 )
             try:
-                is_valid, reason = _run_with_timeout(
+                is_valid, reason, veto_notes = _run_with_timeout(
                     _llm_veto,
                     _API_HARD_TIMEOUT,
                     client,
@@ -1598,265 +1741,400 @@ class DuplicateExtractor(Refactor):
             if not is_valid:
                 continue
 
-            try:
-                extraction = _run_with_timeout(
-                    _llm_extract,
-                    _API_HARD_TIMEOUT,
-                    client,
-                    group,
-                    source,
-                    escaping_vars,
-                    used_names=frozenset(used_names),
-                    model=self._model,
-                    helper_docstrings=self._helper_docstrings,
-                    provider=self._provider,
+            # Extraction retry loop: attempt extraction up to
+            # 1 + _extraction_retries times on algorithmic failure, and up to
+            # 1 + _llm_verify_retries additional times on LLM verify failure.
+            alg_retries_left = self._extraction_retries
+            llm_verify_retries_left = self._llm_verify_retries
+            prev_failures: List[str] = []
+            prev_output: Optional[dict] = None
+
+            while True:
+                try:
+                    extraction = _run_with_timeout(
+                        _llm_extract,
+                        _API_HARD_TIMEOUT,
+                        client,
+                        group,
+                        source,
+                        escaping_vars,
+                        used_names=frozenset(used_names),
+                        model=self._model,
+                        helper_docstrings=self._helper_docstrings,
+                        provider=self._provider,
+                        veto_notes=veto_notes,
+                        prev_failures=prev_failures,
+                        prev_output=prev_output,
+                    )
+                except _ApiTimeout:
+                    print(
+                        "crispen: DuplicateExtractor: API call timed out,"
+                        " skipping group",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
+                if extraction is None:
+                    break  # pragma: no cover
+
+                helper_source = extraction["helper_source"]
+                if not self._helper_docstrings:
+                    helper_source = _strip_helper_docstring(helper_source)
+                call_replacements = extraction["call_site_replacements"]
+                placement = extraction.get("placement", "module_level")
+                func_name = extraction["function_name"]
+
+                _check_failed = False
+                _failures: List[str] = []
+
+                # Check 1: name collision
+                if func_name in used_names:
+                    _failures.append(
+                        f"name collision: '{func_name}' is already defined,"
+                        " choose a different name"
+                    )
+                    if self.verbose:
+                        print(
+                            f"crispen: DuplicateExtractor: extraction FAILED — "
+                            f"name collision: '{func_name}' is already defined",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    _check_failed = True
+
+                # Check 2: call site count
+                if not _check_failed and len(call_replacements) != len(group):
+                    _failures.append(
+                        f"wrong call_site_replacements count"
+                        f" (expected {len(group)}, got {len(call_replacements)})"
+                    )
+                    if self.verbose:
+                        print(
+                            f"crispen: DuplicateExtractor: extraction FAILED — "
+                            f"wrong call_site_replacements count "
+                            f"(expected {len(group)}, got {len(call_replacements)})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        print(
+                            f"crispen: DuplicateExtractor:   helper_source: "
+                            f"{helper_source!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        print(
+                            f"crispen: DuplicateExtractor:   call_site_replacements: "
+                            f"{call_replacements!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    _check_failed = True
+
+                if not _check_failed:
+                    # Normalize each replacement's indentation to match its
+                    # original block.  The LLM sometimes returns replacements at
+                    # column 0; this re-indents them so the assembled edit is
+                    # valid Python.
+                    call_replacements = [
+                        _normalize_replacement_indentation(seq, r)
+                        for seq, r in zip(group, call_replacements)
+                    ]
+
+                    # Check 3: post-block line theft
+                    if _replacement_steals_post_block_line(
+                        group, call_replacements, source_lines
+                    ):
+                        _failures.append(
+                            "replacement duplicates the line after the block"
+                        )
+                        if self.verbose:
+                            print(
+                                "crispen: DuplicateExtractor: extraction FAILED — "
+                                "replacement duplicates the line after the block",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
+
+                # Check 4: syntax validation
+                if not _check_failed and not _verify_extraction(
+                    helper_source, call_replacements
+                ):
+                    _failures.append("invalid helper or replacement syntax")
+                    if self.verbose:
+                        print(
+                            "crispen: DuplicateExtractor: extraction FAILED — "
+                            "invalid helper or replacement syntax",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        print(
+                            f"crispen: DuplicateExtractor:   helper_source: "
+                            f"{helper_source!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        print(
+                            f"crispen: DuplicateExtractor:   call_site_replacements: "
+                            f"{call_replacements!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    _check_failed = True
+
+                # Check 5: return statement consistency
+                if not _check_failed and any(
+                    _seq_ends_with_return(seq)
+                    and not _replacement_contains_return(repl)
+                    for seq, repl in zip(group, call_replacements)
+                ):
+                    _failures.append("block ends with return but replacement omits it")
+                    if self.verbose:
+                        print(
+                            "crispen: DuplicateExtractor: extraction FAILED — "
+                            "block ends with return but replacement omits it",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    _check_failed = True
+
+                # Check 6: helper must not import local names
+                if not _check_failed and _helper_imports_local_name(
+                    helper_source, source
+                ):
+                    _failures.append(
+                        "helper imports a name that is a parameter/local"
+                        " in the original file"
+                    )
+                    if self.verbose:
+                        print(
+                            "crispen: DuplicateExtractor: extraction FAILED — "
+                            "helper imports a name that is a parameter/local "
+                            "in the original file",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    _check_failed = True
+
+                # Check 7: new attribute access
+                if not _check_failed:
+                    new_attrs = _collect_called_attr_names(
+                        textwrap.dedent(helper_source)
+                    ) - _collect_called_attr_names(source)
+                    if new_attrs:
+                        _failures.append(
+                            f"helper introduces new attribute access(es) not in"
+                            f" original: {', '.join(sorted(new_attrs))}"
+                        )
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor: extraction FAILED — "
+                                f"helper introduces new attribute access(es) not in"
+                                f" original: {', '.join(sorted(new_attrs))}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
+
+                # Check 8: free variable preservation
+                if not _check_failed:
+                    seq0 = group[0]
+                    block_src = "".join(
+                        source_lines[seq0.start_line - 1 : seq0.end_line]
+                    )
+                    missing = _missing_free_vars(
+                        block_src, call_replacements, helper_source, source
+                    )
+                    if missing:
+                        _failures.append(
+                            f"free variable(s) from original block missing in"
+                            f" replacement: {', '.join(sorted(missing))}"
+                        )
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor: extraction FAILED — "
+                                f"free variable(s) from original block missing in "
+                                f"replacement: {', '.join(sorted(missing))}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
+
+                # Build this group's edits (only if pre-edit checks passed).
+                group_edits: List[Tuple[int, int, str]] = []
+                candidate = ""
+                if not _check_failed:
+                    for seq, replacement in zip(group, call_replacements):
+                        group_edits.append(
+                            (seq.start_line - 1, seq.end_line, replacement)
+                        )
+                    first_seq = min(group, key=lambda s: s.start_line)
+                    if placement.startswith("staticmethod:"):
+                        # Insert inside the class body, one line after "class Foo:".
+                        scope = placement.split(":", 1)[1]
+                        insert_pos = _find_insertion_point(source, scope) + 1
+                    else:
+                        scope = first_seq.scope
+                        insert_pos = _find_insertion_point(source, scope)
+                    group_edits.append(
+                        _build_helper_insertion(
+                            source_lines, insert_pos, helper_source, placement
+                        )
+                    )
+                    # Compile the per-group candidate independently so one bad
+                    # extraction doesn't discard valid ones for the same file.
+                    candidate = _apply_edits(source, group_edits)
+
+                    # Check 9: assembled output is valid Python
+                    try:
+                        compile(candidate, "<rewritten>", "exec")
+                    except SyntaxError as exc:
+                        _failures.append(f"assembled edit not valid Python: {exc}")
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor: extraction FAILED — "
+                                f"assembled edit not valid Python: {exc}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            print(
+                                f"crispen: DuplicateExtractor:   helper_source: "
+                                f"{helper_source!r}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            print(
+                                f"crispen: DuplicateExtractor:"
+                                f"   call_site_replacements: "
+                                f"{call_replacements!r}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
+
+                    # Check 10: extracted function is actually called
+                    if not _check_failed and not _has_call_to(func_name, candidate):
+                        _failures.append(
+                            f"'{func_name}' not called in candidate output"
+                        )
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor: extraction FAILED — "
+                                f"'{func_name}' not called in candidate output",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
+
+                    # Check 11: no new undefined names
+                    if not _check_failed:
+                        undef = _pyflakes_new_undefined_names(source, candidate)
+                        if undef:
+                            _failures.append(
+                                f"undefined name(s) introduced by edit: "
+                                f"{', '.join(sorted(undef))}"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"undefined name(s) introduced by edit: "
+                                    f"{', '.join(sorted(undef))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                # Retry decision for algorithmic failures
+                if _check_failed:
+                    if alg_retries_left > 0:
+                        alg_retries_left -= 1
+                        prev_failures = _failures
+                        prev_output = None
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor:   → retrying"
+                                f" extraction ({alg_retries_left} retries"
+                                f" remaining after algorithmic failure)",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        continue
+                    break  # exhausted algorithmic retries — skip group
+
+                # ---- LLM verification step ----
+                try:
+                    verify_ok, verify_issues = _run_with_timeout(
+                        _llm_verify_extraction,
+                        _API_HARD_TIMEOUT,
+                        client,
+                        group,
+                        helper_source,
+                        call_replacements,
+                        source,
+                        self._model,
+                        self._provider,
+                    )
+                except _ApiTimeout:
+                    if self.verbose:
+                        print(
+                            "crispen: DuplicateExtractor:   → verify timed out,"
+                            " accepting extraction",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    verify_ok, verify_issues = True, []
+
+                if self.verbose:
+                    v_status = "ACCEPTED" if verify_ok else "REJECTED"
+                    print(
+                        f"crispen: DuplicateExtractor:   → verify {v_status}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if not verify_ok:
+                        for issue in verify_issues:
+                            print(
+                                f"crispen: DuplicateExtractor:" f"     issue: {issue}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+
+                if not verify_ok:
+                    if llm_verify_retries_left > 0:
+                        llm_verify_retries_left -= 1
+                        prev_failures = [
+                            f"LLM verification issue: {i}" for i in verify_issues
+                        ]
+                        prev_output = extraction
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor:   → retrying"
+                                f" extraction after verify rejection"
+                                f" ({llm_verify_retries_left} retries remaining)",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        continue
+                    break  # exhausted LLM verify retries — skip group
+
+                # ---- All checks passed: accept this extraction ----
+                used_names.add(func_name)
+                if self.verbose:
+                    print(
+                        f"crispen: DuplicateExtractor: extracting '{func_name}'",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                extraction_groups.append(
+                    (
+                        func_name,
+                        group_edits,
+                        f"DuplicateExtractor: extracted '{func_name}' "
+                        f"from {len(group)} duplicate blocks",
+                    )
                 )
-            except _ApiTimeout:
-                print(
-                    "crispen: DuplicateExtractor: API call timed out, skipping group",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                continue
-            if extraction is None:
-                continue  # pragma: no cover
-
-            helper_source = extraction["helper_source"]
-            if not self._helper_docstrings:
-                helper_source = _strip_helper_docstring(helper_source)
-            call_replacements = extraction["call_site_replacements"]
-            placement = extraction.get("placement", "module_level")
-            func_name = extraction["function_name"]
-
-            if func_name in used_names:
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: extraction FAILED — "
-                        f"name collision: '{func_name}' is already defined",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            if len(call_replacements) != len(group):
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: extraction FAILED — "
-                        f"wrong call_site_replacements count "
-                        f"(expected {len(group)}, got {len(call_replacements)})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    print(
-                        f"crispen: DuplicateExtractor:   helper_source: "
-                        f"{helper_source!r}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    print(
-                        f"crispen: DuplicateExtractor:   call_site_replacements: "
-                        f"{call_replacements!r}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            # Normalize each replacement's indentation to match its original block.
-            # The LLM sometimes returns replacements at column 0; this re-indents
-            # them so the assembled edit is valid Python.
-            call_replacements = [
-                _normalize_replacement_indentation(seq, r)
-                for seq, r in zip(group, call_replacements)
-            ]
-
-            # Guard: reject if any replacement "steals" the first line after the
-            # block.  The LLM sometimes appends the post-block statement to the
-            # replacement, causing it to appear twice in the assembled output.
-            if _replacement_steals_post_block_line(
-                group, call_replacements, source_lines
-            ):
-                if self.verbose:
-                    print(
-                        "crispen: DuplicateExtractor: extraction FAILED — "
-                        "replacement duplicates the line after the block",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            if not _verify_extraction(helper_source, call_replacements):
-                if self.verbose:
-                    print(
-                        "crispen: DuplicateExtractor: extraction FAILED — "
-                        "invalid helper or replacement syntax",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    print(
-                        f"crispen: DuplicateExtractor:   helper_source: "
-                        f"{helper_source!r}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    print(
-                        f"crispen: DuplicateExtractor:   call_site_replacements: "
-                        f"{call_replacements!r}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            # Guard: if any original block ends with a return statement, the
-            # corresponding replacement must also contain one.  A missing
-            # return silently changes the function's return value to None.
-            if any(
-                _seq_ends_with_return(seq) and not _replacement_contains_return(repl)
-                for seq, repl in zip(group, call_replacements)
-            ):
-                if self.verbose:
-                    print(
-                        "crispen: DuplicateExtractor: extraction FAILED — "
-                        "block ends with return but replacement omits it",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            # Guard: the helper must not import names that are only local
-            # variables or parameters in the original file.  Doing so would
-            # raise ModuleNotFoundError at runtime.
-            if _helper_imports_local_name(helper_source, source):
-                if self.verbose:
-                    print(
-                        "crispen: DuplicateExtractor: extraction FAILED — "
-                        "helper imports a name that is a parameter/local "
-                        "in the original file",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            new_attrs = _collect_called_attr_names(
-                textwrap.dedent(helper_source)
-            ) - _collect_called_attr_names(source)
-            if new_attrs:
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: extraction FAILED — "
-                        f"helper introduces new attribute access(es) not in original: "
-                        f"{', '.join(sorted(new_attrs))}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            # Guard: every free variable read by the original block must appear
-            # as a bare name somewhere in the call-site replacements or the
-            # helper body.  A missing name means the LLM silently changed the
-            # data flow — e.g. replacing a local-variable reference with an
-            # attribute access on one of the parameters.
-            seq0 = group[0]
-            block_src = "".join(source_lines[seq0.start_line - 1 : seq0.end_line])
-            missing = _missing_free_vars(
-                block_src, call_replacements, helper_source, source
-            )
-            if missing:
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: extraction FAILED — "
-                        f"free variable(s) from original block missing in "
-                        f"replacement: {', '.join(sorted(missing))}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            # Build this group's edits.
-            group_edits: List[Tuple[int, int, str]] = []
-            for seq, replacement in zip(group, call_replacements):
-                group_edits.append((seq.start_line - 1, seq.end_line, replacement))
-
-            first_seq = min(group, key=lambda s: s.start_line)
-            if placement.startswith("staticmethod:"):
-                # Insert inside the class body, one line after "class Foo:".
-                scope = placement.split(":", 1)[1]
-                insert_pos = _find_insertion_point(source, scope) + 1
-            else:
-                scope = first_seq.scope
-                insert_pos = _find_insertion_point(source, scope)
-            group_edits.append(
-                _build_helper_insertion(
-                    source_lines, insert_pos, helper_source, placement
-                )
-            )
-
-            # Compile this group's edits independently so one bad extraction
-            # doesn't discard valid ones for the same file.
-            candidate = _apply_edits(source, group_edits)
-            try:
-                compile(candidate, "<rewritten>", "exec")
-            except SyntaxError as exc:
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: extraction FAILED — "
-                        f"assembled edit not valid Python: {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    print(
-                        f"crispen: DuplicateExtractor:   helper_source: "
-                        f"{helper_source!r}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    print(
-                        f"crispen: DuplicateExtractor:   call_site_replacements: "
-                        f"{call_replacements!r}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            # Verify the extracted function is actually called in the per-group
-            # candidate.  If the LLM returned call replacements that reference a
-            # different name (or none at all), reject this group early.
-            if not _has_call_to(func_name, candidate):
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: extraction FAILED — "
-                        f"'{func_name}' not called in candidate output",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            undef = _pyflakes_new_undefined_names(source, candidate)
-            if undef:
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: extraction FAILED — "
-                        f"undefined name(s) introduced by edit: "
-                        f"{', '.join(sorted(undef))}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                continue
-
-            used_names.add(func_name)
-            if self.verbose:
-                print(
-                    f"crispen: DuplicateExtractor: extracting '{func_name}'",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            extraction_groups.append(
-                (
-                    func_name,
-                    group_edits,
-                    f"DuplicateExtractor: extracted '{func_name}' "
-                    f"from {len(group)} duplicate blocks",
-                )
-            )
+                break  # done with this group
 
         # 18. Combine all accepted edits, verify all extracted functions are
         # actually called in the combined output, then write.

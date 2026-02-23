@@ -34,6 +34,13 @@ class CrispenConfig:
     # When False and unreachable callers exist, the transformation is skipped.
     update_diff_file_callers: bool = True
 
+    # Number of additional extraction attempts after an algorithmic check fails.
+    # 0 means no retry: the group is skipped on the first failure.
+    extraction_retries: int = 1
+    # Number of additional extraction attempts after the LLM verification step
+    # rejects the output.  0 means no retry: the group is skipped on rejection.
+    llm_verify_retries: int = 1
+
 
 def _read_toml(path: Path) -> dict:
     """Read a TOML file; return empty dict if missing or unparseable."""

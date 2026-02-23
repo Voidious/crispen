@@ -1259,6 +1259,7 @@ def test_successful_extraction_has_two_blank_lines(monkeypatch):
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
         de = DuplicateExtractor([(9, 11)], source=source)
 
@@ -1314,6 +1315,7 @@ def test_helper_placed_before_class_not_inside(monkeypatch):
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
         de = DuplicateExtractor([(1, 100)], source=source)
 
@@ -1668,6 +1670,16 @@ def _make_extract_response(data: dict) -> MagicMock:
     return resp
 
 
+def _make_verify_response(is_correct: bool, issues: list) -> MagicMock:
+    block = MagicMock()
+    block.type = "tool_use"
+    block.name = "verify_extraction"
+    block.input = {"is_correct": is_correct, "issues": issues}
+    resp = MagicMock()
+    resp.content = [block]
+    return resp
+
+
 def test_api_error_in_veto_raises(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
@@ -1751,7 +1763,12 @@ def test_wrong_replacement_count_skipped(monkeypatch):
             ),
         ]
 
-        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE)
+        de = DuplicateExtractor(
+            _DUP_RANGES,
+            source=_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
     assert de._new_source is None
 
@@ -1775,7 +1792,13 @@ def test_wrong_replacement_count_skipped_verbose_false(monkeypatch):
             ),
         ]
 
-        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
+        de = DuplicateExtractor(
+            _DUP_RANGES,
+            source=_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
     assert de._new_source is None
 
@@ -1814,6 +1837,7 @@ def test_escaping_vars_passed_to_extract(monkeypatch):
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
         de = DuplicateExtractor(_ESC_RANGES, source=_ESC_SOURCE)
 
@@ -1856,7 +1880,13 @@ def _make_invalid_assembled_extractor(monkeypatch, verbose=True):
                 }
             ),
         ]
-        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+        return DuplicateExtractor(
+            _DUP_RANGES,
+            source=_DUP_SOURCE,
+            verbose=verbose,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
 
 def test_invalid_assembled_source_skipped(monkeypatch):
@@ -1906,7 +1936,13 @@ def _make_pyflakes_check_extractor(monkeypatch, verbose=True):
                 }
             ),
         ]
-        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+        return DuplicateExtractor(
+            _DUP_RANGES,
+            source=_DUP_SOURCE,
+            verbose=verbose,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
 
 def test_pyflakes_check_skips_group_verbose(monkeypatch, capsys):
@@ -1957,7 +1993,13 @@ def _make_missing_free_vars_extractor(monkeypatch, verbose=True):
                 }
             ),
         ]
-        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+        return DuplicateExtractor(
+            _DUP_RANGES,
+            source=_DUP_SOURCE,
+            verbose=verbose,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
 
 def test_missing_free_vars_check_skips_group_verbose(monkeypatch, capsys):
@@ -2002,7 +2044,12 @@ def test_verify_fails_skipped(monkeypatch):
             ),
         ]
 
-        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE)
+        de = DuplicateExtractor(
+            _DUP_RANGES,
+            source=_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
     assert de._new_source is None
 
@@ -2029,7 +2076,13 @@ def test_verify_fails_skipped_verbose_false(monkeypatch):
             ),
         ]
 
-        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
+        de = DuplicateExtractor(
+            _DUP_RANGES,
+            source=_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
     assert de._new_source is None
 
@@ -2082,7 +2135,12 @@ def test_replacement_steals_post_block_skipped(monkeypatch):
                 }
             ),
         ]
-        de = DuplicateExtractor(_POST_STEAL_RANGES, source=_POST_STEAL_SOURCE)
+        de = DuplicateExtractor(
+            _POST_STEAL_RANGES,
+            source=_POST_STEAL_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
     assert de._new_source is None
 
@@ -2114,7 +2172,11 @@ def test_replacement_steals_post_block_skipped_verbose_false(monkeypatch):
             ),
         ]
         de = DuplicateExtractor(
-            _POST_STEAL_RANGES, source=_POST_STEAL_SOURCE, verbose=False
+            _POST_STEAL_RANGES,
+            source=_POST_STEAL_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
         )
 
     assert de._new_source is None
@@ -2144,7 +2206,13 @@ def _make_new_attr_extractor(monkeypatch, verbose=True):
                 }
             ),
         ]
-        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+        return DuplicateExtractor(
+            _DUP_RANGES,
+            source=_DUP_SOURCE,
+            verbose=verbose,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
 
 def test_new_attribute_check_skips_group_verbose(monkeypatch, capsys):
@@ -2185,7 +2253,13 @@ def _make_no_call_extractor(monkeypatch, verbose=True):
                 }
             ),
         ]
-        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+        return DuplicateExtractor(
+            _DUP_RANGES,
+            source=_DUP_SOURCE,
+            verbose=verbose,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
 
 
 def test_no_call_check_skips_group_verbose(monkeypatch, capsys):
@@ -2234,6 +2308,7 @@ def _make_uncalled_in_combined_extractor(monkeypatch, verbose=True):
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
         return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
 
@@ -2307,7 +2382,7 @@ def _make_two_group_drop_extractor(monkeypatch, verbose=True):
         mock_client = MagicMock()
         mock_anthropic.Anthropic.return_value = mock_client
         mock_anthropic.APIError = Exception
-        # Four LLM calls: veto+extract for each of the two groups in processing order.
+        # Six LLM calls: veto+extract+verify for each of the two groups.
         mock_client.messages.create.side_effect = [
             _make_veto_response(True, "same logic"),
             _make_extract_response(
@@ -2321,6 +2396,7 @@ def _make_two_group_drop_extractor(monkeypatch, verbose=True):
                     ],
                 }
             ),
+            _make_verify_response(True, []),
             _make_veto_response(True, "same logic"),
             _make_extract_response(
                 {
@@ -2333,6 +2409,7 @@ def _make_two_group_drop_extractor(monkeypatch, verbose=True):
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
         return DuplicateExtractor(
             _TWO_PAIR_RANGES, source=_TWO_PAIR_SOURCE, verbose=verbose
@@ -2386,6 +2463,7 @@ def test_successful_extraction_module_level(monkeypatch, tmp_path):
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
 
         de = DuplicateExtractor([(9, 11)], source=source)
@@ -2436,6 +2514,7 @@ def test_staticmethod_placement(monkeypatch):
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
 
         de = DuplicateExtractor([(8, 10)], source=source)
@@ -2474,7 +2553,7 @@ def test_llm_veto_skips_non_matching_blocks(monkeypatch):
     client.messages.create.return_value = response
 
     group = [_make_seq_info(1, 3), _make_seq_info(5, 7)]
-    is_valid, reason = _llm_veto(client, group)
+    is_valid, reason, _ = _llm_veto(client, group)
     assert is_valid is True
 
 
@@ -2541,6 +2620,7 @@ def test_verbose_false_suppresses_stderr(monkeypatch):
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
 
         de = DuplicateExtractor([(9, 11)], source=source, verbose=False)
@@ -2641,7 +2721,7 @@ def test_veto_timeout_skips_group(monkeypatch):
 def test_extract_timeout_skips_group(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     # First call (veto) returns success; second call (extract) times out.
-    side_effects = [(True, "same logic"), _ApiTimeout("extract timed out")]
+    side_effects = [(True, "same logic", ""), _ApiTimeout("extract timed out")]
 
     def _mock_run(func, timeout, *args, **kwargs):
         result = side_effects.pop(0)
@@ -2689,7 +2769,7 @@ def test_llm_veto_func_match_accepted():
         body_stmt_count=1,
         params=[],
     )
-    is_valid, reason = _llm_veto_func_match(client, seq, func, "source")
+    is_valid, reason, _ = _llm_veto_func_match(client, seq, func, "source")
     assert is_valid is True
     assert reason == "same op"
 
@@ -2708,7 +2788,7 @@ def test_llm_veto_func_match_rejected():
         body_stmt_count=1,
         params=[],
     )
-    is_valid, reason = _llm_veto_func_match(client, seq, func, "source")
+    is_valid, reason, _ = _llm_veto_func_match(client, seq, func, "source")
     assert is_valid is False
 
 
@@ -2751,7 +2831,7 @@ def test_llm_veto_func_match_skips_non_matching_blocks():
         body_stmt_count=1,
         params=[],
     )
-    is_valid, reason = _llm_veto_func_match(client, seq, func, "source")
+    is_valid, reason, _ = _llm_veto_func_match(client, seq, func, "source")
     assert is_valid is True
 
 
@@ -2960,7 +3040,7 @@ def test_func_match_no_arg_replaces_body(monkeypatch):
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
-            return_value=(True, "same operation"),
+            return_value=(True, "same operation", ""),
         ),
     ):
         de = DuplicateExtractor(
@@ -2977,7 +3057,7 @@ def test_func_match_verbose_false(monkeypatch):
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
-            return_value=(True, "same operation"),
+            return_value=(True, "same operation", ""),
         ),
     ):
         de = DuplicateExtractor(
@@ -2993,7 +3073,7 @@ def test_func_match_veto_rejects(monkeypatch):
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
             "crispen.refactors.duplicate_extractor._run_with_timeout",
-            return_value=(False, "different"),
+            return_value=(False, "different", ""),
         ),
     ):
         de = DuplicateExtractor(
@@ -3023,7 +3103,7 @@ def test_func_match_verify_fails(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     # Call 1: func match veto → (True, "ok")
     # Call 2: dup group veto → (False, "different") so extract is never called
-    side_effects = [(True, "ok"), (False, "different")]
+    side_effects = [(True, "ok", ""), (False, "different", "")]
 
     def _mock_run(func, timeout, *args, **kwargs):
         return side_effects.pop(0)
@@ -3048,7 +3128,7 @@ def test_func_match_param_call_gen_success(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     # Call 1: func match veto → (True, "ok")
     # Call 2: _llm_generate_call → replacement string
-    side_effects: list = [(True, "ok"), "    _process(data)\n"]
+    side_effects: list = [(True, "ok", ""), "    _process(data)\n"]
 
     def _mock_run(func, timeout, *args, **kwargs):
         return side_effects.pop(0)
@@ -3074,7 +3154,11 @@ def test_func_match_param_call_gen_timeout(monkeypatch):
     # Call 1: func match veto → (True, "ok")
     # Call 2: _llm_generate_call → timeout
     # Call 3: dup group veto → (False, "reject") so no extract called
-    side_effects: list = [(True, "ok"), _ApiTimeout("timed out"), (False, "reject")]
+    side_effects: list = [
+        (True, "ok", ""),
+        _ApiTimeout("timed out"),
+        (False, "reject", ""),
+    ]
 
     def _mock_run(func, timeout, *args, **kwargs):
         result = side_effects.pop(0)
@@ -3106,10 +3190,16 @@ def test_func_match_then_dup_extract(monkeypatch):
         "helper_source": "def _helper():\n    pass\n",
         "call_site_replacements": ["    _helper()\n", "    _helper()\n"],
     }
-    # Call 1: func match veto → (True, "ok")
-    # Call 2: dup group veto → (True, "ok")
+    # Call 1: func match veto → (True, "ok", "")
+    # Call 2: dup group veto → (True, "ok", "")
     # Call 3: dup group extract → extraction dict
-    side_effects: list = [(True, "ok"), (True, "ok"), extraction_dict]
+    # Call 4: LLM verify → (True, [])
+    side_effects: list = [
+        (True, "ok", ""),
+        (True, "ok", ""),
+        extraction_dict,
+        (True, []),
+    ]
 
     def _mock_run(func, timeout, *args, **kwargs):
         return side_effects.pop(0)
@@ -3176,7 +3266,11 @@ def test_extraction_name_collision_skipped(monkeypatch, capsys):
             ),
         ]
         de = DuplicateExtractor(
-            _COLLISION_RANGES, source=_COLLISION_SOURCE, verbose=True
+            _COLLISION_RANGES,
+            source=_COLLISION_SOURCE,
+            verbose=True,
+            extraction_retries=0,
+            llm_verify_retries=0,
         )
 
     assert de._new_source is None
@@ -3208,7 +3302,11 @@ def test_extraction_name_collision_silent(monkeypatch, capsys):
             ),
         ]
         de = DuplicateExtractor(
-            _COLLISION_RANGES, source=_COLLISION_SOURCE, verbose=False
+            _COLLISION_RANGES,
+            source=_COLLISION_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
         )
 
     assert de._new_source is None
@@ -3304,6 +3402,7 @@ def test_duplicate_extractor_helper_docstrings_false_strips_docstring(
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
         de = DuplicateExtractor(
             _DUP_RANGES, source=_DUP_SOURCE, verbose=False, helper_docstrings=False
@@ -3339,6 +3438,7 @@ def test_duplicate_extractor_helper_docstrings_true_keeps_docstring(
                     ],
                 }
             ),
+            _make_verify_response(True, []),
         ]
         de = DuplicateExtractor(
             _DUP_RANGES, source=_DUP_SOURCE, verbose=False, helper_docstrings=True
@@ -3585,7 +3685,12 @@ def test_block_ends_with_return_guard_skips(monkeypatch, capsys):
             _make_veto_response(True),
             _make_return_block_extract_response(),
         ]
-        de = DuplicateExtractor(_RETURN_BLOCK_RANGES, source=_RETURN_BLOCK_SOURCE)
+        de = DuplicateExtractor(
+            _RETURN_BLOCK_RANGES,
+            source=_RETURN_BLOCK_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
     assert de._new_source is None
     assert "block ends with return but replacement omits it" in capsys.readouterr().err
 
@@ -3602,7 +3707,11 @@ def test_block_ends_with_return_guard_skips_silent(monkeypatch):
             _make_return_block_extract_response(),
         ]
         de = DuplicateExtractor(
-            _RETURN_BLOCK_RANGES, source=_RETURN_BLOCK_SOURCE, verbose=False
+            _RETURN_BLOCK_RANGES,
+            source=_RETURN_BLOCK_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
         )
     assert de._new_source is None
 
@@ -3659,7 +3768,12 @@ def test_helper_imports_local_guard_skips(monkeypatch, capsys):
             _make_veto_response(True),
             _make_import_local_extract_response(),
         ]
-        de = DuplicateExtractor(_PARAM_DUP_RANGES, source=_PARAM_DUP_SOURCE)
+        de = DuplicateExtractor(
+            _PARAM_DUP_RANGES,
+            source=_PARAM_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
     assert de._new_source is None
     assert "helper imports a name that is a parameter/local" in capsys.readouterr().err
 
@@ -3676,6 +3790,318 @@ def test_helper_imports_local_guard_skips_silent(monkeypatch):
             _make_import_local_extract_response(),
         ]
         de = DuplicateExtractor(
-            _PARAM_DUP_RANGES, source=_PARAM_DUP_SOURCE, verbose=False
+            _PARAM_DUP_RANGES,
+            source=_PARAM_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
         )
     assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# New behaviour: veto notes, algorithmic retry, LLM verify step
+# ---------------------------------------------------------------------------
+
+
+def _make_veto_response_with_notes(
+    is_valid: bool, reason: str, notes: str
+) -> MagicMock:
+    block = MagicMock()
+    block.type = "tool_use"
+    block.name = "evaluate_duplicate"
+    block.input = {
+        "is_valid_duplicate": is_valid,
+        "reason": reason,
+        "extraction_notes": notes,
+    }
+    resp = MagicMock()
+    resp.content = [block]
+    return resp
+
+
+def test_veto_notes_passed_to_extract(monkeypatch):
+    """extraction_notes from veto are forwarded to the extract prompt."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    helper = "def _helper(data):\n    pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response_with_notes(True, "same logic", "watch out for x"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE)
+
+    assert de._new_source is not None
+    extract_call = mock_client.messages.create.call_args_list[1]
+    extract_prompt = extract_call.kwargs["messages"][0]["content"]
+    assert "watch out for x" in extract_prompt
+
+
+def test_extraction_retry_on_alg_failure_verbose(monkeypatch, capsys):
+    """First extract has wrong call count -> retry -> second succeeds. verbose=True."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    helper = "def _helper(data):\n    pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": ["    _helper(data)\n"],  # wrong count
+                }
+            ),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _DUP_RANGES, source=_DUP_SOURCE, verbose=True, extraction_retries=1
+        )
+
+    assert de._new_source is not None
+    err = capsys.readouterr().err
+    assert "retrying" in err
+
+
+def test_extraction_retry_on_alg_failure_silent(monkeypatch):
+    """First extract has wrong call count -> retry -> second succeeds. verbose=False."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    helper = "def _helper(data):\n    pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": ["    _helper(data)\n"],  # wrong count
+                }
+            ),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _DUP_RANGES, source=_DUP_SOURCE, verbose=False, extraction_retries=1
+        )
+
+    assert de._new_source is not None
+
+
+def test_llm_verify_timeout_verbose(monkeypatch, capsys):
+    """Verify times out (verbose=True) -> extraction is accepted and logged."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from crispen.refactors.duplicate_extractor import _llm_verify_extraction
+
+    extraction_dict = {
+        "function_name": "_helper",
+        "placement": "module_level",
+        "helper_source": "def _helper(data):\n    pass\n",
+        "call_site_replacements": ["    _helper(data)\n", "    _helper(data)\n"],
+    }
+    side_effects: list = [(True, "same logic", ""), extraction_dict]
+
+    def _mock_run(func, timeout, *args, **kwargs):
+        if func is _llm_verify_extraction:
+            raise _ApiTimeout("verify timed out")
+        return side_effects.pop(0)
+
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            side_effect=_mock_run,
+        ),
+    ):
+        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=True)
+
+    assert de._new_source is not None
+    err = capsys.readouterr().err
+    assert "verify timed out" in err
+
+
+def test_llm_verify_rejects_then_retries_verbose(monkeypatch, capsys):
+    """Verify rejects first attempt; retry extract passes. verbose=True."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    helper = "def _helper(data):\n    pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(False, ["wrong variable name"]),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _DUP_RANGES, source=_DUP_SOURCE, verbose=True, llm_verify_retries=1
+        )
+
+    assert de._new_source is not None
+    err = capsys.readouterr().err
+    assert "REJECTED" in err
+    assert "wrong variable name" in err
+    assert "retrying" in err
+
+
+def test_llm_verify_rejects_then_retries_silent(monkeypatch):
+    """Verify rejects first attempt; retry extract passes. verbose=False."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    helper = "def _helper(data):\n    pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(False, ["wrong variable name"]),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _DUP_RANGES, source=_DUP_SOURCE, verbose=False, llm_verify_retries=1
+        )
+
+    assert de._new_source is not None
+
+
+def test_llm_verify_exhausted_skips_group(monkeypatch):
+    """All verify attempts fail -> group skipped."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    helper = "def _helper(data):\n    pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(False, ["issue"]),
+        ]
+        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, llm_verify_retries=0)
+
+    assert de._new_source is None
+
+
+def test_llm_verify_timeout_silent(monkeypatch):
+    """Verify times out (verbose=False) -> extraction is accepted silently."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from crispen.refactors.duplicate_extractor import _llm_verify_extraction
+
+    extraction_dict = {
+        "function_name": "_helper",
+        "placement": "module_level",
+        "helper_source": "def _helper(data):\n    pass\n",
+        "call_site_replacements": ["    _helper(data)\n", "    _helper(data)\n"],
+    }
+    side_effects: list = [(True, "same logic", ""), extraction_dict]
+
+    def _mock_run(func, timeout, *args, **kwargs):
+        if func is _llm_verify_extraction:
+            raise _ApiTimeout("verify timed out")
+        return side_effects.pop(0)
+
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            side_effect=_mock_run,
+        ),
+    ):
+        de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
+
+    assert de._new_source is not None

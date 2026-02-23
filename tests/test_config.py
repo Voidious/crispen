@@ -113,7 +113,9 @@ def test_load_config_all_options(tmp_path):
         "model = 'claude-opus-4-6'\n"
         "max_function_length = 100\n"
         "helper_docstrings = true\n"
-        "update_diff_file_callers = false\n",
+        "update_diff_file_callers = false\n"
+        "extraction_retries = 2\n"
+        "llm_verify_retries = 3\n",
         encoding="utf-8",
     )
     cfg = load_config(project_root=tmp_path)
@@ -124,3 +126,5 @@ def test_load_config_all_options(tmp_path):
     assert cfg.max_function_length == 100
     assert cfg.helper_docstrings is True
     assert cfg.update_diff_file_callers is False
+    assert cfg.extraction_retries == 2
+    assert cfg.llm_verify_retries == 3
