@@ -1247,7 +1247,7 @@ def _find_insertion_point(source: str, scope: str) -> int:
                 last_import = i
         return last_import + 1
 
-    pattern = re.compile(rf"^\s*(?:def|class)\s+{re.escape(scope)}\s*[\(:]")
+    pattern = re.compile(rf"^\s*(?:async\s+def|def|class)\s+{re.escape(scope)}\s*[\(:]")
     for i, line in enumerate(source_lines):
         if pattern.match(line):
             method_indent = len(line) - len(line.lstrip())

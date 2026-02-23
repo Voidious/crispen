@@ -999,6 +999,30 @@ def test_find_insertion_point_indented_func_at_file_start():
     assert _find_insertion_point(source, "inner") == 0
 
 
+def test_find_insertion_point_async_def():
+    # Regression: helpers extracted from async functions were inserted at line 0
+    # (before imports) because the pattern only matched 'def', not 'async def'.
+    source = (
+        "import pytest\n"  # 0
+        "\n"  # 1
+        "async def target(client):\n"  # 2
+        "    pass\n"  # 3
+    )
+    assert _find_insertion_point(source, "target") == 2
+
+
+def test_find_insertion_point_async_def_with_decorator():
+    # async def with a preceding decorator: helper should land before the decorator.
+    source = (
+        "import pytest\n"  # 0
+        "\n"  # 1
+        "@pytest.mark.asyncio\n"  # 2
+        "async def target(client):\n"  # 3
+        "    pass\n"  # 4
+    )
+    assert _find_insertion_point(source, "target") == 2
+
+
 def test_find_insertion_point_skips_over_decorators():
     # Helper must be inserted before the decorator block, not between the
     # decorators and the def they decorate.
