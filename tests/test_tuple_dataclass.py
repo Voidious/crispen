@@ -14,22 +14,23 @@ from crispen.refactors.tuple_dataclass import (
 )
 
 
-def _apply(source: str, ranges=None, min_size: int = 3) -> str:
+def _setup_transformer(source: str, ranges=None, min_size: int = 3):
     if ranges is None:
         ranges = [(1, 100)]
     tree = cst.parse_module(source)
     wrapper = MetadataWrapper(tree)
     transformer = TupleDataclass(ranges, min_size=min_size, source=source)
+    return wrapper, transformer
+
+
+def _apply(source: str, ranges=None, min_size: int = 3) -> str:
+    wrapper, transformer = _setup_transformer(source, ranges, min_size)
     new_tree = wrapper.visit(transformer)
     return new_tree.code
 
 
 def _changes(source: str, ranges=None, min_size: int = 3) -> list:
-    if ranges is None:
-        ranges = [(1, 100)]
-    tree = cst.parse_module(source)
-    wrapper = MetadataWrapper(tree)
-    transformer = TupleDataclass(ranges, min_size=min_size, source=source)
+    wrapper, transformer = _setup_transformer(source, ranges, min_size)
     wrapper.visit(transformer)
     return transformer.changes_made
 
@@ -405,28 +406,26 @@ def test_unpacking_collector_finds_tuple_target():
     assert list(collector.unpackings.values())[0] == ["a", "b", "c"]
 
 
-def test_unpacking_collector_skips_multiple_targets():
-    source = "a = b = some_func()\n"
+def _assert_no_unpackings(source: str) -> None:
     tree = cst.parse_module(source)
     collector = _UnpackingCollector()
     MetadataWrapper(tree).visit(collector)
     assert collector.unpackings == {}
+
+
+def test_unpacking_collector_skips_multiple_targets():
+    source = "a = b = some_func()\n"
+    _assert_no_unpackings(source)
 
 
 def test_unpacking_collector_skips_non_tuple_target():
     source = "a = some_func()\n"
-    tree = cst.parse_module(source)
-    collector = _UnpackingCollector()
-    MetadataWrapper(tree).visit(collector)
-    assert collector.unpackings == {}
+    _assert_no_unpackings(source)
 
 
 def test_unpacking_collector_skips_complex_elements():
     source = "a, b[0] = some_func()\n"
-    tree = cst.parse_module(source)
-    collector = _UnpackingCollector()
-    MetadataWrapper(tree).visit(collector)
-    assert collector.unpackings == {}
+    _assert_no_unpackings(source)
 
 
 # ---------------------------------------------------------------------------
@@ -439,12 +438,18 @@ def public_func():
 """
 
 
-def _make_td_for_public_func_3() -> TupleDataclass:
-    """Run TupleDataclass on BEFORE_PUBLIC_FUNC_3 and return the transformer."""
-    tree = cst.parse_module(BEFORE_PUBLIC_FUNC_3)
-    td = TupleDataclass([(1, 100)], min_size=3)
+def _create_td_and_visit(
+    source: str, ranges: list, min_size: int = 3
+) -> TupleDataclass:
+    tree = cst.parse_module(source)
+    td = TupleDataclass(ranges, min_size=min_size)
     MetadataWrapper(tree).visit(td)
     return td
+
+
+def _make_td_for_public_func_3() -> TupleDataclass:
+    """Run TupleDataclass on BEFORE_PUBLIC_FUNC_3 and return the transformer."""
+    return _create_td_and_visit(BEFORE_PUBLIC_FUNC_3, [(1, 100)], min_size=3)
 
 
 def test_public_function_candidate_recorded():
@@ -520,10 +525,7 @@ def _f():
 
 def _make_private_td(source: str = "def _private():\n    return (1, 2, 3)\n"):
     """Parse *source*, run TupleDataclass over it, and return the transformer."""
-    tree = cst.parse_module(source)
-    td = TupleDataclass([(1, 100)], min_size=3)
-    MetadataWrapper(tree).visit(td)
-    return td
+    return _create_td_and_visit(source, [(1, 100)], min_size=3)
 
 
 def test_private_function_in_get_private_transforms():
@@ -737,27 +739,27 @@ def _f(flag):
 # ---------------------------------------------------------------------------
 
 
-def test_default_min_size_is_4_skips_3_tuple():
-    """With the default min_size=4, a 3-element tuple is NOT transformed."""
-    source = "def _f():\n    return (1, 2, 3)\n"
+def _create_td_with_default_min_size(source: str):
     tree = cst.parse_module(source)
     from libcst.metadata import MetadataWrapper
 
     wrapper = MetadataWrapper(tree)
     td = TupleDataclass([(1, 2)], source=source)  # no min_size → default 4
     wrapper.visit(td)
+    return td
+
+
+def test_default_min_size_is_4_skips_3_tuple():
+    """With the default min_size=4, a 3-element tuple is NOT transformed."""
+    source = "def _f():\n    return (1, 2, 3)\n"
+    td = _create_td_with_default_min_size(source)
     assert td.changes_made == []
 
 
 def test_default_min_size_is_4_transforms_4_tuple():
     """With the default min_size=4, a 4-element tuple IS transformed."""
     source = "def _f():\n    return (1, 2, 3, 4)\n"
-    tree = cst.parse_module(source)
-    from libcst.metadata import MetadataWrapper
-
-    wrapper = MetadataWrapper(tree)
-    td = TupleDataclass([(1, 2)], source=source)  # no min_size → default 4
-    wrapper.visit(td)
+    td = _create_td_with_default_min_size(source)
     assert td.changes_made != []
 
 

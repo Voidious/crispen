@@ -339,6 +339,13 @@ class _FunctionCollector(cst.CSTVisitor):
 # ---------------------------------------------------------------------------
 
 
+def _parse_source_or_empty(source: str) -> ast.AST | None:
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return None
+
+
 def _collect_called_names(source: str) -> set:
     """Return a set of all names called (as functions) in *source*.
 
@@ -346,9 +353,8 @@ def _collect_called_names(source: str) -> set:
     called name: func.id for ast.Name callees, func.attr for ast.Attribute
     callees.  On SyntaxError, returns an empty set.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_source_or_empty(source)
+    if tree == None:
         return set()
     names: set = set()
     for node in ast.walk(tree):
@@ -519,6 +525,22 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
+def _call_llm_veto_tool(client, provider, model, prompt):
+    result = _llm_client.call_with_tool(
+        client,
+        provider,
+        model,
+        256,
+        _VETO_TOOL,
+        "evaluate_duplicate",
+        [{"role": "user", "content": prompt}],
+        caller="DuplicateExtractor",
+    )
+    if result is not None:
+        return result["is_valid_duplicate"], result.get("reason", "")
+    return False, "no tool response"  # pragma: no cover
+
+
 def _llm_veto(
     client,
     group: List[_SeqInfo],
@@ -537,19 +559,7 @@ def _llm_veto(
         "a shared helper function would improve clarity? Or are they coincidentally "
         "similar but conceptually distinct?"
     )
-    result = _llm_client.call_with_tool(
-        client,
-        provider,
-        model,
-        256,
-        _VETO_TOOL,
-        "evaluate_duplicate",
-        [{"role": "user", "content": prompt}],
-        caller="DuplicateExtractor",
-    )
-    if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+    return _call_llm_veto_tool(client, provider, model, prompt)
 
 
 def _llm_extract(
@@ -662,19 +672,7 @@ def _llm_veto_func_match(
         "body, such that it could be replaced by a call to the function? "
         "Use the evaluate_duplicate tool to answer."
     )
-    result = _llm_client.call_with_tool(
-        client,
-        provider,
-        model,
-        256,
-        _VETO_TOOL,
-        "evaluate_duplicate",
-        [{"role": "user", "content": prompt}],
-        caller="DuplicateExtractor",
-    )
-    if result is not None:
-        return result["is_valid_duplicate"], result.get("reason", "")
-    return False, "no tool response"  # pragma: no cover
+    return _call_llm_veto_tool(client, provider, model, prompt)
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
@@ -980,9 +978,8 @@ def _missing_free_vars(
     # parameters somewhere in the full source.  Module-level names that are
     # only ever read (e.g. imported functions, global constants) are in scope
     # from the helper definition too and do not need to be passed as args.
-    try:
-        source_tree = ast.parse(source)
-    except SyntaxError:
+    source_tree = _parse_source_or_empty(source)
+    if source_tree == None:
         return set()
     source_locals: set = set()
     for node in ast.walk(source_tree):
@@ -1079,6 +1076,17 @@ def _replacement_steals_post_block_line(
     return False
 
 
+def _collect_import_names(node, target_set):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name.split(".")[0]
+            target_set.add(name)
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            target_set.add(name)
+
+
 def _helper_imports_local_name(helper_source: str, original_source: str) -> bool:
     """Return True if helper_source imports a name that is only a local in original.
 
@@ -1093,14 +1101,7 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
 
     helper_imports: set = set()
     for node in ast.walk(helper_tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                helper_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                helper_imports.add(name)
+        _collect_import_names(node, helper_imports)
 
     if not helper_imports:
         return False
@@ -1113,14 +1114,7 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
     # Names already imported at the top level of the original file.
     orig_top_imports: set = set()
     for node in orig_tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                orig_top_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                orig_top_imports.add(name)
+        _collect_import_names(node, orig_top_imports)
 
     new_helper_imports = helper_imports - orig_top_imports
     if not new_helper_imports:
@@ -1371,6 +1365,20 @@ def _find_insertion_point(source: str, scope: str) -> int:
 
 
 class DuplicateExtractor(Refactor):
+
+    @staticmethod
+    def _log_veto_and_maybe_continue(
+        verbose: bool, is_valid: bool, reason: str
+    ) -> bool:
+        if verbose:
+            status = "ACCEPTED" if is_valid else "VETOED"
+            print(
+                f"crispen: DuplicateExtractor:   → {status}: {reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return not is_valid
+
     """Detect and extract duplicate code blocks into helper functions via LLM."""
 
     def __init__(
@@ -1487,14 +1495,7 @@ class DuplicateExtractor(Refactor):
                         flush=True,
                     )
                     continue
-                if self.verbose:
-                    status = "ACCEPTED" if is_valid else "VETOED"
-                    print(
-                        f"crispen: DuplicateExtractor:   → {status}: {reason}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                if not is_valid:
+                if self._log_veto_and_maybe_continue(self.verbose, is_valid, reason):
                     continue
                 if func.scope == "<module>" and not func.params:
                     replacement = _generate_no_arg_call(seq, func)
@@ -1588,14 +1589,7 @@ class DuplicateExtractor(Refactor):
                     flush=True,
                 )
                 continue
-            if self.verbose:
-                status = "ACCEPTED" if is_valid else "VETOED"
-                print(
-                    f"crispen: DuplicateExtractor:   → {status}: {reason}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            if not is_valid:
+            if self._log_veto_and_maybe_continue(self.verbose, is_valid, reason):
                 continue
 
             try:
