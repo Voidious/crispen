@@ -182,3 +182,28 @@ def test_call_with_tool_moonshot_api_error():
                 _MESSAGES,
                 caller="Test",
             )
+
+
+def test_call_with_tool_moonshot_malformed_json():
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        tc = MagicMock()
+        tc.function.arguments = '{"key": "unterminated'
+        message = MagicMock()
+        message.tool_calls = [tc]
+        choice = MagicMock()
+        choice.message = message
+        resp = MagicMock()
+        resp.choices = [choice]
+        client.chat.completions.create.return_value = resp
+        result = call_with_tool(
+            client,
+            "moonshot",
+            "moonshot-v1-32k",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+        )
+    assert result is None

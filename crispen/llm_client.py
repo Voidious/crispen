@@ -85,7 +85,10 @@ def call_with_tool(
             ) from exc
         if response.choices and response.choices[0].message.tool_calls:
             tc = response.choices[0].message.tool_calls[0]
-            return json.loads(tc.function.arguments)
+            try:
+                return json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                return None
         return None  # pragma: no cover
     else:
         try:
