@@ -319,6 +319,17 @@ def _apply_tuple_dataclass(
 # ---------------------------------------------------------------------------
 
 
+def _collect_changes(
+    msgs: List[str],
+    filepath: str,
+    source: str,
+    transformer,
+) -> str:
+    for msg in transformer.get_changes():
+        msgs.append(f"{filepath}: {msg}")
+    return source
+
+
 def run_engine(
     changed: Dict[str, List[Tuple[int, int]]],
     verbose: bool = True,
@@ -406,9 +417,9 @@ def run_engine(
                 )
                 continue
 
-            for msg in transformer.get_changes():
-                file_msgs.append(f"{filepath}: {msg}")
-            current_source = new_source
+            current_source = _collect_changes(
+                file_msgs, filepath, new_source, transformer
+            )
 
         # Apply TupleDataclass — private functions only in this pass.
         candidates: Dict[str, TransformInfo] = {}
@@ -451,9 +462,9 @@ def run_engine(
                         except SyntaxError:  # pragma: no cover
                             pass
                         else:
-                            for msg in cu.get_changes():
-                                file_msgs.append(f"{filepath}: {msg}")
-                            current_source = cu_new_source
+                            current_source = _collect_changes(
+                                file_msgs, filepath, cu_new_source, cu
+                            )
 
         per_file[filepath] = {
             "original": original_source,
