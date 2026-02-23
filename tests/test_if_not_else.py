@@ -6,22 +6,23 @@ from libcst.metadata import MetadataWrapper
 from crispen.refactors.if_not_else import IfNotElse
 
 
-def _apply(source: str, ranges=None) -> str:
+def _create_transformer(source: str, ranges=None):
     if ranges is None:
         ranges = [(1, 100)]
     tree = cst.parse_module(source)
     wrapper = MetadataWrapper(tree)
     transformer = IfNotElse(ranges)
+    return transformer, wrapper
+
+
+def _apply(source: str, ranges=None) -> str:
+    transformer, wrapper = _create_transformer(source, ranges)
     new_tree = wrapper.visit(transformer)
     return new_tree.code
 
 
 def _changes(source: str, ranges=None) -> list:
-    if ranges is None:
-        ranges = [(1, 100)]
-    tree = cst.parse_module(source)
-    wrapper = MetadataWrapper(tree)
-    transformer = IfNotElse(ranges)
+    transformer, wrapper = _create_transformer(source, ranges)
     wrapper.visit(transformer)
     return transformer.changes_made
 
