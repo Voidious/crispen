@@ -33,6 +33,8 @@ model = "claude-sonnet-4-6"
 max_function_length = 75
 helper_docstrings = false
 update_diff_file_callers = true
+extraction_retries = 1
+llm_verify_retries = 1
 
 [tool.pytest.ini_options]
 addopts = "--cov=crispen --cov-branch --cov-fail-under=100"
