@@ -1612,7 +1612,7 @@ class DuplicateExtractor(Refactor):
         # 12. Create API client.
         api_key = _llm_client.get_api_key(self._provider, caller="DuplicateExtractor")
         client = _llm_client.make_client(
-            self._provider, api_key, timeout=60.0, base_url=self._base_url
+            self._provider, api_key, timeout=180.0, base_url=self._base_url
         )
         edits: List[Tuple[int, int, str]] = []
         pending_changes: List[str] = []
