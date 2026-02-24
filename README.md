@@ -17,12 +17,6 @@ Crispen operates only on the lines you actually changed — not the whole file. 
 Crispen requires Python 3.12+.
 
 ```bash
-pip install crispen
-```
-
-Or from source:
-
-```bash
 git clone https://github.com/Voidious/crispen
 cd crispen
 uv sync
