@@ -114,6 +114,8 @@ def call_with_tool(
         }
         if provider == "moonshot":
             create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        if provider == "lmstudio":
+            create_kwargs["tool_choice"] = "required"
         try:
             response = client.chat.completions.create(**create_kwargs)
         except openai.APIError as exc:
