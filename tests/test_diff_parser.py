@@ -13,11 +13,15 @@ SIMPLE_DIFF = """\
 """
 
 
+def assert_and_get_ranges(result, filename):
+    assert filename in result
+    return result[filename]
+
+
 def test_parse_simple_diff():
     result = parse_diff(SIMPLE_DIFF)
-    assert "foo.py" in result
     # Lines 2 and 3 are added (print and return)
-    ranges = result["foo.py"]
+    ranges = assert_and_get_ranges(result, "foo.py")
     assert len(ranges) >= 1
     covered = set()
     for start, end in ranges:
@@ -80,8 +84,7 @@ def test_non_consecutive_lines_two_ranges():
 +line5
 """
     result = parse_diff(diff)
-    assert "foo.py" in result
-    ranges = result["foo.py"]
+    ranges = assert_and_get_ranges(result, "foo.py")
     assert len(ranges) == 2
     assert ranges[0] == (1, 2)
     assert ranges[1] == (4, 5)
@@ -111,8 +114,7 @@ def test_consecutive_lines_merged():
 +line4
 """
     result = parse_diff(diff)
-    assert "foo.py" in result
-    ranges = result["foo.py"]
+    ranges = assert_and_get_ranges(result, "foo.py")
     # Should be merged into a single range
     assert len(ranges) == 1
     assert ranges[0] == (1, 4)
