@@ -207,10 +207,18 @@ def _make_openai_response(tool_name: str, arguments: dict) -> MagicMock:
     return resp
 
 
+def setup_mock_and_client(mock_oai):
+    mock_oai.APIError = Exception
+    client = MagicMock()
+    client.chat.completions.create.return_value = _make_openai_response(
+        "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+    )
+    return client
+
+
 def test_call_with_tool_moonshot_success():
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
+        client = setup_mock_and_client(mock_oai)
         client.chat.completions.create.return_value = _make_openai_response(
             "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
         )
@@ -282,8 +290,7 @@ def test_call_with_tool_moonshot_malformed_json():
 
 def test_call_with_tool_openai_success():
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
+        client = setup_mock_and_client(mock_oai)
         client.chat.completions.create.return_value = _make_openai_response(
             "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
         )

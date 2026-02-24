@@ -363,6 +363,9 @@ class TupleDataclass(Refactor):
             for fname, val in zip(field_names, values)
         ]
         # Add commas between args
+        return self._convert_tuple_to_class(args, class_name, field_names, lineno)
+
+    def _convert_tuple_to_class(self, args, class_name, field_names, lineno):
         args_with_comma = []
         for i, arg in enumerate(args):
             if i < len(args) - 1:

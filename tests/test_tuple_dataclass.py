@@ -14,22 +14,23 @@ from crispen.refactors.tuple_dataclass import (
 )
 
 
-def _apply(source: str, ranges=None, min_size: int = 3) -> str:
+def _init_transformer(source: str, ranges=None, min_size: int = 3) -> tuple:
     if ranges is None:
         ranges = [(1, 100)]
     tree = cst.parse_module(source)
     wrapper = MetadataWrapper(tree)
     transformer = TupleDataclass(ranges, min_size=min_size, source=source)
+    return wrapper, transformer
+
+
+def _apply(source: str, ranges=None, min_size: int = 3) -> str:
+    wrapper, transformer = _init_transformer(source, ranges=ranges, min_size=min_size)
     new_tree = wrapper.visit(transformer)
     return new_tree.code
 
 
 def _changes(source: str, ranges=None, min_size: int = 3) -> list:
-    if ranges is None:
-        ranges = [(1, 100)]
-    tree = cst.parse_module(source)
-    wrapper = MetadataWrapper(tree)
-    transformer = TupleDataclass(ranges, min_size=min_size, source=source)
+    wrapper, transformer = _init_transformer(source, ranges=ranges, min_size=min_size)
     wrapper.visit(transformer)
     return transformer.changes_made
 
@@ -405,28 +406,26 @@ def test_unpacking_collector_finds_tuple_target():
     assert list(collector.unpackings.values())[0] == ["a", "b", "c"]
 
 
-def test_unpacking_collector_skips_multiple_targets():
-    source = "a = b = some_func()\n"
+def test_unpacking_collector_common(source):
     tree = cst.parse_module(source)
     collector = _UnpackingCollector()
     MetadataWrapper(tree).visit(collector)
     assert collector.unpackings == {}
+
+
+def test_unpacking_collector_skips_multiple_targets():
+    source = "a = b = some_func()\n"
+    return test_unpacking_collector_common(source)
 
 
 def test_unpacking_collector_skips_non_tuple_target():
     source = "a = some_func()\n"
-    tree = cst.parse_module(source)
-    collector = _UnpackingCollector()
-    MetadataWrapper(tree).visit(collector)
-    assert collector.unpackings == {}
+    return test_unpacking_collector_common(source)
 
 
 def test_unpacking_collector_skips_complex_elements():
     source = "a, b[0] = some_func()\n"
-    tree = cst.parse_module(source)
-    collector = _UnpackingCollector()
-    MetadataWrapper(tree).visit(collector)
-    assert collector.unpackings == {}
+    return test_unpacking_collector_common(source)
 
 
 # ---------------------------------------------------------------------------

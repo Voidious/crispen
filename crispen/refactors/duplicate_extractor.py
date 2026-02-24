@@ -559,6 +559,16 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
+def _llm_veto_check(result):
+    if result is not None:
+        return (
+            result["is_valid_duplicate"],
+            result.get("reason", ""),
+            result.get("extraction_notes", ""),
+        )
+    return False, "no tool response", ""  # pragma: no cover
+
+
 def _llm_veto(
     client,
     group: List[_SeqInfo],
@@ -591,13 +601,7 @@ def _llm_veto(
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
     )
-    if result is not None:
-        return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
-        )
-    return False, "no tool response", ""  # pragma: no cover
+    return _llm_veto_check(result)
 
 
 def _llm_extract(
@@ -762,13 +766,7 @@ def _llm_veto_func_match(
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
     )
-    if result is not None:
-        return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
-        )
-    return False, "no tool response", ""  # pragma: no cover
+    return _llm_veto_check(result)
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
@@ -1242,6 +1240,17 @@ def _replacement_steals_post_block_line(
     return False
 
 
+def _extract_helper_imports_local_name(node):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name.split(".")[0]
+            yield name
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            yield name
+
+
 def _helper_imports_local_name(helper_source: str, original_source: str) -> bool:
     """Return True if helper_source imports a name that is only a local in original.
 
@@ -1256,14 +1265,8 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
 
     helper_imports: set = set()
     for node in ast.walk(helper_tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                helper_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                helper_imports.add(name)
+        for name in _extract_helper_imports_local_name(node):
+            helper_imports.add(name)
 
     if not helper_imports:
         return False
@@ -1276,14 +1279,8 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
     # Names already imported at the top level of the original file.
     orig_top_imports: set = set()
     for node in orig_tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                orig_top_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                orig_top_imports.add(name)
+        for name in _extract_helper_imports_local_name(node):
+            orig_top_imports.add(name)
 
     new_helper_imports = helper_imports - orig_top_imports
     if not new_helper_imports:

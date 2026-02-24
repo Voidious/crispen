@@ -25,7 +25,7 @@ _TRANSFORMS = {
 }
 
 
-def _apply(source, transforms=None, ranges=None, file_module="mypkg.api"):
+def setup_caller_updater(transforms, ranges, source, file_module):
     if transforms is None:
         transforms = _TRANSFORMS
     if ranges is None:
@@ -33,18 +33,17 @@ def _apply(source, transforms=None, ranges=None, file_module="mypkg.api"):
     tree = cst.parse_module(source)
     wrapper = MetadataWrapper(tree)
     cu = CallerUpdater(ranges, transforms, file_module=file_module, source=source)
+    return wrapper, cu
+
+
+def _apply(source, transforms=None, ranges=None, file_module="mypkg.api"):
+    wrapper, cu = setup_caller_updater(transforms, ranges, source, file_module)
     new_tree = wrapper.visit(cu)
     return new_tree.code
 
 
 def _changes(source, transforms=None, ranges=None, file_module="mypkg.api"):
-    if transforms is None:
-        transforms = _TRANSFORMS
-    if ranges is None:
-        ranges = [(1, 100)]
-    tree = cst.parse_module(source)
-    wrapper = MetadataWrapper(tree)
-    cu = CallerUpdater(ranges, transforms, file_module=file_module, source=source)
+    wrapper, cu = setup_caller_updater(transforms, ranges, source, file_module)
     wrapper.visit(cu)
     return cu.changes_made
 
