@@ -19,7 +19,7 @@ from .base import Refactor
 _MODEL = "claude-sonnet-4-6"
 _MIN_WEIGHT = 3
 _MAX_SEQ_LEN = 8
-_API_HARD_TIMEOUT = 90  # seconds — hard wall-clock limit per LLM call
+_API_HARD_TIMEOUT = 600  # seconds — hard wall-clock limit per LLM call
 
 
 # ---------------------------------------------------------------------------
