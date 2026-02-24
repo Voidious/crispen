@@ -763,12 +763,14 @@ class FunctionSplitter(Refactor):
         model: str = _MODEL,
         provider: str = "anthropic",
         helper_docstrings: bool = False,
+        base_url: Optional[str] = None,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self._max_lines = max_lines
         self._model = model
         self._provider = provider
         self._helper_docstrings = helper_docstrings
+        self._base_url = base_url
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -841,7 +843,9 @@ class FunctionSplitter(Refactor):
             # 3. LLM call for names
             try:
                 api_key = _llm_client.get_api_key(self._provider, "FunctionSplitter")
-                client = _llm_client.make_client(self._provider, api_key)
+                client = _llm_client.make_client(
+                    self._provider, api_key, base_url=self._base_url
+                )
                 names = _run_with_timeout(
                     _llm_name_helpers,
                     _API_HARD_TIMEOUT,

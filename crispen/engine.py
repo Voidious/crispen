@@ -369,6 +369,7 @@ def run_engine(
                         provider=config.provider,
                         extraction_retries=config.extraction_retries,
                         llm_verify_retries=config.llm_verify_retries,
+                        base_url=config.base_url,
                     )
                 elif RefactorClass is FunctionSplitter:
                     transformer = FunctionSplitter(
@@ -379,6 +380,7 @@ def run_engine(
                         model=config.model,
                         provider=config.provider,
                         helper_docstrings=config.helper_docstrings,
+                        base_url=config.base_url,
                     )
                 else:
                     transformer = RefactorClass(

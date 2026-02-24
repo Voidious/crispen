@@ -20,10 +20,15 @@ class CrispenConfig:
     # TupleDataclass: minimum tuple element count to trigger replacement
     min_tuple_size: int = 4
 
-    # LLM provider to use: "anthropic" (default) or "moonshot"
+    # LLM provider to use: "anthropic" (default), "moonshot", "openai", "deepseek",
+    # or "lmstudio"
     provider: str = "anthropic"
     # LLM model to use for all API calls
     model: str = "claude-sonnet-4-6"
+    # Optional base URL override for OpenAI-compatible providers.
+    # Useful for LM Studio when running on a non-default port, or for other
+    # self-hosted OpenAI-compatible endpoints.
+    base_url: Optional[str] = None
     # Whether to generate docstrings in extracted helper functions
     helper_docstrings: bool = False
 

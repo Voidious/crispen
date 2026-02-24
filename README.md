@@ -2,7 +2,7 @@
 
 Crispen is a Python code refactoring CLI tool. It reads a unified diff from stdin, identifies which lines changed, and applies a set of automated refactors only to the changed regions of affected files, writing the modified files back in place.
 
-It uses [libcst](https://github.com/Instagram/LibCST) for format-preserving AST transformations and an LLM (Anthropic Claude or Moonshot/Kimi) for intelligent, context-aware changes.
+It uses [libcst](https://github.com/Instagram/LibCST) for format-preserving AST transformations and an LLM for intelligent, context-aware changes. Supported providers: Anthropic Claude, OpenAI, DeepSeek, Moonshot/Kimi, and LM Studio (local).
 
 ## Overview
 
@@ -45,11 +45,15 @@ Crispen reads configuration from `[tool.crispen]` in `pyproject.toml`, with opti
 
 ```toml
 [tool.crispen]
-# LLM provider: "anthropic" (default) or "moonshot"
+# LLM provider: "anthropic" (default), "openai", "deepseek", "moonshot", or "lmstudio"
 provider = "anthropic"
 
 # LLM model to use (default: "claude-sonnet-4-6")
 model = "claude-sonnet-4-6"
+
+# Optional base URL override for OpenAI-compatible providers.
+# Useful for LM Studio on a non-default port, or other self-hosted endpoints.
+# base_url = "http://localhost:1234/v1"
 
 # FunctionSplitter: max function body lines before splitting (default: 75)
 max_function_length = 75
@@ -77,12 +81,29 @@ llm_verify_retries = 1
 
 ### API Keys
 
-Set the appropriate environment variable for your provider:
+Set the appropriate environment variable for your chosen provider:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...   # for provider = "anthropic"
+export OPENAI_API_KEY=sk-...          # for provider = "openai"
+export DEEPSEEK_API_KEY=sk-...        # for provider = "deepseek"
 export MOONSHOT_API_KEY=sk-...        # for provider = "moonshot"
+# LM Studio (provider = "lmstudio") runs locally and requires no API key.
 ```
+
+### LM Studio
+
+Point crispen at a running [LM Studio](https://lmstudio.ai) local server:
+
+```toml
+[tool.crispen]
+provider = "lmstudio"
+model = "your-loaded-model-name"
+# base_url defaults to "http://localhost:1234/v1"; override if needed:
+# base_url = "http://localhost:8080/v1"
+```
+
+No API key is required — LM Studio does not authenticate requests.
 
 ## Refactors
 
