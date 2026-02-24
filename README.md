@@ -14,7 +14,7 @@ Crispen operates only on the lines you actually changed — not the whole file. 
 
 ## Installation
 
-Crispen requires Python 3.11+.
+Crispen requires Python 3.12+.
 
 ```bash
 pip install crispen
@@ -23,7 +23,7 @@ pip install crispen
 Or from source:
 
 ```bash
-git clone https://github.com/your-org/crispen
+git clone https://github.com/Voidious/crispen
 cd crispen
 uv sync
 ```
@@ -60,8 +60,12 @@ model = "claude-sonnet-4-6"
 # FunctionSplitter: max function body lines before splitting (default: 75)
 max_function_length = 75
 
-# TupleDataclass: min tuple element count to trigger replacement (default: 4)
+# Tuple Return to Dataclass: min tuple element count to trigger replacement (default: 4)
 min_tuple_size = 4
+
+# Tuple Return to Dataclass: update callers in diff files even outside changed ranges (default: true)
+# When false and unreachable callers exist, the transformation is skipped instead
+update_diff_file_callers = true
 
 # DuplicateExtractor: min statement weight for a duplicate group (default: 3)
 min_duplicate_weight = 3
@@ -123,7 +127,7 @@ Functions that return large tuples (4+ elements by default) are difficult to rea
 Only fires when:
 - The tuple is inside a `return` statement (not a function argument).
 - Every in-file caller of the function uses tuple-unpacking assignment (`a, b = func()`).
-- The function has at least `min_tuple_size` elements (default 4).
+- The tuple has at least `min_tuple_size` elements (default 4).
 
 **Before:**
 ```python
@@ -182,8 +186,11 @@ Crispen scans the changed functions for repeated sequences of statements. When a
 The algorithm:
 1. Hashes each statement in a function by its AST structure (ignoring whitespace and comments).
 2. Finds repeated subsequences above a minimum weight threshold.
-3. Asks the LLM to write the helper, determine its parameters, and verify the extraction is correct.
-4. Validates the output syntactically and with pyflakes before applying it.
+3. Asks the LLM if the matching sections of code are a semantic match ("veto check"), and requests any pitfalls to note for the extraction step. These notes are passed to every subsequent extraction attempt.
+4. If accepted, asks the LLM to write the helper, determine its parameters, and update the call sites.
+5. Runs a series of algorithmic checks to verify the code change. A failure triggers a retry (step 4, up to `extraction_retries`), including a note to the LLM about the verification failure.
+6. After passing the algorithmic checks, asks the LLM to verify the output. A failure triggers a retry (step 4, up to `llm_verify_retries`), including both the previous code change and detailed feedback from the LLM verification step.
+7. If accepted, validates the output syntactically and with pyflakes before applying it.
 
 **Before:**
 ```python
@@ -238,26 +245,29 @@ The algorithm:
 
 **Before:**
 ```python
-def _load_config(path):
-    with open(path) as f:
-        return json.load(f)
+def _fetch_json(url, headers):
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
-def process(path):
-    # ... later in the same file, duplicating _load_config's body:
-    with open(path) as f:
-        config = json.load(f)
-    apply(config)
+def sync_orders():
+    # Inline copy of _fetch_json's body with different variable names:
+    resp = requests.get(orders_url, headers=api_headers)
+    resp.raise_for_status()
+    orders = resp.json()
+    process(orders)
 ```
 
 **After:**
 ```python
-def _load_config(path):
-    with open(path) as f:
-        return json.load(f)
+def _fetch_json(url, headers):
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
-def process(path):
-    config = _load_config(path)
-    apply(config)
+def sync_orders():
+    orders = _fetch_json(orders_url, api_headers)
+    process(orders)
 ```
 
 The LLM veto step ensures the replacement is only applied when the semantics genuinely match — structural similarity alone is not enough.
@@ -336,8 +346,8 @@ crispen/cli.py         # Entry point: reads stdin, calls parse_diff then run_eng
                         ├── if_not_else.py         # if not x: A else B  →  if x: B else A
                         ├── tuple_dataclass.py     # Large tuple returns → @dataclass
                         ├── caller_updater.py      # Update tuple-unpacking call sites
-                        ├── duplicate_extractor.py # Extract duplicate blocks via LLM
-                        └── function_splitter.py   # Split oversized functions via LLM
+                        ├── duplicate_extractor.py # Extract duplicate blocks
+                        └── function_splitter.py   # Split oversized functions
 ```
 
 ### Adding a new refactor
