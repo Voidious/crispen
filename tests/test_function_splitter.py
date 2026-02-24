@@ -1067,22 +1067,23 @@ def test_function_collector_class_method():
     assert collector.functions[0].indent == "    "
 
 
-def test_function_collector_skips_async():
-    src = "async def foo():\n    pass\n"
+def _collect_functions_and_assert_empty(src: str):
     tree = cst.parse_module(src)
     wrapper = MetadataWrapper(tree)
     collector = _FunctionCollector()
     wrapper.visit(collector)
+    # outer has a nested funcdef  skipped; inner is in a function scope  skipped
     assert len(collector.functions) == 0
+
+
+def test_function_collector_skips_async():
+    src = "async def foo():\n    pass\n"
+    _collect_functions_and_assert_empty(src)
 
 
 def test_function_collector_skips_generator():
     src = "def gen():\n    yield 1\n"
-    tree = cst.parse_module(src)
-    wrapper = MetadataWrapper(tree)
-    collector = _FunctionCollector()
-    wrapper.visit(collector)
-    assert len(collector.functions) == 0
+    _collect_functions_and_assert_empty(src)
 
 
 def test_function_collector_skips_nested_functions():
@@ -1096,12 +1097,7 @@ def test_function_collector_skips_nested_functions():
             return inner
     """
     )
-    tree = cst.parse_module(src)
-    wrapper = MetadataWrapper(tree)
-    collector = _FunctionCollector()
-    wrapper.visit(collector)
-    # outer has a nested funcdef → skipped; inner is in a function scope → skipped
-    assert len(collector.functions) == 0
+    _collect_functions_and_assert_empty(src)
 
 
 def test_function_collector_captures_params():
@@ -1295,6 +1291,15 @@ def test_function_splitter_over_line_limit(mock_anthropic):
     assert len(splitter.changes_made) >= 1
 
 
+def _create_splitter_and_check_none(src):
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=10
+        )
+
+    assert splitter.get_rewritten_source() is None
+
+
 @patch("crispen.llm_client.anthropic")
 def test_function_splitter_nested_funcdef_not_split(mock_anthropic):
     # A long function containing a nested funcdef should never be split,
@@ -1308,12 +1313,7 @@ def test_function_splitter_nested_funcdef_not_split(mock_anthropic):
     lines.append("    return inner()\n")
     src = "".join(lines)
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=10
-        )
-
-    assert splitter.get_rewritten_source() is None
+    _create_splitter_and_check_none(src)
 
 
 @patch("crispen.llm_client.anthropic")
@@ -1325,12 +1325,7 @@ def test_function_splitter_async_skipped(mock_anthropic):
         + "    return 0\n"
     )
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=10
-        )
-
-    assert splitter.get_rewritten_source() is None
+    _create_splitter_and_check_none(src)
 
 
 @patch("crispen.llm_client.anthropic")
@@ -1342,12 +1337,7 @@ def test_function_splitter_generator_skipped(mock_anthropic):
         + "    yield 0\n"
     )
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=10
-        )
-
-    assert splitter.get_rewritten_source() is None
+    _create_splitter_and_check_none(src)
 
 
 @patch("crispen.llm_client.anthropic")
@@ -1600,6 +1590,14 @@ def test_has_new_undefined_names_exception():
         assert _has_new_undefined_names("x = 1\n", "y = 1\n") is False
 
 
+def _setup_splitter_with_mock_key(src):
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=50
+        )
+    return splitter
+
+
 @patch(
     "crispen.refactors.function_splitter._has_new_undefined_names", return_value=True
 )
@@ -1611,12 +1609,9 @@ def test_function_splitter_pyflakes_rejects_output(mock_anthropic, mock_has_unde
     )
     src = _make_long_func(80, "foo")
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=50
-        )
+    splitter = _setup_splitter_with_mock_key(src)
 
-    # Pyflakes check returned True → split not applied
+    # Pyflakes check returned True      split not applied
     assert splitter.get_rewritten_source() is None
 
 
@@ -1673,10 +1668,7 @@ def test_function_splitter_skips_name_collision(mock_anthropic):
     existing = "def _helper():\n    pass\n\n\n"
     src = existing + _make_long_func(80)
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=50
-        )
+    splitter = _setup_splitter_with_mock_key(src)
 
-    # collision detected → task dropped → no rewrite
+    # collision detected      task dropped      no rewrite
     assert splitter.get_rewritten_source() is None
