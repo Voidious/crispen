@@ -1144,16 +1144,29 @@ def test_llm_name_helpers_success(mock_anthropic):
     assert result == ["process_tail"]
 
 
+def _call_llm_name_helpers(
+    mock_anthropic,
+    mock_response,
+    make_task_func,
+    llm_name_helpers_func,
+    task_name="my_func",
+):
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = mock_response
+
+    tasks = [make_task_func(task_name)]
+    client = mock_anthropic.Anthropic.return_value
+    result = llm_name_helpers_func(client, "claude-sonnet-4-6", "anthropic", tasks)
+    return result
+
+
 @patch("crispen.llm_client.anthropic")
 def test_llm_name_helpers_result_none(mock_anthropic):
     # LLM returns no tool use block
     mock_response = MagicMock()
     mock_response.content = []
-    mock_anthropic.Anthropic.return_value.messages.create.return_value = mock_response
-
-    tasks = [_make_task("my_func")]
-    client = mock_anthropic.Anthropic.return_value
-    result = _llm_name_helpers(client, "claude-sonnet-4-6", "anthropic", tasks)
+    result = _call_llm_name_helpers(
+        mock_anthropic, mock_response, _make_task, _llm_name_helpers
+    )
     # Falls back to "my_func_helper"
     assert result == ["my_func_helper"]
 
@@ -1167,11 +1180,9 @@ def test_llm_name_helpers_no_names_key(mock_anthropic):
     mock_block.input = {"something_else": []}
     mock_response = MagicMock()
     mock_response.content = [mock_block]
-    mock_anthropic.Anthropic.return_value.messages.create.return_value = mock_response
-
-    tasks = [_make_task("my_func")]
-    client = mock_anthropic.Anthropic.return_value
-    result = _llm_name_helpers(client, "claude-sonnet-4-6", "anthropic", tasks)
+    result = _call_llm_name_helpers(
+        mock_anthropic, mock_response, _make_task, _llm_name_helpers
+    )
     assert result == ["my_func_helper"]
 
 

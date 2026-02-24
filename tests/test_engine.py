@@ -757,8 +757,7 @@ def _make_phase1_pkg(root):
     return pkg
 
 
-def test_phase1_private_caller_updated(tmp_path):
-    """Private function callers in the same file are updated after Phase 1."""
+def _make_tuple_test_file(tmp_path):
     source = textwrap.dedent(
         """\
         def _make_result():
@@ -770,6 +769,12 @@ def test_phase1_private_caller_updated(tmp_path):
     )
     f = tmp_path / "code.py"
     f.write_text(source, encoding="utf-8")
+    return f
+
+
+def test_phase1_private_caller_updated(tmp_path):
+    """Private function callers in the same file are updated after Phase 1."""
+    f = _make_tuple_test_file(tmp_path)
     msgs = _run({str(f): [(1, 100)]})
     result = f.read_text(encoding="utf-8")
     assert "_ = _make_result()" in result
@@ -788,17 +793,7 @@ def test_phase1_private_no_callers_no_caller_updater_msg(tmp_path):
 
 def test_phase1_private_caller_updater_exception_ignored(tmp_path):
     """If CallerUpdater raises during Phase 1, the engine continues gracefully."""
-    source = textwrap.dedent(
-        """\
-        def _make_result():
-            return (1, 2, 3)
-
-        def use_it():
-            a, b, c = _make_result()
-        """
-    )
-    f = tmp_path / "code.py"
-    f.write_text(source, encoding="utf-8")
+    f = _make_tuple_test_file(tmp_path)
     with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
         msgs = _run({str(f): [(1, 100)]})
     # TupleDataclass still ran successfully
