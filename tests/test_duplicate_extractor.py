@@ -2860,6 +2860,8 @@ def test_engine_propagates_api_error(tmp_path, monkeypatch):
     f.write_text(_DUP_SOURCE, encoding="utf-8")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
 
     with pytest.raises(CrispenAPIError):
         list(run_engine({str(f): _DUP_RANGES}))
@@ -2876,6 +2878,8 @@ def test_cli_exits_on_api_error(tmp_path, monkeypatch):
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
 
     # Write file so engine can read it
     f = tmp_path / "dup.py"
