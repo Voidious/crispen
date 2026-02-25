@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Dict, Generator, List, NamedTuple, Optional, Set, Tuple
 
+from .stats import RunStats
+
 import libcst as cst
 from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvider
 
@@ -315,6 +317,25 @@ def _apply_tuple_dataclass(
 
 
 # ---------------------------------------------------------------------------
+# Stats helpers
+# ---------------------------------------------------------------------------
+
+
+def _categorize_into_stats(stats: RunStats, msg: str) -> None:
+    """Increment the appropriate counter in *stats* for a raw change message."""
+    if msg.startswith("IfNotElse:"):
+        stats.if_not_else += 1
+    elif msg.startswith("TupleDataclass:"):
+        stats.tuple_to_dataclass += 1
+    elif msg.startswith("DuplicateExtractor:") and "with call to" in msg:
+        stats.duplicate_matched += 1
+    elif msg.startswith("DuplicateExtractor:"):
+        stats.duplicate_extracted += 1
+    elif msg.startswith("split "):
+        stats.function_split += 1
+
+
+# ---------------------------------------------------------------------------
 # Main engine
 # ---------------------------------------------------------------------------
 
@@ -324,10 +345,12 @@ def run_engine(
     verbose: bool = True,
     _repo_root: Optional[str] = None,
     config: Optional[CrispenConfig] = None,
+    stats: Optional[RunStats] = None,
 ) -> Generator[str, None, None]:
     """Apply all refactors to changed files and yield summary messages."""
     if config is None:
         config = load_config()
+    _stats = stats if stats is not None else RunStats()
 
     # ------------------------------------------------------------------ #
     # Phase 1 — single-file refactors + TupleDataclass (private only)     #
@@ -414,6 +437,8 @@ def run_engine(
 
             for msg in transformer.get_changes():
                 file_msgs.append(f"{filepath}: {msg}")
+                _categorize_into_stats(_stats, msg)
+            _stats.merge(transformer.stats)
             current_source = new_source
 
         # Apply TupleDataclass — private functions only in this pass.
@@ -434,6 +459,8 @@ def run_engine(
             current_source = new_source
             file_msgs.extend(msgs)
             if td is not None:
+                for m in td.get_changes():
+                    _categorize_into_stats(_stats, m)
                 candidates = td.get_candidate_public_transforms()
                 # Run CallerUpdater for private function callers in this file.
                 private_transforms = td.get_private_transforms()
@@ -459,6 +486,7 @@ def run_engine(
                         else:
                             for msg in cu.get_changes():
                                 file_msgs.append(f"{filepath}: {msg}")
+                                _categorize_into_stats(_stats, msg)
                             current_source = cu_new_source
 
         per_file[filepath] = {
@@ -538,7 +566,7 @@ def run_engine(
                 # Second TupleDataclass pass — approved public functions only.
                 for filepath, funcs in approved_by_file.items():
                     state = per_file[filepath]
-                    new_source, msgs, _ = _apply_tuple_dataclass(
+                    new_source, msgs, td2 = _apply_tuple_dataclass(
                         filepath,
                         state["ranges"],
                         state["source"],
@@ -548,6 +576,9 @@ def run_engine(
                     )
                     state["source"] = new_source
                     state["msgs"].extend(msgs)
+                    if td2 is not None:
+                        for m in td2.get_changes():
+                            _categorize_into_stats(_stats, m)
 
                 # CallerUpdater pass — all diff files.
                 for filepath, state in per_file.items():
@@ -585,6 +616,7 @@ def run_engine(
 
                     for msg in cu.get_changes():
                         state["msgs"].append(f"{filepath}: {msg}")
+                        _categorize_into_stats(_stats, msg)
                     state["source"] = new_source
 
     # ------------------------------------------------------------------ #
@@ -593,4 +625,6 @@ def run_engine(
     for filepath, state in per_file.items():
         if state["source"] != state["original"]:
             Path(filepath).write_text(state["source"], encoding="utf-8")
+            _stats.files_edited.append(filepath)
+            _stats.count_lines_changed(state["original"], state["source"])
         yield from state["msgs"]

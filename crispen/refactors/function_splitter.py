@@ -855,6 +855,7 @@ class FunctionSplitter(Refactor):
                     timeout=self._api_timeout,
                     base_url=self._base_url,
                 )
+                self.stats.llm_edit_calls += 1
                 names = _run_with_timeout(
                     _llm_name_helpers,
                     self._hard_timeout,

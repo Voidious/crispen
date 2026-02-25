@@ -5,6 +5,8 @@ from typing import List, Optional, Sequence, Tuple
 import libcst as cst
 from libcst.metadata import PositionProvider
 
+from ..stats import RunStats
+
 
 class Refactor(cst.CSTTransformer):
     """Base class for all Crispen refactors.
@@ -25,6 +27,7 @@ class Refactor(cst.CSTTransformer):
         self.changed_ranges = changed_ranges
         self.changes_made: List[str] = []
         self.verbose = verbose
+        self.stats: RunStats = RunStats()
 
     def _in_changed_range(self, node: cst.CSTNode) -> bool:
         """Return True if the node's start line overlaps any changed range."""

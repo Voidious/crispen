@@ -13,6 +13,7 @@ from crispen.engine import (
     _apply_tuple_dataclass,
     _blocked_private_scopes,
     _build_alias_map,
+    _categorize_into_stats,
     _compute_qname,
     _file_to_module,
     _find_outside_callers,
@@ -23,6 +24,7 @@ from crispen.engine import (
 )
 from crispen.errors import CrispenAPIError
 from crispen.refactors.base import Refactor
+from crispen.stats import RunStats
 
 
 def _run(changed):
@@ -990,3 +992,111 @@ def test_update_diff_file_callers_false_allows_public_with_all_callers_in_diff(
     # update_diff_file_callers=False (no callers outside diff ranges)
     assert any("TupleDataclass" in m for m in msgs)
     assert any("CallerUpdater" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# _categorize_into_stats
+# ---------------------------------------------------------------------------
+
+
+def test_categorize_if_not_else():
+    s = RunStats()
+    _categorize_into_stats(s, "IfNotElse: flipped if/else at line 3")
+    assert s.if_not_else == 1
+    assert s.total_edits == 1
+
+
+def test_categorize_tuple_to_dataclass():
+    s = RunStats()
+    _categorize_into_stats(
+        s, "TupleDataclass: replaced 3-tuple with FooResult at line 5"
+    )
+    assert s.tuple_to_dataclass == 1
+
+
+def test_categorize_duplicate_matched():
+    s = RunStats()
+    _categorize_into_stats(s, "DuplicateExtractor: replaced '_f' body with call to 'g'")
+    assert s.duplicate_matched == 1
+    assert s.duplicate_extracted == 0
+
+
+def test_categorize_duplicate_extracted():
+    s = RunStats()
+    _categorize_into_stats(
+        s, "DuplicateExtractor: extracted '_helper' from 2 duplicate blocks"
+    )
+    assert s.duplicate_extracted == 1
+    assert s.duplicate_matched == 0
+
+
+def test_categorize_function_split():
+    s = RunStats()
+    _categorize_into_stats(s, "split 'big_func': extracted _step_two")
+    assert s.function_split == 1
+
+
+def test_categorize_other_message_ignored():
+    s = RunStats()
+    _categorize_into_stats(s, "CallerUpdater: expanded FooResult unpacking at line 7")
+    assert s.total_edits == 0
+
+
+# ---------------------------------------------------------------------------
+# run_engine: stats parameter is populated
+# ---------------------------------------------------------------------------
+
+
+def test_run_engine_stats_populated(tmp_path):
+    source = "if not x:\n    a()\nelse:\n    b()\n"
+    f = tmp_path / "code.py"
+    f.write_text(source, encoding="utf-8")
+    s = RunStats()
+    list(run_engine({str(f): [(1, 4)]}, config=CrispenConfig(), stats=s))
+    assert s.if_not_else == 1
+    assert s.files_edited == [str(f)]
+    assert s.lines_changed > 0
+
+
+def test_run_engine_stats_none_default(tmp_path):
+    """When stats is None (default), engine runs without error."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    msgs = list(run_engine({str(f): [(1, 1)]}, config=CrispenConfig()))
+    assert msgs == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 _apply_tuple_dataclass returning td=None (covers 579->567 branch)
+# ---------------------------------------------------------------------------
+
+
+def test_phase2_apply_tuple_dataclass_td_none(tmp_path):
+    """Phase 2 _apply_tuple_dataclass returning td=None is handled gracefully."""
+    pkg = _make_pkg(tmp_path, "mypkg")
+
+    service = pkg / "service.py"
+    service.write_text("def approved():\n    return (1, 2, 3)\n", encoding="utf-8")
+
+    orig_apply = _apply_tuple_dataclass
+    call_count = {"n": 0}
+
+    def patched_apply(filepath, ranges, source, verbose, approved_public_funcs, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            # Phase 2 call: return td=None to exercise the td2 is None branch
+            return (source, [], None)
+        return orig_apply(
+            filepath, ranges, source, verbose, approved_public_funcs, **kw
+        )
+
+    with patch("crispen.engine._apply_tuple_dataclass", patched_apply):
+        msgs = list(
+            run_engine(
+                {str(service): [(1, 2)]},
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(min_tuple_size=3),
+            )
+        )
+    # Should not crash; Phase 2 gracefully skips categorization
+    assert isinstance(msgs, list)

@@ -1654,6 +1654,7 @@ class DuplicateExtractor(Refactor):
                         file=sys.stderr,
                         flush=True,
                     )
+                self.stats.llm_veto_calls += 1
                 try:
                     is_valid, reason, _veto_notes = _run_with_timeout(
                         _llm_veto_func_match,
@@ -1681,10 +1682,12 @@ class DuplicateExtractor(Refactor):
                         flush=True,
                     )
                 if not is_valid:
+                    self.stats.llm_rejected += 1
                     continue
                 if func.scope == "<module>" and not func.params:
                     replacement = _generate_no_arg_call(seq, func)
                 else:
+                    self.stats.llm_edit_calls += 1
                     try:
                         replacement = _run_with_timeout(
                             _llm_generate_call,
@@ -1759,6 +1762,7 @@ class DuplicateExtractor(Refactor):
                     file=sys.stderr,
                     flush=True,
                 )
+            self.stats.llm_veto_calls += 1
             try:
                 is_valid, reason, veto_notes = _run_with_timeout(
                     _llm_veto,
@@ -1784,6 +1788,7 @@ class DuplicateExtractor(Refactor):
                     flush=True,
                 )
             if not is_valid:
+                self.stats.llm_rejected += 1
                 continue
 
             # Extraction retry loop: attempt extraction up to
@@ -1795,6 +1800,7 @@ class DuplicateExtractor(Refactor):
             prev_output: Optional[dict] = None
 
             while True:
+                self.stats.llm_edit_calls += 1
                 try:
                     extraction = _run_with_timeout(
                         _llm_extract,
@@ -2123,9 +2129,11 @@ class DuplicateExtractor(Refactor):
                                 flush=True,
                             )
                         continue
+                    self.stats.algorithmic_rejected += 1
                     break  # exhausted algorithmic retries — skip group
 
                 # ---- LLM verification step ----
+                self.stats.llm_verify_calls += 1
                 try:
                     verify_ok, verify_issues = _run_with_timeout(
                         _llm_verify_extraction,
@@ -2180,6 +2188,7 @@ class DuplicateExtractor(Refactor):
                                 flush=True,
                             )
                         continue
+                    self.stats.llm_rejected += 1
                     break  # exhausted LLM verify retries — skip group
 
                 # ---- All checks passed: accept this extraction ----
