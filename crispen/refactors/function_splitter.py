@@ -784,6 +784,9 @@ class FunctionSplitter(Refactor):
 
     def _analyze(self, source: str) -> None:
         """Iteratively split oversized functions until stable or limit reached."""
+        return self._split_long_functions_with_helpers(source)
+
+    def _split_long_functions_with_helpers(self, source):
         current = source
 
         for _iteration in range(_MAX_SPLIT_ITERATIONS):
