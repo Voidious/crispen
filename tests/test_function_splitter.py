@@ -1477,22 +1477,20 @@ def test_function_splitter_class_method(mock_anthropic):
 @patch("crispen.llm_client.anthropic")
 def test_function_splitter_llm_timeout_fallback(mock_anthropic):
     # LLM call times out → fallback names
-    import time
+    from crispen.refactors.function_splitter import _ApiTimeout
 
-    def _slow(*args, **kwargs):
-        time.sleep(10)
-
-    mock_anthropic.Anthropic.return_value.messages.create.side_effect = _slow
+    mock_anthropic.Anthropic.return_value.messages.create.side_effect = _ApiTimeout(
+        "timed out"
+    )
     src = _make_long_func(60, "slow_func")
 
     with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        with patch("crispen.refactors.function_splitter._API_HARD_TIMEOUT", 0.05):
-            splitter = FunctionSplitter(
-                [(1, 1000)],
-                source=src,
-                verbose=False,
-                max_lines=30,
-            )
+        splitter = FunctionSplitter(
+            [(1, 1000)],
+            source=src,
+            verbose=False,
+            max_lines=30,
+        )
 
     result = splitter.get_rewritten_source()
     assert result is not None

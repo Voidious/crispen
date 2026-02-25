@@ -371,6 +371,7 @@ def run_engine(
                         llm_verify_retries=config.llm_verify_retries,
                         base_url=config.base_url,
                         tool_choice=config.tool_choice,
+                        api_timeout=config.api_timeout,
                     )
                 elif RefactorClass is FunctionSplitter:
                     transformer = FunctionSplitter(
@@ -383,6 +384,7 @@ def run_engine(
                         helper_docstrings=config.helper_docstrings,
                         base_url=config.base_url,
                         tool_choice=config.tool_choice,
+                        api_timeout=config.api_timeout,
                     )
                 else:
                     transformer = RefactorClass(

@@ -34,6 +34,11 @@ class CrispenConfig:
     # the default named-function dict.  Use "required" for local models
     # (e.g. LM Studio / qwen3-8b) that do not support the named-function form.
     tool_choice: Optional[str] = None
+    # HTTP timeout in seconds for each LLM API call.  A hard wall-clock limit
+    # of api_timeout + 30 s is enforced on top of this to catch OS-level
+    # blocking that the SDK timeout cannot interrupt.  Raise this when using a
+    # slow local model (e.g. LM Studio on large models).
+    api_timeout: float = 60.0
     # Whether to generate docstrings in extracted helper functions
     helper_docstrings: bool = False
 

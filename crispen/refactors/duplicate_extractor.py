@@ -19,7 +19,6 @@ from .base import Refactor
 _MODEL = "claude-sonnet-4-6"
 _MIN_WEIGHT = 3
 _MAX_SEQ_LEN = 8
-_API_HARD_TIMEOUT = 90  # seconds — hard wall-clock limit per LLM call
 
 
 # ---------------------------------------------------------------------------
@@ -1560,6 +1559,7 @@ class DuplicateExtractor(Refactor):
         llm_verify_retries: int = 1,
         base_url: Optional[str] = None,
         tool_choice: Optional[str] = None,
+        api_timeout: float = 60.0,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self._min_weight = min_weight
@@ -1571,6 +1571,8 @@ class DuplicateExtractor(Refactor):
         self._llm_verify_retries = llm_verify_retries
         self._base_url = base_url
         self._tool_choice = tool_choice
+        self._api_timeout = api_timeout
+        self._hard_timeout = api_timeout + 30
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -1624,7 +1626,7 @@ class DuplicateExtractor(Refactor):
         # 12. Create API client.
         api_key = _llm_client.get_api_key(self._provider, caller="DuplicateExtractor")
         client = _llm_client.make_client(
-            self._provider, api_key, timeout=60.0, base_url=self._base_url
+            self._provider, api_key, timeout=self._api_timeout, base_url=self._base_url
         )
         edits: List[Tuple[int, int, str]] = []
         pending_changes: List[str] = []
@@ -1655,7 +1657,7 @@ class DuplicateExtractor(Refactor):
                 try:
                     is_valid, reason, _veto_notes = _run_with_timeout(
                         _llm_veto_func_match,
-                        _API_HARD_TIMEOUT,
+                        self._hard_timeout,
                         client,
                         seq,
                         func,
@@ -1686,7 +1688,7 @@ class DuplicateExtractor(Refactor):
                     try:
                         replacement = _run_with_timeout(
                             _llm_generate_call,
-                            _API_HARD_TIMEOUT,
+                            self._hard_timeout,
                             client,
                             seq,
                             func,
@@ -1760,7 +1762,7 @@ class DuplicateExtractor(Refactor):
             try:
                 is_valid, reason, veto_notes = _run_with_timeout(
                     _llm_veto,
-                    _API_HARD_TIMEOUT,
+                    self._hard_timeout,
                     client,
                     group,
                     self._model,
@@ -1796,7 +1798,7 @@ class DuplicateExtractor(Refactor):
                 try:
                     extraction = _run_with_timeout(
                         _llm_extract,
-                        _API_HARD_TIMEOUT,
+                        self._hard_timeout,
                         client,
                         group,
                         source,
@@ -2127,7 +2129,7 @@ class DuplicateExtractor(Refactor):
                 try:
                     verify_ok, verify_issues = _run_with_timeout(
                         _llm_verify_extraction,
-                        _API_HARD_TIMEOUT,
+                        self._hard_timeout,
                         client,
                         group,
                         helper_source,
