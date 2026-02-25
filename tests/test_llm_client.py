@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from crispen.errors import CrispenAPIError
-from crispen.llm_client import call_with_tool, get_api_key, make_client
+from crispen.llm_client import _token_param, call_with_tool, get_api_key, make_client
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,31 @@ def test_get_api_key_openai_missing(monkeypatch):
 def test_get_api_key_lmstudio_no_key_needed():
     # LM Studio never requires an API key — returns the placeholder regardless.
     assert get_api_key("lmstudio") == "lm-studio"
+
+
+# ---------------------------------------------------------------------------
+# _token_param
+# ---------------------------------------------------------------------------
+
+
+def test_token_param_modern_models():
+    for model in (
+        "gpt-5",
+        "gpt-5.1",
+        "o1-mini",
+        "o3",
+        "o4-mini",
+        "gpt-4.1",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "computer-use-preview",
+    ):
+        assert _token_param(model) == "max_completion_tokens", model
+
+
+def test_token_param_legacy_models():
+    for model in ("gpt-3.5-turbo", "gpt-4", "moonshot-v1-32k", "qwen3-8b"):
+        assert _token_param(model) == "max_tokens", model
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +325,9 @@ def test_call_with_tool_openai_success():
     call_kwargs = client.chat.completions.create.call_args[1]
     # extra_body must NOT be set for non-moonshot providers
     assert "extra_body" not in call_kwargs
+    # gpt-4o requires max_completion_tokens, not max_tokens
+    assert "max_completion_tokens" in call_kwargs
+    assert "max_tokens" not in call_kwargs
 
 
 def test_call_with_tool_openai_api_error():

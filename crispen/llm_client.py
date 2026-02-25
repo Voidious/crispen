@@ -17,8 +17,18 @@ _PROVIDER_BASE_URLS: dict[str, str] = {
     "lmstudio": "http://localhost:1234/v1",
 }
 
+
 # Maps provider name to its required environment variable.
 # None means no API key is required (e.g. LM Studio running locally).
+def _token_param(model: str) -> str:
+    """Return the correct token-limit parameter name for an OpenAI model."""
+    if model.startswith(
+        ("gpt-5", "o1", "o3", "o4", "computer-use", "gpt-4.1", "gpt-4o")
+    ):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
 _PROVIDER_ENV_VARS: dict[str, Optional[str]] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "moonshot": "MOONSHOT_API_KEY",
@@ -112,7 +122,7 @@ def call_with_tool(
             resolved_tool_choice = {"type": "function", "function": {"name": tool_name}}
         create_kwargs: dict[str, Any] = {
             "model": model,
-            "max_tokens": max_tokens,
+            _token_param(model): max_tokens,
             "tools": [openai_tool],
             "tool_choice": resolved_tool_choice,
             "messages": messages,
