@@ -564,6 +564,7 @@ def _llm_veto(
     group: List[_SeqInfo],
     model: str = _MODEL,
     provider: str = "anthropic",
+    tool_choice_override: Optional[str] = None,
 ) -> Tuple[bool, str, str]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
@@ -590,6 +591,7 @@ def _llm_veto(
         "evaluate_duplicate",
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
+        tool_choice_override=tool_choice_override,
     )
     if result is not None:
         return (
@@ -612,6 +614,7 @@ def _llm_extract(
     veto_notes: str = "",
     prev_failures: List[str] = [],
     prev_output: Optional[dict] = None,
+    tool_choice_override: Optional[str] = None,
 ) -> Optional[dict]:
     src_lines = full_source.splitlines(keepends=True)
     block_entries = []
@@ -727,6 +730,7 @@ def _llm_extract(
         "extract_helper",
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
+        tool_choice_override=tool_choice_override,
     )
 
 
@@ -737,6 +741,7 @@ def _llm_veto_func_match(
     full_source: str,
     model: str = _MODEL,
     provider: str = "anthropic",
+    tool_choice_override: Optional[str] = None,
 ) -> Tuple[bool, str, str]:
     """Ask the LLM whether *seq* performs the same operation as *func*'s body."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -761,6 +766,7 @@ def _llm_veto_func_match(
         "evaluate_duplicate",
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
+        tool_choice_override=tool_choice_override,
     )
     if result is not None:
         return (
@@ -785,6 +791,7 @@ def _llm_generate_call(
     full_source: str,
     model: str = _MODEL,
     provider: str = "anthropic",
+    tool_choice_override: Optional[str] = None,
 ) -> Optional[str]:
     """Ask the LLM to generate a call expression replacing *seq* with *func*."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -808,6 +815,7 @@ def _llm_generate_call(
         "generate_call",
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
+        tool_choice_override=tool_choice_override,
     )
     if result is not None:
         return result["replacement"]
@@ -822,6 +830,7 @@ def _llm_verify_extraction(
     full_source: str,
     model: str = _MODEL,
     provider: str = "anthropic",
+    tool_choice_override: Optional[str] = None,
 ) -> Tuple[bool, List[str]]:
     """Ask the LLM to verify the extraction is semantically correct.
 
@@ -869,6 +878,7 @@ def _llm_verify_extraction(
         "verify_extraction",
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
+        tool_choice_override=tool_choice_override,
     )
     if result is None:
         return True, []  # pragma: no cover
@@ -1549,6 +1559,7 @@ class DuplicateExtractor(Refactor):
         extraction_retries: int = 1,
         llm_verify_retries: int = 1,
         base_url: Optional[str] = None,
+        tool_choice: Optional[str] = None,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self._min_weight = min_weight
@@ -1559,6 +1570,7 @@ class DuplicateExtractor(Refactor):
         self._extraction_retries = extraction_retries
         self._llm_verify_retries = llm_verify_retries
         self._base_url = base_url
+        self._tool_choice = tool_choice
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -1650,6 +1662,7 @@ class DuplicateExtractor(Refactor):
                         source,
                         self._model,
                         self._provider,
+                        tool_choice_override=self._tool_choice,
                     )
                 except _ApiTimeout:
                     print(
@@ -1680,6 +1693,7 @@ class DuplicateExtractor(Refactor):
                             source,
                             self._model,
                             self._provider,
+                            tool_choice_override=self._tool_choice,
                         )
                     except _ApiTimeout:
                         print(
@@ -1751,6 +1765,7 @@ class DuplicateExtractor(Refactor):
                     group,
                     self._model,
                     self._provider,
+                    tool_choice_override=self._tool_choice,
                 )
             except _ApiTimeout:
                 print(
@@ -1793,6 +1808,7 @@ class DuplicateExtractor(Refactor):
                         veto_notes=veto_notes,
                         prev_failures=prev_failures,
                         prev_output=prev_output,
+                        tool_choice_override=self._tool_choice,
                     )
                 except _ApiTimeout:
                     print(
@@ -2119,6 +2135,7 @@ class DuplicateExtractor(Refactor):
                         source,
                         self._model,
                         self._provider,
+                        tool_choice_override=self._tool_choice,
                     )
                 except _ApiTimeout:
                     if self.verbose:

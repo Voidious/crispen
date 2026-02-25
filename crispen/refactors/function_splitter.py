@@ -573,6 +573,7 @@ def _llm_name_helpers(
     model: str,
     provider: str,
     tasks: List[_SplitTask],
+    tool_choice_override: Optional[str] = None,
 ) -> List[str]:
     """Single LLM call to name all helper functions. Falls back on error."""
     task_texts = []
@@ -603,6 +604,7 @@ def _llm_name_helpers(
         "name_helper_functions",
         [{"role": "user", "content": prompt}],
         caller="FunctionSplitter",
+        tool_choice_override=tool_choice_override,
     )
 
     fallback = [f"{t.func_info.node.name.value}_helper" for t in tasks]
@@ -764,6 +766,7 @@ class FunctionSplitter(Refactor):
         provider: str = "anthropic",
         helper_docstrings: bool = False,
         base_url: Optional[str] = None,
+        tool_choice: Optional[str] = None,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self._max_lines = max_lines
@@ -771,6 +774,7 @@ class FunctionSplitter(Refactor):
         self._provider = provider
         self._helper_docstrings = helper_docstrings
         self._base_url = base_url
+        self._tool_choice = tool_choice
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -853,6 +857,7 @@ class FunctionSplitter(Refactor):
                     self._model,
                     self._provider,
                     tasks,
+                    tool_choice_override=self._tool_choice,
                 )
             except Exception:
                 names = [f"{t.func_info.node.name.value}_helper" for t in tasks]

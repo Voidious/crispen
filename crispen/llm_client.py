@@ -73,6 +73,7 @@ def call_with_tool(
     tool_name: str,
     messages: list,
     caller: str = "crispen",
+    tool_choice_override: Optional[str] = None,
 ) -> Optional[dict]:
     """Call the LLM with forced tool use; return the tool input dict or None.
 
@@ -105,11 +106,15 @@ def call_with_tool(
                 "parameters": tool["input_schema"],
             },
         }
+        if tool_choice_override is not None:
+            resolved_tool_choice: Any = tool_choice_override
+        else:
+            resolved_tool_choice = {"type": "function", "function": {"name": tool_name}}
         create_kwargs: dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens,
             "tools": [openai_tool],
-            "tool_choice": {"type": "function", "function": {"name": tool_name}},
+            "tool_choice": resolved_tool_choice,
             "messages": messages,
         }
         if provider == "moonshot":

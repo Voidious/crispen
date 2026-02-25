@@ -318,3 +318,25 @@ def test_call_with_tool_openai_api_error():
                 _MESSAGES,
                 caller="Test",
             )
+
+
+def test_call_with_tool_tool_choice_override():
+    """tool_choice_override sends the string directly instead of named-function dict."""
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.return_value = _make_openai_response(
+            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+        )
+        call_with_tool(
+            client,
+            "lmstudio",
+            "qwen3-8b",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+            tool_choice_override="required",
+        )
+    call_kwargs = client.chat.completions.create.call_args[1]
+    assert call_kwargs["tool_choice"] == "required"

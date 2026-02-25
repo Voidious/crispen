@@ -29,6 +29,11 @@ class CrispenConfig:
     # Useful for LM Studio when running on a non-default port, or for other
     # self-hosted OpenAI-compatible endpoints.
     base_url: Optional[str] = None
+    # Optional tool_choice value for OpenAI-compatible providers.
+    # When set, this string is sent as the tool_choice parameter instead of
+    # the default named-function dict.  Use "required" for local models
+    # (e.g. LM Studio / qwen3-8b) that do not support the named-function form.
+    tool_choice: Optional[str] = None
     # Whether to generate docstrings in extracted helper functions
     helper_docstrings: bool = False
 
