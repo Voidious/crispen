@@ -51,10 +51,10 @@ class CrispenConfig:
 
     # Number of additional extraction attempts after an algorithmic check fails.
     # 0 means no retry: the group is skipped on the first failure.
-    extraction_retries: int = 1
+    extraction_retries: int = 2
     # Number of additional extraction attempts after the LLM verification step
     # rejects the output.  0 means no retry: the group is skipped on rejection.
-    llm_verify_retries: int = 1
+    llm_verify_retries: int = 2
 
 
 def _read_toml(path: Path) -> dict:

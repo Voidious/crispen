@@ -75,8 +75,8 @@ max_duplicate_seq_len = 8
 helper_docstrings = false
 
 # Retry counts for extraction and LLM verification failures
-extraction_retries = 1
-llm_verify_retries = 1
+extraction_retries = 2
+llm_verify_retries = 2
 ```
 
 ### API Keys
@@ -241,8 +241,8 @@ def process_users(users):
 Configuration:
 - `min_duplicate_weight` — minimum "weight" (sum of statement sizes) a repeated group must have to be extracted (default: 3).
 - `max_duplicate_seq_len` — maximum number of statements in a duplicate sequence (default: 8).
-- `extraction_retries` — how many times to retry after an algorithmic check fails (default: 1).
-- `llm_verify_retries` — how many times to retry after the LLM verification step rejects the output (default: 1).
+- `extraction_retries` — how many times to retry after an algorithmic check fails (default: 2).
+- `llm_verify_retries` — how many times to retry after the LLM verification step rejects the output (default: 2).
 
 ---
 
