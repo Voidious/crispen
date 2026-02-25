@@ -93,7 +93,7 @@ export MOONSHOT_API_KEY=sk-...        # for provider = "moonshot"
 
 ### LM Studio
 
-Point crispen at a running [LM Studio](https://lmstudio.ai) local server:
+Point crispen at a running [LM Studio](https://lmstudio.ai) local server. LM Studio exposes an OpenAI-compatible API, which crispen uses directly:
 
 ```toml
 [tool.crispen]
@@ -107,7 +107,7 @@ No API key is required — LM Studio does not authenticate requests.
 
 ## Refactors
 
-### 1. IfNotElse
+### 1. Flip negated if/else
 
 **Flips negated `if/else` conditions to eliminate the `not`.**
 
@@ -192,7 +192,7 @@ Configuration:
 
 ---
 
-### 3. DuplicateExtractor
+### 3. Duplicate code extraction
 
 **Extracts duplicate code blocks into shared helper functions using an LLM.**
 
@@ -209,33 +209,35 @@ The algorithm:
 
 **Before:**
 ```python
-def process_users(users):
+def process_users(users, archived_users):
     for user in users:
         name = user["name"].strip().lower()
         email = user["email"].strip().lower()
         db.save(name, email)
 
-    for user in archived_users:
-        name = user["name"].strip().lower()
-        email = user["email"].strip().lower()
-        archive.save(name, email)
+    for person in archived_users:
+        full_name = person["name"].strip().lower()
+        contact = person["email"].strip().lower()
+        archive.save(full_name, contact)
 ```
+
+Note that the two blocks use different variable names (`name`/`email` vs `full_name`/`contact`, `user` vs `person`). The algorithm detects the structural match regardless, and the LLM generalises the variable names into appropriate parameter names.
 
 **After:**
 ```python
-def _normalize_user(user):
-    name = user["name"].strip().lower()
-    email = user["email"].strip().lower()
+def _normalize_contact(record):
+    name = record["name"].strip().lower()
+    email = record["email"].strip().lower()
     return name, email
 
-def process_users(users):
+def process_users(users, archived_users):
     for user in users:
-        name, email = _normalize_user(user)
+        name, email = _normalize_contact(user)
         db.save(name, email)
 
-    for user in archived_users:
-        name, email = _normalize_user(user)
-        archive.save(name, email)
+    for person in archived_users:
+        full_name, contact = _normalize_contact(person)
+        archive.save(full_name, contact)
 ```
 
 Configuration:
@@ -246,7 +248,7 @@ Configuration:
 
 ---
 
-### 4. MatchExistingFunction
+### 4. Match existing function
 
 **Replaces a code block with a call to an existing function that performs the same operation.**
 
@@ -289,7 +291,7 @@ The LLM veto step ensures the replacement is only applied when the semantics gen
 
 ---
 
-### 5. FunctionSplitter
+### 5. Function splitter
 
 **Splits functions that exceed the line-count limit into smaller helpers.**
 
@@ -342,7 +344,7 @@ Safety checks applied before writing:
 
 Configuration:
 - `max_function_length` — maximum allowed body lines (default: 75).
-- `helper_docstrings` — whether to add a `"""..."""` stub docstring to helpers (default: `false`).
+- `helper_docstrings` — whether to include a docstring in extracted helper functions (default: `false`).
 
 ## Architecture
 
