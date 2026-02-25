@@ -405,28 +405,31 @@ def test_unpacking_collector_finds_tuple_target():
     assert list(collector.unpackings.values())[0] == ["a", "b", "c"]
 
 
-def test_unpacking_collector_skips_multiple_targets():
-    source = "a = b = some_func()\n"
+def run_unpacking_collector(source: str):
     tree = cst.parse_module(source)
     collector = _UnpackingCollector()
     MetadataWrapper(tree).visit(collector)
-    assert collector.unpackings == {}
+    return collector.unpackings
+
+
+def test_unpacking_collector_skips_multiple_targets():
+    source = "a = b = some_func()\n"
+    result = run_unpacking_collector(source)
+    assert result == {}
 
 
 def test_unpacking_collector_skips_non_tuple_target():
     source = "a = some_func()\n"
-    tree = cst.parse_module(source)
-    collector = _UnpackingCollector()
-    MetadataWrapper(tree).visit(collector)
-    assert collector.unpackings == {}
+
+    result = run_unpacking_collector(source)
+    assert result == {}
 
 
 def test_unpacking_collector_skips_complex_elements():
     source = "a, b[0] = some_func()\n"
-    tree = cst.parse_module(source)
-    collector = _UnpackingCollector()
-    MetadataWrapper(tree).visit(collector)
-    assert collector.unpackings == {}
+
+    result = run_unpacking_collector(source)
+    assert result == {}
 
 
 # ---------------------------------------------------------------------------

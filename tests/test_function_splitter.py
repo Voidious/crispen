@@ -1067,22 +1067,24 @@ def test_function_collector_class_method():
     assert collector.functions[0].indent == "    "
 
 
-def test_function_collector_skips_async():
-    src = "async def foo():\n    pass\n"
+def _collect_functions_and_assert_count(src):
     tree = cst.parse_module(src)
     wrapper = MetadataWrapper(tree)
     collector = _FunctionCollector()
     wrapper.visit(collector)
-    assert len(collector.functions) == 0
+    return len(collector.functions)
+
+
+def test_function_collector_skips_async():
+    src = "async def foo():\n    pass\n"
+    result = _collect_functions_and_assert_count(src)
+    assert result == 0
 
 
 def test_function_collector_skips_generator():
     src = "def gen():\n    yield 1\n"
-    tree = cst.parse_module(src)
-    wrapper = MetadataWrapper(tree)
-    collector = _FunctionCollector()
-    wrapper.visit(collector)
-    assert len(collector.functions) == 0
+    result = _collect_functions_and_assert_count(src)
+    assert result == 0
 
 
 def test_function_collector_skips_nested_functions():
@@ -1096,12 +1098,9 @@ def test_function_collector_skips_nested_functions():
             return inner
     """
     )
-    tree = cst.parse_module(src)
-    wrapper = MetadataWrapper(tree)
-    collector = _FunctionCollector()
-    wrapper.visit(collector)
+    result = _collect_functions_and_assert_count(src)
     # outer has a nested funcdef → skipped; inner is in a function scope → skipped
-    assert len(collector.functions) == 0
+    assert result == 0
 
 
 def test_function_collector_captures_params():
