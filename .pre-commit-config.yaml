@@ -14,16 +14,17 @@ repos:
       - id: black
         language_version: python3
         args: [--line-length=88]
-        exclude: ".venv/"
+        exclude: "(.venv/|examples/)"
 -   repo: https://github.com/pycqa/flake8
     rev: 7.3.0
     hooks:
       - id: flake8
+        exclude: "^examples/"
 -   repo: local
     hooks:
     -   id: pytest-coverage
         name: pytest (with coverage)
-        entry: uv run pytest
+        entry: uv run pytest --ignore=tests/test_examples.py
         language: system
         types: [python]
         pass_filenames: false

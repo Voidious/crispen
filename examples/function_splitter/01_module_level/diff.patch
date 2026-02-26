@@ -1,0 +1,32 @@
+--- a/input.py
++++ b/input.py
+@@ -0,0 +1,28 @@
++def process_batch_records(records, db, config):
++    errors = []
++    for record in records:
++        if record.id is None:
++            errors.append("Record missing ID")
++        if record.type not in config.valid_types:
++            errors.append(f"Record {record.id}: unknown type {record.type!r}")
++        if record.value < config.min_value:
++            errors.append(f"Record {record.id}: value below minimum")
++        if record.value > config.max_value:
++            errors.append(f"Record {record.id}: value above maximum")
++    if errors:
++        raise ValidationError("\n".join(errors))
++    transformed = []
++    for record in records:
++        data = {
++            "id": record.id,
++            "type": record.type,
++            "value": record.value * config.scale_factor,
++            "tag": config.tag,
++        }
++        transformed.append(data)
++    db.begin()
++    inserted = 0
++    for data in transformed:
++        db.insert(config.table_name, data)
++        inserted += 1
++    db.commit()
++    return inserted

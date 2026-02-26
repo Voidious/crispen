@@ -1,6 +1,6 @@
 [project]
 name = "crispen"
-version = "0.5.2"
+version = "0.5.3"
 description = "Automated refactoring tool for Python code diffs"
 requires-python = ">=3.12"
 dependencies = [
@@ -38,6 +38,7 @@ llm_verify_retries = 1
 
 [tool.pytest.ini_options]
 addopts = "--cov=crispen --cov-branch --cov-fail-under=100"
+markers = ["examples: full-stack example tests (excluded from pre-commit)"]
 
 [tool.coverage.run]
 branch = true

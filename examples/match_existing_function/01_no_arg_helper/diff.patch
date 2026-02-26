@@ -1,0 +1,14 @@
+--- a/input.py
++++ b/input.py
+@@ -11,0 +12,11 @@
++
++
++def run_migration(db, plan):
++    handler = logging.StreamHandler(sys.stderr)
++    formatter = logging.Formatter("%(levelname)s %(message)s")
++    handler.setFormatter(formatter)
++    logging.root.addHandler(handler)
++    logging.root.setLevel(logging.DEBUG)
++    for step in plan.steps:
++        db.execute(step.sql)
++    db.commit()

@@ -1,0 +1,18 @@
+# Functions containing nested defs (closures) are never split — crispen skips them.
+def make_validator(schema):
+    required = schema.get("required", [])
+    defaults = schema.get("defaults", {})
+    validators = schema.get("validators", {})
+
+    def validate(data):
+        result = dict(defaults)
+        result.update(data)
+        for field in required:
+            if field not in result:
+                raise ValueError(f"Missing required field: {field}")
+        for field, validator_fn in validators.items():
+            if field in result:
+                validator_fn(result[field])
+        return result
+
+    return validate

@@ -1,0 +1,12 @@
+# Both branches have multiple statements.
+# All statements in each branch must be correctly swapped — not just the first.
+def save_record(record, db, logger):
+    if not record.is_valid():
+        logger.warning("Skipping invalid record: %s", record.id)
+        metrics.increment("records.invalid")
+        return None
+    else:
+        row = db.insert(record)
+        logger.info("Saved record: %s", record.id)
+        metrics.increment("records.saved")
+        return row

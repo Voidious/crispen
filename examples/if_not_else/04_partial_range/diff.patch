@@ -1,0 +1,10 @@
+--- a/input.py
++++ b/input.py
+@@ -5,0 +6,7 @@
++
++
++def check_ownership(resource, user):
++    if not resource.owner == user:
++        return "not owner"
++    else:
++        return "owner"
