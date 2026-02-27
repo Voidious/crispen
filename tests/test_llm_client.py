@@ -232,13 +232,18 @@ def _make_openai_response(tool_name: str, arguments: dict) -> MagicMock:
     return resp
 
 
+def _make_openai_mock_client(mock_oai):
+    mock_oai.APIError = Exception
+    client = MagicMock()
+    client.chat.completions.create.return_value = _make_openai_response(
+        "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+    )
+    return client
+
+
 def test_call_with_tool_moonshot_success():
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
-        client.chat.completions.create.return_value = _make_openai_response(
-            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
-        )
+        client = _make_openai_mock_client(mock_oai)
         result = call_with_tool(
             client,
             "moonshot",
@@ -307,11 +312,7 @@ def test_call_with_tool_moonshot_malformed_json():
 
 def test_call_with_tool_openai_success():
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
-        client.chat.completions.create.return_value = _make_openai_response(
-            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
-        )
+        client = _make_openai_mock_client(mock_oai)
         result = call_with_tool(
             client,
             "openai",
@@ -351,11 +352,7 @@ def test_call_with_tool_openai_api_error():
 def test_call_with_tool_tool_choice_override():
     """tool_choice_override sends the string directly instead of named-function dict."""
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
-        client.chat.completions.create.return_value = _make_openai_response(
-            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
-        )
+        client = _make_openai_mock_client(mock_oai)
         call_with_tool(
             client,
             "lmstudio",

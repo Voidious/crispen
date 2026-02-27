@@ -1067,22 +1067,22 @@ def test_function_collector_class_method():
     assert collector.functions[0].indent == "    "
 
 
-def test_function_collector_skips_async():
-    src = "async def foo():\n    pass\n"
+def _assert_collector_count(src: str, expected: int = 0):
     tree = cst.parse_module(src)
     wrapper = MetadataWrapper(tree)
     collector = _FunctionCollector()
     wrapper.visit(collector)
-    assert len(collector.functions) == 0
+    assert len(collector.functions) == expected
+
+
+def test_function_collector_skips_async():
+    src = "async def foo():\n    pass\n"
+    _assert_collector_count(src)
 
 
 def test_function_collector_skips_generator():
     src = "def gen():\n    yield 1\n"
-    tree = cst.parse_module(src)
-    wrapper = MetadataWrapper(tree)
-    collector = _FunctionCollector()
-    wrapper.visit(collector)
-    assert len(collector.functions) == 0
+    _assert_collector_count(src)
 
 
 def test_function_collector_skips_nested_functions():
@@ -1096,12 +1096,8 @@ def test_function_collector_skips_nested_functions():
             return inner
     """
     )
-    tree = cst.parse_module(src)
-    wrapper = MetadataWrapper(tree)
-    collector = _FunctionCollector()
-    wrapper.visit(collector)
     # outer has a nested funcdef → skipped; inner is in a function scope → skipped
-    assert len(collector.functions) == 0
+    _assert_collector_count(src)
 
 
 def test_function_collector_captures_params():
@@ -1295,6 +1291,15 @@ def test_function_splitter_over_line_limit(mock_anthropic):
     assert len(splitter.changes_made) >= 1
 
 
+def _assert_splitter_no_rewrite(src):
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=10
+        )
+
+    assert splitter.get_rewritten_source() is None
+
+
 @patch("crispen.llm_client.anthropic")
 def test_function_splitter_nested_funcdef_not_split(mock_anthropic):
     # A long function containing a nested funcdef should never be split,
@@ -1308,12 +1313,7 @@ def test_function_splitter_nested_funcdef_not_split(mock_anthropic):
     lines.append("    return inner()\n")
     src = "".join(lines)
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=10
-        )
-
-    assert splitter.get_rewritten_source() is None
+    _assert_splitter_no_rewrite(src)
 
 
 @patch("crispen.llm_client.anthropic")
@@ -1325,12 +1325,7 @@ def test_function_splitter_async_skipped(mock_anthropic):
         + "    return 0\n"
     )
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=10
-        )
-
-    assert splitter.get_rewritten_source() is None
+    _assert_splitter_no_rewrite(src)
 
 
 @patch("crispen.llm_client.anthropic")
@@ -1342,12 +1337,7 @@ def test_function_splitter_generator_skipped(mock_anthropic):
         + "    yield 0\n"
     )
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(
-            [(1, 1000)], source=src, verbose=False, max_lines=10
-        )
-
-    assert splitter.get_rewritten_source() is None
+    _assert_splitter_no_rewrite(src)
 
 
 @patch("crispen.llm_client.anthropic")
