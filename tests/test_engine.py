@@ -328,7 +328,7 @@ def _make_pkg(root, name):
     return pkg
 
 
-def test_cross_file_transforms_public_func_and_caller(tmp_path):
+def _make_cross_file_pkg(tmp_path):
     pkg = _make_pkg(tmp_path, "mypkg")
 
     service = pkg / "service.py"
@@ -343,6 +343,12 @@ def test_cross_file_transforms_public_func_and_caller(tmp_path):
         "    a, b, c = get_user()\n",
         encoding="utf-8",
     )
+
+    return pkg, service, api
+
+
+def test_cross_file_transforms_public_func_and_caller(tmp_path):
+    pkg, service, api = _make_cross_file_pkg(tmp_path)
 
     changed = {str(service): [(1, 2)], str(api): [(1, 4)]}
     msgs = list(
@@ -370,6 +376,19 @@ def test_cross_file_transforms_public_func_and_caller(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _run_cross_file_test(service_path, repo_root, expected_msg_substr):
+    changed = {str(service_path): [(1, 2)]}
+    msgs = list(
+        run_engine(
+            changed,
+            _repo_root=str(repo_root),
+            config=CrispenConfig(min_tuple_size=3),
+        )
+    )
+
+    assert any(expected_msg_substr in m for m in msgs)
+
+
 def test_cross_file_skips_when_outside_caller_exists(tmp_path):
     pkg = _make_pkg(tmp_path, "mypkg")
 
@@ -385,16 +404,7 @@ def test_cross_file_skips_when_outside_caller_exists(tmp_path):
         encoding="utf-8",
     )
 
-    changed = {str(service): [(1, 2)]}
-    msgs = list(
-        run_engine(
-            changed,
-            _repo_root=str(tmp_path),
-            config=CrispenConfig(min_tuple_size=3),
-        )
-    )
-
-    assert any("callers exist outside the diff" in m for m in msgs)
+    _run_cross_file_test(service, tmp_path, "callers exist outside the diff")
     assert "return (name, age, score)" in service.read_text(encoding="utf-8")
 
 
@@ -595,13 +605,23 @@ def test_cross_file_caller_updater_file_not_under_repo_root(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_cross_file_caller_updater_parse_error(tmp_path):
-    pkg = _make_pkg(tmp_path, "mypkg")
+def _setup_service_pkg(
+    tmp_path,
+    pkg_name="mypkg",
+    func_def="def approved():\n    return (1, 2, 3)\n",
+    line_range=(1, 2),
+):
+    pkg = _make_pkg(tmp_path, pkg_name)
 
     service = pkg / "service.py"
-    service.write_text("def approved():\n    return (1, 2, 3)\n", encoding="utf-8")
+    service.write_text(func_def, encoding="utf-8")
 
-    changed = {str(service): [(1, 2)]}
+    changed = {str(service): [line_range]}
+    return pkg, service, changed
+
+
+def test_cross_file_caller_updater_parse_error(tmp_path):
+    pkg, service, changed = _setup_service_pkg(tmp_path)
 
     original_parse = cst.parse_module
 
@@ -631,12 +651,7 @@ def test_cross_file_caller_updater_parse_error(tmp_path):
 
 
 def test_cross_file_caller_updater_raises(tmp_path):
-    pkg = _make_pkg(tmp_path, "mypkg")
-
-    service = pkg / "service.py"
-    service.write_text("def approved():\n    return (1, 2, 3)\n", encoding="utf-8")
-
-    changed = {str(service): [(1, 2)]}
+    pkg, service, changed = _setup_service_pkg(tmp_path)
 
     with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
         # Should not crash; the exception is caught.
@@ -673,14 +688,7 @@ def test_cross_file_init_alias_detected_as_outside_caller(tmp_path):
         "from mypkg import get_user\na, b, c = get_user()\n", encoding="utf-8"
     )
 
-    changed = {str(service): [(1, 2)]}
-    msgs = list(
-        run_engine(
-            changed, _repo_root=str(tmp_path), config=CrispenConfig(min_tuple_size=3)
-        )
-    )
-
-    assert any("callers exist outside the diff" in m for m in msgs)
+    _run_cross_file_test(service, tmp_path, "callers exist outside the diff")
 
 
 # ---------------------------------------------------------------------------
@@ -759,8 +767,7 @@ def _make_phase1_pkg(root):
     return pkg
 
 
-def test_phase1_private_caller_updated(tmp_path):
-    """Private function callers in the same file are updated after Phase 1."""
+def _write_test_file(tmp_path, filename="code.py"):
     source = textwrap.dedent(
         """\
         def _make_result():
@@ -770,8 +777,14 @@ def test_phase1_private_caller_updated(tmp_path):
             a, b, c = _make_result()
         """
     )
-    f = tmp_path / "code.py"
+    f = tmp_path / filename
     f.write_text(source, encoding="utf-8")
+    return f
+
+
+def test_phase1_private_caller_updated(tmp_path):
+    """Private function callers in the same file are updated after Phase 1."""
+    f = _write_test_file(tmp_path)
     msgs = _run({str(f): [(1, 100)]})
     result = f.read_text(encoding="utf-8")
     assert "_ = _make_result()" in result
@@ -790,17 +803,7 @@ def test_phase1_private_no_callers_no_caller_updater_msg(tmp_path):
 
 def test_phase1_private_caller_updater_exception_ignored(tmp_path):
     """If CallerUpdater raises during Phase 1, the engine continues gracefully."""
-    source = textwrap.dedent(
-        """\
-        def _make_result():
-            return (1, 2, 3)
-
-        def use_it():
-            a, b, c = _make_result()
-        """
-    )
-    f = tmp_path / "code.py"
-    f.write_text(source, encoding="utf-8")
+    f = _write_test_file(tmp_path)
     with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
         msgs = _run({str(f): [(1, 100)]})
     # TupleDataclass still ran successfully
@@ -885,6 +888,16 @@ def test_run_engine_config_none_loads_default(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _setup_test_file_and_run_engine(tmp_path, source, update_diff_file_callers=False):
+    f = tmp_path / "code.py"
+    f.write_text(source, encoding="utf-8")
+    config = CrispenConfig(
+        min_tuple_size=3, update_diff_file_callers=update_diff_file_callers
+    )
+    msgs = list(run_engine({str(f): [(1, 5)]}, config=config))
+    return f, msgs
+
+
 def test_update_diff_file_callers_false_blocks_private_with_outside_caller(tmp_path):
     """Private function with a caller outside diff ranges is NOT transformed."""
     source = textwrap.dedent(
@@ -899,11 +912,10 @@ def test_update_diff_file_callers_false_blocks_private_with_outside_caller(tmp_p
             p, q, r = _make_result()
         """
     )
-    f = tmp_path / "code.py"
-    f.write_text(source, encoding="utf-8")
-    config = CrispenConfig(min_tuple_size=3, update_diff_file_callers=False)
     # Diff only covers the function definition and use_in_diff
-    msgs = list(run_engine({str(f): [(1, 5)]}, config=config))
+    f, msgs = _setup_test_file_and_run_engine(
+        tmp_path, source, update_diff_file_callers=False
+    )
     # Should NOT have been transformed (outside callers exist)
     assert not any("TupleDataclass" in m for m in msgs)
     assert "return (a, b, c)" in f.read_text(encoding="utf-8")
@@ -922,10 +934,10 @@ def test_update_diff_file_callers_false_allows_private_with_only_diff_callers(
             x, y, z = _make_result()
         """
     )
-    f = tmp_path / "code.py"
-    f.write_text(source, encoding="utf-8")
-    config = CrispenConfig(min_tuple_size=3, update_diff_file_callers=False)
-    msgs = list(run_engine({str(f): [(1, 5)]}, config=config))
+    # Only diff caller exists → transformation should proceed
+    f, msgs = _setup_test_file_and_run_engine(
+        tmp_path, source, update_diff_file_callers=False
+    )
     # Only diff caller exists → transformation should proceed
     assert any("TupleDataclass" in m for m in msgs)
 
@@ -969,20 +981,7 @@ def test_update_diff_file_callers_false_allows_public_with_all_callers_in_diff(
     tmp_path,
 ):
     """Public function with all callers inside diff (no diff-file outside callers)."""
-    pkg = _make_pkg(tmp_path, "mypkg")
-
-    service = pkg / "service.py"
-    service.write_text(
-        "def get_user():\n    return (name, age, score)\n", encoding="utf-8"
-    )
-
-    api = pkg / "api.py"
-    api.write_text(
-        "from mypkg.service import get_user\n"
-        "def main():\n"
-        "    a, b, c = get_user()\n",
-        encoding="utf-8",
-    )
+    pkg, service, api = _make_cross_file_pkg(tmp_path)
 
     changed = {str(service): [(1, 2)], str(api): [(1, 3)]}
     config = CrispenConfig(min_tuple_size=3, update_diff_file_callers=False)
