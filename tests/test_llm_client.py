@@ -220,15 +220,20 @@ def test_call_with_tool_anthropic_api_error():
 # ---------------------------------------------------------------------------
 
 
-def _make_openai_response(tool_name: str, arguments: dict) -> MagicMock:
-    tc = MagicMock()
-    tc.function.arguments = json.dumps(arguments)
+def _make_tool_response(tool_calls):
     message = MagicMock()
-    message.tool_calls = [tc]
+    message.tool_calls = [tool_calls]
     choice = MagicMock()
     choice.message = message
     resp = MagicMock()
     resp.choices = [choice]
+    return resp
+
+
+def _make_openai_response(tool_name: str, arguments: dict) -> MagicMock:
+    tc = MagicMock()
+    tc.function.arguments = json.dumps(arguments)
+    resp = _make_tool_response(tc)
     return resp
 
 
@@ -281,12 +286,7 @@ def test_call_with_tool_moonshot_malformed_json():
         client = MagicMock()
         tc = MagicMock()
         tc.function.arguments = '{"key": "unterminated'
-        message = MagicMock()
-        message.tool_calls = [tc]
-        choice = MagicMock()
-        choice.message = message
-        resp = MagicMock()
-        resp.choices = [choice]
+        resp = _make_tool_response(tc)
         client.chat.completions.create.return_value = resp
         result = call_with_tool(
             client,
