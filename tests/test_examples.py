@@ -1,7 +1,4 @@
-"""Full-stack example tests — intentionally excluded from pre-commit.
-
-Run with:
-    uv run pytest tests/test_examples.py -v
+"""Full-stack example tests.
 
 Each test loads a realistic code diff from the examples/ directory,
 runs the relevant refactor, and verifies the expected outcome.  LLM
@@ -14,7 +11,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import libcst as cst
-import pytest
 from libcst.metadata import MetadataWrapper
 
 from crispen.diff_parser import parse_diff
@@ -22,8 +18,6 @@ from crispen.refactors.duplicate_extractor import DuplicateExtractor
 from crispen.refactors.function_splitter import FunctionSplitter
 from crispen.refactors.if_not_else import IfNotElse
 from crispen.refactors.tuple_dataclass import TupleDataclass
-
-pytestmark = pytest.mark.examples
 
 EXAMPLES = Path(__file__).parent.parent / "examples"
 
@@ -401,3 +395,24 @@ def test_function_splitter_skip_nested_def(mock_anthropic):
 
     assert splitter.get_rewritten_source() is None
     mock_anthropic.Anthropic.return_value.messages.create.assert_not_called()
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_instance_method_helper(mock_anthropic):
+    """A method whose tail references self → helper is a regular instance method."""
+    src, diff, _ = _load("function_splitter", "06_instance_method")
+    ranges = _ranges(diff)
+
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_naming_response(["build_summary"])
+    )
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(ranges, source=src, verbose=False, max_lines=20)
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    compile(result, "<test>", "exec")
+    assert "_build_summary" in result
+    assert "@staticmethod" not in result
+    assert "return self._build_summary(" in result
+    assert len(splitter.changes_made) >= 1

@@ -28,5 +28,4 @@ LLM calls are mocked so the suite runs offline without API keys.
 uv run pytest tests/test_examples.py -v
 ```
 
-The examples suite is excluded from the pre-commit hook (which enforces 100% branch
-coverage).  Run it explicitly when working on a refactor or verifying behavior.
+The examples suite runs as part of the normal test suite (including pre-commit).

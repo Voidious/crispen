@@ -38,7 +38,6 @@ llm_verify_retries = 1
 
 [tool.pytest.ini_options]
 addopts = "--cov=crispen --cov-branch --cov-fail-under=100"
-markers = ["examples: full-stack example tests (excluded from pre-commit)"]
 
 [tool.coverage.run]
 branch = true
