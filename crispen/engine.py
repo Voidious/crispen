@@ -340,6 +340,17 @@ def _categorize_into_stats(stats: RunStats, msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _record_changes(
+    changes: list,
+    filepath: str,
+    file_msgs: list,
+    _stats: RunStats,
+) -> None:
+    for msg in changes:
+        file_msgs.append(f"{filepath}: {msg}")
+        _categorize_into_stats(_stats, msg)
+
+
 def run_engine(
     changed: Dict[str, List[Tuple[int, int]]],
     verbose: bool = True,
@@ -435,9 +446,7 @@ def run_engine(
                 )
                 continue
 
-            for msg in transformer.get_changes():
-                file_msgs.append(f"{filepath}: {msg}")
-                _categorize_into_stats(_stats, msg)
+            _record_changes(transformer.get_changes(), filepath, file_msgs, _stats)
             _stats.merge(transformer.stats)
             current_source = new_source
 
@@ -484,9 +493,9 @@ def run_engine(
                         except SyntaxError:  # pragma: no cover
                             pass
                         else:
-                            for msg in cu.get_changes():
-                                file_msgs.append(f"{filepath}: {msg}")
-                                _categorize_into_stats(_stats, msg)
+                            _record_changes(
+                                cu.get_changes(), filepath, file_msgs, _stats
+                            )
                             current_source = cu_new_source
 
         per_file[filepath] = {
