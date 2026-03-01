@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Set, Tuple
 
 from .dep_graph import build_dep_graph, find_sccs
-from .entity_parser import Entity, parse_entities
+from .entity_parser import Entity, EntityKind, parse_entities
 
 
 class EntityClass(Enum):
@@ -73,6 +74,28 @@ def _assign_sccs(
     return set_1, set_2_groups, set_3_groups
 
 
+def _is_import_only_entity(entity: Entity, source_lines: List[str]) -> bool:
+    """Return True if *entity* consists solely of import statements and/or
+    module-level string literals (e.g. a module docstring).
+
+    Such entities must always remain in the original file: they define no
+    callable symbols that are useful in a standalone module, and removing
+    them from the original strips all imports, breaking the file.
+    """
+    entity_src = "".join(source_lines[entity.start_line - 1 : entity.end_line])
+    try:
+        tree = ast.parse(entity_src)
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -118,6 +141,15 @@ def classify_entities(
         elif _entity_overlaps_diff(entity, diff_ranges):
             entity_class[entity.name] = EntityClass.MODIFIED
         else:
+            entity_class[entity.name] = EntityClass.UNMODIFIED
+
+    # Import-only TOP_LEVEL entities must always stay in the original file.
+    # Moving them would strip all imports from the original, breaking it.
+    source_lines = post_refactor_source.splitlines(keepends=True)
+    for entity in entities:
+        if entity.kind == EntityKind.TOP_LEVEL and _is_import_only_entity(
+            entity, source_lines
+        ):
             entity_class[entity.name] = EntityClass.UNMODIFIED
 
     # Abort when the entire file is one strongly connected component.

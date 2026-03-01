@@ -8,6 +8,7 @@ from crispen.file_limiter.classifier import (
     EntityClass,
     _assign_sccs,
     _entity_overlaps_diff,
+    _is_import_only_entity,
     classify_entities,
 )
 from crispen.file_limiter.entity_parser import Entity, EntityKind
@@ -274,3 +275,101 @@ def test_classify_graph_exposed():
     # foo depends on bar
     assert "bar" in result.graph.get("foo", set())
     assert result.graph.get("bar") == set()
+
+
+# ---------------------------------------------------------------------------
+# _is_import_only_entity
+# ---------------------------------------------------------------------------
+
+
+def _top_level_entity(name: str, start: int, end: int) -> Entity:
+    return Entity(EntityKind.TOP_LEVEL, name, start, end, [])
+
+
+def test_is_import_only_imports_only():
+    src = "import os\nimport sys\n"
+    lines = src.splitlines(keepends=True)
+    entity = _top_level_entity("_block_1", 1, 2)
+    assert _is_import_only_entity(entity, lines) is True
+
+
+def test_is_import_only_docstring_and_imports():
+    src = '"""Module docstring."""\nimport os\nfrom sys import argv\n'
+    lines = src.splitlines(keepends=True)
+    entity = _top_level_entity("_block_1", 1, 3)
+    assert _is_import_only_entity(entity, lines) is True
+
+
+def test_is_import_only_has_assignment():
+    src = "import os\n_X = 1\n"
+    lines = src.splitlines(keepends=True)
+    entity = _top_level_entity("_block_1", 1, 2)
+    assert _is_import_only_entity(entity, lines) is False
+
+
+def test_is_import_only_syntax_error():
+    # Unparseable source → returns False
+    src = "def (\n"
+    lines = src.splitlines(keepends=True)
+    entity = _top_level_entity("_block_1", 1, 1)
+    assert _is_import_only_entity(entity, lines) is False
+
+
+def test_is_import_only_empty():
+    # Empty body → True (no non-import statements)
+    src = "\n"
+    lines = src.splitlines(keepends=True)
+    entity = _top_level_entity("_block_1", 1, 1)
+    assert _is_import_only_entity(entity, lines) is True
+
+
+# ---------------------------------------------------------------------------
+# classify_entities: import-only block forced to UNMODIFIED
+# ---------------------------------------------------------------------------
+
+
+def test_classify_import_only_block_stays_unmodified_even_when_diff_overlaps():
+    # The import block overlaps the diff range but must stay UNMODIFIED.
+    post = textwrap.dedent(
+        """\
+        import os
+        import sys
+
+        def foo():
+            return os.getcwd()
+    """
+    )
+    # diff covers line 1-2 (the import block)
+    result = classify_entities(post, post, [(1, 2)])
+    assert result.entity_class["_block_1"] == EntityClass.UNMODIFIED
+    assert "_block_1" in result.set_1
+
+
+def test_classify_import_only_block_with_docstring_stays_unmodified():
+    post = textwrap.dedent(
+        """\
+        \"\"\"Docstring.\"\"\"
+        import os
+
+        def foo():
+            return os.getcwd()
+    """
+    )
+    result = classify_entities(post, post, [(1, 2)])
+    assert result.entity_class["_block_1"] == EntityClass.UNMODIFIED
+    assert "_block_1" in result.set_1
+
+
+def test_classify_mixed_block_not_forced_unmodified():
+    # Block with imports AND an assignment is not import-only → stays MODIFIED.
+    post = textwrap.dedent(
+        """\
+        import os
+        _X = 1
+
+        def foo():
+            return _X
+    """
+    )
+    result = classify_entities(post, post, [(1, 2)])
+    assert result.entity_class["_block_1"] == EntityClass.MODIFIED
