@@ -24,6 +24,25 @@ from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
 # Single-file refactors applied in order before TupleDataclass.
 _REFACTORS = [IfNotElse, DuplicateExtractor, FunctionSplitter]
 
+# Canonical snake_case name for each refactor class (used by _should_run).
+_REFACTOR_KEY: Dict[type, str] = {
+    IfNotElse: "if_not_else",
+    DuplicateExtractor: "duplicate_extractor",
+    FunctionSplitter: "function_splitter",
+}
+
+
+def _should_run(name: str, config: CrispenConfig) -> bool:
+    """Return True if the named refactor should run given the config.
+
+    When ``config.enabled_refactors`` is non-empty only names in that list run.
+    Otherwise names in ``config.disabled_refactors`` are skipped.
+    """
+    if config.enabled_refactors:
+        return name in config.enabled_refactors
+    return name not in config.disabled_refactors
+
+
 # Directory names excluded from the outside-caller scan (e.g. virtual environments).
 _EXCLUDED_DIR_NAMES = frozenset(
     {".venv", "venv", "env", ".tox", "__pycache__", "node_modules"}
@@ -370,6 +389,9 @@ def run_engine(
         had_parse_error = False
 
         for RefactorClass in _REFACTORS:
+            key = _REFACTOR_KEY.get(RefactorClass)
+            if key is not None and not _should_run(key, config):
+                continue
             try:
                 current_tree = cst.parse_module(current_source)
             except cst.ParserSyntaxError as exc:
@@ -396,6 +418,7 @@ def run_engine(
                         base_url=config.base_url,
                         tool_choice=config.tool_choice,
                         api_timeout=config.api_timeout,
+                        match_functions=_should_run("match_function", config),
                     )
                 elif RefactorClass is FunctionSplitter:
                     transformer = FunctionSplitter(
@@ -444,7 +467,7 @@ def run_engine(
 
         # Apply TupleDataclass — private functions only in this pass.
         candidates: Dict[str, TransformInfo] = {}
-        if not had_parse_error:
+        if not had_parse_error and _should_run("tuple_dataclass", config):
             blocked: Set[str] = set()
             if not config.update_diff_file_callers:
                 blocked = _blocked_private_scopes(current_source, ranges)
@@ -623,7 +646,7 @@ def run_engine(
     # ------------------------------------------------------------------ #
     # Phase 3 — FileLimiter: split files exceeding max_file_lines        #
     # ------------------------------------------------------------------ #
-    if config.max_file_lines > 0:
+    if config.max_file_lines > 0 and _should_run("file_limiter", config):
         for filepath, state in per_file.items():
             if len(state["source"].splitlines()) <= config.max_file_lines:
                 continue

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -59,6 +59,18 @@ class CrispenConfig:
     # Number of additional extraction attempts after the LLM verification step
     # rejects the output.  0 means no retry: the group is skipped on rejection.
     llm_verify_retries: int = 2
+
+    # Refactor allow-list: if non-empty, only the named refactors are run.
+    # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
+    # "tuple_dataclass", "file_limiter", "match_function".
+    # "match_function" controls the sub-pass inside duplicate_extractor that
+    # replaces code blocks with calls to existing functions; it only takes
+    # effect when duplicate_extractor is also running.
+    # An empty list means "run all" (the default).
+    enabled_refactors: List[str] = field(default_factory=list)
+    # Refactor deny-list: named refactors are always skipped.
+    # Ignored when enabled_refactors is non-empty.
+    disabled_refactors: List[str] = field(default_factory=list)
 
 
 def _read_toml(path: Path) -> dict:

@@ -134,3 +134,48 @@ def test_load_config_all_options(tmp_path):
     assert cfg.tool_choice == "required"
     assert cfg.api_timeout == 120.0
     assert cfg.max_file_lines == 500
+
+
+# ---------------------------------------------------------------------------
+# enabled_refactors / disabled_refactors
+# ---------------------------------------------------------------------------
+
+
+def test_refactor_filter_defaults():
+    cfg = CrispenConfig()
+    assert cfg.enabled_refactors == []
+    assert cfg.disabled_refactors == []
+
+
+def test_load_config_enabled_refactors(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.crispen]\nenabled_refactors = ["if_not_else", "function_splitter"]\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(project_root=tmp_path)
+    assert cfg.enabled_refactors == ["if_not_else", "function_splitter"]
+    assert cfg.disabled_refactors == []
+
+
+def test_load_config_disabled_refactors(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.crispen]\ndisabled_refactors = ["duplicate_extractor"]\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(project_root=tmp_path)
+    assert cfg.disabled_refactors == ["duplicate_extractor"]
+    assert cfg.enabled_refactors == []
+
+
+def test_crispen_toml_overrides_refactor_lists(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.crispen]\nenabled_refactors = ["if_not_else"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / ".crispen.toml").write_text(
+        'disabled_refactors = ["function_splitter"]\nenabled_refactors = []\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(project_root=tmp_path)
+    assert cfg.enabled_refactors == []
+    assert cfg.disabled_refactors == ["function_splitter"]

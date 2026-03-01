@@ -1560,6 +1560,7 @@ class DuplicateExtractor(Refactor):
         base_url: Optional[str] = None,
         tool_choice: Optional[str] = None,
         api_timeout: float = 60.0,
+        match_functions: bool = True,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self._min_weight = min_weight
@@ -1573,6 +1574,7 @@ class DuplicateExtractor(Refactor):
         self._tool_choice = tool_choice
         self._api_timeout = api_timeout
         self._hard_timeout = api_timeout + 30
+        self._match_functions = match_functions
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -1612,11 +1614,15 @@ class DuplicateExtractor(Refactor):
         groups = _find_duplicate_groups(collector.sequences, self.changed_ranges)
 
         # 9. Check whether any sequence can be replaced with an existing function.
-        has_func_matches = func_body_fps and any(
-            _overlaps_diff(seq, self.changed_ranges)
-            and seq.fingerprint in func_body_fps
-            and func_body_fps[seq.fingerprint].name != seq.scope
-            for seq in collector.sequences
+        has_func_matches = (
+            self._match_functions
+            and func_body_fps
+            and any(
+                _overlaps_diff(seq, self.changed_ranges)
+                and seq.fingerprint in func_body_fps
+                and func_body_fps[seq.fingerprint].name != seq.scope
+                for seq in collector.sequences
+            )
         )
 
         # 10. Early exit — nothing to do.
@@ -1637,7 +1643,7 @@ class DuplicateExtractor(Refactor):
         matched_line_ranges: set = set()
 
         # 14. Function body match pass.
-        if func_body_fps:
+        if self._match_functions and func_body_fps:
             for seq in collector.sequences:
                 if not _overlaps_diff(seq, self.changed_ranges):
                     continue
