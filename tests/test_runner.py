@@ -70,7 +70,7 @@ def test_verify_entity_source_in_original():
         original_source="def foo():\n    pass\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source) is True
+    assert _verify_preservation([entity], split, post_source) == []
 
 
 def test_verify_entity_source_in_new_file():
@@ -81,7 +81,7 @@ def test_verify_entity_source_in_new_file():
         original_source="# original\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source) is True
+    assert _verify_preservation([entity], split, post_source) == []
 
 
 def test_verify_entity_source_missing():
@@ -92,7 +92,25 @@ def test_verify_entity_source_missing():
         original_source="# nothing relevant\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source) is False
+    failures = _verify_preservation([entity], split, post_source)
+    assert len(failures) == 1
+    assert "'foo'" in failures[0]
+    assert "1" in failures[0]  # start line
+    assert "2" in failures[0]  # end line
+
+
+def test_verify_entity_source_missing_long():
+    # Entity with more than 3 lines → preview includes trailing "..."
+    post_source = "def foo():\n    a = 1\n    b = 2\n    c = 3\n    pass\n"
+    entity = _make_entity("foo", 1, 5)
+    split = SplitResult(
+        new_files={},
+        original_source="# nothing relevant\n",
+        abort=False,
+    )
+    failures = _verify_preservation([entity], split, post_source)
+    assert len(failures) == 1
+    assert "..." in failures[0]
 
 
 def test_verify_empty_entity_source_skipped():
@@ -104,7 +122,7 @@ def test_verify_empty_entity_source_skipped():
         original_source="# completely different",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source) is True
+    assert _verify_preservation([entity], split, post_source) == []
 
 
 # ---------------------------------------------------------------------------

@@ -31,8 +31,8 @@ def _verify_preservation(
     entities: List[Entity],
     split: SplitResult,
     post_source: str,
-) -> bool:
-    """Return True if every non-empty entity source appears verbatim in *split*.
+) -> List[str]:
+    """Return a list of failure descriptions (empty = all entities preserved).
 
     Checks that each entity's source text from *post_source* is present in
     either ``split.original_source`` or one of ``split.new_files.values()``.
@@ -40,12 +40,22 @@ def _verify_preservation(
     """
     lines = post_source.splitlines(keepends=True)
     combined = split.original_source + "".join(split.new_files.values())
+    failures: List[str] = []
 
     for entity in entities:
         entity_src = "".join(lines[entity.start_line - 1 : entity.end_line]).rstrip()
         if entity_src and entity_src not in combined:
-            return False
-    return True
+            preview_lines = entity_src.splitlines()[:3]
+            preview = "\n    ".join(preview_lines)
+            if len(entity_src.splitlines()) > 3:
+                preview += "\n    ..."
+            failures.append(
+                f"  entity {entity.name!r} ({entity.kind.value},"
+                f" lines {entity.start_line}–{entity.end_line}):\n"
+                f"    {preview}"
+            )
+
+    return failures
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +101,13 @@ def run_file_limiter(
 
     split = generate_file_splits(classified, plan, post_source, filepath)
 
-    if not _verify_preservation(classified.entities, split, post_source):
+    failures = _verify_preservation(classified.entities, split, post_source)
+    if failures:
+        detail = "\n".join(failures)
         return FileLimiterResult(
             original_source=post_source,
             new_files={},
-            messages=[f"SKIP {filepath} (FileLimiter): verification failed"],
+            messages=[f"SKIP {filepath} (FileLimiter): verification failed\n{detail}"],
             abort=True,
         )
 
