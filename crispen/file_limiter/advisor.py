@@ -159,11 +159,13 @@ def _advise_set3(
         }
     ]
 
+    n_groups = len(classified.set_3_groups)
+    max_tokens = max(512, 20 + n_groups * 15)
     result = call_with_tool(
         client,
         config.provider,
         config.model,
-        512,
+        max_tokens,
         _SET3_TOOL,
         "advise_set3_actions",
         messages,
@@ -215,11 +217,13 @@ def _assign_placements(
         }
     ]
 
+    n_groups = len(groups_to_place)
+    max_tokens = max(512, 20 + n_groups * 20)
     result = call_with_tool(
         client,
         config.provider,
         config.model,
-        512,
+        max_tokens,
         _PLACEMENT_TOOL,
         "assign_file_placements",
         messages,
