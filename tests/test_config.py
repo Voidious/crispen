@@ -117,7 +117,8 @@ def test_load_config_all_options(tmp_path):
         "extraction_retries = 2\n"
         "llm_verify_retries = 3\n"
         "tool_choice = 'required'\n"
-        "api_timeout = 120.0\n",
+        "api_timeout = 120.0\n"
+        "max_file_lines = 500\n",
         encoding="utf-8",
     )
     cfg = load_config(project_root=tmp_path)
@@ -132,3 +133,4 @@ def test_load_config_all_options(tmp_path):
     assert cfg.llm_verify_retries == 3
     assert cfg.tool_choice == "required"
     assert cfg.api_timeout == 120.0
+    assert cfg.max_file_lines == 500

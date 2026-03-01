@@ -14,6 +14,7 @@ from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvi
 
 from .config import CrispenConfig, load_config
 from .errors import CrispenAPIError
+from .file_limiter.runner import run_file_limiter
 from .refactors.caller_updater import CallerUpdater
 from .refactors.duplicate_extractor import DuplicateExtractor
 from .refactors.function_splitter import FunctionSplitter
@@ -618,6 +619,40 @@ def run_engine(
                         state["msgs"].append(f"{filepath}: {msg}")
                         _categorize_into_stats(_stats, msg)
                     state["source"] = new_source
+
+    # ------------------------------------------------------------------ #
+    # Phase 3 — FileLimiter: split files exceeding max_file_lines        #
+    # ------------------------------------------------------------------ #
+    if config.max_file_lines > 0:
+        for filepath, state in per_file.items():
+            if len(state["source"].splitlines()) <= config.max_file_lines:
+                continue
+
+            try:
+                fl_result = run_file_limiter(
+                    filepath=filepath,
+                    original_source=state["original"],
+                    post_source=state["source"],
+                    diff_ranges=state["ranges"],
+                    config=config,
+                )
+            except CrispenAPIError:
+                raise
+
+            if fl_result.messages:
+                state["msgs"].extend(fl_result.messages)
+
+            if fl_result.abort or not fl_result.new_files:
+                continue
+
+            original_dir = Path(filepath).parent
+            for rel_path, new_source in fl_result.new_files.items():
+                new_path = original_dir / rel_path
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                new_path.write_text(new_source, encoding="utf-8")
+                _stats.files_edited.append(str(new_path))
+
+            state["source"] = fl_result.original_source
 
     # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #

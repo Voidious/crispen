@@ -45,6 +45,10 @@ class CrispenConfig:
     # FunctionSplitter: maximum function body lines (excluding docstring)
     max_function_length: int = 75
 
+    # FileLimiter: maximum file line count before splitting is triggered.
+    # Set to 0 to disable FileLimiter entirely.
+    max_file_lines: int = 1000
+
     # Whether to update callers in diff files even if outside the diff ranges.
     # When False and unreachable callers exist, the transformation is skipped.
     update_diff_file_callers: bool = True
