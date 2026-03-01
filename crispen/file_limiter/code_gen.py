@@ -44,6 +44,9 @@ class SplitResult:
 # Matches any line that is an import statement (plain or from-import).
 _IMPORT_LINE_RE = re.compile(r"^[ \t]*(import\s+|from\s+\S.*\s+import\s+)")
 
+# Matches a `from __future__ import …` line (with optional trailing newline).
+_FUTURE_IMPORT_LINE_RE = re.compile(r"^from __future__ import .*\n?", re.MULTILINE)
+
 
 def _collect_name_loads(source: str) -> Set[str]:
     """Return all Name loads referenced in *source*."""
@@ -392,8 +395,11 @@ def generate_file_splits(
             ent_names, entity_source_map, name_to_target_file, target_file
         )
         entity_srcs = [
-            src for name in ent_names if (src := entity_source_map.get(name))
+            _FUTURE_IMPORT_LINE_RE.sub("", src).rstrip()
+            for name in ent_names
+            if (src := entity_source_map.get(name))
         ]
+        entity_srcs = [s for s in entity_srcs if s]
         parts: List[str] = []
         all_imports = needed + cross
         if all_imports:

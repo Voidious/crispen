@@ -439,6 +439,38 @@ def test_generate_multiple_different_target_files():
     assert "from .foo_module import foo" in result.original_source
 
 
+def test_generate_future_import_not_duplicated_when_in_entity_source():
+    # Entity source itself contains `from __future__ import annotations`
+    # (e.g. the _block_1 TOP_LEVEL entity which IS the file's import block).
+    # It must appear only once at the top of the new file, not again inside
+    # the entity source, which would cause a SyntaxError.
+    source = textwrap.dedent(
+        """\
+        from __future__ import annotations
+
+        \"\"\"Module docstring.\"\"\"
+
+        from __future__ import annotations
+
+        import os
+
+        _CONST = 42
+    """
+    )
+    # _block_1 spans the whole file and contains the future import + constants.
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 9, ["_CONST"])
+    c = _classified(entities=[e_block])
+    plan = _plan([GroupPlacement(group=["_block_1"], target_file="constants.py")])
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    new_src = result.new_files["constants.py"]
+    assert new_src.count("from __future__ import annotations") == 1
+    # Must be at the very start of the file (before any other code).
+    first_non_blank = next(line for line in new_src.splitlines() if line.strip())
+    assert first_non_blank == "from __future__ import annotations"
+
+
 def test_generate_future_import_always_included():
     source = "from __future__ import annotations\n\ndef foo():\n    pass\n"
     entity = _make_entity("foo", 3, 4)
