@@ -119,31 +119,60 @@ def _find_needed_imports(
     return needed
 
 
+def _relative_import_prefix(from_file: str, to_file: str) -> str:
+    """Return the Python relative-import prefix for *to_file* as seen from *from_file*.
+
+    Both paths are relative to the same base directory (the original file's
+    directory).  Examples::
+
+        _relative_import_prefix("utils.py", "helpers.py")          → ".helpers"
+        _relative_import_prefix("sub/a.py", "helpers/b.py")        → "..helpers.b"
+        _relative_import_prefix("sub/a.py", "sub/b.py")            → ".b"
+    """
+    from_parts = Path(from_file).parent.parts  # () for top-level files
+    to_module_parts = Path(to_file).with_suffix("").parts  # ("helpers", "b")
+    to_dir_parts = Path(to_file).parent.parts  # ("helpers",)
+
+    # Length of the common directory prefix between from_dir and to_dir.
+    common_len = 0
+    for fp, tp in zip(from_parts, to_dir_parts):
+        if fp == tp:
+            common_len += 1
+        else:
+            break
+
+    levels_up = len(from_parts) - common_len
+    module = ".".join(to_module_parts[common_len:])
+    return "." * (levels_up + 1) + module
+
+
 def _find_cross_file_imports(
     entity_names: List[str],
     entity_source_map: Dict[str, str],
     name_to_target_file: Dict[str, str],
     current_target: str,
 ) -> List[str]:
-    """Return ``from .module import name`` statements for sibling-file dependencies.
+    """Return relative ``from … import name`` statements for other-file dependencies.
 
     When an entity being moved to *current_target* references a name that is
     defined by another entity being moved to a different target file, the new
-    file needs an explicit import for that name.
+    file needs an explicit import for that name.  The import prefix is computed
+    relative to *current_target*'s directory so it works even when the two
+    files live in different subdirectories.
     """
     referenced: Set[str] = set()
     for name in entity_names:
         src = entity_source_map.get(name, "")
         referenced |= _collect_name_loads(src)
-    from_modules: Dict[str, List[str]] = {}
+    from_files: Dict[str, List[str]] = {}  # source_file → names
     for ref_name in sorted(referenced):
         source_file = name_to_target_file.get(ref_name)
         if source_file and source_file != current_target:
-            module = _target_module_name(source_file)
-            from_modules.setdefault(module, []).append(ref_name)
+            from_files.setdefault(source_file, []).append(ref_name)
     return [
-        f"from .{module} import {', '.join(sorted(names))}"
-        for module, names in sorted(from_modules.items())
+        f"from {_relative_import_prefix(current_target, source_file)}"
+        f" import {', '.join(sorted(names))}"
+        for source_file, names in sorted(from_files.items())
     ]
 
 
@@ -213,6 +242,29 @@ def _add_re_exports(
     return "".join(lines[:last_import_line] + export_stmts + lines[last_import_line:])
 
 
+def _topo_depth(graph: Dict[str, Set[str]]) -> Dict[str, int]:
+    """Return topological depth for each node in a DAG.
+
+    Depth 0 = leaf (no outgoing edges).  A node's depth is 1 + the maximum
+    depth of its dependencies.  All dependency nodes must be keys in *graph*.
+    On non-DAG inputs (cycles detected), returns 0 for every node as a safe
+    fallback so that callers degrade to arbitrary candidate ordering.
+    """
+    if any(len(s) > 1 for s in find_sccs(graph)):
+        return {node: 0 for node in graph}
+    depths: Dict[str, int] = {}
+
+    def dfs(node: str) -> int:
+        if node in depths:
+            return depths[node]
+        depths[node] = 1 + max((dfs(dep) for dep in graph[node]), default=-1)
+        return depths[node]
+
+    for node in graph:
+        dfs(node)
+    return depths
+
+
 def _extract_shared_helpers(
     file_entity_names: Dict[str, List[str]],
     entity_source_map: Dict[str, str],
@@ -228,10 +280,17 @@ def _extract_shared_helpers(
     from the original O, the generated ``from .O import X`` combined with O's
     re-export ``from .F import …`` creates a cycle O→F→O.
 
-    Fix: pull X (and all helpers X transitively depends on) into the first new
-    file that references them.  Mutually-dependent helpers (those forming a
-    cycle among themselves) are grouped into the same file via SCC analysis so
-    that no inter-new-file cycle can arise (F1→F2→F1).
+    Fix: pull X (and all helpers X transitively depends on) into a new file
+    that uses them.  The destination is chosen using topological depth ordering:
+    the inter-file dependency graph is built from migrated-entity cross-references
+    first, then for each helper SCC the candidates (all files wanting the
+    helpers) are sorted by topological depth (deepest / most-downstream first).
+    For a DAG the deepest wanting file is always cycle-free on the first try;
+    for non-DAG inputs (pre-existing cycles) _topo_depth falls back to 0 for
+    all nodes and the loop exhausts all candidates via trial SCC analysis.
+    If no cycle-free placement exists the SCC is left in the original file and
+    the safety-net in :func:`generate_file_splits` will abort if the result is
+    unloadable.
 
     Mutates *file_entity_names*, *migrated_names*, and *name_to_target_file*
     in place.  Returns synthetic :class:`GroupPlacement` objects for the
@@ -249,44 +308,108 @@ def _extract_shared_helpers(
             if name_to_target_file.get(defined_name) == original_basename:
                 defined_to_entity[defined_name] = entity.name
 
-    # Collect directly-wanted helpers: entity_name → first target_file that needs it.
-    wanted: Dict[str, str] = {}
+    # Collect directly-wanted helpers: entity_name → set of target_files that want it.
+    wanting: Dict[str, Set[str]] = {}
     for target_file, ent_names in list(file_entity_names.items()):
         for ent_name in ent_names:
             src = entity_source_map.get(ent_name, "")
             for ref_name in _collect_name_loads(src):
                 entity_name = defined_to_entity.get(ref_name)
-                if entity_name and entity_name not in wanted:
-                    wanted[entity_name] = target_file
+                if entity_name is not None:
+                    wanting.setdefault(entity_name, set()).add(target_file)
 
-    if not wanted:
+    if not wanting:
         return []
 
-    # Transitively pull in helpers referenced by already-wanted helpers,
-    # preventing O→new-file→O cycles introduced by the extracted helpers.
-    queue = list(wanted.keys())
-    while queue:
-        entity_name = queue.pop(0)
+    # Transitively expand wanting-sets to cover helpers referenced by
+    # already-wanted helpers, preventing O→new-file→O cycles.
+    # Re-queue a helper whenever its wanting-set gains new target files so that
+    # the propagation reaches all transitive dependents.
+    queue = list(wanting.keys())
+    idx = 0
+    while idx < len(queue):
+        entity_name = queue[idx]
+        idx += 1
         src = entity_source_map.get(entity_name, "")
         for ref_name in _collect_name_loads(src):
             dep_name = defined_to_entity.get(ref_name)
-            if dep_name and dep_name not in wanted:
-                wanted[dep_name] = wanted[entity_name]
+            if dep_name and wanting[entity_name] - wanting.get(dep_name, set()):
+                wanting.setdefault(dep_name, set()).update(wanting[entity_name])
                 queue.append(dep_name)
 
     # SCC analysis on the sub-graph of wanted helpers to co-locate
-    # mutually-dependent helpers and prevent inter-new-file cycles (F1→F2→F1).
+    # mutually-dependent helpers.
     sub_graph: Dict[str, Set[str]] = {
-        name: {d for d in classified.graph.get(name, set()) if d in wanted}
-        for name in wanted
+        name: {d for d in classified.graph.get(name, set()) if d in wanting}
+        for name in wanting
     }
     sccs = find_sccs(sub_graph)
 
-    plan_order = {tf: i for i, tf in enumerate(file_entity_names)}
+    # Build the initial inter-file dependency graph from migrated-entity
+    # cross-references (before any helper placement).  This is the baseline for
+    # the cycle-aware candidate selection below.
+    file_deps: Dict[str, Set[str]] = {f: set() for f in file_entity_names}
+    for target_file, ent_names in file_entity_names.items():
+        for ent_name in ent_names:
+            src = entity_source_map.get(ent_name, "")
+            for ref_name in _collect_name_loads(src):
+                dep_file = name_to_target_file.get(ref_name)
+                if (
+                    dep_file
+                    and dep_file != target_file
+                    and dep_file in file_entity_names
+                ):
+                    file_deps[target_file].add(dep_file)
+
     synthetic_placements: List[GroupPlacement] = []
     for scc in sccs:
-        scc_targets = {wanted[name] for name in scc}
-        chosen = min(scc_targets, key=lambda t: plan_order.get(t, len(plan_order)))
+        # Union of wanting-sets across this helper SCC.
+        scc_wanting: Set[str] = set()
+        for name in scc:
+            scc_wanting.update(wanting.get(name, set()))
+
+        # Sort candidates by topological depth (deepest / most-downstream first).
+        # For a DAG the deepest wanting file is always cycle-free on the first try,
+        # eliminating trial-and-error.  Depths are recomputed after each placement
+        # because file_deps grows as helpers are extracted.
+        topo_depth = _topo_depth(file_deps)
+        candidates = sorted(scc_wanting, key=lambda t: topo_depth.get(t, 0))
+        chosen: Optional[str] = None
+        for candidate in candidates:
+            trial_deps: Dict[str, Set[str]] = {
+                f: set(deps) for f, deps in file_deps.items()
+            }
+            for wanting_file in scc_wanting:
+                if wanting_file != candidate:
+                    trial_deps[wanting_file].add(candidate)
+            for helper_name in scc:
+                src = entity_source_map.get(helper_name, "")
+                for ref_name in _collect_name_loads(src):
+                    dep_file = name_to_target_file.get(ref_name)
+                    if (
+                        dep_file
+                        and dep_file != candidate
+                        and dep_file in file_entity_names
+                    ):
+                        trial_deps[candidate].add(dep_file)
+            if not any(len(s) > 1 for s in find_sccs(trial_deps)):
+                chosen = candidate
+                break
+
+        if chosen is None:
+            continue  # No cycle-free placement — leave helpers in original file.
+
+        # Apply the chosen placement: update file_deps for subsequent SCC decisions.
+        for wanting_file in scc_wanting:
+            if wanting_file != chosen:
+                file_deps[wanting_file].add(chosen)
+        for helper_name in scc:
+            src = entity_source_map.get(helper_name, "")
+            for ref_name in _collect_name_loads(src):
+                dep_file = name_to_target_file.get(ref_name)
+                if dep_file and dep_file != chosen and dep_file in file_entity_names:
+                    file_deps[chosen].add(dep_file)
+
         # Prepend extracted helpers so they appear before the functions that use them.
         file_entity_names[chosen] = list(scc) + file_entity_names[chosen]
         for entity_name in scc:
@@ -455,6 +578,25 @@ def generate_file_splits(
         migrated_names,
         original_basename,
     )
+
+    # Detect circular imports between new files.  When entity in file A
+    # references a name that lives in file B, and vice-versa, A and B would
+    # import from each other — a Python circular-import error at load time.
+    # Abort rather than emit broken code.
+    new_file_deps: Dict[str, Set[str]] = {f: set() for f in file_entity_names}
+    for target_file, ent_names in file_entity_names.items():
+        for ent_name in ent_names:
+            src = entity_source_map.get(ent_name, "")
+            for ref_name in _collect_name_loads(src):
+                dep_file = name_to_target_file.get(ref_name)
+                if (
+                    dep_file
+                    and dep_file != target_file
+                    and dep_file in file_entity_names
+                ):
+                    new_file_deps[target_file].add(dep_file)
+    if any(len(scc) > 1 for scc in find_sccs(new_file_deps)):
+        return SplitResult(new_files={}, original_source=post_source, abort=True)
 
     # Generate new file contents.
     new_files: Dict[str, str] = {}

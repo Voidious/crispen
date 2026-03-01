@@ -1203,7 +1203,7 @@ def test_file_limiter_success_writes_new_file(tmp_path):
 
 
 def test_file_limiter_creates_nested_directory(tmp_path):
-    """FileLimiter target in subdir → parent dirs created automatically."""
+    """FileLimiter target in subdir → parent dirs and __init__.py created."""
     f = tmp_path / "big.py"
     f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
     success_result = FileLimiterResult(
@@ -1222,6 +1222,31 @@ def test_file_limiter_creates_nested_directory(tmp_path):
     nested = tmp_path / "helpers" / "utils.py"
     assert nested.exists()
     assert nested.read_text(encoding="utf-8") == "# helpers\n"
+    # Subdirectory is initialised as a Python package.
+    assert (tmp_path / "helpers" / "__init__.py").exists()
+
+
+def test_file_limiter_existing_init_not_overwritten(tmp_path):
+    """If the target subdir already has __init__.py, it is not overwritten."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+    helpers = tmp_path / "helpers"
+    helpers.mkdir()
+    (helpers / "__init__.py").write_text("# existing\n", encoding="utf-8")
+    success_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"helpers/utils.py": "# utils\n"},
+        messages=[],
+        abort=False,
+    )
+    with patch(_FL_PATCH, return_value=success_result):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5),
+            )
+        )
+    assert (helpers / "__init__.py").read_text(encoding="utf-8") == "# existing\n"
 
 
 def test_file_limiter_api_error_propagates(tmp_path):

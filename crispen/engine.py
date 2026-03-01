@@ -672,6 +672,10 @@ def run_engine(
             for rel_path, new_source in fl_result.new_files.items():
                 new_path = original_dir / rel_path
                 new_path.parent.mkdir(parents=True, exist_ok=True)
+                if new_path.parent != original_dir:
+                    init_py = new_path.parent / "__init__.py"
+                    if not init_py.exists():
+                        init_py.write_text("", encoding="utf-8")
                 new_path.write_text(new_source, encoding="utf-8")
                 _stats.files_edited.append(str(new_path))
 
