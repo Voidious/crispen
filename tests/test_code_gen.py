@@ -1357,3 +1357,38 @@ def test_generate_prunes_unused_names_from_multiname_import():
     new_src = result.new_files["utils.py"]
     assert "from typing import List" in new_src
     assert "Dict" not in new_src
+
+
+def test_generate_prunes_fully_unused_import_from_original():
+    # import os is only used by foo; after foo migrates the original no longer
+    # needs os, so the import should be removed.
+    source = "import os\n\ndef foo():\n    os.getcwd()\n\ndef bar():\n    return 1\n"
+    e_foo = _make_entity("foo", 3, 4)
+    e_bar = _make_entity("bar", 6, 7)
+    c = _classified(entities=[e_foo, e_bar])
+    plan = _plan([GroupPlacement(group=["foo"], target_file="utils.py")])
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    assert "from .utils import foo" in result.original_source
+    assert "import os" not in result.original_source
+    assert "def bar():" in result.original_source
+
+
+def test_generate_narrows_partial_unused_import_in_original():
+    # foo uses Dict; bar uses List.  After foo migrates, Dict should be
+    # stripped from the original's import while List is kept.
+    source = (
+        "from typing import Dict, List\n\n"
+        "def foo(x: Dict):\n    return x\n\n"
+        "def bar(x: List):\n    return x\n"
+    )
+    e_foo = _make_entity("foo", 3, 4)
+    e_bar = _make_entity("bar", 6, 7)
+    c = _classified(entities=[e_foo, e_bar])
+    plan = _plan([GroupPlacement(group=["foo"], target_file="utils.py")])
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    assert "from typing import List" in result.original_source
+    assert "Dict" not in result.original_source

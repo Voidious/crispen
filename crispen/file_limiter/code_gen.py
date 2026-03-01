@@ -623,6 +623,7 @@ def generate_file_splits(
 
     # Build updated original source.
     updated = _remove_entity_lines(post_source, migrated_names, entity_map)
+    updated = _prune_unused_imports(updated)
     updated = _add_re_exports(
         updated, valid_placements + synthetic_placements, entity_map
     )
