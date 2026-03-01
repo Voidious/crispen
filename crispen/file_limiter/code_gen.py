@@ -143,17 +143,26 @@ def _remove_entity_lines(
 def _add_re_exports(
     source: str, placements: List[GroupPlacement], entity_map: Dict[str, Entity]
 ) -> str:
-    """Add ``from .module import name`` re-exports for public migrated entities.
+    """Add ``from .module import name`` imports for migrated entities.
+
+    Public names are always re-exported so external callers can still import
+    them from the original module.  Private names (starting with ``_``) are
+    re-imported only when the remaining *source* still references them.
 
     Inserts after the last import line in *source*.  Returns *source* unchanged
-    when all migrated entities are private (name starts with ``_``).
+    when there are no names to import.
     """
+    still_loaded = _collect_name_loads(source)
     re_exports: Dict[str, List[str]] = {}
     for placement in placements:
         module = _target_module_name(placement.target_file)
-        public = [name for name in placement.group if not name.startswith("_")]
-        if public:
-            re_exports.setdefault(module, []).extend(public)
+        to_import = [
+            name
+            for name in placement.group
+            if not name.startswith("_") or name in still_loaded
+        ]
+        if to_import:
+            re_exports.setdefault(module, []).extend(to_import)
 
     if not re_exports:
         return source
