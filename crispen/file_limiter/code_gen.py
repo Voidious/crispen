@@ -115,6 +115,34 @@ def _find_needed_imports(
     return needed
 
 
+def _find_cross_file_imports(
+    entity_names: List[str],
+    entity_source_map: Dict[str, str],
+    name_to_target_file: Dict[str, str],
+    current_target: str,
+) -> List[str]:
+    """Return ``from .module import name`` statements for sibling-file dependencies.
+
+    When an entity being moved to *current_target* references a name that is
+    defined by another entity being moved to a different target file, the new
+    file needs an explicit import for that name.
+    """
+    referenced: Set[str] = set()
+    for name in entity_names:
+        src = entity_source_map.get(name, "")
+        referenced |= _collect_name_loads(src)
+    from_modules: Dict[str, List[str]] = {}
+    for ref_name in sorted(referenced):
+        source_file = name_to_target_file.get(ref_name)
+        if source_file and source_file != current_target:
+            module = _target_module_name(source_file)
+            from_modules.setdefault(module, []).append(ref_name)
+    return [
+        f"from .{module} import {', '.join(sorted(names))}"
+        for module, names in sorted(from_modules.items())
+    ]
+
+
 def _target_module_name(target_file: str) -> str:
     """Convert a relative target filename to a dotted module name.
 
@@ -229,18 +257,31 @@ def generate_file_splits(
     # All migrated entity names.
     migrated_names: Set[str] = {name for p in plan.placements for name in p.group}
 
+    # Build name → target-file map for cross-file import detection.
+    name_to_target_file: Dict[str, str] = {}
+    for target_file, ent_names in file_entity_names.items():
+        for ent_name in ent_names:
+            entity = entity_map.get(ent_name)
+            if entity:
+                for defined_name in entity.names_defined:
+                    name_to_target_file[defined_name] = target_file
+
     # Generate new file contents.
     new_files: Dict[str, str] = {}
     for target_file, ent_names in file_entity_names.items():
         needed = _find_needed_imports(
             ent_names, entity_source_map, import_infos, all_entity_names
         )
+        cross = _find_cross_file_imports(
+            ent_names, entity_source_map, name_to_target_file, target_file
+        )
         entity_srcs = [
             src for name in ent_names if (src := entity_source_map.get(name))
         ]
         parts: List[str] = []
-        if needed:
-            parts.append("\n".join(needed))
+        all_imports = needed + cross
+        if all_imports:
+            parts.append("\n".join(all_imports))
         parts.extend(entity_srcs)
         new_files[target_file] = "\n\n".join(parts) + "\n"
 

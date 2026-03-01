@@ -11,6 +11,7 @@ from crispen.file_limiter.code_gen import (
     _add_re_exports,
     _collect_name_loads,
     _extract_import_info,
+    _find_cross_file_imports,
     _find_needed_imports,
     _remove_entity_lines,
     _target_module_name,
@@ -447,3 +448,69 @@ def test_generate_future_import_always_included():
 
     new_src = result.new_files["utils.py"]
     assert "from __future__ import annotations" in new_src
+
+
+# ---------------------------------------------------------------------------
+# _find_cross_file_imports
+# ---------------------------------------------------------------------------
+
+
+def test_find_cross_file_imports_basic():
+    # fn_a references _MODEL which is defined in block_1.py
+    entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
+    name_to_target_file = {"_MODEL": "block_1.py"}
+    result = _find_cross_file_imports(
+        ["fn_a"], entity_source_map, name_to_target_file, "llm_extract.py"
+    )
+    assert result == ["from .block_1 import _MODEL"]
+
+
+def test_find_cross_file_imports_same_file_excluded():
+    # _MODEL goes to the same file as fn_a → no cross-file import needed
+    entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
+    name_to_target_file = {"_MODEL": "llm_extract.py"}
+    result = _find_cross_file_imports(
+        ["fn_a"], entity_source_map, name_to_target_file, "llm_extract.py"
+    )
+    assert result == []
+
+
+def test_find_cross_file_imports_no_match():
+    # Referenced name not in name_to_target_file → no cross-file import
+    entity_source_map = {"fn_a": "def fn_a():\n    return os.getcwd()\n"}
+    result = _find_cross_file_imports(["fn_a"], entity_source_map, {}, "utils.py")
+    assert result == []
+
+
+def test_find_cross_file_imports_entity_not_in_map():
+    # Entity name not in entity_source_map → treated as empty source, no imports
+    result = _find_cross_file_imports(["ghost"], {}, {"x": "other.py"}, "utils.py")
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# generate_file_splits — cross-file import integration
+# ---------------------------------------------------------------------------
+
+
+def test_generate_cross_file_import():
+    # fn_a goes to fn_module.py; _block_1 (defining _CONST) goes to constants.py.
+    # fn_a references _CONST → fn_module.py must have `from .constants import _CONST`.
+    source = "_CONST = 42\n\ndef fn_a():\n    return _CONST\n"
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
+    e_fn = _make_entity("fn_a", 3, 4)
+    c = _classified(entities=[e_block, e_fn])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1"], target_file="constants.py"),
+            GroupPlacement(group=["fn_a"], target_file="fn_module.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    fn_src = result.new_files["fn_module.py"]
+    assert "from .constants import _CONST" in fn_src
+    # constants.py should NOT have a cross-import (it defines _CONST, not uses it)
+    const_src = result.new_files["constants.py"]
+    assert "from .fn_module" not in const_src
