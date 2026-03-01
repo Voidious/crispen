@@ -514,3 +514,31 @@ def test_generate_cross_file_import():
     # constants.py should NOT have a cross-import (it defines _CONST, not uses it)
     const_src = result.new_files["constants.py"]
     assert "from .fn_module" not in const_src
+
+
+def test_generate_import_from_original_for_non_migrated_helper():
+    # _run stays in original; test_fn is migrated. test_fn uses _run, so the
+    # new file must get `from .original import _run`.
+    source = textwrap.dedent(
+        """\
+        import textwrap
+
+        def _run(x):
+            return x
+
+        def test_fn():
+            return _run(1)
+    """
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["textwrap"])
+    e_run = _make_entity("_run", 3, 4)
+    e_test = _make_entity("test_fn", 6, 7)
+    c = _classified(entities=[e_block, e_run, e_test])
+    plan = _plan([GroupPlacement(group=["test_fn"], target_file="test_helpers.py")])
+
+    result = generate_file_splits(c, plan, source, "original.py")
+
+    new_src = result.new_files["test_helpers.py"]
+    assert "from .original import _run" in new_src
+    # import textwrap is handled by _find_needed_imports, not cross-file import
+    assert "from .original import textwrap" not in new_src

@@ -266,6 +266,17 @@ def generate_file_splits(
                 for defined_name in entity.names_defined:
                     name_to_target_file[defined_name] = target_file
 
+    # Also map names from non-migrated entities to the original file so that
+    # split files can import helpers (e.g. _run) that stayed behind.
+    # Exclude import-derived names since _find_needed_imports handles those.
+    import_defined_names = {name for info in import_infos for name in info.names}
+    original_basename = Path(original_path).name
+    for entity in classified.entities:
+        if entity.name not in migrated_names:
+            for defined_name in entity.names_defined:
+                if defined_name not in import_defined_names:
+                    name_to_target_file.setdefault(defined_name, original_basename)
+
     # Generate new file contents.
     new_files: Dict[str, str] = {}
     for target_file, ent_names in file_entity_names.items():
