@@ -10,7 +10,8 @@ from typing import Dict, List, Set
 
 from .advisor import FileLimiterPlan, GroupPlacement
 from .classifier import ClassifiedEntities
-from .entity_parser import Entity
+from .dep_graph import find_sccs
+from .entity_parser import Entity, EntityKind
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +210,91 @@ def _add_re_exports(
     return "".join(lines[:last_import_line] + export_stmts + lines[last_import_line:])
 
 
+def _extract_shared_helpers(
+    file_entity_names: Dict[str, List[str]],
+    entity_source_map: Dict[str, str],
+    entity_map: Dict[str, Entity],
+    classified: ClassifiedEntities,
+    name_to_target_file: Dict[str, str],
+    migrated_names: Set[str],
+    original_basename: str,
+) -> List[GroupPlacement]:
+    """Extract non-migrated functions/classes referenced by migrated entities.
+
+    When a migrated entity in new file F references a non-migrated function X
+    from the original O, the generated ``from .O import X`` combined with O's
+    re-export ``from .F import …`` creates a cycle O→F→O.
+
+    Fix: pull X (and all helpers X transitively depends on) into the first new
+    file that references them.  Mutually-dependent helpers (those forming a
+    cycle among themselves) are grouped into the same file via SCC analysis so
+    that no inter-new-file cycle can arise (F1→F2→F1).
+
+    Mutates *file_entity_names*, *migrated_names*, and *name_to_target_file*
+    in place.  Returns synthetic :class:`GroupPlacement` objects for the
+    extracted entities so that :func:`_add_re_exports` can re-import them from
+    their new location in the updated original source.
+    """
+    # Build defined-name → entity-name map for non-migrated FUNCTION/CLASS entities.
+    defined_to_entity: Dict[str, str] = {}
+    for entity in classified.entities:
+        if entity.name in migrated_names:
+            continue
+        if entity.kind not in (EntityKind.FUNCTION, EntityKind.CLASS):
+            continue
+        for defined_name in entity.names_defined:
+            if name_to_target_file.get(defined_name) == original_basename:
+                defined_to_entity[defined_name] = entity.name
+
+    # Collect directly-wanted helpers: entity_name → first target_file that needs it.
+    wanted: Dict[str, str] = {}
+    for target_file, ent_names in list(file_entity_names.items()):
+        for ent_name in ent_names:
+            src = entity_source_map.get(ent_name, "")
+            for ref_name in _collect_name_loads(src):
+                entity_name = defined_to_entity.get(ref_name)
+                if entity_name and entity_name not in wanted:
+                    wanted[entity_name] = target_file
+
+    if not wanted:
+        return []
+
+    # Transitively pull in helpers referenced by already-wanted helpers,
+    # preventing O→new-file→O cycles introduced by the extracted helpers.
+    queue = list(wanted.keys())
+    while queue:
+        entity_name = queue.pop(0)
+        src = entity_source_map.get(entity_name, "")
+        for ref_name in _collect_name_loads(src):
+            dep_name = defined_to_entity.get(ref_name)
+            if dep_name and dep_name not in wanted:
+                wanted[dep_name] = wanted[entity_name]
+                queue.append(dep_name)
+
+    # SCC analysis on the sub-graph of wanted helpers to co-locate
+    # mutually-dependent helpers and prevent inter-new-file cycles (F1→F2→F1).
+    sub_graph: Dict[str, Set[str]] = {
+        name: {d for d in classified.graph.get(name, set()) if d in wanted}
+        for name in wanted
+    }
+    sccs = find_sccs(sub_graph)
+
+    plan_order = {tf: i for i, tf in enumerate(file_entity_names)}
+    synthetic_placements: List[GroupPlacement] = []
+    for scc in sccs:
+        scc_targets = {wanted[name] for name in scc}
+        chosen = min(scc_targets, key=lambda t: plan_order.get(t, len(plan_order)))
+        # Prepend extracted helpers so they appear before the functions that use them.
+        file_entity_names[chosen] = list(scc) + file_entity_names[chosen]
+        for entity_name in scc:
+            migrated_names.add(entity_name)
+            entity = entity_map[entity_name]
+            for defined_name in entity.names_defined:
+                name_to_target_file[defined_name] = chosen
+        synthetic_placements.append(GroupPlacement(group=list(scc), target_file=chosen))
+    return synthetic_placements
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -284,6 +370,18 @@ def generate_file_splits(
                 if defined_name not in import_defined_names:
                     name_to_target_file.setdefault(defined_name, original_basename)
 
+    # Extract non-migrated FUNCTION/CLASS entities referenced by migrated ones
+    # into the new files that use them, breaking O→F→O import cycles.
+    synthetic_placements = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        original_basename,
+    )
+
     # Generate new file contents.
     new_files: Dict[str, str] = {}
     for target_file, ent_names in file_entity_names.items():
@@ -305,6 +403,8 @@ def generate_file_splits(
 
     # Build updated original source.
     updated = _remove_entity_lines(post_source, migrated_names, entity_map)
-    updated = _add_re_exports(updated, valid_placements, entity_map)
+    updated = _add_re_exports(
+        updated, valid_placements + synthetic_placements, entity_map
+    )
 
     return SplitResult(new_files=new_files, original_source=updated, abort=False)

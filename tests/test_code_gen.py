@@ -11,6 +11,7 @@ from crispen.file_limiter.code_gen import (
     _add_re_exports,
     _collect_name_loads,
     _extract_import_info,
+    _extract_shared_helpers,
     _find_cross_file_imports,
     _find_needed_imports,
     _remove_entity_lines,
@@ -516,9 +517,9 @@ def test_generate_cross_file_import():
     assert "from .fn_module" not in const_src
 
 
-def test_generate_import_from_original_for_non_migrated_helper():
-    # _run stays in original; test_fn is migrated. test_fn uses _run, so the
-    # new file must get `from .original import _run`.
+def test_generate_non_migrated_helper_extracted_to_new_file():
+    # _run is non-migrated; test_fn is migrated and references _run.
+    # _run is extracted into test_helpers.py to prevent an O→F→O cycle.
     source = textwrap.dedent(
         """\
         import textwrap
@@ -539,8 +540,10 @@ def test_generate_import_from_original_for_non_migrated_helper():
     result = generate_file_splits(c, plan, source, "original.py")
 
     new_src = result.new_files["test_helpers.py"]
-    assert "from .original import _run" in new_src
-    # import textwrap is handled by _find_needed_imports, not cross-file import
+    # _run is defined in the new file (extracted), not imported from original
+    assert "def _run" in new_src
+    assert "from .original import _run" not in new_src
+    # import textwrap is not referenced by either entity
     assert "from .original import textwrap" not in new_src
 
 
@@ -584,3 +587,345 @@ def test_generate_all_placements_self_referential():
     assert result.new_files == {}
     assert "from .original import foo" not in result.original_source
     assert "def foo" in result.original_source
+
+
+# ---------------------------------------------------------------------------
+# _extract_shared_helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_classified(entities, migrated_names=None):
+    migrated = set(migrated_names or [])
+    return (
+        ClassifiedEntities(
+            entities=entities,
+            entity_class={},
+            graph={},
+            set_1=[],
+            set_2_groups=[],
+            set_3_groups=[],
+            abort=False,
+        ),
+        migrated,
+    )
+
+
+def test_extract_shared_helpers_extracts_referenced_function():
+    # _helper is non-migrated, test_fn (migrated to helpers.py) references it.
+    e_helper = Entity(EntityKind.FUNCTION, "_helper", 1, 2, ["_helper"])
+    e_test = Entity(EntityKind.FUNCTION, "test_fn", 4, 6, ["test_fn"])
+    classified, migrated_names = _make_classified([e_helper, e_test], ["test_fn"])
+    entity_map = {"_helper": e_helper, "test_fn": e_test}
+    entity_source_map = {
+        "_helper": "def _helper():\n    pass",
+        "test_fn": "def test_fn():\n    return _helper()",
+    }
+    file_entity_names = {"helpers.py": ["test_fn"]}
+    name_to_target_file = {"_helper": "original.py", "test_fn": "helpers.py"}
+
+    synthetic = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+
+    # _helper extracted into helpers.py (prepended before test_fn)
+    assert file_entity_names["helpers.py"] == ["_helper", "test_fn"]
+    assert "_helper" in migrated_names
+    assert name_to_target_file["_helper"] == "helpers.py"
+    assert len(synthetic) == 1
+    assert synthetic[0].group == ["_helper"]
+    assert synthetic[0].target_file == "helpers.py"
+
+
+def test_extract_shared_helpers_skips_top_level_entities():
+    # TOP_LEVEL entities are not extracted (only FUNCTION/CLASS).
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
+    e_test = Entity(EntityKind.FUNCTION, "test_fn", 3, 4, ["test_fn"])
+    classified, migrated_names = _make_classified([e_block, e_test], ["test_fn"])
+    entity_map = {"_block_1": e_block, "test_fn": e_test}
+    entity_source_map = {
+        "_block_1": "_CONST = 42",
+        "test_fn": "def test_fn():\n    return _CONST",
+    }
+    file_entity_names = {"helpers.py": ["test_fn"]}
+    name_to_target_file = {"_CONST": "original.py", "test_fn": "helpers.py"}
+
+    synthetic = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+
+    assert "_block_1" not in migrated_names
+    assert file_entity_names["helpers.py"] == ["test_fn"]
+    assert synthetic == []
+
+
+def test_extract_shared_helpers_extracts_only_once_for_multiple_refs():
+    # _helper referenced twice in the same migrated entity → extracted once.
+    e_helper = Entity(EntityKind.FUNCTION, "_helper", 1, 2, ["_helper"])
+    e_test = Entity(EntityKind.FUNCTION, "test_fn", 4, 6, ["test_fn"])
+    classified, migrated_names = _make_classified([e_helper, e_test], ["test_fn"])
+    entity_map = {"_helper": e_helper, "test_fn": e_test}
+    entity_source_map = {
+        "_helper": "def _helper():\n    pass",
+        "test_fn": "def test_fn():\n    _helper()\n    _helper()",
+    }
+    file_entity_names = {"helpers.py": ["test_fn"]}
+    name_to_target_file = {"_helper": "original.py", "test_fn": "helpers.py"}
+
+    _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+
+    assert file_entity_names["helpers.py"].count("_helper") == 1
+
+
+def test_extract_shared_helpers_skips_name_already_pointing_to_other_target():
+    # A non-migrated FUNCTION entity whose defined name already points to a
+    # non-original target in name_to_target_file (e.g. a migrated entity also
+    # defines it) should not be added to defined_to_entity.
+    e_helper = Entity(EntityKind.FUNCTION, "_helper", 1, 2, ["_helper"])
+    e_test = Entity(EntityKind.FUNCTION, "test_fn", 4, 5, ["test_fn"])
+    classified, migrated_names = _make_classified([e_helper, e_test], ["test_fn"])
+    entity_map = {"_helper": e_helper, "test_fn": e_test}
+    entity_source_map = {
+        "_helper": "def _helper(): pass",
+        "test_fn": "def test_fn(): return _helper()",
+    }
+    file_entity_names = {"helpers.py": ["test_fn"]}
+    # _helper already points to helpers.py (not original) — skip it
+    name_to_target_file = {"_helper": "helpers.py", "test_fn": "helpers.py"}
+
+    synthetic = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+
+    assert "_helper" not in migrated_names
+    assert synthetic == []
+
+
+def test_extract_shared_helpers_no_extraction_when_no_original_dep():
+    # test_fn references other_fn which is also migrated → no extraction needed.
+    e_other = Entity(EntityKind.FUNCTION, "other_fn", 1, 2, ["other_fn"])
+    e_test = Entity(EntityKind.FUNCTION, "test_fn", 4, 5, ["test_fn"])
+    classified, migrated_names = _make_classified(
+        [e_other, e_test], ["test_fn", "other_fn"]
+    )
+    entity_map = {"other_fn": e_other, "test_fn": e_test}
+    entity_source_map = {
+        "other_fn": "def other_fn():\n    pass",
+        "test_fn": "def test_fn():\n    return other_fn()",
+    }
+    file_entity_names = {"helpers.py": ["test_fn", "other_fn"]}
+    name_to_target_file = {"other_fn": "helpers.py", "test_fn": "helpers.py"}
+
+    synthetic = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+
+    assert synthetic == []
+    assert file_entity_names["helpers.py"] == ["test_fn", "other_fn"]
+
+
+def test_extract_shared_helpers_transitive_pull_in():
+    # _helper_a is directly wanted by fn_a (in f1.py).
+    # _helper_a's source calls _helper_b (non-migrated, in original).
+    # _helper_b must be transitively extracted into f1.py to prevent an
+    # O→f1.py cycle (f1.py imports _helper_a which calls _helper_b in original;
+    # original re-exports _helper_a from f1.py → cycle).
+    e_a = Entity(EntityKind.FUNCTION, "_helper_a", 1, 2, ["_helper_a"])
+    e_b = Entity(EntityKind.FUNCTION, "_helper_b", 3, 4, ["_helper_b"])
+    e_fn = Entity(EntityKind.FUNCTION, "fn_a", 6, 7, ["fn_a"])
+    classified, migrated_names = _make_classified([e_a, e_b, e_fn], ["fn_a"])
+    entity_map = {"_helper_a": e_a, "_helper_b": e_b, "fn_a": e_fn}
+    entity_source_map = {
+        "_helper_a": "def _helper_a():\n    _helper_b()",
+        "_helper_b": "def _helper_b():\n    pass",
+        "fn_a": "def fn_a():\n    _helper_a()",
+    }
+    file_entity_names = {"f1.py": ["fn_a"]}
+    name_to_target_file = {
+        "_helper_a": "original.py",
+        "_helper_b": "original.py",
+        "fn_a": "f1.py",
+    }
+
+    synthetic = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+
+    # Both helpers extracted into f1.py.
+    assert "_helper_a" in file_entity_names["f1.py"]
+    assert "_helper_b" in file_entity_names["f1.py"]
+    assert "_helper_a" in migrated_names
+    assert "_helper_b" in migrated_names
+    assert name_to_target_file["_helper_a"] == "f1.py"
+    assert name_to_target_file["_helper_b"] == "f1.py"
+    assert len(synthetic) == 2
+
+
+def test_extract_shared_helpers_scc_prevents_new_to_new_cycle():
+    # helper_a is wanted by f1.py; helper_b is wanted by f2.py.
+    # They mutually reference each other → one SCC → must go to the same file
+    # to prevent the F1→F2→F1 import cycle.
+    e_a = Entity(EntityKind.FUNCTION, "helper_a", 1, 2, ["helper_a"])
+    e_b = Entity(EntityKind.FUNCTION, "helper_b", 3, 4, ["helper_b"])
+    e_fn1 = Entity(EntityKind.FUNCTION, "fn_1", 6, 7, ["fn_1"])
+    e_fn2 = Entity(EntityKind.FUNCTION, "fn_2", 9, 10, ["fn_2"])
+    classified = ClassifiedEntities(
+        entities=[e_a, e_b, e_fn1, e_fn2],
+        entity_class={},
+        graph={
+            "helper_a": {"helper_b"},
+            "helper_b": {"helper_a"},
+            "fn_1": set(),
+            "fn_2": set(),
+        },
+        set_1=[],
+        set_2_groups=[],
+        set_3_groups=[],
+        abort=False,
+    )
+    migrated_names = {"fn_1", "fn_2"}
+    entity_map = {"helper_a": e_a, "helper_b": e_b, "fn_1": e_fn1, "fn_2": e_fn2}
+    entity_source_map = {
+        "helper_a": "def helper_a():\n    helper_b()",
+        "helper_b": "def helper_b():\n    helper_a()",
+        "fn_1": "def fn_1():\n    helper_a()",
+        "fn_2": "def fn_2():\n    helper_b()",
+    }
+    file_entity_names = {"f1.py": ["fn_1"], "f2.py": ["fn_2"]}
+    name_to_target_file = {
+        "helper_a": "original.py",
+        "helper_b": "original.py",
+        "fn_1": "f1.py",
+        "fn_2": "f2.py",
+    }
+
+    synthetic = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+
+    # Both helpers must land in the same file (f1.py is first in plan order).
+    assert name_to_target_file["helper_a"] == name_to_target_file["helper_b"]
+    chosen = name_to_target_file["helper_a"]
+    assert "helper_a" in file_entity_names[chosen]
+    assert "helper_b" in file_entity_names[chosen]
+    assert "helper_a" in migrated_names
+    assert "helper_b" in migrated_names
+    # One synthetic placement covering both (single SCC).
+    assert len(synthetic) == 1
+    assert set(synthetic[0].group) == {"helper_a", "helper_b"}
+
+
+def test_extract_shared_helpers_transitive_dep_already_wanted():
+    # helper_a is directly wanted by f1.py; helper_b is directly wanted by f2.py.
+    # helper_a's source also references helper_b (transitive), but helper_b is
+    # already in wanted → the "dep_name in wanted" branch prevents re-adding it.
+    e_a = Entity(EntityKind.FUNCTION, "helper_a", 1, 2, ["helper_a"])
+    e_b = Entity(EntityKind.FUNCTION, "helper_b", 3, 4, ["helper_b"])
+    e_fn1 = Entity(EntityKind.FUNCTION, "fn_1", 6, 7, ["fn_1"])
+    e_fn2 = Entity(EntityKind.FUNCTION, "fn_2", 9, 10, ["fn_2"])
+    classified, migrated_names = _make_classified(
+        [e_a, e_b, e_fn1, e_fn2], ["fn_1", "fn_2"]
+    )
+    entity_map = {"helper_a": e_a, "helper_b": e_b, "fn_1": e_fn1, "fn_2": e_fn2}
+    entity_source_map = {
+        "helper_a": "def helper_a():\n    helper_b()",
+        "helper_b": "def helper_b():\n    pass",
+        "fn_1": "def fn_1():\n    helper_a()",
+        "fn_2": "def fn_2():\n    helper_b()",
+    }
+    file_entity_names = {"f1.py": ["fn_1"], "f2.py": ["fn_2"]}
+    name_to_target_file = {
+        "helper_a": "original.py",
+        "helper_b": "original.py",
+        "fn_1": "f1.py",
+        "fn_2": "f2.py",
+    }
+
+    synthetic = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+
+    # Both helpers are extracted (as separate SCCs since no mutual cycle in graph).
+    assert "helper_a" in migrated_names
+    assert "helper_b" in migrated_names
+    # Two synthetic placements — one for each singleton SCC.
+    assert len(synthetic) == 2
+
+
+def test_generate_no_circular_import_when_helper_referenced_by_migrated():
+    # Integration test: _run stays in original and is used by test_fn (migrated).
+    # Without the fix: original → helpers.py (re-export) and helpers.py → original.
+    # With the fix: _run is moved into helpers.py; original imports _run from helpers.
+    source = textwrap.dedent(
+        """\
+        def _run(x):
+            return x
+
+        def test_fn(tmp_path):
+            return _run(tmp_path)
+    """
+    )
+    e_run = _make_entity("_run", 1, 2)
+    e_test = _make_entity("test_fn", 4, 5)
+    c = _classified(entities=[e_run, e_test])
+    plan = _plan([GroupPlacement(group=["test_fn"], target_file="helpers.py")])
+
+    result = generate_file_splits(c, plan, source, "original.py")
+
+    helpers_src = result.new_files["helpers.py"]
+    # _run is defined in helpers.py (extracted), not imported from original
+    assert "def _run" in helpers_src
+    assert "from .original import _run" not in helpers_src
+    # original re-imports _run from helpers.py (since it's still used there via
+    # non-migrated code — but in this minimal example there's nothing left)
+    # At minimum, no circular self-import exists
+    assert "from .original import" not in helpers_src
