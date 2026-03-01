@@ -249,13 +249,21 @@ def generate_file_splits(
     # Extract import info from post-refactor source.
     import_infos = _extract_import_info(post_source)
 
+    # Placements whose target_file matches the original filename would create a
+    # self-referential import (e.g. `from .duplicate_extractor import Foo` inside
+    # duplicate_extractor.py).  Drop them — entities stay in the original file.
+    original_basename = Path(original_path).name
+    valid_placements = [
+        p for p in plan.placements if p.target_file != original_basename
+    ]
+
     # Group placements by target file (preserving order for topo sort).
     file_entity_names: Dict[str, List[str]] = {}
-    for placement in plan.placements:
+    for placement in valid_placements:
         file_entity_names.setdefault(placement.target_file, []).extend(placement.group)
 
     # All migrated entity names.
-    migrated_names: Set[str] = {name for p in plan.placements for name in p.group}
+    migrated_names: Set[str] = {name for p in valid_placements for name in p.group}
 
     # Build name → target-file map for cross-file import detection.
     name_to_target_file: Dict[str, str] = {}
@@ -270,7 +278,6 @@ def generate_file_splits(
     # split files can import helpers (e.g. _run) that stayed behind.
     # Exclude import-derived names since _find_needed_imports handles those.
     import_defined_names = {name for info in import_infos for name in info.names}
-    original_basename = Path(original_path).name
     for entity in classified.entities:
         if entity.name not in migrated_names:
             for defined_name in entity.names_defined:
@@ -298,6 +305,6 @@ def generate_file_splits(
 
     # Build updated original source.
     updated = _remove_entity_lines(post_source, migrated_names, entity_map)
-    updated = _add_re_exports(updated, plan.placements, entity_map)
+    updated = _add_re_exports(updated, valid_placements, entity_map)
 
     return SplitResult(new_files=new_files, original_source=updated, abort=False)
