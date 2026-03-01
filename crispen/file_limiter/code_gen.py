@@ -220,7 +220,8 @@ def _add_re_exports(
         to_import = [
             name
             for name in placement.group
-            if not name.startswith("_") or name in still_loaded
+            if (not name.startswith("_") and not name.startswith("test_"))
+            or name in still_loaded
         ]
         if to_import:
             re_exports.setdefault(module, []).extend(to_import)
