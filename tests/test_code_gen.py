@@ -22,6 +22,94 @@ from crispen.file_limiter.code_gen import (
     generate_file_splits,
 )
 from crispen.file_limiter.entity_parser import Entity, EntityKind
+from .test_add_re_exports import (
+    test_add_re_exports_all_private_no_change,
+    test_add_re_exports_from_import_line,
+    test_add_re_exports_mixed_public_private,
+    test_add_re_exports_multiple_targets_sorted,
+    test_add_re_exports_no_import_in_source,
+    test_add_re_exports_private_referenced_in_source,
+    test_add_re_exports_public_inserted_after_imports,
+)
+from .test_collect_name_loads import (
+    test_collect_name_loads_basic,
+    test_collect_name_loads_store_not_included,
+    test_collect_name_loads_syntax_error,
+)
+from .test_extract_import_info import (
+    test_extract_import_info_dotted_import,
+    test_extract_import_info_from_import,
+    test_extract_import_info_from_import_with_asname,
+    test_extract_import_info_future_import,
+    test_extract_import_info_import_with_asname,
+    test_extract_import_info_multiple,
+    test_extract_import_info_plain_import,
+    test_extract_import_info_skips_non_imports,
+    test_extract_import_info_syntax_error,
+)
+from .test_find_cross_file_imports import (
+    test_find_cross_file_imports_basic,
+    test_find_cross_file_imports_cross_directory,
+    test_find_cross_file_imports_entity_not_in_map,
+    test_find_cross_file_imports_no_match,
+    test_find_cross_file_imports_same_file_excluded,
+)
+from .test_find_needed_imports import (
+    test_find_needed_imports_deduplicates,
+    test_find_needed_imports_entity_not_in_map,
+    test_find_needed_imports_future_always_included,
+    test_find_needed_imports_referenced_name,
+    test_find_needed_imports_unreferenced_name,
+)
+from .test_generate import (
+    test_generate_abort_plan,
+    test_generate_empty_placements,
+    test_generate_entity_not_in_source_map,
+    test_generate_future_import_always_included,
+    test_generate_future_import_not_duplicated_when_in_entity_source,
+    test_generate_multiple_different_target_files,
+    test_generate_multiple_groups_same_file,
+    test_generate_no_imports_needed,
+    test_generate_private_entity_no_reexport,
+    test_generate_single_entity_migration,
+)
+from .test_generate_cross_file_import import (
+    _classified,
+    _make_entity,
+    _plan,
+    test_generate_aborts_on_cross_file_import_cycle,
+    test_generate_all_placements_self_referential,
+    test_generate_cross_file_import,
+    test_generate_non_migrated_helper_extracted_to_new_file,
+    test_generate_self_referential_placement_dropped,
+)
+from .test_prune_unused_imports import (
+    test_generate_prunes_unused_names_from_multiname_import,
+    test_prune_unused_imports_multiline_import_collapsed,
+    test_prune_unused_imports_narrows_partial_from_import,
+    test_prune_unused_imports_narrows_plain_import,
+    test_prune_unused_imports_no_replacements_needed,
+    test_prune_unused_imports_preserves_future_import,
+    test_prune_unused_imports_preserves_star_import,
+    test_prune_unused_imports_relative_import_narrowed,
+    test_prune_unused_imports_removes_fully_unused_from_import,
+    test_prune_unused_imports_removes_fully_unused_plain_import,
+    test_prune_unused_imports_syntax_error,
+)
+from .test_relative_import_prefix import (
+    test_relative_import_prefix_same_directory,
+    test_relative_import_prefix_same_subdir,
+    test_relative_import_prefix_sibling_subdir,
+    test_relative_import_prefix_to_nested,
+)
+from .test_remove_entity_lines import (
+    test_remove_entity_lines_name_not_in_map,
+    test_remove_entity_lines_removes_range,
+)
+from .test_target_module_name import (
+    test_target_module_name_nested,
+    test_target_module_name_simple,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -29,53 +117,9 @@ from crispen.file_limiter.entity_parser import Entity, EntityKind
 # ---------------------------------------------------------------------------
 
 
-def _make_entity(name: str, start: int, end: int, defines=None) -> Entity:
-    return Entity(EntityKind.FUNCTION, name, start, end, defines or [name])
-
-
-def _classified(
-    *, entities=None, set_2_groups=None, set_3_groups=None
-) -> ClassifiedEntities:
-    return ClassifiedEntities(
-        entities=entities or [],
-        entity_class={},
-        graph={},
-        set_1=[],
-        set_2_groups=set_2_groups or [],
-        set_3_groups=set_3_groups or [],
-        abort=False,
-    )
-
-
-def _plan(placements=None) -> FileLimiterPlan:
-    return FileLimiterPlan(set3_migrate=[], placements=placements or [], abort=False)
-
-
-def _abort_plan() -> FileLimiterPlan:
-    return FileLimiterPlan(set3_migrate=[], placements=[], abort=True)
-
-
 # ---------------------------------------------------------------------------
 # _collect_name_loads
 # ---------------------------------------------------------------------------
-
-
-def test_collect_name_loads_basic():
-    source = "x = foo + bar"
-    names = _collect_name_loads(source)
-    assert "foo" in names
-    assert "bar" in names
-
-
-def test_collect_name_loads_store_not_included():
-    source = "x = 1"
-    names = _collect_name_loads(source)
-    # x is a Store, not a Load
-    assert "x" not in names
-
-
-def test_collect_name_loads_syntax_error():
-    assert _collect_name_loads("def (invalid") == set()
 
 
 # ---------------------------------------------------------------------------
@@ -83,106 +127,9 @@ def test_collect_name_loads_syntax_error():
 # ---------------------------------------------------------------------------
 
 
-def test_extract_import_info_syntax_error():
-    assert _extract_import_info("def (invalid") == []
-
-
-def test_extract_import_info_plain_import():
-    infos = _extract_import_info("import os\n")
-    assert len(infos) == 1
-    assert "os" in infos[0].names
-    assert infos[0].is_future is False
-
-
-def test_extract_import_info_import_with_asname():
-    infos = _extract_import_info("import os as operating_system\n")
-    assert infos[0].names == ["operating_system"]
-
-
-def test_extract_import_info_dotted_import():
-    infos = _extract_import_info("import os.path\n")
-    assert infos[0].names == ["os"]
-
-
-def test_extract_import_info_from_import():
-    infos = _extract_import_info("from pathlib import Path\n")
-    assert "Path" in infos[0].names
-    assert infos[0].is_future is False
-
-
-def test_extract_import_info_from_import_with_asname():
-    infos = _extract_import_info("from pathlib import Path as P\n")
-    assert infos[0].names == ["P"]
-
-
-def test_extract_import_info_future_import():
-    infos = _extract_import_info("from __future__ import annotations\n")
-    assert infos[0].is_future is True
-    assert "annotations" in infos[0].names
-
-
-def test_extract_import_info_skips_non_imports():
-    infos = _extract_import_info("def foo():\n    pass\n")
-    assert infos == []
-
-
-def test_extract_import_info_multiple():
-    source = "import os\nfrom pathlib import Path\n"
-    infos = _extract_import_info(source)
-    assert len(infos) == 2
-
-
 # ---------------------------------------------------------------------------
 # _find_needed_imports
 # ---------------------------------------------------------------------------
-
-
-def test_find_needed_imports_referenced_name():
-    # Entity references "os"; import for "os" should be included.
-    entity_src_map = {"foo": "def foo():\n    os.getcwd()\n"}
-    infos = [ImportInfo(names=["os"], source="import os", is_future=False)]
-    result = _find_needed_imports(["foo"], entity_src_map, infos, {"foo"})
-    assert "import os" in result
-
-
-def test_find_needed_imports_unreferenced_name():
-    # Entity doesn't reference "sys"; import should be excluded.
-    entity_src_map = {"foo": "def foo():\n    pass\n"}
-    infos = [ImportInfo(names=["sys"], source="import sys", is_future=False)]
-    result = _find_needed_imports(["foo"], entity_src_map, infos, {"foo"})
-    assert result == []
-
-
-def test_find_needed_imports_future_always_included():
-    # __future__ import is always included regardless of entity references.
-    entity_src_map = {"foo": "def foo():\n    pass\n"}
-    infos = [
-        ImportInfo(
-            names=["annotations"],
-            source="from __future__ import annotations",
-            is_future=True,
-        )
-    ]
-    result = _find_needed_imports(["foo"], entity_src_map, infos, {"foo"})
-    assert "from __future__ import annotations" in result
-
-
-def test_find_needed_imports_deduplicates():
-    # Two ImportInfo entries with the same source string → only one included.
-    entity_src_map = {"foo": "def foo():\n    os.getcwd()\n"}
-    infos = [
-        ImportInfo(names=["os"], source="import os", is_future=False),
-        ImportInfo(names=["os"], source="import os", is_future=False),  # duplicate
-    ]
-    result = _find_needed_imports(["foo"], entity_src_map, infos, {"foo"})
-    assert result.count("import os") == 1
-
-
-def test_find_needed_imports_entity_not_in_map():
-    # Entity name not in entity_source_map → treated as empty source.
-    infos = [ImportInfo(names=["os"], source="import os", is_future=False)]
-    result = _find_needed_imports(["ghost"], {}, infos, set())
-    assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -190,35 +137,9 @@ def test_find_needed_imports_entity_not_in_map():
 # ---------------------------------------------------------------------------
 
 
-def test_target_module_name_simple():
-    assert _target_module_name("utils.py") == "utils"
-
-
-def test_target_module_name_nested():
-    assert _target_module_name("helpers/io.py") == "helpers.io"
-
-
 # ---------------------------------------------------------------------------
 # _remove_entity_lines
 # ---------------------------------------------------------------------------
-
-
-def test_remove_entity_lines_removes_range():
-    source = "line1\nline2\nline3\nline4\n"
-    entity = _make_entity("foo", 2, 3)
-    entity_map = {"foo": entity}
-    result = _remove_entity_lines(source, {"foo"}, entity_map)
-    assert "line1" in result
-    assert "line2" not in result
-    assert "line3" not in result
-    assert "line4" in result
-
-
-def test_remove_entity_lines_name_not_in_map():
-    # Name not in entity_map → nothing removed.
-    source = "line1\nline2\n"
-    result = _remove_entity_lines(source, {"ghost"}, {})
-    assert result == source
 
 
 # ---------------------------------------------------------------------------
@@ -226,264 +147,9 @@ def test_remove_entity_lines_name_not_in_map():
 # ---------------------------------------------------------------------------
 
 
-def test_add_re_exports_all_private_no_change():
-    # Private name not called anywhere in remaining source → no import added.
-    source = "import os\n\ndef _helper():\n    pass\n"
-    entity = _make_entity("_helper", 3, 4)
-    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"_helper": entity})
-    assert result == source
-
-
-def test_add_re_exports_private_referenced_in_source():
-    # Private name still called in remaining source → import is added.
-    source = "import os\n\n_helper()\n"
-    entity = _make_entity("_helper", 3, 3)
-    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"_helper": entity})
-    assert "from .utils import _helper" in result
-
-
-def test_add_re_exports_public_inserted_after_imports():
-    source = "import os\n\ndef foo():\n    pass\n"
-    entity = _make_entity("foo", 3, 4)
-    placement = GroupPlacement(group=["foo"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"foo": entity})
-    assert "from .utils import foo" in result
-    # Re-export line should come after "import os"
-    lines = result.splitlines()
-    import_idx = next(i for i, l in enumerate(lines) if "import os" in l)
-    reexport_idx = next(i for i, l in enumerate(lines) if "from .utils import foo" in l)
-    assert reexport_idx > import_idx
-
-
-def test_add_re_exports_no_import_in_source():
-    # No imports in source → re-export inserted at beginning.
-    source = "\ndef foo():\n    pass\n"
-    entity = _make_entity("foo", 2, 3)
-    placement = GroupPlacement(group=["foo"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"foo": entity})
-    assert "from .utils import foo" in result
-
-
-def test_add_re_exports_from_import_line():
-    # "from pathlib import Path" should be detected as an import line.
-    source = "from pathlib import Path\n\ndef foo():\n    pass\n"
-    entity = _make_entity("foo", 3, 4)
-    placement = GroupPlacement(group=["foo"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"foo": entity})
-    lines = result.splitlines()
-    from_import_idx = next(
-        i for i, l in enumerate(lines) if "from pathlib import Path" in l
-    )
-    reexport_idx = next(i for i, l in enumerate(lines) if "from .utils import foo" in l)
-    assert reexport_idx > from_import_idx
-
-
-def test_add_re_exports_multiple_targets_sorted():
-    source = "import os\n"
-    e1 = _make_entity("foo", 1, 2)
-    e2 = _make_entity("bar", 3, 4)
-    placements = [
-        GroupPlacement(group=["foo"], target_file="b_module.py"),
-        GroupPlacement(group=["bar"], target_file="a_module.py"),
-    ]
-    result = _add_re_exports(source, placements, {"foo": e1, "bar": e2})
-    # a_module comes before b_module (sorted)
-    a_idx = result.index("a_module")
-    b_idx = result.index("b_module")
-    assert a_idx < b_idx
-
-
-def test_add_re_exports_mixed_public_private():
-    source = "import os\n"
-    entity_map = {
-        "pub": _make_entity("pub", 1, 2),
-        "_priv": _make_entity("_priv", 3, 4),
-    }
-    placement = GroupPlacement(group=["pub", "_priv"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], entity_map)
-    # Only "pub" in re-export, not "_priv"
-    assert "pub" in result
-    assert "_priv" not in result
-
-
 # ---------------------------------------------------------------------------
 # generate_file_splits
 # ---------------------------------------------------------------------------
-
-
-def test_generate_abort_plan():
-    plan = _abort_plan()
-    c = _classified()
-    result = generate_file_splits(c, plan, "def foo():\n    pass\n", "big.py")
-    assert result.abort is True
-    assert result.new_files == {}
-    assert result.original_source == "def foo():\n    pass\n"
-
-
-def test_generate_empty_placements():
-    plan = _plan()  # placements=[]
-    c = _classified()
-    source = "def foo():\n    pass\n"
-    result = generate_file_splits(c, plan, source, "big.py")
-    assert result.abort is False
-    assert result.new_files == {}
-    assert result.original_source == source
-
-
-def test_generate_single_entity_migration():
-    source = "import os\n\ndef foo():\n    os.getcwd()\n"
-    entity = _make_entity("foo", 3, 4)
-    c = _classified(entities=[entity])
-    plan = _plan([GroupPlacement(group=["foo"], target_file="utils.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    assert result.abort is False
-    assert "utils.py" in result.new_files
-    new_src = result.new_files["utils.py"]
-    assert "import os" in new_src
-    assert "def foo():" in new_src
-    # Original should not have foo's def anymore
-    assert "def foo():" not in result.original_source
-    # But should have a re-export
-    assert "from .utils import foo" in result.original_source
-
-
-def test_generate_private_entity_no_reexport():
-    source = "def _helper():\n    pass\n"
-    entity = _make_entity("_helper", 1, 2)
-    c = _classified(entities=[entity])
-    plan = _plan([GroupPlacement(group=["_helper"], target_file="private.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    assert "from .private import" not in result.original_source
-
-
-def test_generate_entity_not_in_source_map():
-    # Group has entity name not in classified.entities → entity skipped in new file.
-    source = "def foo():\n    pass\n"
-    entity = _make_entity("foo", 1, 2)
-    c = _classified(entities=[entity])
-    # "ghost" is in the group but has no matching entity
-    plan = _plan([GroupPlacement(group=["foo", "ghost"], target_file="utils.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    assert "utils.py" in result.new_files
-    # "ghost" produces no source so only "foo" appears
-    new_src = result.new_files["utils.py"]
-    assert "def foo():" in new_src
-
-
-def test_generate_no_imports_needed():
-    # Entity uses no imports → no import section in new file.
-    source = "def add(a, b):\n    return a + b\n"
-    entity = _make_entity("add", 1, 2)
-    c = _classified(entities=[entity])
-    plan = _plan([GroupPlacement(group=["add"], target_file="math_utils.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    new_src = result.new_files["math_utils.py"]
-    # No "import" prefix expected
-    assert not new_src.startswith("import")
-    assert "def add" in new_src
-
-
-def test_generate_multiple_groups_same_file():
-    source = textwrap.dedent(
-        """\
-        import os
-
-        def foo():
-            pass
-
-        def bar():
-            pass
-        """
-    )
-    e_foo = _make_entity("foo", 3, 4)
-    e_bar = _make_entity("bar", 6, 7)
-    c = _classified(entities=[e_foo, e_bar])
-    plan = _plan(
-        [
-            GroupPlacement(group=["foo"], target_file="utils.py"),
-            GroupPlacement(group=["bar"], target_file="utils.py"),
-        ]
-    )
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    new_src = result.new_files["utils.py"]
-    assert "def foo():" in new_src
-    assert "def bar():" in new_src
-
-
-def test_generate_multiple_different_target_files():
-    source = "def foo():\n    pass\n\ndef bar():\n    pass\n"
-    e_foo = _make_entity("foo", 1, 2)
-    e_bar = _make_entity("bar", 4, 5)
-    c = _classified(entities=[e_foo, e_bar])
-    plan = _plan(
-        [
-            GroupPlacement(group=["foo"], target_file="foo_module.py"),
-            GroupPlacement(group=["bar"], target_file="bar_module.py"),
-        ]
-    )
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    assert "foo_module.py" in result.new_files
-    assert "bar_module.py" in result.new_files
-    assert "def foo():" in result.new_files["foo_module.py"]
-    assert "def bar():" in result.new_files["bar_module.py"]
-    assert "from .bar_module import bar" in result.original_source
-    assert "from .foo_module import foo" in result.original_source
-
-
-def test_generate_future_import_not_duplicated_when_in_entity_source():
-    # Entity source itself contains `from __future__ import annotations`
-    # (e.g. the _block_1 TOP_LEVEL entity which IS the file's import block).
-    # It must appear only once at the top of the new file, not again inside
-    # the entity source, which would cause a SyntaxError.
-    source = textwrap.dedent(
-        """\
-        from __future__ import annotations
-
-        \"\"\"Module docstring.\"\"\"
-
-        from __future__ import annotations
-
-        import os
-
-        _CONST = 42
-    """
-    )
-    # _block_1 spans the whole file and contains the future import + constants.
-    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 9, ["_CONST"])
-    c = _classified(entities=[e_block])
-    plan = _plan([GroupPlacement(group=["_block_1"], target_file="constants.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    new_src = result.new_files["constants.py"]
-    assert new_src.count("from __future__ import annotations") == 1
-    # Must be at the very start of the file (before any other code).
-    first_non_blank = next(line for line in new_src.splitlines() if line.strip())
-    assert first_non_blank == "from __future__ import annotations"
-
-
-def test_generate_future_import_always_included():
-    source = "from __future__ import annotations\n\ndef foo():\n    pass\n"
-    entity = _make_entity("foo", 3, 4)
-    c = _classified(entities=[entity])
-    plan = _plan([GroupPlacement(group=["foo"], target_file="utils.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    new_src = result.new_files["utils.py"]
-    assert "from __future__ import annotations" in new_src
 
 
 # ---------------------------------------------------------------------------
@@ -491,195 +157,14 @@ def test_generate_future_import_always_included():
 # ---------------------------------------------------------------------------
 
 
-def test_find_cross_file_imports_basic():
-    # fn_a references _MODEL which is defined in block_1.py
-    entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
-    name_to_target_file = {"_MODEL": "block_1.py"}
-    result = _find_cross_file_imports(
-        ["fn_a"], entity_source_map, name_to_target_file, "llm_extract.py"
-    )
-    assert result == ["from .block_1 import _MODEL"]
-
-
-def test_find_cross_file_imports_same_file_excluded():
-    # _MODEL goes to the same file as fn_a → no cross-file import needed
-    entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
-    name_to_target_file = {"_MODEL": "llm_extract.py"}
-    result = _find_cross_file_imports(
-        ["fn_a"], entity_source_map, name_to_target_file, "llm_extract.py"
-    )
-    assert result == []
-
-
-def test_find_cross_file_imports_no_match():
-    # Referenced name not in name_to_target_file → no cross-file import
-    entity_source_map = {"fn_a": "def fn_a():\n    return os.getcwd()\n"}
-    result = _find_cross_file_imports(["fn_a"], entity_source_map, {}, "utils.py")
-    assert result == []
-
-
-def test_find_cross_file_imports_entity_not_in_map():
-    # Entity name not in entity_source_map → treated as empty source, no imports
-    result = _find_cross_file_imports(["ghost"], {}, {"x": "other.py"}, "utils.py")
-    assert result == []
-
-
 # ---------------------------------------------------------------------------
 # _relative_import_prefix
 # ---------------------------------------------------------------------------
 
 
-def test_relative_import_prefix_same_directory():
-    # Both files at the root level → single dot.
-    assert _relative_import_prefix("a.py", "b.py") == ".b"
-
-
-def test_relative_import_prefix_sibling_subdir():
-    # from_file is in sub/, to_file is in helpers/ → go up one, then down.
-    assert _relative_import_prefix("sub/a.py", "helpers/b.py") == "..helpers.b"
-
-
-def test_relative_import_prefix_same_subdir():
-    # Both in the same subdirectory → single dot.
-    assert _relative_import_prefix("sub/a.py", "sub/b.py") == ".b"
-
-
-def test_relative_import_prefix_to_nested():
-    # to_file is in a subdirectory of root while from_file is at root.
-    assert _relative_import_prefix("a.py", "helpers/b.py") == ".helpers.b"
-
-
-def test_find_cross_file_imports_cross_directory():
-    # fn_a is in tests/test.py; helper is in helpers/entities.py.
-    # Cross-directory import needs ".." to go up from tests/ to root.
-    entity_source_map = {"fn_a": "def fn_a():\n    return _helper()\n"}
-    name_to_target_file = {"_helper": "helpers/entities.py"}
-    result = _find_cross_file_imports(
-        ["fn_a"], entity_source_map, name_to_target_file, "tests/test.py"
-    )
-    assert result == ["from ..helpers.entities import _helper"]
-
-
 # ---------------------------------------------------------------------------
 # generate_file_splits — cross-file import integration
 # ---------------------------------------------------------------------------
-
-
-def test_generate_cross_file_import():
-    # fn_a goes to fn_module.py; _block_1 (defining _CONST) goes to constants.py.
-    # fn_a references _CONST → fn_module.py must have `from .constants import _CONST`.
-    source = "_CONST = 42\n\ndef fn_a():\n    return _CONST\n"
-    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
-    e_fn = _make_entity("fn_a", 3, 4)
-    c = _classified(entities=[e_block, e_fn])
-    plan = _plan(
-        [
-            GroupPlacement(group=["_block_1"], target_file="constants.py"),
-            GroupPlacement(group=["fn_a"], target_file="fn_module.py"),
-        ]
-    )
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    fn_src = result.new_files["fn_module.py"]
-    assert "from .constants import _CONST" in fn_src
-    # constants.py should NOT have a cross-import (it defines _CONST, not uses it)
-    const_src = result.new_files["constants.py"]
-    assert "from .fn_module" not in const_src
-
-
-def test_generate_non_migrated_helper_extracted_to_new_file():
-    # _run is non-migrated; test_fn is migrated and references _run.
-    # _run is extracted into test_helpers.py to prevent an O→F→O cycle.
-    source = textwrap.dedent(
-        """\
-        import textwrap
-
-        def _run(x):
-            return x
-
-        def test_fn():
-            return _run(1)
-    """
-    )
-    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["textwrap"])
-    e_run = _make_entity("_run", 3, 4)
-    e_test = _make_entity("test_fn", 6, 7)
-    c = _classified(entities=[e_block, e_run, e_test])
-    plan = _plan([GroupPlacement(group=["test_fn"], target_file="test_helpers.py")])
-
-    result = generate_file_splits(c, plan, source, "original.py")
-
-    new_src = result.new_files["test_helpers.py"]
-    # _run is defined in the new file (extracted), not imported from original
-    assert "def _run" in new_src
-    assert "from .original import _run" not in new_src
-    # import textwrap is not referenced by either entity
-    assert "from .original import textwrap" not in new_src
-
-
-def test_generate_self_referential_placement_dropped():
-    # LLM names a target file the same as the original → would create a
-    # circular import.  The placement must be silently dropped so the entity
-    # stays in the original file and no self-import is added.
-    source = "class Foo:\n    pass\n\nclass Bar:\n    pass\n"
-    e_foo = _make_entity("Foo", 1, 2)
-    e_bar = _make_entity("Bar", 4, 5)
-    c = _classified(entities=[e_foo, e_bar])
-    # "mymodule.py" is also the original filename → self-referential
-    plan = _plan(
-        [
-            GroupPlacement(group=["Foo"], target_file="mymodule.py"),
-            GroupPlacement(group=["Bar"], target_file="helpers.py"),
-        ]
-    )
-
-    result = generate_file_splits(c, plan, source, "mymodule.py")
-
-    # Foo stays in the original — no circular self-import
-    assert "from .mymodule import Foo" not in result.original_source
-    assert "mymodule.py" not in result.new_files
-    # Bar is still moved normally
-    assert "helpers.py" in result.new_files
-    assert "class Bar" in result.new_files["helpers.py"]
-    # Foo remains in the original source (not removed)
-    assert "class Foo" in result.original_source
-
-
-def test_generate_all_placements_self_referential():
-    # All placements target the original file → nothing is moved.
-    source = "def foo():\n    pass\n"
-    e_foo = _make_entity("foo", 1, 2)
-    c = _classified(entities=[e_foo])
-    plan = _plan([GroupPlacement(group=["foo"], target_file="original.py")])
-
-    result = generate_file_splits(c, plan, source, "original.py")
-
-    assert result.new_files == {}
-    assert "from .original import foo" not in result.original_source
-    assert "def foo" in result.original_source
-
-
-def test_generate_aborts_on_cross_file_import_cycle():
-    # fn_a references fn_b (in b.py) and fn_b references fn_a (in a.py).
-    # This creates a circular import a.py ↔ b.py that Python cannot load.
-    # generate_file_splits must detect the cycle and abort rather than emit
-    # broken code.
-    source = "def fn_a():\n    return fn_b()\n\ndef fn_b():\n    return fn_a()\n"
-    e_a = _make_entity("fn_a", 1, 2)
-    e_b = _make_entity("fn_b", 4, 5)
-    c = _classified(entities=[e_a, e_b])
-    plan = _plan(
-        [
-            GroupPlacement(group=["fn_a"], target_file="a.py"),
-            GroupPlacement(group=["fn_b"], target_file="b.py"),
-        ]
-    )
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    assert result.abort is True
-    assert result.new_files == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1237,103 +722,6 @@ def test_generate_no_circular_import_when_helper_referenced_by_migrated():
 # ---------------------------------------------------------------------------
 
 
-def test_prune_unused_imports_syntax_error():
-    # Unparseable source → returned unchanged.
-    source = "def (invalid syntax"
-    assert _prune_unused_imports(source) == source
-
-
-def test_prune_unused_imports_no_replacements_needed():
-    # All imports are fully used → fast-path returns source unchanged.
-    source = "import os\n\ndef f():\n    os.getcwd()\n"
-    assert _prune_unused_imports(source) == source
-
-
-def test_prune_unused_imports_preserves_future_import():
-    # __future__ imports are always kept, even when the name isn't referenced.
-    source = "from __future__ import annotations\n\ndef f():\n    pass\n"
-    result = _prune_unused_imports(source)
-    assert "from __future__ import annotations" in result
-
-
-def test_prune_unused_imports_preserves_star_import():
-    # Star imports cannot be pruned — kept as-is.
-    source = "from os.path import *\n\ndef f():\n    pass\n"
-    result = _prune_unused_imports(source)
-    assert "from os.path import *" in result
-
-
-def test_prune_unused_imports_removes_fully_unused_plain_import():
-    # import whose name is never referenced is dropped entirely.
-    source = "import sys\n\ndef f():\n    pass\n"
-    result = _prune_unused_imports(source)
-    assert "import sys" not in result
-
-
-def test_prune_unused_imports_removes_fully_unused_from_import():
-    # from-import whose names are never referenced is dropped entirely.
-    source = "from typing import Dict\n\ndef f():\n    return 1\n"
-    result = _prune_unused_imports(source)
-    assert "from typing import" not in result
-
-
-def test_prune_unused_imports_narrows_partial_from_import():
-    # Only List is used — import narrowed to just List.
-    source = "from typing import Dict, List\n\ndef f(x: List):\n    return x\n"
-    result = _prune_unused_imports(source)
-    assert "from typing import List" in result
-    assert "Dict" not in result
-
-
-def test_prune_unused_imports_narrows_plain_import():
-    # import x, y where only y is used → narrowed to import y.
-    source = "import os, sys\n\ndef f():\n    sys.exit()\n"
-    result = _prune_unused_imports(source)
-    assert "import sys" in result
-    assert "os" not in result
-
-
-def test_prune_unused_imports_multiline_import_collapsed():
-    # Multi-line parenthesised import is collapsed to a single line.
-    source = textwrap.dedent(
-        """\
-        from typing import (
-            Dict,
-            List,
-        )
-
-        def f(x: List):
-            return x
-        """
-    )
-    result = _prune_unused_imports(source)
-    assert "from typing import List" in result
-    assert "Dict" not in result
-    assert "(\n" not in result
-
-
-def test_prune_unused_imports_relative_import_narrowed():
-    # Relative from-import is reconstructed with dots preserved.
-    source = "from .utils import foo, bar\n\ndef f():\n    return foo()\n"
-    result = _prune_unused_imports(source)
-    assert "from .utils import foo" in result
-    assert "bar" not in result
-
-
 # ---------------------------------------------------------------------------
 # generate_file_splits — import pruning integration
 # ---------------------------------------------------------------------------
-
-
-def test_generate_prunes_unused_names_from_multiname_import():
-    # foo uses only List, not Dict; the new file's import should be narrowed.
-    source = "from typing import Dict, List\n\ndef foo(x: List):\n    return x\n"
-    entity = _make_entity("foo", 3, 4)
-    c = _classified(entities=[entity])
-    plan = _plan([GroupPlacement(group=["foo"], target_file="utils.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    new_src = result.new_files["utils.py"]
-    assert "from typing import List" in new_src
-    assert "Dict" not in new_src
