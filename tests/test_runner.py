@@ -70,7 +70,7 @@ def test_verify_entity_source_in_original():
         original_source="def foo():\n    pass\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source) == []
+    assert _verify_preservation([entity], split, post_source, []) == []
 
 
 def test_verify_entity_source_in_new_file():
@@ -81,7 +81,7 @@ def test_verify_entity_source_in_new_file():
         original_source="# original\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source) == []
+    assert _verify_preservation([entity], split, post_source, []) == []
 
 
 def test_verify_entity_source_missing():
@@ -92,7 +92,7 @@ def test_verify_entity_source_missing():
         original_source="# nothing relevant\n",
         abort=False,
     )
-    failures = _verify_preservation([entity], split, post_source)
+    failures = _verify_preservation([entity], split, post_source, [])
     assert len(failures) == 1
     assert "'foo'" in failures[0]
     assert "1" in failures[0]  # start line
@@ -108,7 +108,7 @@ def test_verify_entity_source_missing_long():
         original_source="# nothing relevant\n",
         abort=False,
     )
-    failures = _verify_preservation([entity], split, post_source)
+    failures = _verify_preservation([entity], split, post_source, [])
     assert len(failures) == 1
     assert "..." in failures[0]
 
@@ -122,7 +122,7 @@ def test_verify_empty_entity_source_skipped():
         original_source="# completely different",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source) == []
+    assert _verify_preservation([entity], split, post_source, []) == []
 
 
 def test_verify_top_level_entity_skipped():
@@ -135,7 +135,37 @@ def test_verify_top_level_entity_skipped():
         original_source="# completely different",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source) == []
+    assert _verify_preservation([entity], split, post_source, []) == []
+
+
+def test_verify_annotation_migrated():
+    # Failure for an entity that was in the plan → annotated "migrated → target".
+    post_source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    split = SplitResult(
+        new_files={"utils.py": "# empty"},
+        original_source="# empty",
+        abort=False,
+    )
+    placements = [GroupPlacement(group=["foo"], target_file="utils.py")]
+    failures = _verify_preservation([entity], split, post_source, placements)
+    assert len(failures) == 1
+    assert "migrated" in failures[0]
+    assert "utils.py" in failures[0]
+
+
+def test_verify_annotation_stayed():
+    # Failure for an entity not in any placement → annotated "stayed in original".
+    post_source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    split = SplitResult(
+        new_files={},
+        original_source="# empty",
+        abort=False,
+    )
+    failures = _verify_preservation([entity], split, post_source, [])
+    assert len(failures) == 1
+    assert "stayed in original" in failures[0]
 
 
 # ---------------------------------------------------------------------------

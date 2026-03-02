@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 from ..config import CrispenConfig
-from .advisor import advise_file_limiter
+from .advisor import GroupPlacement, advise_file_limiter
 from .classifier import classify_entities
 from .code_gen import SplitResult, generate_file_splits
 from .entity_parser import Entity, EntityKind
@@ -31,15 +31,23 @@ def _verify_preservation(
     entities: List[Entity],
     split: SplitResult,
     post_source: str,
+    placements: List[GroupPlacement],
 ) -> List[str]:
     """Return a list of failure descriptions (empty = all entities preserved).
 
     Checks that each entity's source text from *post_source* is present in
     either ``split.original_source`` or one of ``split.new_files.values()``.
     Empty entity sources (e.g. blank-line blocks) are skipped.
+    TOP_LEVEL entities (import/docstring blocks) are always skipped because
+    they are intentionally restructured during a split.
+    Each failure is annotated with where the entity was expected to appear:
+    ``migrated → <target>`` or ``stayed in original``.
     """
     lines = post_source.splitlines(keepends=True)
     combined = split.original_source + "".join(split.new_files.values())
+    name_to_file: Dict[str, str] = {
+        name: p.target_file for p in placements for name in p.group
+    }
     failures: List[str] = []
 
     for entity in entities:
@@ -51,9 +59,11 @@ def _verify_preservation(
             preview = "\n    ".join(preview_lines)
             if len(entity_src.splitlines()) > 3:
                 preview += "\n    ..."
+            target = name_to_file.get(entity.name)
+            loc = f"migrated \u2192 {target}" if target else "stayed in original"
             failures.append(
                 f"  entity {entity.name!r} ({entity.kind.value},"
-                f" lines {entity.start_line}–{entity.end_line}):\n"
+                f" lines {entity.start_line}\u2013{entity.end_line}) [{loc}]:\n"
                 f"    {preview}"
             )
 
@@ -103,7 +113,9 @@ def run_file_limiter(
 
     split = generate_file_splits(classified, plan, post_source, filepath)
 
-    failures = _verify_preservation(classified.entities, split, post_source)
+    failures = _verify_preservation(
+        classified.entities, split, post_source, plan.placements
+    )
     if failures:
         detail = "\n".join(failures)
         return FileLimiterResult(
