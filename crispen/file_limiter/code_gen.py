@@ -293,14 +293,15 @@ def _collect_external_imported_names(original_path: str) -> Set[str]:
     statements targeting the module corresponding to *original_path*, and
     returns the union of all imported original names (before any ``as`` alias).
 
-    Returns an empty set when *original_path* is not absolute, does not exist,
-    the project root cannot be determined, or the path cannot be mapped to a
-    module.
+    Returns an empty set when *original_path* does not resolve to an existing
+    file, the project root cannot be determined, or the path cannot be mapped
+    to a module.  Both absolute and relative paths are accepted; relative paths
+    are resolved against the current working directory (the repo root when
+    crispen is invoked as ``git diff | crispen``).
     """
-    orig = Path(original_path)
-    if not orig.is_absolute() or not orig.exists():
+    orig = Path(original_path).resolve()
+    if not orig.exists():
         return set()
-    orig = orig.resolve()
     project_root = _find_project_root(orig.parent)
     if project_root is None:
         return set()
