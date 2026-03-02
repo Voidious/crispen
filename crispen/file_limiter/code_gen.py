@@ -550,18 +550,19 @@ def generate_file_splits(
     migrated_names: Set[str] = {name for p in valid_placements for name in p.group}
 
     # Build name → target-file map for cross-file import detection.
+    # Exclude import-derived names (_find_needed_imports handles those).
+    import_defined_names = {name for info in import_infos for name in info.names}
     name_to_target_file: Dict[str, str] = {}
     for target_file, ent_names in file_entity_names.items():
         for ent_name in ent_names:
             entity = entity_map.get(ent_name)
             if entity:
                 for defined_name in entity.names_defined:
-                    name_to_target_file[defined_name] = target_file
+                    if defined_name not in import_defined_names:
+                        name_to_target_file[defined_name] = target_file
 
     # Also map names from non-migrated entities to the original file so that
     # split files can import helpers (e.g. _run) that stayed behind.
-    # Exclude import-derived names since _find_needed_imports handles those.
-    import_defined_names = {name for info in import_infos for name in info.names}
     for entity in classified.entities:
         if entity.name not in migrated_names:
             for defined_name in entity.names_defined:
