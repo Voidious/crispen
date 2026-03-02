@@ -30,6 +30,7 @@ class ClassifiedEntities:
     set_2_groups: List[List[str]]  # SCC groups to move to new files
     set_3_groups: List[List[str]]  # SCC groups that may be split or migrated
     abort: bool  # True → all entities form one SCC; file cannot be split
+    abort_reason: str = ""  # human-readable explanation when abort=True
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +155,11 @@ def classify_entities(
 
     # Abort when the entire file is one strongly connected component.
     abort = len(entities) >= 2 and len(sccs) == 1
+    abort_reason = (
+        f"all {len(entities)} top-level entities form one dependency cycle"
+        if abort
+        else ""
+    )
 
     set_1, set_2_groups, set_3_groups = _assign_sccs(sccs, entity_class)
 
@@ -165,4 +171,5 @@ def classify_entities(
         set_2_groups=set_2_groups,
         set_3_groups=set_3_groups,
         abort=abort,
+        abort_reason=abort_reason,
     )

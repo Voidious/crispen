@@ -35,6 +35,7 @@ class SplitResult:
     new_files: Dict[str, str]  # {target_file: source_code}
     original_source: str  # updated original file source
     abort: bool  # True if generation failed / nothing to split
+    abort_reason: str = ""  # human-readable explanation when abort=True
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +679,12 @@ def generate_file_splits(
     with the original source unchanged (``abort`` mirrors ``plan.abort``).
     """
     if plan.abort:
-        return SplitResult(new_files={}, original_source=post_source, abort=True)
+        return SplitResult(
+            new_files={},
+            original_source=post_source,
+            abort=True,
+            abort_reason=plan.abort_reason,
+        )
 
     if not plan.placements:
         return SplitResult(new_files={}, original_source=post_source, abort=False)
@@ -792,7 +798,12 @@ def generate_file_splits(
                         file_deps[original_basename].add(placement.target_file)
                         break
     if any(len(scc) > 1 for scc in find_sccs(file_deps)):
-        return SplitResult(new_files={}, original_source=post_source, abort=True)
+        return SplitResult(
+            new_files={},
+            original_source=post_source,
+            abort=True,
+            abort_reason="proposed split would create circular file imports",
+        )
 
     # Generate new file contents.
     new_files: Dict[str, str] = {}

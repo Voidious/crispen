@@ -34,6 +34,7 @@ class FileLimiterPlan:
     placements: List[GroupPlacement]
     # True if planning failed and the file should not be split.
     abort: bool
+    abort_reason: str = ""  # human-readable explanation when abort=True
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +285,12 @@ def advise_file_limiter(
     or the file cannot be split (e.g. single SCC covering all entities).
     """
     if classified.abort:
-        return FileLimiterPlan(set3_migrate=[], placements=[], abort=True)
+        return FileLimiterPlan(
+            set3_migrate=[],
+            placements=[],
+            abort=True,
+            abort_reason=classified.abort_reason,
+        )
 
     if not classified.set_2_groups and not classified.set_3_groups:
         return FileLimiterPlan(set3_migrate=[], placements=[], abort=False)
@@ -299,7 +305,12 @@ def advise_file_limiter(
     if classified.set_3_groups:
         result = _advise_set3(classified, original_path, client, config)
         if result is None:
-            return FileLimiterPlan(set3_migrate=[], placements=[], abort=True)
+            return FileLimiterPlan(
+                set3_migrate=[],
+                placements=[],
+                abort=True,
+                abort_reason="LLM failed to plan set-3 groups",
+            )
         set3_migrate = result
 
     # Call 2: assign filenames for set_2 + migrating set_3.
@@ -311,7 +322,12 @@ def advise_file_limiter(
         groups_to_place, classified, original_path, existing_files, client, config
     )
     if placements is None:
-        return FileLimiterPlan(set3_migrate=set3_migrate, placements=[], abort=True)
+        return FileLimiterPlan(
+            set3_migrate=set3_migrate,
+            placements=[],
+            abort=True,
+            abort_reason="LLM failed to assign file placements",
+        )
 
     return FileLimiterPlan(
         set3_migrate=set3_migrate, placements=placements, abort=False

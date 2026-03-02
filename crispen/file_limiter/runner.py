@@ -103,18 +103,25 @@ def run_file_limiter(
     plan = advise_file_limiter(classified, filepath, config, existing_files)
 
     if plan.abort:
+        reason = f": {plan.abort_reason}" if plan.abort_reason else ""
         return FileLimiterResult(
             original_source=post_source,
             new_files={},
-            messages=[f"SKIP {filepath} (FileLimiter): file cannot be split"],
+            messages=[f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"],
             abort=True,
         )
 
     if not plan.placements:
+        msgs = []
+        if classified.set_2_groups or classified.set_3_groups:
+            msgs = [
+                f"SKIP {filepath} (FileLimiter): no entities selected for migration"
+            ]
         return FileLimiterResult(
             original_source=post_source,
             new_files={},
             abort=False,
+            messages=msgs,
         )
 
     # If the source file is a test module, new files that contain test
@@ -132,10 +139,11 @@ def run_file_limiter(
     split = generate_file_splits(classified, plan, post_source, filepath)
 
     if split.abort:
+        reason = f": {split.abort_reason}" if split.abort_reason else ""
         return FileLimiterResult(
             original_source=post_source,
             new_files={},
-            messages=[f"SKIP {filepath} (FileLimiter): file cannot be split"],
+            messages=[f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"],
             abort=True,
         )
 

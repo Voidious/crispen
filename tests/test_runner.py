@@ -186,6 +186,20 @@ def test_runner_plan_abort(mock_classify, mock_advise):
     assert any("cannot be split" in m for m in result.messages)
 
 
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_plan_abort_with_reason(mock_classify, mock_advise):
+    mock_classify.return_value = _make_classified()
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[], placements=[], abort=True, abort_reason="all 3 entities cycle"
+    )
+
+    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], _CONFIG)
+
+    assert result.abort is True
+    assert any("all 3 entities cycle" in m for m in result.messages)
+
+
 # ---------------------------------------------------------------------------
 # run_file_limiter — no placements path
 # ---------------------------------------------------------------------------
@@ -204,6 +218,31 @@ def test_runner_no_placements(mock_classify, mock_advise):
     assert result.new_files == {}
     assert result.original_source == source
     assert result.messages == []
+
+
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_no_placements_with_groups(mock_classify, mock_advise):
+    # When set_3_groups is non-empty but the LLM selects nothing to migrate,
+    # runner should emit a SKIP message so the user knows the file was examined.
+    entity = _make_entity("foo", 1, 2)
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[entity],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[],
+        set_3_groups=[["foo"]],
+        abort=False,
+    )
+    mock_advise.return_value = _empty_plan()
+
+    source = "def foo():\n    pass\n"
+    result = run_file_limiter("big.py", "", source, [], _CONFIG)
+
+    assert result.abort is False
+    assert result.new_files == {}
+    assert any("no entities selected for migration" in m for m in result.messages)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +331,27 @@ def test_runner_split_aborts_on_cycle(mock_classify, mock_advise, mock_gen):
     # Must not claim to have moved anything.
     assert not any("FileLimiter: moved" in m for m in result.messages)
     assert any("cannot be split" in m for m in result.messages)
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_split_aborts_with_reason(mock_classify, mock_advise, mock_gen):
+    source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    mock_classify.return_value = _make_classified(entities=[entity])
+    mock_advise.return_value = _plan_with(["foo"], "utils.py")
+    mock_gen.return_value = SplitResult(
+        new_files={},
+        original_source=source,
+        abort=True,
+        abort_reason="proposed split would create circular file imports",
+    )
+
+    result = run_file_limiter("big.py", "", source, [], _CONFIG)
+
+    assert result.abort is True
+    assert any("circular file imports" in m for m in result.messages)
 
 
 # ---------------------------------------------------------------------------
