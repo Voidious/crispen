@@ -218,10 +218,18 @@ def _add_re_exports(
     for placement in placements:
         module = _target_module_name(placement.target_file)
         to_import = [
-            name
-            for name in placement.group
-            if (not name.startswith("_") and not name.startswith("test_"))
-            or name in still_loaded
+            defined_name
+            for entity_name in placement.group
+            for defined_name in (
+                entity_map[entity_name].names_defined
+                if entity_name in entity_map
+                else [entity_name]
+            )
+            if (
+                not defined_name.startswith("_")
+                and not defined_name.startswith("test_")
+            )
+            or defined_name in still_loaded
         ]
         if to_import:
             re_exports.setdefault(module, []).extend(to_import)

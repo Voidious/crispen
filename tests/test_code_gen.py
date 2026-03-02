@@ -328,6 +328,35 @@ def test_add_re_exports_test_function_re_exported_when_referenced():
     assert "from .tests.helpers import test_something" in result
 
 
+def test_add_re_exports_top_level_block_private_names_referenced():
+    # TOP_LEVEL block entity name (_block_1) differs from its defined names.
+    # Both defined names are still loaded in remaining source → re-imported.
+    source = "import os\n\n_DUP_SOURCE\n_DUP_RANGES\n"
+    entity = Entity(
+        EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_DUP_SOURCE", "_DUP_RANGES"]
+    )
+    placement = GroupPlacement(group=["_block_1"], target_file="test_helpers.py")
+    result = _add_re_exports(source, [placement], {"_block_1": entity})
+    assert "from .test_helpers import _DUP_RANGES, _DUP_SOURCE" in result
+
+
+def test_add_re_exports_entity_not_in_map_falls_back_to_entity_name():
+    # Entity name in group is missing from entity_map → falls back to entity name.
+    source = "import os\n\nghost()\n"  # 'ghost' is still referenced
+    placement = GroupPlacement(group=["ghost"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {})
+    assert "from .utils import ghost" in result
+
+
+def test_add_re_exports_top_level_block_private_names_not_referenced():
+    # TOP_LEVEL block entity whose defined name is private and not used → no import.
+    source = "import os\n"
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
+    placement = GroupPlacement(group=["_block_1"], target_file="constants.py")
+    result = _add_re_exports(source, [placement], {"_block_1": entity})
+    assert result == source
+
+
 # ---------------------------------------------------------------------------
 # generate_file_splits
 # ---------------------------------------------------------------------------
