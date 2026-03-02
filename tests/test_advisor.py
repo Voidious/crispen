@@ -397,6 +397,31 @@ def test_plan_placement_non_int_group_id_aborts(mock_key, mock_client, mock_call
 
 
 # ---------------------------------------------------------------------------
+# Placement targets an existing file → abort
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_plan_placement_targets_existing_file_aborts(mock_key, mock_client, mock_call):
+    """LLM suggests a target that already exists on disk → abort."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [{"group_id": 0, "target_file": "existing.py"}]
+    }
+    c = _classified(
+        entities=[_make_entity("foo", 1, 5)],
+        set_2_groups=[["foo"]],
+    )
+    plan = advise_file_limiter(
+        c, "src/big.py", _CONFIG, existing_files=frozenset({"existing.py"})
+    )
+    assert plan.abort is True
+
+
+# ---------------------------------------------------------------------------
 # _group_summary: entity not in map
 # ---------------------------------------------------------------------------
 

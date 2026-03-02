@@ -194,6 +194,7 @@ def _assign_placements(
     groups_to_place: List[List[str]],
     classified: ClassifiedEntities,
     original_path: str,
+    existing_files: frozenset,
     client: object,
     config: CrispenConfig,
 ) -> Optional[List[GroupPlacement]]:
@@ -205,6 +206,14 @@ def _assign_placements(
         group_lines.append(f"  [{idx}]: {summary}")
     groups_text = "\n".join(group_lines)
 
+    exclude_section = ""
+    if existing_files:
+        file_list = "\n".join(f"  - {f}" for f in sorted(existing_files))
+        exclude_section = (
+            "\n\nThe following files already exist — do NOT use them as targets:\n"
+            + file_list
+        )
+
     messages = [
         {
             "role": "user",
@@ -213,6 +222,7 @@ def _assign_placements(
                 f"The original file is '{original_path}'. "
                 "Use filenames relative to the same directory.\n\n"
                 f"Groups to place:\n{groups_text}"
+                f"{exclude_section}"
             ),
         }
     ]
@@ -244,6 +254,8 @@ def _assign_placements(
             and gid not in placed_ids
             and target
         ):
+            if target in existing_files:
+                return None
             placements.append(
                 GroupPlacement(group=groups_to_place[gid], target_file=target)
             )
@@ -264,6 +276,7 @@ def advise_file_limiter(
     classified: ClassifiedEntities,
     original_path: str,
     config: CrispenConfig,
+    existing_files: frozenset = frozenset(),
 ) -> FileLimiterPlan:
     """Ask the LLM to plan entity placement across new files.
 
@@ -295,7 +308,7 @@ def advise_file_limiter(
         return FileLimiterPlan(set3_migrate=set3_migrate, placements=[], abort=False)
 
     placements = _assign_placements(
-        groups_to_place, classified, original_path, client, config
+        groups_to_place, classified, original_path, existing_files, client, config
     )
     if placements is None:
         return FileLimiterPlan(set3_migrate=set3_migrate, placements=[], abort=True)

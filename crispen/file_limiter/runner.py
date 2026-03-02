@@ -95,7 +95,12 @@ def run_file_limiter(
     the LLM is propagated to the caller.
     """
     classified = classify_entities(original_source, post_source, diff_ranges)
-    plan = advise_file_limiter(classified, filepath, config)
+    source_dir = Path(filepath).parent
+    source_name = Path(filepath).name
+    existing_files: frozenset = frozenset(
+        p.name for p in source_dir.glob("*.py") if p.name != source_name
+    )
+    plan = advise_file_limiter(classified, filepath, config, existing_files)
 
     if plan.abort:
         return FileLimiterResult(
