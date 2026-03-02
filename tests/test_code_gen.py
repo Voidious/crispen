@@ -357,6 +357,32 @@ def test_add_re_exports_top_level_block_private_names_not_referenced():
     assert result == source
 
 
+def test_add_re_exports_indented_local_import_not_treated_as_last_import():
+    # Functions with local (indented) imports must not cause re-exports to be
+    # inserted inside the function body.  The re-export should appear after the
+    # top-level "import os" line, not after the indented "from x import y".
+    source = (
+        "import os\n"
+        "\n"
+        "def foo():\n"
+        "    from unittest.mock import MagicMock\n"
+        "    MagicMock()\n"
+        "\n"
+        "def bar():\n"
+        "    pass\n"
+    )
+    entity = _make_entity("baz", 7, 8)
+    placement = GroupPlacement(group=["baz"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"baz": entity})
+    # Re-export must appear immediately after "import os", not inside foo().
+    lines = result.splitlines()
+    os_idx = next(i for i, l in enumerate(lines) if l == "import os")
+    reexport_idx = next(i for i, l in enumerate(lines) if "from .utils import baz" in l)
+    assert reexport_idx == os_idx + 1
+    # The function body must remain intact (local import line must still be there).
+    assert "    from unittest.mock import MagicMock" in result
+
+
 # ---------------------------------------------------------------------------
 # generate_file_splits
 # ---------------------------------------------------------------------------
