@@ -244,9 +244,13 @@ def _add_re_exports(
 
     lines = source.splitlines(keepends=True)
     last_import_line = 0
-    for i, line in enumerate(lines):
-        if _IMPORT_LINE_RE.match(line):
-            last_import_line = i + 1
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            last_import_line = max(last_import_line, node.end_lineno)
 
     return "".join(lines[:last_import_line] + export_stmts + lines[last_import_line:])
 

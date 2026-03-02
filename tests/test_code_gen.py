@@ -383,6 +383,16 @@ def test_add_re_exports_indented_local_import_not_treated_as_last_import():
     assert "    from unittest.mock import MagicMock" in result
 
 
+def test_add_re_exports_syntax_error_returns_source_unchanged():
+    # If the source has a SyntaxError, _add_re_exports cannot determine where
+    # to insert re-exports and must return the source unchanged.
+    source = "import os\ndef (invalid\n"
+    entity = _make_entity("baz", 1, 1)
+    placement = GroupPlacement(group=["baz"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"baz": entity})
+    assert result == source
+
+
 # ---------------------------------------------------------------------------
 # generate_file_splits
 # ---------------------------------------------------------------------------
