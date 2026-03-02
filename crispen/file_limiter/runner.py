@@ -9,7 +9,7 @@ from ..config import CrispenConfig
 from .advisor import advise_file_limiter
 from .classifier import classify_entities
 from .code_gen import SplitResult, generate_file_splits
-from .entity_parser import Entity
+from .entity_parser import Entity, EntityKind
 
 
 @dataclass
@@ -43,6 +43,8 @@ def _verify_preservation(
     failures: List[str] = []
 
     for entity in entities:
+        if entity.kind == EntityKind.TOP_LEVEL:
+            continue  # import/docstring blocks are intentionally restructured
         entity_src = "".join(lines[entity.start_line - 1 : entity.end_line]).rstrip()
         if entity_src and entity_src not in combined:
             preview_lines = entity_src.splitlines()[:3]

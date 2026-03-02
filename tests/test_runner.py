@@ -125,6 +125,19 @@ def test_verify_empty_entity_source_skipped():
     assert _verify_preservation([entity], split, post_source) == []
 
 
+def test_verify_top_level_entity_skipped():
+    # TOP_LEVEL entities (import/docstring blocks) are always skipped —
+    # they are intentionally restructured when the file is split.
+    post_source = "from __future__ import annotations\nimport os\n"
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 2, ["annotations", "os"])
+    split = SplitResult(
+        new_files={},
+        original_source="# completely different",
+        abort=False,
+    )
+    assert _verify_preservation([entity], split, post_source) == []
+
+
 # ---------------------------------------------------------------------------
 # run_file_limiter — plan.abort path
 # ---------------------------------------------------------------------------
