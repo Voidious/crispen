@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from ..config import CrispenConfig
@@ -111,7 +112,27 @@ def run_file_limiter(
             abort=False,
         )
 
+    # If the source file is a test module, new files that contain test
+    # functions must also have the "test_" prefix so pytest can discover them.
+    # Files containing only helpers (no test_ entities) are left as-is.
+    source_name = Path(filepath).name
+    if source_name.startswith("test_"):
+        for p in plan.placements:
+            target = Path(p.target_file)
+            if not target.name.startswith("test_") and any(
+                name.startswith("test_") for name in p.group
+            ):
+                p.target_file = str(target.parent / ("test_" + target.name))
+
     split = generate_file_splits(classified, plan, post_source, filepath)
+
+    if split.abort:
+        return FileLimiterResult(
+            original_source=post_source,
+            new_files={},
+            messages=[f"SKIP {filepath} (FileLimiter): file cannot be split"],
+            abort=True,
+        )
 
     failures = _verify_preservation(
         classified.entities, split, post_source, plan.placements
