@@ -702,6 +702,37 @@ def test_generate_aborts_on_cross_file_import_cycle():
     assert result.new_files == {}
 
 
+def test_generate_aborts_on_cycle_through_original():
+    # _CONST is a TOP_LEVEL constant (stays in original).
+    # _worker is migrated to helpers.py and references _CONST.
+    # main() (non-migrated) calls _worker → original will re-export _worker.
+    # Cycle: original → helpers.py (re-export of _worker)
+    #              → original (via `from .original import _CONST`).
+    source = textwrap.dedent(
+        """\
+        _CONST = "value"
+
+        def _worker():
+            return _CONST
+
+        def main():
+            return _worker()
+    """
+    )
+    e_const = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
+    e_worker = _make_entity("_worker", 3, 4)
+    e_main = _make_entity("main", 6, 7)
+    c = _classified(entities=[e_const, e_worker, e_main])
+    plan = _plan([GroupPlacement(group=["_worker"], target_file="helpers.py")])
+
+    result = generate_file_splits(c, plan, source, "original.py")
+
+    # helpers.py would need `from .original import _CONST` while original
+    # re-exports _worker from helpers.py → circular import → must abort.
+    assert result.abort is True
+    assert result.new_files == {}
+
+
 # ---------------------------------------------------------------------------
 # _extract_shared_helpers
 # ---------------------------------------------------------------------------

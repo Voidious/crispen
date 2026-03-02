@@ -580,23 +580,39 @@ def generate_file_splits(
         original_basename,
     )
 
-    # Detect circular imports between new files.  When entity in file A
-    # references a name that lives in file B, and vice-versa, A and B would
-    # import from each other — a Python circular-import error at load time.
-    # Abort rather than emit broken code.
-    new_file_deps: Dict[str, Set[str]] = {f: set() for f in file_entity_names}
+    # Detect circular imports.  Cycles can pass through the original file:
+    # a new file that imports a non-migrated name from the original can form a
+    # chain back to the original via the re-exports the original adds.
+    # Model the original as an explicit node in the dependency graph.
+    #
+    # Original's outgoing edges: it will re-export a migrated name when the
+    # name is public (no _/test_ prefix) OR referenced by a non-migrated entity.
+    non_migrated_loads: Set[str] = set()
+    for ent_name, src in entity_source_map.items():
+        if ent_name not in migrated_names:
+            non_migrated_loads |= _collect_name_loads(src)
+
+    all_dep_nodes = set(file_entity_names.keys()) | {original_basename}
+    file_deps: Dict[str, Set[str]] = {node: set() for node in all_dep_nodes}
     for target_file, ent_names in file_entity_names.items():
         for ent_name in ent_names:
             src = entity_source_map.get(ent_name, "")
             for ref_name in _collect_name_loads(src):
                 dep_file = name_to_target_file.get(ref_name)
-                if (
-                    dep_file
-                    and dep_file != target_file
-                    and dep_file in file_entity_names
-                ):
-                    new_file_deps[target_file].add(dep_file)
-    if any(len(scc) > 1 for scc in find_sccs(new_file_deps)):
+                if dep_file and dep_file != target_file and dep_file in file_deps:
+                    file_deps[target_file].add(dep_file)
+    for placement in valid_placements + synthetic_placements:
+        for ent_name in placement.group:
+            entity = entity_map.get(ent_name)
+            if entity:
+                for defined_name in entity.names_defined:
+                    if (
+                        not defined_name.startswith("_")
+                        and not defined_name.startswith("test_")
+                    ) or defined_name in non_migrated_loads:
+                        file_deps[original_basename].add(placement.target_file)
+                        break
+    if any(len(scc) > 1 for scc in find_sccs(file_deps)):
         return SplitResult(new_files={}, original_source=post_source, abort=True)
 
     # Generate new file contents.
