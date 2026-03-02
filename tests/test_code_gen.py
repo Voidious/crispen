@@ -14,6 +14,8 @@ from crispen.file_limiter.code_gen import (
     _extract_shared_helpers,
     _find_cross_file_imports,
     _find_needed_imports,
+    _import_derived_names,
+    _import_line_numbers,
     _prune_unused_imports,
     _relative_import_prefix,
     _remove_entity_lines,
@@ -207,7 +209,7 @@ def test_remove_entity_lines_removes_range():
     source = "line1\nline2\nline3\nline4\n"
     entity = _make_entity("foo", 2, 3)
     entity_map = {"foo": entity}
-    result = _remove_entity_lines(source, {"foo"}, entity_map)
+    result = _remove_entity_lines(source, {"foo"}, entity_map, {})
     assert "line1" in result
     assert "line2" not in result
     assert "line3" not in result
@@ -217,8 +219,106 @@ def test_remove_entity_lines_removes_range():
 def test_remove_entity_lines_name_not_in_map():
     # Name not in entity_map → nothing removed.
     source = "line1\nline2\n"
-    result = _remove_entity_lines(source, {"ghost"}, {})
+    result = _remove_entity_lines(source, {"ghost"}, {}, {})
     assert result == source
+
+
+def test_remove_entity_lines_top_level_preserves_import_lines():
+    # When a TOP_LEVEL entity containing both imports and assignments is
+    # migrated, the import lines must be kept in the original file so that
+    # the remaining functions still have access to those names.
+    source = "import os\n_CONST = 1\n\ndef foo():\n    return os.getcwd()\n"
+    entity_src = "import os\n_CONST = 1\n"
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 2, ["os", "_CONST"])
+    entity_map = {"_block_1": entity}
+    entity_source_map = {"_block_1": entity_src}
+    result = _remove_entity_lines(source, {"_block_1"}, entity_map, entity_source_map)
+    assert "import os" in result  # import line preserved
+    assert "_CONST" not in result  # assignment line removed
+    assert "def foo():" in result  # function untouched
+
+
+def test_remove_entity_lines_top_level_no_source_map_removes_all():
+    # Empty entity_source_map → no imports can be identified, all lines removed.
+    source = "import os\n_CONST = 1\n\ndef foo():\n    pass\n"
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 2, ["os", "_CONST"])
+    entity_map = {"_block_1": entity}
+    result = _remove_entity_lines(source, {"_block_1"}, entity_map, {})
+    assert "import os" not in result
+    assert "_CONST" not in result
+
+
+# ---------------------------------------------------------------------------
+# _import_derived_names
+# ---------------------------------------------------------------------------
+
+
+def test_import_derived_names_plain_import():
+    src = "import os\nimport sys\n"
+    assert _import_derived_names(src) == {"os", "sys"}
+
+
+def test_import_derived_names_from_import():
+    src = "from typing import Dict, List\n"
+    assert _import_derived_names(src) == {"Dict", "List"}
+
+
+def test_import_derived_names_aliased():
+    src = "import libcst as cst\nfrom dataclasses import dataclass\n"
+    assert _import_derived_names(src) == {"cst", "dataclass"}
+
+
+def test_import_derived_names_ignores_assignments():
+    src = "_MODEL = 'x'\n_MIN = 3\n"
+    assert _import_derived_names(src) == set()
+
+
+def test_import_derived_names_syntax_error():
+    assert _import_derived_names("def (\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _import_line_numbers
+# ---------------------------------------------------------------------------
+
+
+def test_import_line_numbers_basic():
+    src = "import os\n_CONST = 1\n"
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 5, 6, [])
+    # Entity starts at line 5; "import os" is relative line 1 → absolute line 5.
+    result = _import_line_numbers(entity, src)
+    assert result == {5}
+
+
+def test_import_line_numbers_no_imports():
+    src = "_CONST = 1\n_OTHER = 2\n"
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 2, [])
+    assert _import_line_numbers(entity, src) == set()
+
+
+def test_import_line_numbers_syntax_error():
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, [])
+    assert _import_line_numbers(entity, "def (\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _add_re_exports — import-derived name filtering
+# ---------------------------------------------------------------------------
+
+
+def test_add_re_exports_top_level_import_derived_names_not_re_exported():
+    # A TOP_LEVEL entity that includes import statements: the names introduced
+    # by those imports must NOT appear in re-exports because they are preserved
+    # in the original file by _remove_entity_lines, not moved to the new file.
+    source = "import os\n\nMY_CONST\n"  # MY_CONST still loaded
+    entity_src = "from typing import Dict\n\nMY_CONST = 42\n"
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, ["Dict", "MY_CONST"])
+    placement = GroupPlacement(group=["_block_1"], target_file="constants.py")
+    result = _add_re_exports(
+        source, [placement], {"_block_1": entity}, {"_block_1": entity_src}
+    )
+    assert "MY_CONST" in result  # assignment-defined name re-exported
+    assert "Dict" not in result  # import-derived name suppressed
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +331,7 @@ def test_add_re_exports_all_private_no_change():
     source = "import os\n\ndef _helper():\n    pass\n"
     entity = _make_entity("_helper", 3, 4)
     placement = GroupPlacement(group=["_helper"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"_helper": entity})
+    result = _add_re_exports(source, [placement], {"_helper": entity}, {})
     assert result == source
 
 
@@ -240,7 +340,7 @@ def test_add_re_exports_private_referenced_in_source():
     source = "import os\n\n_helper()\n"
     entity = _make_entity("_helper", 3, 3)
     placement = GroupPlacement(group=["_helper"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"_helper": entity})
+    result = _add_re_exports(source, [placement], {"_helper": entity}, {})
     assert "from .utils import _helper" in result
 
 
@@ -248,7 +348,7 @@ def test_add_re_exports_public_inserted_after_imports():
     source = "import os\n\ndef foo():\n    pass\n"
     entity = _make_entity("foo", 3, 4)
     placement = GroupPlacement(group=["foo"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"foo": entity})
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
     assert "from .utils import foo" in result
     # Re-export line should come after "import os"
     lines = result.splitlines()
@@ -262,7 +362,7 @@ def test_add_re_exports_no_import_in_source():
     source = "\ndef foo():\n    pass\n"
     entity = _make_entity("foo", 2, 3)
     placement = GroupPlacement(group=["foo"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"foo": entity})
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
     assert "from .utils import foo" in result
 
 
@@ -271,7 +371,7 @@ def test_add_re_exports_from_import_line():
     source = "from pathlib import Path\n\ndef foo():\n    pass\n"
     entity = _make_entity("foo", 3, 4)
     placement = GroupPlacement(group=["foo"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"foo": entity})
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
     lines = result.splitlines()
     from_import_idx = next(
         i for i, l in enumerate(lines) if "from pathlib import Path" in l
@@ -288,7 +388,7 @@ def test_add_re_exports_multiple_targets_sorted():
         GroupPlacement(group=["foo"], target_file="b_module.py"),
         GroupPlacement(group=["bar"], target_file="a_module.py"),
     ]
-    result = _add_re_exports(source, placements, {"foo": e1, "bar": e2})
+    result = _add_re_exports(source, placements, {"foo": e1, "bar": e2}, {})
     # a_module comes before b_module (sorted)
     a_idx = result.index("a_module")
     b_idx = result.index("b_module")
@@ -302,7 +402,7 @@ def test_add_re_exports_mixed_public_private():
         "_priv": _make_entity("_priv", 3, 4),
     }
     placement = GroupPlacement(group=["pub", "_priv"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], entity_map)
+    result = _add_re_exports(source, [placement], entity_map, {})
     # Only "pub" in re-export, not "_priv"
     assert "pub" in result
     assert "_priv" not in result
@@ -314,7 +414,7 @@ def test_add_re_exports_test_function_not_re_exported():
     source = "import os\n"
     entity = _make_entity("test_something", 1, 3)
     placement = GroupPlacement(group=["test_something"], target_file="tests/helpers.py")
-    result = _add_re_exports(source, [placement], {"test_something": entity})
+    result = _add_re_exports(source, [placement], {"test_something": entity}, {})
     assert result == source
 
 
@@ -324,7 +424,7 @@ def test_add_re_exports_test_function_re_exported_when_referenced():
     source = "import os\n\ntest_something()\n"
     entity = _make_entity("test_something", 1, 3)
     placement = GroupPlacement(group=["test_something"], target_file="tests/helpers.py")
-    result = _add_re_exports(source, [placement], {"test_something": entity})
+    result = _add_re_exports(source, [placement], {"test_something": entity}, {})
     assert "from .tests.helpers import test_something" in result
 
 
@@ -336,7 +436,7 @@ def test_add_re_exports_top_level_block_private_names_referenced():
         EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_DUP_SOURCE", "_DUP_RANGES"]
     )
     placement = GroupPlacement(group=["_block_1"], target_file="test_helpers.py")
-    result = _add_re_exports(source, [placement], {"_block_1": entity})
+    result = _add_re_exports(source, [placement], {"_block_1": entity}, {})
     assert "from .test_helpers import _DUP_RANGES, _DUP_SOURCE" in result
 
 
@@ -344,7 +444,7 @@ def test_add_re_exports_entity_not_in_map_falls_back_to_entity_name():
     # Entity name in group is missing from entity_map → falls back to entity name.
     source = "import os\n\nghost()\n"  # 'ghost' is still referenced
     placement = GroupPlacement(group=["ghost"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {})
+    result = _add_re_exports(source, [placement], {}, {})
     assert "from .utils import ghost" in result
 
 
@@ -353,7 +453,7 @@ def test_add_re_exports_top_level_block_private_names_not_referenced():
     source = "import os\n"
     entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
     placement = GroupPlacement(group=["_block_1"], target_file="constants.py")
-    result = _add_re_exports(source, [placement], {"_block_1": entity})
+    result = _add_re_exports(source, [placement], {"_block_1": entity}, {})
     assert result == source
 
 
@@ -373,7 +473,7 @@ def test_add_re_exports_indented_local_import_not_treated_as_last_import():
     )
     entity = _make_entity("baz", 7, 8)
     placement = GroupPlacement(group=["baz"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"baz": entity})
+    result = _add_re_exports(source, [placement], {"baz": entity}, {})
     # Re-export must appear immediately after "import os", not inside foo().
     lines = result.splitlines()
     os_idx = next(i for i, l in enumerate(lines) if l == "import os")
@@ -389,7 +489,7 @@ def test_add_re_exports_syntax_error_returns_source_unchanged():
     source = "import os\ndef (invalid\n"
     entity = _make_entity("baz", 1, 1)
     placement = GroupPlacement(group=["baz"], target_file="utils.py")
-    result = _add_re_exports(source, [placement], {"baz": entity})
+    result = _add_re_exports(source, [placement], {"baz": entity}, {})
     assert result == source
 
 

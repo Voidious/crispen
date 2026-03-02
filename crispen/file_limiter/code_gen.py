@@ -48,6 +48,28 @@ _IMPORT_LINE_RE = re.compile(r"^(import\s+|from\s+\S.*\s+import\s+)")
 _FUTURE_IMPORT_LINE_RE = re.compile(r"^from __future__ import .*\n?", re.MULTILINE)
 
 
+def _import_derived_names(source: str) -> Set[str]:
+    """Return names introduced solely by import statements in *source*.
+
+    These names live in the original file's namespace via its import
+    statements and cannot be re-exported from a new module the way
+    assignment-defined names can.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name)
+    return names
+
+
 def _collect_name_loads(source: str) -> Set[str]:
     """Return all Name loads referenced in *source*."""
     try:
@@ -186,29 +208,70 @@ def _target_module_name(target_file: str) -> str:
     return ".".join(parts)
 
 
+def _import_line_numbers(entity: Entity, entity_src: str) -> Set[int]:
+    """Return absolute 1-based line numbers of import statements in *entity*.
+
+    Used to preserve import lines in the original file when a TOP_LEVEL
+    entity that mixes imports and assignments is migrated.
+    """
+    try:
+        tree = ast.parse(entity_src)
+    except SyntaxError:
+        return set()
+    result: Set[int] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for rel_ln in range(node.lineno, node.end_lineno + 1):
+                result.add(entity.start_line + rel_ln - 1)
+    return result
+
+
 def _remove_entity_lines(
-    source: str, migrated_names: Set[str], entity_map: Dict[str, Entity]
+    source: str,
+    migrated_names: Set[str],
+    entity_map: Dict[str, Entity],
+    entity_source_map: Dict[str, str],
 ) -> str:
-    """Return *source* with lines belonging to migrated entities removed."""
+    """Return *source* with lines belonging to migrated entities removed.
+
+    For TOP_LEVEL entities, import statement lines are preserved in the
+    original file even when the entity is migrated: the remaining code may
+    still reference those imported names, and stdlib/third-party names
+    cannot be safely re-exported from a new module.
+    """
     remove: Set[int] = set()
+    preserve: Set[int] = set()
     for name in migrated_names:
         entity = entity_map.get(name)
-        if entity:
-            for ln in range(entity.start_line, entity.end_line + 1):
-                remove.add(ln)
+        if entity is None:
+            continue
+        for ln in range(entity.start_line, entity.end_line + 1):
+            remove.add(ln)
+        if entity.kind == EntityKind.TOP_LEVEL:
+            preserve |= _import_line_numbers(entity, entity_source_map.get(name, ""))
 
     lines = source.splitlines(keepends=True)
-    return "".join(line for i, line in enumerate(lines, 1) if i not in remove)
+    return "".join(
+        line for i, line in enumerate(lines, 1) if i not in remove or i in preserve
+    )
 
 
 def _add_re_exports(
-    source: str, placements: List[GroupPlacement], entity_map: Dict[str, Entity]
+    source: str,
+    placements: List[GroupPlacement],
+    entity_map: Dict[str, Entity],
+    entity_source_map: Dict[str, str],
 ) -> str:
     """Add ``from .module import name`` imports for migrated entities.
 
     Public names are always re-exported so external callers can still import
     them from the original module.  Private names (starting with ``_``) are
     re-imported only when the remaining *source* still references them.
+
+    Import-derived names (names introduced by ``import`` / ``from … import``
+    statements inside a TOP_LEVEL entity) are never re-exported: they were
+    kept in the original file by :func:`_remove_entity_lines` and cannot
+    meaningfully be re-exported from a new module.
 
     Inserts after the last import line in *source*.  Returns *source* unchanged
     when there are no names to import.
@@ -217,20 +280,22 @@ def _add_re_exports(
     re_exports: Dict[str, List[str]] = {}
     for placement in placements:
         module = _target_module_name(placement.target_file)
-        to_import = [
-            defined_name
-            for entity_name in placement.group
-            for defined_name in (
-                entity_map[entity_name].names_defined
-                if entity_name in entity_map
-                else [entity_name]
-            )
-            if (
-                not defined_name.startswith("_")
-                and not defined_name.startswith("test_")
-            )
-            or defined_name in still_loaded
-        ]
+        to_import: List[str] = []
+        for entity_name in placement.group:
+            if entity_name in entity_map:
+                entity = entity_map[entity_name]
+                defined = entity.names_defined
+                if entity.kind == EntityKind.TOP_LEVEL:
+                    skip = _import_derived_names(entity_source_map.get(entity_name, ""))
+                    defined = [n for n in defined if n not in skip]
+            else:
+                defined = [entity_name]
+            for defined_name in defined:
+                if (
+                    not defined_name.startswith("_")
+                    and not defined_name.startswith("test_")
+                ) or defined_name in still_loaded:
+                    to_import.append(defined_name)
         if to_import:
             re_exports.setdefault(module, []).extend(to_import)
 
@@ -651,10 +716,12 @@ def generate_file_splits(
         new_files[target_file] = _prune_unused_imports("\n\n".join(parts) + "\n")
 
     # Build updated original source.
-    updated = _remove_entity_lines(post_source, migrated_names, entity_map)
+    updated = _remove_entity_lines(
+        post_source, migrated_names, entity_map, entity_source_map
+    )
     updated = _prune_unused_imports(updated)
     updated = _add_re_exports(
-        updated, valid_placements + synthetic_placements, entity_map
+        updated, valid_placements + synthetic_placements, entity_map, entity_source_map
     )
 
     return SplitResult(new_files=new_files, original_source=updated, abort=False)
