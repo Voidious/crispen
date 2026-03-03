@@ -62,9 +62,9 @@ class CrispenConfig:
 
     # Number of additional FileLimiter attempts after an LLM-related failure
     # (e.g. LLM returned no placements, placement call failed, or code-gen
-    # detected circular file imports).  0 means no retry.  Default 1 = two
+    # detected circular file imports).  0 means no retry.  Default 2 = three
     # total attempts.  Deterministic failures (single-SCC abort) are not retried.
-    file_limiter_retries: int = 1
+    file_limiter_retries: int = 2
 
     # Refactor allow-list: if non-empty, only the named refactors are run.
     # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",

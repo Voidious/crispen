@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -28,6 +29,28 @@ class FileLimiterResult:
 # ---------------------------------------------------------------------------
 
 
+def _strip_imports_by_line(src: str) -> str:
+    """Return *src* with every import statement removed.
+
+    Uses AST to locate the exact line range of each import node (correctly
+    handling multi-line imports).  Returns *src* unchanged when it cannot be
+    parsed as Python.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+    remove: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for ln in range(node.lineno, node.end_lineno + 1):
+                remove.add(ln)
+    if not remove:
+        return src
+    lines = src.splitlines(keepends=True)
+    return "".join(ln_text for i, ln_text in enumerate(lines, 1) if i not in remove)
+
+
 def _verify_preservation(
     entities: List[Entity],
     split: SplitResult,
@@ -36,16 +59,24 @@ def _verify_preservation(
 ) -> List[str]:
     """Return a list of failure descriptions (empty = all entities preserved).
 
-    Checks that each entity's source text from *post_source* is present in
-    either ``split.original_source`` or one of ``split.new_files.values()``.
+    Checks that each entity's source (minus import statements) is present in
+    the import-stripped combined output (original + new files).
     Empty entity sources (e.g. blank-line blocks) are skipped.
     TOP_LEVEL entities (import/docstring blocks) are always skipped because
     they are intentionally restructured during a split.
+
+    Both sides have imports stripped before comparison so that post-generation
+    pruning (``_prune_inline_redundant_imports``) — which removes function-body
+    imports made redundant by file-level imports — does not produce false
+    failures while still catching dropped functions or classes.
+
     Each failure is annotated with where the entity was expected to appear:
     ``migrated → <target>`` or ``stayed in original``.
     """
     lines = post_source.splitlines(keepends=True)
-    combined = split.original_source + "".join(split.new_files.values())
+    combined_no_imports = _strip_imports_by_line(split.original_source)
+    for content in split.new_files.values():
+        combined_no_imports += _strip_imports_by_line(content)
     name_to_file: Dict[str, str] = {
         name: p.target_file for p in placements for name in p.group
     }
@@ -55,7 +86,10 @@ def _verify_preservation(
         if entity.kind == EntityKind.TOP_LEVEL:
             continue  # import/docstring blocks are intentionally restructured
         entity_src = "".join(lines[entity.start_line - 1 : entity.end_line]).rstrip()
-        if entity_src and entity_src not in combined:
+        if not entity_src:
+            continue
+        entity_no_imports = _strip_imports_by_line(entity_src)
+        if entity_no_imports not in combined_no_imports:
             preview_lines = entity_src.splitlines()[:3]
             preview = "\n    ".join(preview_lines)
             if len(entity_src.splitlines()) > 3:

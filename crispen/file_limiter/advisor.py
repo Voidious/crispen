@@ -114,6 +114,12 @@ _PLACEMENT_TOOL: dict = {
 }
 
 
+# Maximum number of groups per placement LLM call.  Large files may have
+# dozens of groups; sending them all in one call frequently causes timeouts
+# or incomplete responses.  This limit keeps each call small and reliable.
+_PLACEMENT_CHUNK_SIZE = 20
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -197,8 +203,8 @@ def _advise_set3(
     ]
 
 
-def _assign_placements(
-    groups_to_place: List[List[str]],
+def _assign_placements_chunk(
+    chunk: List[List[str]],
     classified: ClassifiedEntities,
     original_path: str,
     existing_files: frozenset,
@@ -206,10 +212,15 @@ def _assign_placements(
     config: CrispenConfig,
     prev_failure: str = "",
 ) -> Optional[List[GroupPlacement]]:
-    """Ask the LLM to assign filenames to each group. Returns None on failure."""
+    """Ask the LLM to assign filenames to one chunk of groups.
+
+    Groups within *chunk* are numbered 0…N-1 for this call.
+    Returns ``None`` on failure (LLM error, missing group, or existing-file
+    collision).
+    """
     entity_map = {e.name: e for e in classified.entities}
     group_lines = []
-    for idx, group in enumerate(groups_to_place):
+    for idx, group in enumerate(chunk):
         summary = _group_summary(group, entity_map)
         group_lines.append(f"  [{idx}]: {summary}")
     groups_text = "\n".join(group_lines)
@@ -222,7 +233,7 @@ def _assign_placements(
             + file_list
         )
 
-    n_groups = len(groups_to_place)
+    n_groups = len(chunk)
     original_basename = Path(original_path).name
     content = (
         f"Assign each entity group to a target Python filename. "
@@ -268,21 +279,59 @@ def _assign_placements(
         target = item.get("target_file", "")
         if (
             isinstance(gid, int)
-            and 0 <= gid < len(groups_to_place)
+            and 0 <= gid < len(chunk)
             and gid not in placed_ids
             and target
         ):
             if target in existing_files:
                 return None
-            placements.append(
-                GroupPlacement(group=groups_to_place[gid], target_file=target)
-            )
+            placements.append(GroupPlacement(group=chunk[gid], target_file=target))
             placed_ids.add(gid)
 
-    if len(placements) != len(groups_to_place):
+    if len(placements) != len(chunk):
         return None
 
     return placements
+
+
+def _assign_placements(
+    groups_to_place: List[List[str]],
+    classified: ClassifiedEntities,
+    original_path: str,
+    existing_files: frozenset,
+    client: object,
+    config: CrispenConfig,
+    prev_failure: str = "",
+) -> Optional[List[GroupPlacement]]:
+    """Ask the LLM to assign filenames to each group. Returns None on failure.
+
+    When there are more than :data:`_PLACEMENT_CHUNK_SIZE` groups the request
+    is split into multiple LLM calls of at most that many groups each.  Each
+    chunk gets its own retry budget of ``config.file_limiter_retries`` extra
+    attempts so that a transient timeout on one chunk does not require
+    restarting all chunks.  If any chunk fails all its attempts, ``None`` is
+    returned immediately.
+    """
+    all_placements: List[GroupPlacement] = []
+    for chunk_start in range(0, len(groups_to_place), _PLACEMENT_CHUNK_SIZE):
+        chunk = groups_to_place[chunk_start : chunk_start + _PLACEMENT_CHUNK_SIZE]
+        chunk_placements: Optional[List[GroupPlacement]] = None
+        for _ in range(1 + config.file_limiter_retries):
+            chunk_placements = _assign_placements_chunk(
+                chunk,
+                classified,
+                original_path,
+                existing_files,
+                client,
+                config,
+                prev_failure,
+            )
+            if chunk_placements is not None:
+                break
+        if chunk_placements is None:
+            return None
+        all_placements.extend(chunk_placements)
+    return all_placements
 
 
 # ---------------------------------------------------------------------------
