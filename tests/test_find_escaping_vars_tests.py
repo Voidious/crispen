@@ -1,0 +1,87 @@
+from crispen.refactors.duplicate_extractor import _find_escaping_vars
+from .escape_seq_tests import _make_esc_seq
+
+
+def test_find_escaping_vars_no_assignments():
+    # Block has no assignments → skip (branch A), returns empty set.
+    source_lines = [
+        "def foo():\n",
+        "    compute()\n",
+        "    transform()\n",
+        "    use_result()\n",
+    ]
+    seq = _make_esc_seq(2, 3)
+    assert _find_escaping_vars([seq], source_lines) == set()
+
+
+def test_find_escaping_vars_nothing_after_block():
+    # Block is the last thing in scope → after_lines empty (branch D), returns set().
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",
+        "    y = transform(x)\n",
+        "    z = finalize(y)\n",
+    ]
+    seq = _make_esc_seq(2, 4)
+    assert _find_escaping_vars([seq], source_lines) == set()
+
+
+def test_find_escaping_vars_escapes():
+    # Block assigns z; z is used after the block → {"z"}.
+    # Also covers: blank line (branch B) and lower-indent stop (branch C).
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",
+        "    y = transform(x)\n",
+        "    z = finalize(y)\n",  # block ends line 4
+        "\n",  # blank → branch B
+        "    assert z == 42\n",  # same indent, uses z
+        "\n",
+        "def bar():\n",  # indent 0 < 4 → branch C (stop)
+        "    pass\n",
+    ]
+    seq = _make_esc_seq(2, 4)
+    assert _find_escaping_vars([seq], source_lines) == {"z"}
+
+
+def test_find_escaping_vars_no_escape():
+    # Block assigns x/y/z; none referenced after the block → set().
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",
+        "    y = transform(x)\n",
+        "    z = finalize(y)\n",
+        "    print('done')\n",  # uses 'print', not x/y/z
+    ]
+    seq = _make_esc_seq(2, 4)
+    assert _find_escaping_vars([seq], source_lines) == set()
+
+
+def test_find_escaping_vars_syntax_error_after():
+    # After source is invalid Python → SyntaxError branch: continue, returns set().
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",
+        "    y = transform(x)\n",
+        "    z = finalize(y)\n",
+        "    def bar(x\n",  # unclosed paren at same indent
+    ]
+    seq = _make_esc_seq(2, 4)
+    assert _find_escaping_vars([seq], source_lines) == set()
+
+
+def test_find_escaping_vars_module_level_stops_at_def():
+    # Module-level block (indent 0): a non-def/class line is included,
+    # then a def line stops the scan (break via re.match).
+    source_lines = [
+        "x = compute()\n",
+        "y = transform(x)\n",
+        "z = finalize(y)\n",  # block ends line 3
+        "CONSTANT = 42\n",  # module-level non-def → appended (False branch of re.match)
+        "def foo(z):\n",  # module-level def → stop
+        "    return z\n",
+    ]
+    seq = _make_esc_seq(1, 3)
+    # CONSTANT is in after_lines; not in assigned → set().
+    # z inside def foo(z) is not scanned (stopped before that def).
+    assert _find_escaping_vars([seq], source_lines) == set()
