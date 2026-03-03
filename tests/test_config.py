@@ -116,6 +116,7 @@ def test_load_config_all_options(tmp_path):
         "update_diff_file_callers = false\n"
         "extraction_retries = 2\n"
         "llm_verify_retries = 3\n"
+        "file_limiter_retries = 2\n"
         "tool_choice = 'required'\n"
         "api_timeout = 120.0\n"
         "max_file_lines = 500\n",
@@ -131,6 +132,7 @@ def test_load_config_all_options(tmp_path):
     assert cfg.update_diff_file_callers is False
     assert cfg.extraction_retries == 2
     assert cfg.llm_verify_retries == 3
+    assert cfg.file_limiter_retries == 2
     assert cfg.tool_choice == "required"
     assert cfg.api_timeout == 120.0
     assert cfg.max_file_lines == 500

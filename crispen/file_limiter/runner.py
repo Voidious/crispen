@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..config import CrispenConfig
 from .advisor import GroupPlacement, advise_file_limiter
@@ -90,6 +90,13 @@ def run_file_limiter(
     3. Generate new file contents (Phase 4).
     4. Verify all entity sources are preserved.
 
+    LLM-dependent steps (2 and 3) are retried up to
+    ``config.file_limiter_retries`` additional times on transient failures.
+    Deterministic failures (e.g. single-SCC abort) are never retried.
+    On each failed attempt the SKIP message is accumulated; all attempt
+    messages are returned when every attempt fails.  On success only the
+    success messages are returned.
+
     Returns a :class:`FileLimiterResult` with ``abort=True`` when the file
     cannot be split or verification fails.  :class:`CrispenAPIError` from
     the LLM is propagated to the caller.
@@ -100,10 +107,10 @@ def run_file_limiter(
     existing_files: frozenset = frozenset(
         p.name for p in source_dir.glob("*.py") if p.name != source_name
     )
-    plan = advise_file_limiter(classified, filepath, config, existing_files)
 
-    if plan.abort:
-        reason = f": {plan.abort_reason}" if plan.abort_reason else ""
+    # Deterministic failure — retrying the LLM would not help.
+    if classified.abort:
+        reason = f": {classified.abort_reason}" if classified.abort_reason else ""
         return FileLimiterResult(
             original_source=post_source,
             new_files={},
@@ -111,40 +118,98 @@ def run_file_limiter(
             abort=True,
         )
 
-    if not plan.placements:
-        msgs = []
-        if classified.set_2_groups or classified.set_3_groups:
-            msgs = [
-                f"SKIP {filepath} (FileLimiter): no entities selected for migration"
-            ]
-        return FileLimiterResult(
-            original_source=post_source,
-            new_files={},
-            abort=False,
-            messages=msgs,
+    max_attempts = 1 + config.file_limiter_retries
+    retry_msgs: List[str] = []
+    last_abort: bool = True
+    plan: Optional[object] = None
+    split: Optional[SplitResult] = None
+    prev_set3_failure: str = ""
+    prev_placement_failure: str = ""
+
+    for _attempt in range(max_attempts):
+        plan = advise_file_limiter(
+            classified,
+            filepath,
+            config,
+            existing_files,
+            prev_set3_failure=prev_set3_failure,
+            prev_placement_failure=prev_placement_failure,
         )
 
-    # If the source file is a test module, new files that contain test
-    # functions must also have the "test_" prefix so pytest can discover them.
-    # Files containing only helpers (no test_ entities) are left as-is.
-    source_name = Path(filepath).name
-    if source_name.startswith("test_"):
-        for p in plan.placements:
-            target = Path(p.target_file)
-            if not target.name.startswith("test_") and any(
-                name.startswith("test_") for name in p.group
-            ):
-                p.target_file = str(target.parent / ("test_" + target.name))
+        if plan.abort:
+            reason = f": {plan.abort_reason}" if plan.abort_reason else ""
+            retry_msgs.append(
+                f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"
+            )
+            last_abort = True
+            if "set-3 groups" in plan.abort_reason:
+                prev_set3_failure = (
+                    "Your previous response was incomplete. "
+                    "Please return a decision for every group."
+                )
+            else:
+                prev_placement_failure = (
+                    "Your previous response was incomplete. "
+                    "Please return a target_file for every group, "
+                    "do not use an existing filename."
+                )
+            continue
 
-    split = generate_file_splits(classified, plan, post_source, filepath)
+        if not plan.placements:
+            if classified.set_2_groups or classified.set_3_groups:
+                retry_msgs.append(
+                    f"SKIP {filepath} (FileLimiter): no entities selected for migration"
+                )
+                last_abort = False
+                prev_set3_failure = (
+                    "In your previous attempt, you assigned 'stay' to all groups. "
+                    "This is not acceptable. "
+                    "You MUST assign 'migrate' to at least one group."
+                )
+                continue
+            # Nothing movable regardless of LLM output — don't retry.
+            return FileLimiterResult(
+                original_source=post_source,
+                new_files={},
+                abort=False,
+                messages=[],
+            )
 
-    if split.abort:
-        reason = f": {split.abort_reason}" if split.abort_reason else ""
+        # Apply test_ prefix so pytest can discover moved test files.
+        if source_name.startswith("test_"):
+            for p in plan.placements:
+                target = Path(p.target_file)
+                if not target.name.startswith("test_") and any(
+                    name.startswith("test_") for name in p.group
+                ):
+                    p.target_file = str(target.parent / ("test_" + target.name))
+
+        split = generate_file_splits(classified, plan, post_source, filepath)
+
+        if split.abort:
+            reason = f": {split.abort_reason}" if split.abort_reason else ""
+            retry_msgs.append(
+                f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"
+            )
+            last_abort = True
+            prev_assignments = "; ".join(
+                f"{', '.join(p.group)} \u2192 {p.target_file}" for p in plan.placements
+            )
+            prev_placement_failure = (
+                f"Your previous assignments ({prev_assignments}) caused circular "
+                "file imports. Please choose different target filenames."
+            )
+            continue
+
+        # Success — keep retry_msgs so callers can see which attempts failed.
+        break
+    else:
+        # All attempts exhausted.
         return FileLimiterResult(
             original_source=post_source,
             new_files={},
-            messages=[f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"],
-            abort=True,
+            messages=retry_msgs,
+            abort=last_abort,
         )
 
     failures = _verify_preservation(
@@ -163,10 +228,9 @@ def run_file_limiter(
         f"{filepath}: FileLimiter: moved {', '.join(p.group)} \u2192 {p.target_file}"
         for p in plan.placements
     ]
-
     return FileLimiterResult(
         original_source=split.original_source,
         new_files=split.new_files,
-        messages=msgs,
+        messages=retry_msgs + msgs,
         abort=False,
     )

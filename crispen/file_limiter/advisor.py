@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..config import CrispenConfig
@@ -136,6 +137,7 @@ def _advise_set3(
     original_path: str,
     client: object,
     config: CrispenConfig,
+    prev_failure: str = "",
 ) -> Optional[List[List[str]]]:
     """Ask the LLM which Set 3 groups should migrate. Returns None on failure."""
     entity_map = {e.name: e for e in classified.entities}
@@ -145,22 +147,26 @@ def _advise_set3(
         group_lines.append(f"  [{idx}]: {summary}")
     groups_text = "\n".join(group_lines)
 
-    messages = [
-        {
-            "role": "user",
-            "content": (
-                f"The file '{original_path}' exceeds the line limit and needs to be "
-                "split. The following entity groups are MODIFIED (they existed before "
-                "and were changed by the current diff). Each group is a dependency "
-                "cycle and cannot be split across files.\n\n"
-                f"Groups:\n{groups_text}\n\n"
-                "For each group, decide: 'migrate' to a new file, or 'stay' in the "
-                "original file."
-            ),
-        }
-    ]
-
     n_groups = len(classified.set_3_groups)
+    content = (
+        f"The file '{original_path}' is over the maximum line limit and MUST "
+        "be reduced in size by splitting it. The following entity groups are "
+        "MODIFIED (they existed before the diff and were changed by the "
+        "current diff). Each group is a mutual dependency cycle and must be "
+        "moved as an indivisible unit — it cannot be split further.\n\n"
+        f"Groups:\n{groups_text}\n\n"
+        "IMPORTANT: 'migrate' is the preferred action. The goal is to move "
+        "as many groups as possible to new files so the original file shrinks "
+        "below the line limit. Choose 'stay' ONLY if there is a compelling "
+        "reason the group cannot be extracted (for example, it is the sole "
+        "public API entry-point of the module and callers import it by name "
+        "from this specific file). If ALL groups stay, no split will occur "
+        "and the file will remain over the limit, which is not acceptable.\n\n"
+        "For each group, return 'migrate' (preferred) or 'stay' (exceptional)."
+    )
+    if prev_failure:
+        content += f"\n\nFeedback from the previous attempt: {prev_failure}"
+    messages = [{"role": "user", "content": content}]
     max_tokens = max(512, 20 + n_groups * 15)
     result = call_with_tool(
         client,
@@ -198,6 +204,7 @@ def _assign_placements(
     existing_files: frozenset,
     client: object,
     config: CrispenConfig,
+    prev_failure: str = "",
 ) -> Optional[List[GroupPlacement]]:
     """Ask the LLM to assign filenames to each group. Returns None on failure."""
     entity_map = {e.name: e for e in classified.entities}
@@ -215,20 +222,30 @@ def _assign_placements(
             + file_list
         )
 
-    messages = [
-        {
-            "role": "user",
-            "content": (
-                f"Assign each entity group to a target Python filename. "
-                f"The original file is '{original_path}'. "
-                "Use filenames relative to the same directory.\n\n"
-                f"Groups to place:\n{groups_text}"
-                f"{exclude_section}"
-            ),
-        }
-    ]
-
     n_groups = len(groups_to_place)
+    original_basename = Path(original_path).name
+    content = (
+        f"Assign each entity group to a target Python filename. "
+        f"The original file is '{original_path}'. "
+        "Each group will be written to a NEW file in the same directory "
+        "as the original.\n\n"
+        f"Groups to place (you MUST return a target_file for every "
+        f"group_id listed):\n{groups_text}\n\n"
+        "Rules:\n"
+        f"- You MUST assign a target_file to ALL {n_groups} group(s). "
+        "Missing any group_id will cause the split to fail.\n"
+        f"- Use filenames relative to the same directory "
+        f"(e.g. 'utils.py'). Do NOT use '{original_basename}' "
+        "(the original file being split).\n"
+        "- Multiple groups may share the same target file if they are "
+        "semantically related.\n"
+        "- Choose descriptive names based on what the entities do "
+        "(e.g. 'helpers.py', 'models.py', 'extractors.py')."
+        f"{exclude_section}"
+    )
+    if prev_failure:
+        content += f"\n\nFeedback from the previous attempt: {prev_failure}"
+    messages = [{"role": "user", "content": content}]
     max_tokens = max(512, 20 + n_groups * 20)
     result = call_with_tool(
         client,
@@ -278,6 +295,8 @@ def advise_file_limiter(
     original_path: str,
     config: CrispenConfig,
     existing_files: frozenset = frozenset(),
+    prev_set3_failure: str = "",
+    prev_placement_failure: str = "",
 ) -> FileLimiterPlan:
     """Ask the LLM to plan entity placement across new files.
 
@@ -303,7 +322,9 @@ def advise_file_limiter(
     # Call 1: advise Set 3 groups (only if set_3 is non-empty).
     set3_migrate: List[List[str]] = []
     if classified.set_3_groups:
-        result = _advise_set3(classified, original_path, client, config)
+        result = _advise_set3(
+            classified, original_path, client, config, prev_failure=prev_set3_failure
+        )
         if result is None:
             return FileLimiterPlan(
                 set3_migrate=[],
@@ -319,7 +340,13 @@ def advise_file_limiter(
         return FileLimiterPlan(set3_migrate=set3_migrate, placements=[], abort=False)
 
     placements = _assign_placements(
-        groups_to_place, classified, original_path, existing_files, client, config
+        groups_to_place,
+        classified,
+        original_path,
+        existing_files,
+        client,
+        config,
+        prev_failure=prev_placement_failure,
     )
     if placements is None:
         return FileLimiterPlan(

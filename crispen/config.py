@@ -60,6 +60,12 @@ class CrispenConfig:
     # rejects the output.  0 means no retry: the group is skipped on rejection.
     llm_verify_retries: int = 2
 
+    # Number of additional FileLimiter attempts after an LLM-related failure
+    # (e.g. LLM returned no placements, placement call failed, or code-gen
+    # detected circular file imports).  0 means no retry.  Default 1 = two
+    # total attempts.  Deterministic failures (single-SCC abort) are not retried.
+    file_limiter_retries: int = 1
+
     # Refactor allow-list: if non-empty, only the named refactors are run.
     # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
     # "tuple_dataclass", "file_limiter", "match_function".

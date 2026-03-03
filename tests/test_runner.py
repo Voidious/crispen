@@ -15,6 +15,8 @@ from crispen.file_limiter.runner import (
 )
 
 _CONFIG = CrispenConfig()
+# Zero-retry config for tests that exercise a single-attempt failure path.
+_CONFIG_NO_RETRY = CrispenConfig(file_limiter_retries=0)
 _PATCH_CLASSIFY = "crispen.file_limiter.runner.classify_entities"
 _PATCH_ADVISE = "crispen.file_limiter.runner.advise_file_limiter"
 _PATCH_GEN = "crispen.file_limiter.runner.generate_file_splits"
@@ -53,6 +55,28 @@ def _plan_with(group: list, target: str) -> FileLimiterPlan:
     return FileLimiterPlan(
         set3_migrate=[],
         placements=[GroupPlacement(group=group, target_file=target)],
+        abort=False,
+    )
+
+
+def _classified_with_groups(entities=None) -> ClassifiedEntities:
+    """Classified result with non-empty set_3_groups (triggers LLM advise)."""
+    ents = entities or [_make_entity("foo", 1, 2)]
+    return ClassifiedEntities(
+        entities=ents,
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[],
+        set_3_groups=[[e.name for e in ents]],
+        abort=False,
+    )
+
+
+def _good_split(entity_name: str = "foo", target: str = "utils.py") -> SplitResult:
+    return SplitResult(
+        new_files={target: f"def {entity_name}():\n    pass"},
+        original_source="# original updated\n",
         abort=False,
     )
 
@@ -169,6 +193,54 @@ def test_verify_annotation_stayed():
 
 
 # ---------------------------------------------------------------------------
+# run_file_limiter — classified.abort early-return (no retry)
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_classifier_abort(mock_classify, mock_advise):
+    # classified.abort=True → early return before LLM; advise never called.
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[_make_entity("a", 1, 2), _make_entity("b", 3, 4)],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[],
+        set_3_groups=[],
+        abort=True,
+        abort_reason="",
+    )
+
+    result = run_file_limiter("big.py", "", "def a(): b()\ndef b(): a()\n", [], _CONFIG)
+
+    assert result.abort is True
+    mock_advise.assert_not_called()
+    assert any("cannot be split" in m for m in result.messages)
+
+
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_classifier_abort_with_reason(mock_classify, mock_advise):
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[_make_entity("a", 1, 2), _make_entity("b", 3, 4)],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[],
+        set_3_groups=[],
+        abort=True,
+        abort_reason="all 2 top-level entities form one dependency cycle",
+    )
+
+    result = run_file_limiter("big.py", "", "def a(): b()\ndef b(): a()\n", [], _CONFIG)
+
+    assert result.abort is True
+    mock_advise.assert_not_called()
+    assert any("dependency cycle" in m for m in result.messages)
+
+
+# ---------------------------------------------------------------------------
 # run_file_limiter — plan.abort path
 # ---------------------------------------------------------------------------
 
@@ -179,7 +251,9 @@ def test_runner_plan_abort(mock_classify, mock_advise):
     mock_classify.return_value = _make_classified()
     mock_advise.return_value = _abort_plan()
 
-    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], _CONFIG)
+    result = run_file_limiter(
+        "big.py", "", "def foo():\n    pass\n", [], _CONFIG_NO_RETRY
+    )
 
     assert result.abort is True
     assert result.new_files == {}
@@ -194,10 +268,67 @@ def test_runner_plan_abort_with_reason(mock_classify, mock_advise):
         set3_migrate=[], placements=[], abort=True, abort_reason="all 3 entities cycle"
     )
 
-    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], _CONFIG)
+    result = run_file_limiter(
+        "big.py", "", "def foo():\n    pass\n", [], _CONFIG_NO_RETRY
+    )
 
     assert result.abort is True
     assert any("all 3 entities cycle" in m for m in result.messages)
+
+
+# ---------------------------------------------------------------------------
+# run_file_limiter — plan.abort retry paths
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_plan_abort_retries_and_fails(mock_classify, mock_advise):
+    # retries=1: both attempts produce plan.abort (set-3 failure) → 2 SKIP messages.
+    mock_classify.return_value = _make_classified()
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[],
+        placements=[],
+        abort=True,
+        abort_reason="LLM failed to plan set-3 groups",
+    )
+    cfg = CrispenConfig(file_limiter_retries=1)
+
+    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], cfg)
+
+    assert result.abort is True
+    assert mock_advise.call_count == 2
+    assert sum(1 for m in result.messages if "cannot be split" in m) == 2
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_plan_abort_retries_and_succeeds(mock_classify, mock_advise, mock_gen):
+    # retries=1: first plan.abort (placement failure), second succeeds.
+    entity = _make_entity("foo", 1, 2)
+    mock_classify.return_value = _make_classified(entities=[entity])
+    mock_advise.side_effect = [
+        FileLimiterPlan(
+            set3_migrate=[],
+            placements=[],
+            abort=True,
+            abort_reason="LLM failed to assign file placements",
+        ),
+        _plan_with(["foo"], "utils.py"),
+    ]
+    mock_gen.return_value = _good_split()
+    cfg = CrispenConfig(file_limiter_retries=1)
+
+    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], cfg)
+
+    assert result.abort is False
+    assert mock_advise.call_count == 2
+    # Failed attempt message is preserved alongside the success message.
+    assert any("cannot be split" in m for m in result.messages)
+    assert any("FileLimiter: moved" in m for m in result.messages)
+    # Feedback was forwarded on the second call.
+    assert mock_advise.call_args_list[1].kwargs["prev_placement_failure"] != ""
 
 
 # ---------------------------------------------------------------------------
@@ -225,24 +356,57 @@ def test_runner_no_placements(mock_classify, mock_advise):
 def test_runner_no_placements_with_groups(mock_classify, mock_advise):
     # When set_3_groups is non-empty but the LLM selects nothing to migrate,
     # runner should emit a SKIP message so the user knows the file was examined.
-    entity = _make_entity("foo", 1, 2)
-    mock_classify.return_value = ClassifiedEntities(
-        entities=[entity],
-        entity_class={},
-        graph={},
-        set_1=[],
-        set_2_groups=[],
-        set_3_groups=[["foo"]],
-        abort=False,
-    )
+    mock_classify.return_value = _classified_with_groups()
     mock_advise.return_value = _empty_plan()
 
     source = "def foo():\n    pass\n"
-    result = run_file_limiter("big.py", "", source, [], _CONFIG)
+    result = run_file_limiter("big.py", "", source, [], _CONFIG_NO_RETRY)
 
     assert result.abort is False
     assert result.new_files == {}
     assert any("no entities selected for migration" in m for m in result.messages)
+
+
+# ---------------------------------------------------------------------------
+# run_file_limiter — no-migration retry paths
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_no_migration_retries_and_fails(mock_classify, mock_advise):
+    # retries=1: both attempts → no entities selected → 2 SKIP msgs, abort=False.
+    mock_classify.return_value = _classified_with_groups()
+    mock_advise.return_value = _empty_plan()
+    cfg = CrispenConfig(file_limiter_retries=1)
+
+    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], cfg)
+
+    assert result.abort is False
+    assert mock_advise.call_count == 2
+    assert sum(1 for m in result.messages if "no entities selected" in m) == 2
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_no_migration_retries_and_succeeds(mock_classify, mock_advise, mock_gen):
+    # retries=1: first attempt → no migration; second → placements and success.
+    entity = _make_entity("foo", 1, 2)
+    mock_classify.return_value = _classified_with_groups(entities=[entity])
+    mock_advise.side_effect = [_empty_plan(), _plan_with(["foo"], "utils.py")]
+    mock_gen.return_value = _good_split()
+    cfg = CrispenConfig(file_limiter_retries=1)
+
+    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], cfg)
+
+    assert result.abort is False
+    assert mock_advise.call_count == 2
+    # Failed attempt message is preserved alongside the success message.
+    assert any("no entities selected" in m for m in result.messages)
+    assert any("FileLimiter: moved" in m for m in result.messages)
+    # Feedback about all-stay was forwarded on the second call.
+    assert mock_advise.call_args_list[1].kwargs["prev_set3_failure"] != ""
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +487,7 @@ def test_runner_split_aborts_on_cycle(mock_classify, mock_advise, mock_gen):
         abort=True,
     )
 
-    result = run_file_limiter("big.py", "", source, [], _CONFIG)
+    result = run_file_limiter("big.py", "", source, [], _CONFIG_NO_RETRY)
 
     assert result.abort is True
     assert result.new_files == {}
@@ -348,10 +512,73 @@ def test_runner_split_aborts_with_reason(mock_classify, mock_advise, mock_gen):
         abort_reason="proposed split would create circular file imports",
     )
 
-    result = run_file_limiter("big.py", "", source, [], _CONFIG)
+    result = run_file_limiter("big.py", "", source, [], _CONFIG_NO_RETRY)
 
     assert result.abort is True
     assert any("circular file imports" in m for m in result.messages)
+
+
+# ---------------------------------------------------------------------------
+# run_file_limiter — split.abort retry paths
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_split_abort_retries_and_fails(mock_classify, mock_advise, mock_gen):
+    # retries=1: both attempts produce split.abort → 2 SKIP messages, abort=True.
+    source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    mock_classify.return_value = _make_classified(entities=[entity])
+    mock_advise.return_value = _plan_with(["foo"], "utils.py")
+    mock_gen.return_value = SplitResult(
+        new_files={},
+        original_source=source,
+        abort=True,
+        abort_reason="proposed split would create circular file imports",
+    )
+    cfg = CrispenConfig(file_limiter_retries=1)
+
+    result = run_file_limiter("big.py", "", source, [], cfg)
+
+    assert result.abort is True
+    assert mock_advise.call_count == 2
+    assert mock_gen.call_count == 2
+    assert sum(1 for m in result.messages if "cannot be split" in m) == 2
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_split_abort_retries_and_succeeds(mock_classify, mock_advise, mock_gen):
+    # retries=1: first split.abort, second succeeds → only "moved" message, no SKIP.
+    source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    mock_classify.return_value = _make_classified(entities=[entity])
+    mock_advise.return_value = _plan_with(["foo"], "utils.py")
+    mock_gen.side_effect = [
+        SplitResult(
+            new_files={},
+            original_source=source,
+            abort=True,
+            abort_reason="circular imports",
+        ),
+        _good_split(),
+    ]
+    cfg = CrispenConfig(file_limiter_retries=1)
+
+    result = run_file_limiter("big.py", "", source, [], cfg)
+
+    assert result.abort is False
+    assert mock_advise.call_count == 2
+    assert mock_gen.call_count == 2
+    # Failed attempt message is preserved alongside the success message.
+    assert any("cannot be split" in m for m in result.messages)
+    assert any("FileLimiter: moved" in m for m in result.messages)
+    # Circular-import feedback was forwarded on the second call.
+    prev_pf = mock_advise.call_args_list[1].kwargs["prev_placement_failure"]
+    assert "circular" in prev_pf
 
 
 # ---------------------------------------------------------------------------
