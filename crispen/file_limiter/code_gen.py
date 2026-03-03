@@ -174,14 +174,18 @@ def _find_cross_file_imports(
     entity_source_map: Dict[str, str],
     name_to_target_file: Dict[str, str],
     current_target: str,
+    abs_pkg: Optional[str] = None,
 ) -> List[str]:
-    """Return relative ``from … import name`` statements for other-file dependencies.
+    """Return ``from … import name`` statements for other-file dependencies.
 
     When an entity being moved to *current_target* references a name that is
     defined by another entity being moved to a different target file, the new
-    file needs an explicit import for that name.  The import prefix is computed
-    relative to *current_target*'s directory so it works even when the two
-    files live in different subdirectories.
+    file needs an explicit import for that name.
+
+    When *abs_pkg* is ``None`` the import prefix is relative (e.g.
+    ``from .constants import _CONST``).  When *abs_pkg* is set the import is
+    absolute (e.g. ``from tests.constants import _CONST``), which is required
+    for test files that pytest loads as top-level modules.
     """
     referenced: Set[str] = set()
     for name in entity_names:
@@ -192,11 +196,16 @@ def _find_cross_file_imports(
         source_file = name_to_target_file.get(ref_name)
         if source_file and source_file != current_target:
             from_files.setdefault(source_file, []).append(ref_name)
-    return [
-        f"from {_relative_import_prefix(current_target, source_file)}"
-        f" import {', '.join(sorted(names))}"
-        for source_file, names in sorted(from_files.items())
-    ]
+
+    result = []
+    for source_file, names in sorted(from_files.items()):
+        if abs_pkg is not None:
+            mod = _target_module_name(source_file)
+            prefix = f"{abs_pkg}.{mod}" if abs_pkg else mod
+        else:
+            prefix = _relative_import_prefix(current_target, source_file)
+        result.append(f"from {prefix} import {', '.join(sorted(names))}")
+    return result
 
 
 def _target_module_name(target_file: str) -> str:
@@ -287,6 +296,27 @@ def _module_path_from_file(project_root: Path, file_path: Path) -> Optional[str]
     return ".".join(rel.with_suffix("").parts)
 
 
+def _abs_package_for_dir(file_path: str) -> Optional[str]:
+    """Return the dotted package path of the directory containing *file_path*.
+
+    Used to generate absolute imports for test files so that pytest's default
+    import mode (which loads test files as top-level modules, not package
+    members) does not choke on ``from .module import …`` syntax.
+
+    Returns an empty string for files sitting directly in the project root,
+    ``None`` when the project root cannot be determined.
+    """
+    orig = Path(file_path).resolve()
+    project_root = _find_project_root(orig.parent)
+    if project_root is None:
+        return None
+    try:
+        rel = orig.parent.relative_to(project_root)
+    except ValueError:
+        return None
+    return ".".join(rel.parts)
+
+
 def _collect_external_imported_names(original_path: str) -> Set[str]:
     """Return names imported from *original_path* by other Python files.
 
@@ -347,6 +377,7 @@ def _add_re_exports(
     entity_map: Dict[str, Entity],
     entity_source_map: Dict[str, str],
     external_loads: Set[str] = frozenset(),
+    abs_pkg: Optional[str] = None,
 ) -> str:
     """Add ``from .module import name`` imports for migrated entities.
 
@@ -405,14 +436,18 @@ def _add_re_exports(
     # so that the noqa comment does not suppress warnings for used names.
     export_stmts: List[str] = []
     for module, names in sorted(re_exports.items()):
+        if abs_pkg is not None:
+            prefix = f"{abs_pkg}.{module}" if abs_pkg else module
+        else:
+            prefix = f".{module}"
         sorted_names = sorted(names)
         used = [n for n in sorted_names if n not in noqa_names]
         noqa = [n for n in sorted_names if n in noqa_names]
         if used:
-            export_stmts.append(f"from .{module} import {', '.join(used)}\n")
+            export_stmts.append(f"from {prefix} import {', '.join(used)}\n")
         if noqa:
             export_stmts.append(
-                f"from .{module} import {', '.join(noqa)}  # noqa F401\n"
+                f"from {prefix} import {', '.join(noqa)}  # noqa F401\n"
             )
 
     lines = source.splitlines(keepends=True)
@@ -922,6 +957,14 @@ def generate_file_splits(
             abort_reason="proposed split would create circular file imports",
         )
 
+    # Use absolute imports when the original file is a test file.  Pytest's
+    # default import mode loads test files as top-level modules (not package
+    # members), so relative imports like `from .helpers import foo` would
+    # raise ImportError at collection time.
+    abs_pkg: Optional[str] = None
+    if Path(original_path).name.startswith("test_"):
+        abs_pkg = _abs_package_for_dir(original_path)
+
     # Generate new file contents.
     new_files: Dict[str, str] = {}
     for target_file, ent_names in file_entity_names.items():
@@ -929,7 +972,11 @@ def generate_file_splits(
             ent_names, entity_source_map, import_infos, all_entity_names
         )
         cross = _find_cross_file_imports(
-            ent_names, entity_source_map, name_to_target_file, target_file
+            ent_names,
+            entity_source_map,
+            name_to_target_file,
+            target_file,
+            abs_pkg=abs_pkg,
         )
         entity_srcs = [
             _FUTURE_IMPORT_LINE_RE.sub("", src).rstrip()
@@ -956,6 +1003,7 @@ def generate_file_splits(
         entity_map,
         entity_source_map,
         external_loads=external_loads,
+        abs_pkg=abs_pkg,
     )
 
     return SplitResult(new_files=new_files, original_source=updated, abort=False)
