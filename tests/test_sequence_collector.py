@@ -1,0 +1,62 @@
+import textwrap
+import libcst as cst
+from libcst.metadata import MetadataWrapper
+from crispen.refactors.duplicate_extractor import _SeqInfo, _SequenceCollector
+from tests.test_sequence_collection import _collect_sequences
+
+
+def test_sequence_collector_custom_max_seq_len():
+    # max_seq_len=2 means windows are at most 2 statements.
+    # With 4 statements each of weight 1, all 2-stmt windows have weight 2 <
+    # MIN_WEIGHT=3.  So no sequences pass the weight filter → sequences == [].
+    source = textwrap.dedent(
+        """\
+        def foo():
+            a = 1
+            b = 2
+            c = 3
+            d = 4
+        """
+    )
+    seqs = _collect_sequences(source, max_seq_len=2)
+    # No 3-stmt (or larger) windows generated; all ≤2-stmt windows fail weight check.
+    assert all(len(s.stmts) <= 2 for s in seqs)
+    assert seqs == []
+
+
+def test_sequence_collector_class_scope():
+    """_SequenceCollector sets class_scope for sequences inside class methods."""
+
+    source = textwrap.dedent(
+        """\
+        x = 1
+        y = 2
+        z = 3
+
+        class MyClass:
+            def method(self):
+                a = 1
+                b = 2
+                c = 3
+        """
+    )
+    lines = source.splitlines(keepends=True)
+    tree = cst.parse_module(source)
+    collector = _SequenceCollector(lines, max_seq_len=8)
+    MetadataWrapper(tree).visit(collector)
+
+    module_seqs = [s for s in collector.sequences if s.class_scope is None]
+    class_seqs = [s for s in collector.sequences if s.class_scope == "MyClass"]
+    assert module_seqs, "expected module-level sequences with class_scope=None"
+    assert class_seqs, "expected class-method sequences with class_scope='MyClass'"
+
+
+def _make_seq_info(start: int, end: int, src: str = "") -> _SeqInfo:
+    return _SeqInfo(
+        stmts=[],
+        start_line=start,
+        end_line=end,
+        scope="foo",
+        source=src,
+        fingerprint="",
+    )
