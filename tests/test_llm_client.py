@@ -220,11 +220,9 @@ def test_call_with_tool_anthropic_api_error():
 # ---------------------------------------------------------------------------
 
 
-def _make_openai_response(tool_name: str, arguments: dict) -> MagicMock:
-    tc = MagicMock()
-    tc.function.arguments = json.dumps(arguments)
+def _make_openai_tool_response(tool_calls):
     message = MagicMock()
-    message.tool_calls = [tc]
+    message.tool_calls = tool_calls
     choice = MagicMock()
     choice.message = message
     resp = MagicMock()
@@ -232,13 +230,29 @@ def _make_openai_response(tool_name: str, arguments: dict) -> MagicMock:
     return resp
 
 
+def _make_openai_response(tool_name: str, arguments: dict) -> MagicMock:
+    tc = MagicMock()
+    tc.function.arguments = json.dumps(arguments)
+    resp = _make_openai_tool_response([tc])
+    return resp
+
+
+def _setup_mock_openai_client(
+    mock_oai, tool_name="evaluate_duplicate", result_data=None
+):
+    mock_oai.APIError = Exception
+    client = MagicMock()
+    if result_data is None:
+        result_data = {"is_valid_duplicate": True, "reason": "same"}
+    client.chat.completions.create.return_value = _make_openai_response(
+        tool_name, result_data
+    )
+    return client
+
+
 def test_call_with_tool_moonshot_success():
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
-        client.chat.completions.create.return_value = _make_openai_response(
-            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
-        )
+        client = _setup_mock_openai_client(mock_oai)
         result = call_with_tool(
             client,
             "moonshot",
@@ -257,11 +271,16 @@ def test_call_with_tool_moonshot_success():
     }
 
 
+def _setup_mock_openai_api_error(mock_oai, error_message):
+    mock_oai.APIError = Exception
+    client = MagicMock()
+    client.chat.completions.create.side_effect = Exception(error_message)
+    return client
+
+
 def test_call_with_tool_moonshot_api_error():
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
-        client.chat.completions.create.side_effect = Exception("rate limit")
+        client = _setup_mock_openai_api_error(mock_oai, "rate limit")
         with pytest.raises(CrispenAPIError, match="moonshot API error"):
             call_with_tool(
                 client,
@@ -281,12 +300,7 @@ def test_call_with_tool_moonshot_malformed_json():
         client = MagicMock()
         tc = MagicMock()
         tc.function.arguments = '{"key": "unterminated'
-        message = MagicMock()
-        message.tool_calls = [tc]
-        choice = MagicMock()
-        choice.message = message
-        resp = MagicMock()
-        resp.choices = [choice]
+        resp = _make_openai_tool_response([tc])
         client.chat.completions.create.return_value = resp
         result = call_with_tool(
             client,
@@ -307,11 +321,7 @@ def test_call_with_tool_moonshot_malformed_json():
 
 def test_call_with_tool_openai_success():
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
-        client.chat.completions.create.return_value = _make_openai_response(
-            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
-        )
+        client = _setup_mock_openai_client(mock_oai)
         result = call_with_tool(
             client,
             "openai",
@@ -332,9 +342,7 @@ def test_call_with_tool_openai_success():
 
 def test_call_with_tool_openai_api_error():
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
-        client.chat.completions.create.side_effect = Exception("rate limit")
+        client = _setup_mock_openai_api_error(mock_oai, "rate limit")
         with pytest.raises(CrispenAPIError, match="openai API error"):
             call_with_tool(
                 client,
@@ -351,11 +359,7 @@ def test_call_with_tool_openai_api_error():
 def test_call_with_tool_tool_choice_override():
     """tool_choice_override sends the string directly instead of named-function dict."""
     with patch("crispen.llm_client.openai") as mock_oai:
-        mock_oai.APIError = Exception
-        client = MagicMock()
-        client.chat.completions.create.return_value = _make_openai_response(
-            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
-        )
+        client = _setup_mock_openai_client(mock_oai)
         call_with_tool(
             client,
             "lmstudio",

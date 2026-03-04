@@ -344,6 +344,13 @@ class _FunctionCollector(cst.CSTVisitor):
 # ---------------------------------------------------------------------------
 
 
+def _try_parse_ast(source: str):
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return None
+
+
 def _collect_called_names(source: str) -> set:
     """Return a set of all names called (as functions) in *source*.
 
@@ -351,9 +358,8 @@ def _collect_called_names(source: str) -> set:
     called name: func.id for ast.Name callees, func.attr for ast.Attribute
     callees.  On SyntaxError, returns an empty set.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _try_parse_ast(source)
+    if tree is None:
         return set()
     names: set = set()
     for node in ast.walk(tree):
@@ -558,6 +564,16 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
+def _parse_veto_result(result):
+    if result is not None:
+        return (
+            result["is_valid_duplicate"],
+            result.get("reason", ""),
+            result.get("extraction_notes", ""),
+        )
+    return False, "no tool response", ""  # pragma: no cover
+
+
 def _llm_veto(
     client,
     group: List[_SeqInfo],
@@ -592,13 +608,7 @@ def _llm_veto(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is not None:
-        return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
-        )
-    return False, "no tool response", ""  # pragma: no cover
+    return _parse_veto_result(result)
 
 
 def _llm_extract(
@@ -767,13 +777,7 @@ def _llm_veto_func_match(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is not None:
-        return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
-        )
-    return False, "no tool response", ""  # pragma: no cover
+    return _parse_veto_result(result)
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
@@ -1110,6 +1114,13 @@ def _pyflakes_new_undefined_names(original: str, candidate: str) -> set:
     return after.names - before.names
 
 
+def _parse_block_source(source: str) -> Optional[ast.AST]:
+    try:
+        return ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None
+
+
 def _missing_free_vars(
     block_src: str, call_srcs: List[str], helper_src: str, source: str
 ) -> set:
@@ -1136,9 +1147,8 @@ def _missing_free_vars(
     failure does not block the extraction — the later ``compile()`` guard will
     catch real syntax problems.
     """
-    try:
-        block_tree = ast.parse(textwrap.dedent(block_src))
-    except SyntaxError:
+    block_tree = _parse_block_source(block_src)
+    if block_tree is None:
         return set()
 
     reads: set = set()
@@ -1158,9 +1168,8 @@ def _missing_free_vars(
     # parameters somewhere in the full source.  Module-level names that are
     # only ever read (e.g. imported functions, global constants) are in scope
     # from the helper definition too and do not need to be passed as args.
-    try:
-        source_tree = ast.parse(source)
-    except SyntaxError:
+    source_tree = _try_parse_ast(source)
+    if source_tree is None:
         return set()
     source_locals: set = set()
     for node in ast.walk(source_tree):
@@ -1325,9 +1334,8 @@ def _names_assigned_in(block_source: str) -> set:
     Covers bare ``x = ...`` (ast.Assign) and augmented ``x += ...``
     (ast.AugAssign) statements only; other assignment forms are ignored.
     """
-    try:
-        tree = ast.parse(textwrap.dedent(block_source))
-    except SyntaxError:
+    tree = _parse_block_source(block_source)
+    if tree is None:
         return set()
     names: set = set()
     for node in tree.body:
@@ -1550,6 +1558,21 @@ def _find_insertion_point(source: str, scope: str) -> int:
 
 
 class DuplicateExtractor(Refactor):
+
+    @staticmethod
+    def _log_and_maybe_skip(verbose: bool, is_valid: bool, reason: str, stats) -> bool:
+        if verbose:
+            status = "ACCEPTED" if is_valid else "VETOED"
+            print(
+                f"crispen: DuplicateExtractor:   → {status}: {reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not is_valid:
+            stats.llm_rejected += 1
+            return True
+        return False
+
     """Detect and extract duplicate code blocks into helper functions via LLM."""
 
     def __init__(
@@ -1687,15 +1710,7 @@ class DuplicateExtractor(Refactor):
                         flush=True,
                     )
                     continue
-                if self.verbose:
-                    status = "ACCEPTED" if is_valid else "VETOED"
-                    print(
-                        f"crispen: DuplicateExtractor:   → {status}: {reason}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                if not is_valid:
-                    self.stats.llm_rejected += 1
+                if self._log_and_maybe_skip(self.verbose, is_valid, reason, self.stats):
                     continue
                 if func.scope == "<module>" and not func.params:
                     replacement = _generate_no_arg_call(seq, func)
@@ -1793,15 +1808,7 @@ class DuplicateExtractor(Refactor):
                     flush=True,
                 )
                 continue
-            if self.verbose:
-                status = "ACCEPTED" if is_valid else "VETOED"
-                print(
-                    f"crispen: DuplicateExtractor:   → {status}: {reason}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            if not is_valid:
-                self.stats.llm_rejected += 1
+            if self._log_and_maybe_skip(self.verbose, is_valid, reason, self.stats):
                 continue
 
             # Extraction retry loop: attempt extraction up to

@@ -49,6 +49,13 @@ _IMPORT_LINE_RE = re.compile(r"^(import\s+|from\s+\S.*\s+import\s+)")
 _FUTURE_IMPORT_LINE_RE = re.compile(r"^from __future__ import .*\n?", re.MULTILINE)
 
 
+def _try_parse_ast(source: str) -> Optional[ast.AST]:
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return None
+
+
 def _import_derived_names(source: str) -> Set[str]:
     """Return names introduced solely by import statements in *source*.
 
@@ -56,9 +63,8 @@ def _import_derived_names(source: str) -> Set[str]:
     statements and cannot be re-exported from a new module the way
     assignment-defined names can.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _try_parse_ast(source)
+    if tree is None:
         return set()
     names: Set[str] = set()
     for node in tree.body:
@@ -73,9 +79,8 @@ def _import_derived_names(source: str) -> Set[str]:
 
 def _collect_name_loads(source: str) -> Set[str]:
     """Return all Name loads referenced in *source*."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _try_parse_ast(source)
+    if tree is None:
         return set()
     names: Set[str] = set()
     for node in ast.walk(tree):
@@ -113,6 +118,14 @@ def _extract_import_info(source: str) -> List[ImportInfo]:
     return result
 
 
+def _collect_referenced_names(entity_names, entity_source_map):
+    referenced: Set[str] = set()
+    for name in entity_names:
+        src = entity_source_map.get(name, "")
+        referenced |= _collect_name_loads(src)
+    return referenced
+
+
 def _find_needed_imports(
     entity_names: List[str],
     entity_source_map: Dict[str, str],
@@ -125,10 +138,7 @@ def _find_needed_imports(
     when any of the names they introduce appear in the entities' source.
     Duplicate import source strings are deduplicated.
     """
-    referenced: Set[str] = set()
-    for name in entity_names:
-        src = entity_source_map.get(name, "")
-        referenced |= _collect_name_loads(src)
+    referenced = _collect_referenced_names(entity_names, entity_source_map)
 
     needed: List[str] = []
     seen: Set[str] = set()
@@ -187,10 +197,7 @@ def _find_cross_file_imports(
     absolute (e.g. ``from tests.constants import _CONST``), which is required
     for test files that pytest loads as top-level modules.
     """
-    referenced: Set[str] = set()
-    for name in entity_names:
-        src = entity_source_map.get(name, "")
-        referenced |= _collect_name_loads(src)
+    referenced = _collect_referenced_names(entity_names, entity_source_map)
     from_files: Dict[str, List[str]] = {}  # source_file → names
     for ref_name in sorted(referenced):
         source_file = name_to_target_file.get(ref_name)
@@ -224,9 +231,8 @@ def _import_line_numbers(entity: Entity, entity_src: str) -> Set[int]:
     Used to preserve import lines in the original file when a TOP_LEVEL
     entity that mixes imports and assignments is migrated.
     """
-    try:
-        tree = ast.parse(entity_src)
-    except SyntaxError:
+    tree = _try_parse_ast(entity_src)
+    if tree is None:
         return set()
     result: Set[int] = set()
     for node in tree.body:
@@ -371,6 +377,12 @@ def _collect_external_imported_names(original_path: str) -> Set[str]:
     return result
 
 
+def _guard_and_init_list(items, source):
+    if not items:
+        return source, None
+    return None, []
+
+
 def _add_re_exports(
     source: str,
     placements: List[GroupPlacement],
@@ -434,7 +446,10 @@ def _add_re_exports(
     # (not referenced in the remaining source), add "# noqa F401" so flake8
     # does not flag it as an unused import.  Split mixed imports into two lines
     # so that the noqa comment does not suppress warnings for used names.
-    export_stmts: List[str] = []
+    guard_result, export_stmts = _guard_and_init_list(re_exports, source)
+    if guard_result is not None:
+        return guard_result
+
     for module, names in sorted(re_exports.items()):
         if abs_pkg is not None:
             prefix = f"{abs_pkg}.{module}" if abs_pkg else module
@@ -731,7 +746,10 @@ def _prune_inline_redundant_imports(source: str) -> str:
     if not line_ops:
         return source
 
-    result: List[str] = []
+    guard_result, result = _guard_and_init_list(line_ops, source)
+    if guard_result is not None:
+        return guard_result
+
     for i, line in enumerate(lines, 1):
         if i in line_ops:
             repl = line_ops[i]
@@ -804,7 +822,10 @@ def _prune_unused_imports(source: str) -> str:
     if not replacements:
         return source
 
-    result: List[str] = []
+    guard_result, result = _guard_and_init_list(replacements, source)
+    if guard_result is not None:
+        return guard_result
+
     for i, line in enumerate(lines, 1):
         if i not in replacements:
             result.append(line)

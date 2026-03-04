@@ -463,6 +463,12 @@ def _find_valid_splits(
     return candidates
 
 
+def _maybe_update_best_split(best_idx, best_params, split_idx, params):
+    if best_idx is None or len(params) < len(best_params):
+        return split_idx, params
+    return None
+
+
 def _choose_best_split(
     body_stmts: list,
     valid_splits: List[int],
@@ -500,15 +506,17 @@ def _choose_best_split(
         if is_method and "self" in free:
             # Tail needs instance state — extract as a regular instance method.
             params_no_self = [v for v in free if v != "self"]
-            if best_instance_idx is None or len(params_no_self) < len(
-                best_instance_params
-            ):
-                best_instance_idx = split_idx
-                best_instance_params = params_no_self
+            update = _maybe_update_best_split(
+                best_instance_idx, best_instance_params, split_idx, params_no_self
+            )
+            if update:
+                best_instance_idx, best_instance_params = update
         else:
-            if best_static_idx is None or len(free) < len(best_static_params):
-                best_static_idx = split_idx
-                best_static_params = free
+            update = _maybe_update_best_split(
+                best_static_idx, best_static_params, split_idx, free
+            )
+            if update:
+                best_static_idx, best_static_params = update
 
     # Prefer static (no self dependency) over instance method.
     if best_static_idx is not None:
@@ -786,6 +794,9 @@ class FunctionSplitter(Refactor):
 
     def _analyze(self, source: str) -> None:
         """Iteratively split oversized functions until stable or limit reached."""
+        return self._split_large_functions(source)
+
+    def _split_large_functions(self, source):
         current = source
 
         for _iteration in range(_MAX_SPLIT_ITERATIONS):

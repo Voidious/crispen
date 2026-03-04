@@ -328,6 +328,13 @@ def test_is_import_only_empty():
 # ---------------------------------------------------------------------------
 
 
+def assert_block_unmodified(post, diff_ranges, block_name="_block_1"):
+    result = classify_entities(post, post, diff_ranges)
+    assert result.entity_class[block_name] == EntityClass.UNMODIFIED
+    assert block_name in result.set_1
+    return result
+
+
 def test_classify_import_only_block_stays_unmodified_even_when_diff_overlaps():
     # The import block overlaps the diff range but must stay UNMODIFIED.
     post = textwrap.dedent(
@@ -340,9 +347,7 @@ def test_classify_import_only_block_stays_unmodified_even_when_diff_overlaps():
     """
     )
     # diff covers line 1-2 (the import block)
-    result = classify_entities(post, post, [(1, 2)])
-    assert result.entity_class["_block_1"] == EntityClass.UNMODIFIED
-    assert "_block_1" in result.set_1
+    result = assert_block_unmodified(post, [(1, 2)])
 
 
 def test_classify_import_only_block_with_docstring_stays_unmodified():
@@ -355,9 +360,7 @@ def test_classify_import_only_block_with_docstring_stays_unmodified():
             return os.getcwd()
     """
     )
-    result = classify_entities(post, post, [(1, 2)])
-    assert result.entity_class["_block_1"] == EntityClass.UNMODIFIED
-    assert "_block_1" in result.set_1
+    result = assert_block_unmodified(post, [(1, 2)])
 
 
 def test_classify_mixed_block_not_forced_unmodified():
