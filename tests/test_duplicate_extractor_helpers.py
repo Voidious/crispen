@@ -1,0 +1,123 @@
+import textwrap
+from unittest.mock import MagicMock, patch
+import libcst as cst
+from libcst.metadata import MetadataWrapper
+from crispen.refactors.duplicate_extractor import (
+    _FunctionCollector,
+    _FunctionInfo,
+    _SeqInfo,
+    _SequenceCollector,
+    DuplicateExtractor,
+)
+from tests.duplicate_extractor_test_responses import (
+    _make_extract_response,
+    _make_verify_response,
+    _make_veto_response,
+)
+
+
+def _make_seq(start: int, end: int) -> _SeqInfo:
+    return _SeqInfo(
+        stmts=[],
+        start_line=start,
+        end_line=end,
+        scope="<module>",
+        source="",
+        fingerprint="",
+    )
+
+
+def test_helper_placed_before_class_not_inside(monkeypatch):
+    """Helper extracted from class methods must be placed BEFORE the class.
+
+    When duplicate blocks live inside class methods, inserting a module-level
+    helper before the method (inside the class body) ends the class definition
+    prematurely and turns the remaining methods into nested functions.  The fix
+    in _find_insertion_point walks backwards to the enclosing class.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        import os
+
+        class MyClass:
+            def method_a(self, x):
+                a = compute(x)
+                b = transform(a)
+                c = finalize(b)
+                return c
+
+            def method_b(self, x):
+                a = compute(x)
+                b = transform(a)
+                c = finalize(b)
+                return c
+        """
+    )
+    helper = "def _do_work(x):\n    pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_do_work",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "        return _do_work(x)\n",
+                        "        return _do_work(x)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor([(1, 100)], source=source)
+
+    assert de._new_source is not None
+    compile(de._new_source, "<test>", "exec")
+    # Helper must appear BEFORE the class definition, not inside it.
+    helper_pos = de._new_source.find("def _do_work")
+    class_pos = de._new_source.find("class MyClass")
+    assert (
+        helper_pos < class_pos
+    ), "helper was placed after/inside class instead of before it"
+    # The class structure must be intact: MyClass still has both methods.
+    import ast as _ast
+
+    tree = _ast.parse(de._new_source)
+    classes = [n for n in _ast.walk(tree) if isinstance(n, _ast.ClassDef)]
+    assert len(classes) == 1
+    assert classes[0].name == "MyClass"
+    methods = [n.name for n in classes[0].body if isinstance(n, _ast.FunctionDef)]
+    assert "method_a" in methods
+    assert "method_b" in methods
+
+
+def _make_func_info(name: str, body_source: str = "    pass\n") -> _FunctionInfo:
+    return _FunctionInfo(
+        name=name,
+        source=f"def {name}():\n{body_source}",
+        scope="<module>",
+        body_source=body_source,
+        body_stmt_count=1,
+        params=[],
+    )
+
+
+def _collect_sequences(source: str, max_seq_len: int = 8):
+    tree = cst.parse_module(source)
+    lines = source.splitlines(keepends=True)
+    collector = _SequenceCollector(lines, max_seq_len=max_seq_len)
+    MetadataWrapper(tree).visit(collector)
+    return collector.sequences
+
+
+def _collect_functions(source: str):
+    tree = cst.parse_module(source)
+    lines = source.splitlines(keepends=True)
+    collector = _FunctionCollector(lines)
+    MetadataWrapper(tree).visit(collector)
+    return collector.functions

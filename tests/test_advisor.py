@@ -1,6 +1,8 @@
 """Tests for file_limiter.advisor — 100% branch coverage."""
 
 from __future__ import annotations
+from typing import Any
+from dataclasses import dataclass
 
 from unittest.mock import MagicMock, patch
 
@@ -16,9 +18,13 @@ from crispen.file_limiter.classifier import ClassifiedEntities
 from crispen.file_limiter.entity_parser import Entity, EntityKind
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@dataclass
+class BuildChunkedPlacementFixturesResult:
+    n: Any
+    entities: Any
+    groups: Any
+    first_chunk_response: Any
+    second_chunk_response: Any
 
 
 def _make_entity(name: str, start: int, end: int) -> Entity:
@@ -94,17 +100,40 @@ def test_plan_api_key_error_propagates(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _setup_key_client_call_and_classified(
+    mock_key,
+    mock_client,
+    mock_call,
+    *,
+    entities,
+    set_2_groups,
+    placements=None,
+):
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": (
+            placements
+            if placements is not None
+            else [{"group_id": 0, "target_file": "utils.py"}]
+        ),
+    }
+    c = _classified(
+        entities=entities,
+        set_2_groups=set_2_groups,
+    )
+    return c, mock_call
+
+
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
     """set_2 groups only: call 1 is skipped, call 2 assigns placement."""
-    mock_key.return_value = "key"
-    mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": 0, "target_file": "utils.py"}]
-    }
-    c = _classified(
+    c, mock_call = _setup_key_client_call_and_classified(
+        mock_key,
+        mock_client,
+        mock_call,
         entities=[_make_entity("foo", 1, 10)],
         set_2_groups=[["foo"]],
     )
@@ -123,6 +152,16 @@ def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
 # ---------------------------------------------------------------------------
 
 
+def _assert_set3_all_stay_no_placements(
+    configured: ClassifiedEntities, src_path: str, config: CrispenConfig
+) -> None:
+    plan = advise_file_limiter(configured, src_path, config)
+
+    assert plan.abort is False
+    assert plan.set3_migrate == []
+    assert plan.placements == []
+
+
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
@@ -136,11 +175,7 @@ def test_plan_set3_all_stay_no_placement(mock_key, mock_client, mock_call):
         entities=[_make_entity("bar", 1, 10)],
         set_3_groups=[["bar"]],
     )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
-
-    assert plan.abort is False
-    assert plan.set3_migrate == []
-    assert plan.placements == []
+    _assert_set3_all_stay_no_placements(c, "src/big.py", _CONFIG)
     assert mock_call.call_count == 1  # only set3 advice call
 
 
@@ -263,10 +298,17 @@ def test_plan_set3_invalid_group_id_treated_as_stay(mock_key, mock_client, mock_
         entities=[_make_entity("bar", 1, 10)],
         set_3_groups=[["bar"]],
     )
+    _assert_set3_all_stay_no_placements(c, "src/big.py", _CONFIG)
+
+
+def _plan_set3_bar_stays():
+    c = _classified(
+        entities=[_make_entity("bar", 1, 10)],
+        set_3_groups=[["bar"]],
+    )
     plan = advise_file_limiter(c, "src/big.py", _CONFIG)
-    assert plan.abort is False
     assert plan.set3_migrate == []
-    assert plan.placements == []
+    return plan
 
 
 @patch(_PATCH_CALL)
@@ -277,12 +319,7 @@ def test_plan_set3_non_int_group_id_treated_as_stay(mock_key, mock_client, mock_
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
     mock_call.return_value = {"decisions": [{"group_id": "zero", "action": "migrate"}]}
-    c = _classified(
-        entities=[_make_entity("bar", 1, 10)],
-        set_3_groups=[["bar"]],
-    )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
-    assert plan.set3_migrate == []
+    _plan_set3_bar_stays()
 
 
 @patch(_PATCH_CALL)
@@ -295,17 +332,26 @@ def test_plan_set3_unknown_action_treated_as_stay(mock_key, mock_client, mock_ca
     mock_call.return_value = {
         "decisions": [{"group_id": 0, "action": "delete"}]  # not in enum
     }
-    c = _classified(
-        entities=[_make_entity("bar", 1, 10)],
-        set_3_groups=[["bar"]],
-    )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
-    assert plan.set3_migrate == []
+    _plan_set3_bar_stays()
 
 
 # ---------------------------------------------------------------------------
 # Invalid LLM responses — placement
 # ---------------------------------------------------------------------------
+
+
+def _plan_with_two_set2_groups_aborts(
+    *,
+    path: str = "src/big.py",
+    config: CrispenConfig = _CONFIG,
+):
+    c = _classified(
+        entities=[_make_entity("foo", 1, 5), _make_entity("bar", 6, 10)],
+        set_2_groups=[["foo"], ["bar"]],
+    )
+    plan = advise_file_limiter(c, path, config)
+    assert plan.abort is True
+    return plan
 
 
 @patch(_PATCH_CALL)
@@ -319,12 +365,7 @@ def test_plan_placement_incomplete_aborts(mock_key, mock_client, mock_call):
     mock_call.return_value = {
         "placements": [{"group_id": 0, "target_file": "utils.py"}]
     }
-    c = _classified(
-        entities=[_make_entity("foo", 1, 5), _make_entity("bar", 6, 10)],
-        set_2_groups=[["foo"], ["bar"]],
-    )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
-    assert plan.abort is True
+    _plan_with_two_set2_groups_aborts()
 
 
 @patch(_PATCH_CALL)
@@ -340,12 +381,7 @@ def test_plan_placement_duplicate_group_id_aborts(mock_key, mock_client, mock_ca
             {"group_id": 0, "target_file": "other.py"},  # duplicate
         ]
     }
-    c = _classified(
-        entities=[_make_entity("foo", 1, 5), _make_entity("bar", 6, 10)],
-        set_2_groups=[["foo"], ["bar"]],
-    )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
-    assert plan.abort is True
+    _plan_with_two_set2_groups_aborts()
 
 
 @patch(_PATCH_CALL)
@@ -482,13 +518,10 @@ def test_plan_placement_prev_failure_appended_to_prompt(
     mock_key, mock_client, mock_call
 ):
     """prev_placement_failure is appended to the placement prompt."""
-    mock_key.return_value = "key"
-    mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": 0, "target_file": "utils.py"}]
-    }
-
-    c = _classified(
+    c, mock_call = _setup_key_client_call_and_classified(
+        mock_key,
+        mock_client,
+        mock_call,
         entities=[_make_entity("foo", 1, 10)],
         set_2_groups=[["foo"]],
     )
@@ -507,11 +540,7 @@ def test_plan_placement_prev_failure_appended_to_prompt(
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
-def test_plan_chunked_placement_makes_multiple_calls(mock_key, mock_client, mock_call):
-    """More than _PLACEMENT_CHUNK_SIZE set-2 groups → multiple placement calls."""
+def _build_chunked_placement_fixtures(mock_key, mock_client):
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
 
@@ -529,6 +558,27 @@ def test_plan_chunked_placement_makes_multiple_calls(mock_key, mock_client, mock
     }
     # Second chunk has 1 group (group_id 0).
     second_chunk_response = {"placements": [{"group_id": 0, "target_file": "last.py"}]}
+
+    return BuildChunkedPlacementFixturesResult(
+        n=n,
+        entities=entities,
+        groups=groups,
+        first_chunk_response=first_chunk_response,
+        second_chunk_response=second_chunk_response,
+    )
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_plan_chunked_placement_makes_multiple_calls(mock_key, mock_client, mock_call):
+    """More than _PLACEMENT_CHUNK_SIZE set-2 groups → multiple placement calls."""
+    _ = _build_chunked_placement_fixtures(mock_key, mock_client)
+    n = _.n
+    entities = _.entities
+    groups = _.groups
+    first_chunk_response = _.first_chunk_response
+    second_chunk_response = _.second_chunk_response
 
     mock_call.side_effect = [first_chunk_response, second_chunk_response]
 
@@ -579,20 +629,12 @@ def test_plan_chunked_placement_second_chunk_fails_aborts(
 @patch(_PATCH_KEY)
 def test_plan_chunked_placement_chunk_retry_succeeds(mock_key, mock_client, mock_call):
     """A chunk that fails once is retried; on success the full plan is returned."""
-    mock_key.return_value = "key"
-    mock_client.return_value = MagicMock()
-
-    n = _PLACEMENT_CHUNK_SIZE + 1
-    entities = [_make_entity(f"f{i}", i * 2 + 1, i * 2 + 2) for i in range(n)]
-    groups = [[f"f{i}"] for i in range(n)]
-
-    first_chunk_response = {
-        "placements": [
-            {"group_id": j, "target_file": f"file_{j}.py"}
-            for j in range(_PLACEMENT_CHUNK_SIZE)
-        ]
-    }
-    second_chunk_response = {"placements": [{"group_id": 0, "target_file": "last.py"}]}
+    _ = _build_chunked_placement_fixtures(mock_key, mock_client)
+    n = _.n
+    entities = _.entities
+    groups = _.groups
+    first_chunk_response = _.first_chunk_response
+    second_chunk_response = _.second_chunk_response
 
     cfg = CrispenConfig(file_limiter_retries=1)  # 2 attempts per chunk
     # First chunk succeeds; second chunk fails once then succeeds.

@@ -110,6 +110,16 @@ def _verify_preservation(
 # ---------------------------------------------------------------------------
 
 
+def _append_file_cannot_be_split_skip(
+    abort_reason: Optional[str],
+    filepath: Path,
+    retry_msgs: List[str],
+) -> bool:
+    reason = f": {abort_reason}" if abort_reason else ""
+    retry_msgs.append(f"SKIP {filepath} (FileLimiter): file cannot be split{reason}")
+    return True
+
+
 def run_file_limiter(
     filepath: str,
     original_source: str,
@@ -155,7 +165,57 @@ def run_file_limiter(
     max_attempts = 1 + config.file_limiter_retries
     retry_msgs: List[str] = []
     last_abort: bool = True
+    return _attempt_file_split_with_retries(
+        classified,
+        config,
+        existing_files,
+        filepath,
+        last_abort,
+        max_attempts,
+        post_source,
+        retry_msgs,
+        source_name,
+    )
+
+
+def _attempt_file_split_with_retries(
+    classified,
+    config,
+    existing_files,
+    filepath,
+    last_abort,
+    max_attempts,
+    post_source,
+    retry_msgs,
+    source_name,
+):
     plan: Optional[object] = None
+    return _split_file_with_retries(
+        classified,
+        config,
+        existing_files,
+        filepath,
+        last_abort,
+        max_attempts,
+        plan,
+        post_source,
+        retry_msgs,
+        source_name,
+    )
+
+
+def _split_file_with_retries(
+    classified,
+    config,
+    existing_files,
+    filepath,
+    last_abort,
+    max_attempts,
+    plan,
+    post_source,
+    retry_msgs,
+    source_name,
+):
     split: Optional[SplitResult] = None
     prev_set3_failure: str = ""
     prev_placement_failure: str = ""
@@ -171,11 +231,11 @@ def run_file_limiter(
         )
 
         if plan.abort:
-            reason = f": {plan.abort_reason}" if plan.abort_reason else ""
-            retry_msgs.append(
-                f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"
+            last_abort = _append_file_cannot_be_split_skip(
+                plan.abort_reason,
+                filepath,
+                retry_msgs,
             )
-            last_abort = True
             if "set-3 groups" in plan.abort_reason:
                 prev_set3_failure = (
                     "Your previous response was incomplete. "
@@ -221,11 +281,11 @@ def run_file_limiter(
         split = generate_file_splits(classified, plan, post_source, filepath)
 
         if split.abort:
-            reason = f": {split.abort_reason}" if split.abort_reason else ""
-            retry_msgs.append(
-                f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"
+            last_abort = _append_file_cannot_be_split_skip(
+                split.abort_reason,
+                filepath,
+                retry_msgs,
             )
-            last_abort = True
             prev_assignments = "; ".join(
                 f"{', '.join(p.group)} \u2192 {p.target_file}" for p in plan.placements
             )
