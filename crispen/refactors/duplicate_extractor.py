@@ -865,6 +865,12 @@ def _llm_verify_extraction(
         "replacement also propagates that return value\n"
         "5. The call site replacements match the original indentation and cover "
         "exactly the lines of the original block\n"
+        "6. If the helper is called more than once with different arguments, verify "
+        "each call site against the exact local variables that appeared in the "
+        "original code at that location — not merely variables of the same type. "
+        "Same-type variables (e.g. two dicts, two strings) that are both in scope "
+        "are a swap risk: confirm neither was substituted for the other across call "
+        "sites.\n"
         "If correct, set is_correct=True and issues=[]. "
         "Otherwise set is_correct=False and list each specific issue."
     )
