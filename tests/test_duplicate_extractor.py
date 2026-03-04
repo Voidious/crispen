@@ -3813,10 +3813,29 @@ def test_replacement_steals_post_block_at_eof():
 
 
 def test_replacement_steals_post_block_blank_after():
-    # Post-block line is blank — skip (blank lines are not "code").
+    # Post-block line is blank but there is a non-blank line further down.
+    # The check must scan past the blank to find the real post-block code.
     source_lines = ["x = 1\n", "\n", "y = 2\n"]
-    seq = _make_steal_seq(1)  # next_idx=1 → "\n" → stripped is empty
-    assert not _replacement_steals_post_block_line([seq], ["y = 2\n"], source_lines)
+    seq = _make_steal_seq(1)  # next_idx=1 → "\n" → scan → next_idx=2 → "y = 2"
+    assert _replacement_steals_post_block_line([seq], ["y = 2\n"], source_lines)
+
+
+def test_replacement_steals_post_block_blank_after_no_match():
+    # Blank after block, but replacement doesn't steal the non-blank post-block line.
+    source_lines = ["x = 1\n", "\n", "y = 2\n"]
+    seq = _make_steal_seq(1)
+    assert not _replacement_steals_post_block_line(
+        [seq], ["z = helper()\n"], source_lines
+    )
+
+
+def test_replacement_steals_post_block_all_blank_after():
+    # Only blank lines follow the block — no real post-block line to steal.
+    source_lines = ["x = 1\n", "\n", "\n"]
+    seq = _make_steal_seq(1)
+    assert not _replacement_steals_post_block_line(
+        [seq], ["z = helper()\n"], source_lines
+    )
 
 
 def test_replacement_steals_post_block_no_match():

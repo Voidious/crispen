@@ -1240,11 +1240,12 @@ def _replacement_steals_post_block_line(
     """
     for seq, replacement in zip(group, call_replacements):
         next_idx = seq.end_line  # 0-based index of the first line after the block
+        # Scan forward past blank lines to find the first real post-block line.
+        while next_idx < len(source_lines) and not source_lines[next_idx].strip():
+            next_idx += 1
         if next_idx >= len(source_lines):
             continue
         post_block = source_lines[next_idx].strip()
-        if not post_block:
-            continue
         repl_lines = [ln.strip() for ln in replacement.splitlines() if ln.strip()]
         if repl_lines and repl_lines[-1] == post_block:
             return True
