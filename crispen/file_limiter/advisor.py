@@ -494,11 +494,9 @@ def _assign_placements(
     all_placements: List[GroupPlacement] = []
     for chunk_start in range(0, len(groups_to_place), _PLACEMENT_CHUNK_SIZE):
         chunk = groups_to_place[chunk_start : chunk_start + _PLACEMENT_CHUNK_SIZE]
-        # Scale min_files to this chunk's share of total lines.  The 1.5×
-        # spread factor compensates for naming overlap between chunks: if two
-        # chunks independently pick the same target file, the merged result
-        # still reaches the global minimum.  When total_lines is zero (all
-        # entities have zero-length ranges) fall back to the global value.
+        # Scale min_files to this chunk's share of total lines.  When
+        # total_lines is zero (all entities have zero-length ranges) fall
+        # back to the global value.
         if total_lines > 0:
             chunk_lines = sum(
                 entity_map[name].end_line - entity_map[name].start_line + 1
@@ -506,9 +504,7 @@ def _assign_placements(
                 for name in group
                 if name in entity_map
             )
-            chunk_min_files = max(
-                2, math.ceil(min_files * 1.5 * chunk_lines / total_lines)
-            )
+            chunk_min_files = max(2, math.ceil(min_files * chunk_lines / total_lines))
         else:
             chunk_min_files = min_files
         chunk_placements: Optional[List[GroupPlacement]] = None
