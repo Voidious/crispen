@@ -1,6 +1,8 @@
 """Tests for file_limiter.code_gen — 100% branch coverage."""
 
 from __future__ import annotations
+from typing import Any
+from dataclasses import dataclass
 
 import textwrap
 
@@ -31,9 +33,21 @@ from crispen.file_limiter.code_gen import (
 from crispen.file_limiter.entity_parser import Entity, EntityKind
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@dataclass
+class GenerateFileSplitsSetupResult:
+    e_foo: Any
+    e_bar: Any
+    c: Any
+    plan: Any
+    result: Any
+
+
+@dataclass
+class SetupAddReExportsTestResult:
+    source: Any
+    entity: Any
+    placement: Any
+    result: Any
 
 
 def _make_entity(name: str, start: int, end: int, defines=None) -> Entity:
@@ -684,15 +698,22 @@ def test_generate_future_import_not_duplicated_when_in_entity_source():
     assert first_non_blank == "from __future__ import annotations"
 
 
-def test_generate_future_import_always_included():
-    source = "from __future__ import annotations\n\ndef foo():\n    pass\n"
-    entity = _make_entity("foo", 3, 4)
+def _generate_and_get_new_src(
+    source, entity_name="foo", start=3, end=4, target_file="utils.py"
+):
+    entity = _make_entity(entity_name, start, end)
     c = _classified(entities=[entity])
-    plan = _plan([GroupPlacement(group=["foo"], target_file="utils.py")])
+    plan = _plan([GroupPlacement(group=[entity_name], target_file=target_file)])
 
     result = generate_file_splits(c, plan, source, "big.py")
 
-    new_src = result.new_files["utils.py"]
+    new_src = result.new_files[target_file]
+    return result, new_src
+
+
+def test_generate_future_import_always_included():
+    source = "from __future__ import annotations\n\ndef foo():\n    pass\n"
+    result, new_src = _generate_and_get_new_src(source)
     assert "from __future__ import annotations" in new_src
 
 
@@ -1159,6 +1180,32 @@ def test_extract_shared_helpers_transitive_pull_in():
     assert len(synthetic) == 2
 
 
+def _call_extract_shared_helpers(
+    entity_source_map,
+    entity_map,
+    classified,
+    migrated_names,
+):
+    file_entity_names = {"f1.py": ["fn_1"], "f2.py": ["fn_2"]}
+    name_to_target_file = {
+        "helper_a": "original.py",
+        "helper_b": "original.py",
+        "fn_1": "f1.py",
+        "fn_2": "f2.py",
+    }
+
+    synthetic = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+    return file_entity_names, name_to_target_file, synthetic
+
+
 def test_extract_shared_helpers_scc_prevents_new_to_new_cycle():
     # helper_a is wanted by f1.py; helper_b is wanted by f2.py.
     # They mutually reference each other → one SCC → must go to the same file
@@ -1189,22 +1236,11 @@ def test_extract_shared_helpers_scc_prevents_new_to_new_cycle():
         "fn_1": "def fn_1():\n    helper_a()",
         "fn_2": "def fn_2():\n    helper_b()",
     }
-    file_entity_names = {"f1.py": ["fn_1"], "f2.py": ["fn_2"]}
-    name_to_target_file = {
-        "helper_a": "original.py",
-        "helper_b": "original.py",
-        "fn_1": "f1.py",
-        "fn_2": "f2.py",
-    }
-
-    synthetic = _extract_shared_helpers(
-        file_entity_names,
+    file_entity_names, name_to_target_file, synthetic = _call_extract_shared_helpers(
         entity_source_map,
         entity_map,
         classified,
-        name_to_target_file,
         migrated_names,
-        "original.py",
     )
 
     # Both helpers must land in the same file (f1.py is first in plan order).
@@ -1238,22 +1274,11 @@ def test_extract_shared_helpers_transitive_dep_already_wanted():
         "fn_1": "def fn_1():\n    helper_a()",
         "fn_2": "def fn_2():\n    helper_b()",
     }
-    file_entity_names = {"f1.py": ["fn_1"], "f2.py": ["fn_2"]}
-    name_to_target_file = {
-        "helper_a": "original.py",
-        "helper_b": "original.py",
-        "fn_1": "f1.py",
-        "fn_2": "f2.py",
-    }
-
-    synthetic = _extract_shared_helpers(
-        file_entity_names,
+    file_entity_names, name_to_target_file, synthetic = _call_extract_shared_helpers(
         entity_source_map,
         entity_map,
         classified,
-        name_to_target_file,
         migrated_names,
-        "original.py",
     )
 
     # Both helpers are extracted (as separate SCCs since no mutual cycle in graph).
@@ -1569,27 +1594,32 @@ def test_prune_unused_imports_relative_import_narrowed():
 def test_generate_prunes_unused_names_from_multiname_import():
     # foo uses only List, not Dict; the new file's import should be narrowed.
     source = "from typing import Dict, List\n\ndef foo(x: List):\n    return x\n"
-    entity = _make_entity("foo", 3, 4)
-    c = _classified(entities=[entity])
-    plan = _plan([GroupPlacement(group=["foo"], target_file="utils.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
-
-    new_src = result.new_files["utils.py"]
+    result, new_src = _generate_and_get_new_src(source)
     assert "from typing import List" in new_src
     assert "Dict" not in new_src
+
+
+def _generate_file_splits_setup(source, target_file="utils.py", source_file="big.py"):
+    e_foo = _make_entity("foo", 3, 4)
+    e_bar = _make_entity("bar", 6, 7)
+    c = _classified(entities=[e_foo, e_bar])
+    plan = _plan([GroupPlacement(group=["foo"], target_file=target_file)])
+    result = generate_file_splits(c, plan, source, source_file)
+    return GenerateFileSplitsSetupResult(
+        e_foo=e_foo, e_bar=e_bar, c=c, plan=plan, result=result
+    )
 
 
 def test_generate_prunes_fully_unused_import_from_original():
     # import os is only used by foo; after foo migrates the original no longer
     # needs os, so the import should be removed.
     source = "import os\n\ndef foo():\n    os.getcwd()\n\ndef bar():\n    return 1\n"
-    e_foo = _make_entity("foo", 3, 4)
-    e_bar = _make_entity("bar", 6, 7)
-    c = _classified(entities=[e_foo, e_bar])
-    plan = _plan([GroupPlacement(group=["foo"], target_file="utils.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
+    _ = _generate_file_splits_setup(source)
+    e_foo = _.e_foo
+    e_bar = _.e_bar
+    c = _.c
+    plan = _.plan
+    result = _.result
 
     assert "from .utils import foo" in result.original_source
     assert "import os" not in result.original_source
@@ -1604,12 +1634,12 @@ def test_generate_narrows_partial_unused_import_in_original():
         "def foo(x: Dict):\n    return x\n\n"
         "def bar(x: List):\n    return x\n"
     )
-    e_foo = _make_entity("foo", 3, 4)
-    e_bar = _make_entity("bar", 6, 7)
-    c = _classified(entities=[e_foo, e_bar])
-    plan = _plan([GroupPlacement(group=["foo"], target_file="utils.py")])
-
-    result = generate_file_splits(c, plan, source, "big.py")
+    _ = _generate_file_splits_setup(source)
+    e_foo = _.e_foo
+    e_bar = _.e_bar
+    c = _.c
+    plan = _.plan
+    result = _.result
 
     assert "from typing import List" in result.original_source
     assert "Dict" not in result.original_source
@@ -1730,13 +1760,20 @@ def test_collect_external_imported_names_no_project_root(tmp_path):
     assert isinstance(result, set)
 
 
-def test_collect_external_imported_names_absolute_import(tmp_path):
+def _setup_pkg_with_utils(
+    tmp_path, pkg_name: str = "mypkg", mod_name: str = "utils.py"
+):
     (tmp_path / "pyproject.toml").write_text("")
-    pkg = tmp_path / "mypkg"
+    pkg = tmp_path / pkg_name
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
-    mod = pkg / "utils.py"
+    mod = pkg / mod_name
     mod.write_text("def _helper():\n    pass\n")
+    return pkg, mod
+
+
+def test_collect_external_imported_names_absolute_import(tmp_path):
+    pkg, mod = _setup_pkg_with_utils(tmp_path)
     caller = tmp_path / "tests" / "test_utils.py"
     caller.parent.mkdir()
     caller.write_text("from mypkg.utils import _helper\n")
@@ -1745,12 +1782,7 @@ def test_collect_external_imported_names_absolute_import(tmp_path):
 
 
 def test_collect_external_imported_names_relative_import(tmp_path):
-    (tmp_path / "pyproject.toml").write_text("")
-    pkg = tmp_path / "mypkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("")
-    mod = pkg / "utils.py"
-    mod.write_text("def _helper():\n    pass\n")
+    pkg, mod = _setup_pkg_with_utils(tmp_path)
     sibling = pkg / "other.py"
     sibling.write_text("from .utils import _helper\n")
     result = _collect_external_imported_names(str(mod))
@@ -1831,15 +1863,26 @@ def test_collect_external_imported_names_relative_level_too_deep(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_add_re_exports_private_in_external_loads():
-    # Private name not referenced in remaining source but present in external_loads
-    # → re-export proxy IS added so the external caller continues to work.
+def _setup_add_re_exports_test():
     source = "import os\n"
     entity = _make_entity("_helper", 1, 2)
     placement = GroupPlacement(group=["_helper"], target_file="utils.py")
     result = _add_re_exports(
         source, [placement], {"_helper": entity}, {}, external_loads={"_helper"}
     )
+    return SetupAddReExportsTestResult(
+        source=source, entity=entity, placement=placement, result=result
+    )
+
+
+def test_add_re_exports_private_in_external_loads():
+    # Private name not referenced in remaining source but present in external_loads
+    # → re-export proxy IS added so the external caller continues to work.
+    _ = _setup_add_re_exports_test()
+    source = _.source
+    entity = _.entity
+    placement = _.placement
+    result = _.result
     assert "from .utils import _helper" in result
 
 
@@ -1892,12 +1935,11 @@ def test_generate_private_entity_reexported_when_external_caller(tmp_path):
 
 def test_add_re_exports_private_external_only_gets_noqa():
     # Private name in external_loads but NOT in remaining source → noqa F401 comment.
-    source = "import os\n"
-    entity = _make_entity("_helper", 1, 2)
-    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
-    result = _add_re_exports(
-        source, [placement], {"_helper": entity}, {}, external_loads={"_helper"}
-    )
+    _ = _setup_add_re_exports_test()
+    source = _.source
+    entity = _.entity
+    placement = _.placement
+    result = _.result
     assert "from .utils import _helper  # noqa F401" in result
 
 

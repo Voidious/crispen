@@ -49,6 +49,13 @@ _IMPORT_LINE_RE = re.compile(r"^(import\s+|from\s+\S.*\s+import\s+)")
 _FUTURE_IMPORT_LINE_RE = re.compile(r"^from __future__ import .*\n?", re.MULTILINE)
 
 
+def _safe_parse_ast(source_code: str) -> Optional[ast.AST]:
+    try:
+        return ast.parse(source_code)
+    except SyntaxError:
+        return None
+
+
 def _import_derived_names(source: str) -> Set[str]:
     """Return names introduced solely by import statements in *source*.
 
@@ -56,9 +63,8 @@ def _import_derived_names(source: str) -> Set[str]:
     statements and cannot be re-exported from a new module the way
     assignment-defined names can.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _safe_parse_ast(source)
+    if tree is None:
         return set()
     names: Set[str] = set()
     for node in tree.body:
@@ -73,9 +79,8 @@ def _import_derived_names(source: str) -> Set[str]:
 
 def _collect_name_loads(source: str) -> Set[str]:
     """Return all Name loads referenced in *source*."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _safe_parse_ast(source)
+    if tree is None:
         return set()
     names: Set[str] = set()
     for node in ast.walk(tree):
@@ -113,6 +118,14 @@ def _extract_import_info(source: str) -> List[ImportInfo]:
     return result
 
 
+def _collect_referenced_names(entity_names, entity_source_map):
+    referenced: Set[str] = set()
+    for name in entity_names:
+        src = entity_source_map.get(name, "")
+        referenced |= _collect_name_loads(src)
+    return referenced
+
+
 def _find_needed_imports(
     entity_names: List[str],
     entity_source_map: Dict[str, str],
@@ -125,10 +138,7 @@ def _find_needed_imports(
     when any of the names they introduce appear in the entities' source.
     Duplicate import source strings are deduplicated.
     """
-    referenced: Set[str] = set()
-    for name in entity_names:
-        src = entity_source_map.get(name, "")
-        referenced |= _collect_name_loads(src)
+    referenced = _collect_referenced_names(entity_names, entity_source_map)
 
     needed: List[str] = []
     seen: Set[str] = set()
@@ -187,10 +197,7 @@ def _find_cross_file_imports(
     absolute (e.g. ``from tests.constants import _CONST``), which is required
     for test files that pytest loads as top-level modules.
     """
-    referenced: Set[str] = set()
-    for name in entity_names:
-        src = entity_source_map.get(name, "")
-        referenced |= _collect_name_loads(src)
+    referenced = _collect_referenced_names(entity_names, entity_source_map)
     from_files: Dict[str, List[str]] = {}  # source_file → names
     for ref_name in sorted(referenced):
         source_file = name_to_target_file.get(ref_name)
@@ -224,9 +231,8 @@ def _import_line_numbers(entity: Entity, entity_src: str) -> Set[int]:
     Used to preserve import lines in the original file when a TOP_LEVEL
     entity that mixes imports and assignments is migrated.
     """
-    try:
-        tree = ast.parse(entity_src)
-    except SyntaxError:
+    tree = _safe_parse_ast(entity_src)
+    if tree is None:
         return set()
     result: Set[int] = set()
     for node in tree.body:
@@ -486,6 +492,26 @@ def _topo_depth(graph: Dict[str, Set[str]]) -> Dict[str, int]:
     return depths
 
 
+def _update_deps_for_target(
+    target_file: str,
+    deps: Dict[str, Set[str]],
+    scc: Set[str],
+    scc_wanting: Set[str],
+    entity_source_map: Dict[str, str],
+    name_to_target_file: Dict[str, str],
+    file_entity_names: Set[str],
+) -> None:
+    for wanting_file in scc_wanting:
+        if wanting_file != target_file:
+            deps[wanting_file].add(target_file)
+    for helper_name in scc:
+        src = entity_source_map.get(helper_name, "")
+        for ref_name in _collect_name_loads(src):
+            dep_file = name_to_target_file.get(ref_name)
+            if dep_file and dep_file != target_file and dep_file in file_entity_names:
+                deps[target_file].add(dep_file)
+
+
 def _extract_shared_helpers(
     file_entity_names: Dict[str, List[str]],
     entity_source_map: Dict[str, str],
@@ -600,19 +626,15 @@ def _extract_shared_helpers(
             trial_deps: Dict[str, Set[str]] = {
                 f: set(deps) for f, deps in file_deps.items()
             }
-            for wanting_file in scc_wanting:
-                if wanting_file != candidate:
-                    trial_deps[wanting_file].add(candidate)
-            for helper_name in scc:
-                src = entity_source_map.get(helper_name, "")
-                for ref_name in _collect_name_loads(src):
-                    dep_file = name_to_target_file.get(ref_name)
-                    if (
-                        dep_file
-                        and dep_file != candidate
-                        and dep_file in file_entity_names
-                    ):
-                        trial_deps[candidate].add(dep_file)
+            _update_deps_for_target(
+                candidate,
+                trial_deps,
+                scc,
+                scc_wanting,
+                entity_source_map,
+                name_to_target_file,
+                file_entity_names,
+            )
             if not any(len(s) > 1 for s in find_sccs(trial_deps)):
                 chosen = candidate
                 break
@@ -621,15 +643,15 @@ def _extract_shared_helpers(
             continue  # No cycle-free placement — leave helpers in original file.
 
         # Apply the chosen placement: update file_deps for subsequent SCC decisions.
-        for wanting_file in scc_wanting:
-            if wanting_file != chosen:
-                file_deps[wanting_file].add(chosen)
-        for helper_name in scc:
-            src = entity_source_map.get(helper_name, "")
-            for ref_name in _collect_name_loads(src):
-                dep_file = name_to_target_file.get(ref_name)
-                if dep_file and dep_file != chosen and dep_file in file_entity_names:
-                    file_deps[chosen].add(dep_file)
+        _update_deps_for_target(
+            chosen,
+            file_deps,
+            scc,
+            scc_wanting,
+            entity_source_map,
+            name_to_target_file,
+            file_entity_names,
+        )
 
         # Prepend extracted helpers so they appear before the functions that use them.
         file_entity_names[chosen] = list(scc) + file_entity_names[chosen]

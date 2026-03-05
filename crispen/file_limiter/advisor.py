@@ -228,6 +228,17 @@ def _advise_set3(
     ]
 
 
+def _init_placements_from_result(
+    result: Optional[dict],
+) -> Optional[tuple[List[GroupPlacement], set]]:
+    if result is None:
+        return None
+
+    placements: List[GroupPlacement] = []
+    placed_ids: set = set()
+    return placements, placed_ids
+
+
 def _assign_placements_chunk(
     chunk: List[List[str]],
     classified: ClassifiedEntities,
@@ -294,11 +305,11 @@ def _assign_placements_chunk(
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
     )
-    if result is None:
+    init_result = _init_placements_from_result(result)
+    if init_result is None:
         return None
 
-    placements: List[GroupPlacement] = []
-    placed_ids: set = set()
+    placements, placed_ids = init_result
     for item in result.get("placements", []):
         gid = item.get("group_id")
         target = item.get("target_file", "")
@@ -432,11 +443,15 @@ def _rename_conflicting_chunk(
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
     )
-    if result is None:
+    return _extract_placements_from_result(chunk, forbidden_files, n_groups, result)
+
+
+def _extract_placements_from_result(chunk, forbidden_files, n_groups, result):
+    init_result = _init_placements_from_result(result)
+    if init_result is None:
         return None
 
-    placements: List[GroupPlacement] = []
-    placed_ids: set = set()
+    placements, placed_ids = init_result
     for item in result.get("placements", []):
         gid = item.get("group_id")
         target = item.get("target_file", "")

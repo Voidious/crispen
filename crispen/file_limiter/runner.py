@@ -155,6 +155,15 @@ def _detect_naming_conflicts(
 # ---------------------------------------------------------------------------
 
 
+def _append_skip_message(
+    abort_reason: str | None,
+    retry_msgs: list[str],
+    filepath: Path,
+) -> None:
+    reason = f": {abort_reason}" if abort_reason else ""
+    retry_msgs.append(f"SKIP {filepath} (FileLimiter): file cannot be split{reason}")
+
+
 def run_file_limiter(
     filepath: str,
     original_source: str,
@@ -203,9 +212,125 @@ def run_file_limiter(
     max_attempts = 1 + config.file_limiter_retries
     retry_msgs: List[str] = []
     last_abort: bool = True
+    return _execute_file_limiter(
+        classified,
+        config,
+        existing_dirs,
+        existing_files,
+        filepath,
+        last_abort,
+        max_attempts,
+        post_source,
+        retry_msgs,
+        source_name,
+    )
+
+
+def _execute_file_limiter(
+    classified,
+    config,
+    existing_dirs,
+    existing_files,
+    filepath,
+    last_abort,
+    max_attempts,
+    post_source,
+    retry_msgs,
+    source_name,
+):
     plan: Optional[object] = None
+    return _run_file_limiter_with_retries(
+        classified,
+        config,
+        existing_dirs,
+        existing_files,
+        filepath,
+        last_abort,
+        max_attempts,
+        plan,
+        post_source,
+        retry_msgs,
+        source_name,
+    )
+
+
+def _run_file_limiter_with_retries(
+    classified,
+    config,
+    existing_dirs,
+    existing_files,
+    filepath,
+    last_abort,
+    max_attempts,
+    plan,
+    post_source,
+    retry_msgs,
+    source_name,
+):
     split: Optional[SplitResult] = None
+    return _execute_file_limiter_retry_loop(
+        classified,
+        config,
+        existing_dirs,
+        existing_files,
+        filepath,
+        last_abort,
+        max_attempts,
+        plan,
+        post_source,
+        retry_msgs,
+        source_name,
+        split,
+    )
+
+
+def _execute_file_limiter_retry_loop(
+    classified,
+    config,
+    existing_dirs,
+    existing_files,
+    filepath,
+    last_abort,
+    max_attempts,
+    plan,
+    post_source,
+    retry_msgs,
+    source_name,
+    split,
+):
     prev_set3_failure: str = ""
+    return _run_file_limiter_retry_loop(
+        classified,
+        config,
+        existing_dirs,
+        existing_files,
+        filepath,
+        last_abort,
+        max_attempts,
+        plan,
+        post_source,
+        prev_set3_failure,
+        retry_msgs,
+        source_name,
+        split,
+    )
+
+
+def _run_file_limiter_retry_loop(
+    classified,
+    config,
+    existing_dirs,
+    existing_files,
+    filepath,
+    last_abort,
+    max_attempts,
+    plan,
+    post_source,
+    prev_set3_failure,
+    retry_msgs,
+    source_name,
+    split,
+):
     prev_placement_failure: str = ""
 
     for _attempt in range(max_attempts):
@@ -219,10 +344,7 @@ def run_file_limiter(
         )
 
         if plan.abort:
-            reason = f": {plan.abort_reason}" if plan.abort_reason else ""
-            retry_msgs.append(
-                f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"
-            )
+            _append_skip_message(plan.abort_reason, retry_msgs, filepath)
             last_abort = True
             if "set-3 groups" in plan.abort_reason:
                 prev_set3_failure = (
@@ -299,10 +421,7 @@ def run_file_limiter(
         split = generate_file_splits(classified, plan, post_source, filepath)
 
         if split.abort:
-            reason = f": {split.abort_reason}" if split.abort_reason else ""
-            retry_msgs.append(
-                f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"
-            )
+            _append_skip_message(split.abort_reason, retry_msgs, filepath)
             last_abort = True
             prev_assignments = "; ".join(
                 f"{', '.join(p.group)} \u2192 {p.target_file}" for p in plan.placements

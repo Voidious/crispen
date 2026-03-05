@@ -111,9 +111,7 @@ def test_verify_entity_source_in_new_file():
     assert _verify_preservation([entity], split, post_source, []) == []
 
 
-def test_verify_entity_source_missing():
-    post_source = "def foo():\n    pass\n"
-    entity = _make_entity("foo", 1, 2)
+def _verify_missing_entity(entity, post_source):
     split = SplitResult(
         new_files={},
         original_source="# nothing relevant\n",
@@ -121,6 +119,13 @@ def test_verify_entity_source_missing():
     )
     failures = _verify_preservation([entity], split, post_source, [])
     assert len(failures) == 1
+    return failures
+
+
+def test_verify_entity_source_missing():
+    post_source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    failures = _verify_missing_entity(entity, post_source)
     assert "'foo'" in failures[0]
     assert "1" in failures[0]  # start line
     assert "2" in failures[0]  # end line
@@ -130,13 +135,7 @@ def test_verify_entity_source_missing_long():
     # Entity with more than 3 lines → preview includes trailing "..."
     post_source = "def foo():\n    a = 1\n    b = 2\n    c = 3\n    pass\n"
     entity = _make_entity("foo", 1, 5)
-    split = SplitResult(
-        new_files={},
-        original_source="# nothing relevant\n",
-        abort=False,
-    )
-    failures = _verify_preservation([entity], split, post_source, [])
-    assert len(failures) == 1
+    failures = _verify_missing_entity(entity, post_source)
     assert "..." in failures[0]
 
 
@@ -395,6 +394,21 @@ def test_runner_plan_abort_retries_and_fails(mock_classify, mock_advise):
     assert sum(1 for m in result.messages if "cannot be split" in m) == 2
 
 
+def _run_and_assert_retry_success(
+    mock_gen, mock_advise, mock_gen_return=None, cfg_retries=1
+):
+    if mock_gen_return is None:
+        mock_gen_return = _good_split()
+    mock_gen.return_value = mock_gen_return
+    cfg = CrispenConfig(file_limiter_retries=cfg_retries)
+
+    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], cfg)
+
+    assert result.abort is False
+    assert mock_advise.call_count == 2
+    return result
+
+
 @patch(_PATCH_GEN)
 @patch(_PATCH_ADVISE)
 @patch(_PATCH_CLASSIFY)
@@ -411,13 +425,7 @@ def test_runner_plan_abort_retries_and_succeeds(mock_classify, mock_advise, mock
         ),
         _plan_with(["foo"], "utils.py"),
     ]
-    mock_gen.return_value = _good_split()
-    cfg = CrispenConfig(file_limiter_retries=1)
-
-    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], cfg)
-
-    assert result.abort is False
-    assert mock_advise.call_count == 2
+    result = _run_and_assert_retry_success(mock_gen, mock_advise)
     # Failed attempt message is preserved alongside the success message.
     assert any("cannot be split" in m for m in result.messages)
     assert any("FileLimiter: moved" in m for m in result.messages)
@@ -430,17 +438,29 @@ def test_runner_plan_abort_retries_and_succeeds(mock_classify, mock_advise, mock
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_ADVISE)
-@patch(_PATCH_CLASSIFY)
-def test_runner_no_placements(mock_classify, mock_advise):
-    mock_classify.return_value = _make_classified()
+def _run_no_placement_test(
+    mock_classify,
+    mock_advise,
+    classified_value,
+    config,
+):
+    mock_classify.return_value = classified_value
     mock_advise.return_value = _empty_plan()
 
     source = "def foo():\n    pass\n"
-    result = run_file_limiter("big.py", "", source, [], _CONFIG)
+    result = run_file_limiter("big.py", "", source, [], config)
 
     assert result.abort is False
     assert result.new_files == {}
+    return result, source
+
+
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_no_placements(mock_classify, mock_advise):
+    result, source = _run_no_placement_test(
+        mock_classify, mock_advise, _make_classified(), _CONFIG
+    )
     assert result.original_source == source
     assert result.messages == []
 
@@ -450,14 +470,9 @@ def test_runner_no_placements(mock_classify, mock_advise):
 def test_runner_no_placements_with_groups(mock_classify, mock_advise):
     # When set_3_groups is non-empty but the LLM selects nothing to migrate,
     # runner should emit a SKIP message so the user knows the file was examined.
-    mock_classify.return_value = _classified_with_groups()
-    mock_advise.return_value = _empty_plan()
-
-    source = "def foo():\n    pass\n"
-    result = run_file_limiter("big.py", "", source, [], _CONFIG_NO_RETRY)
-
-    assert result.abort is False
-    assert result.new_files == {}
+    result, source = _run_no_placement_test(
+        mock_classify, mock_advise, _classified_with_groups(), _CONFIG_NO_RETRY
+    )
     assert any("no entities selected for migration" in m for m in result.messages)
 
 
@@ -489,13 +504,7 @@ def test_runner_no_migration_retries_and_succeeds(mock_classify, mock_advise, mo
     entity = _make_entity("foo", 1, 2)
     mock_classify.return_value = _classified_with_groups(entities=[entity])
     mock_advise.side_effect = [_empty_plan(), _plan_with(["foo"], "utils.py")]
-    mock_gen.return_value = _good_split()
-    cfg = CrispenConfig(file_limiter_retries=1)
-
-    result = run_file_limiter("big.py", "", "def foo():\n    pass\n", [], cfg)
-
-    assert result.abort is False
-    assert mock_advise.call_count == 2
+    result = _run_and_assert_retry_success(mock_gen, mock_advise)
     # Failed attempt message is preserved alongside the success message.
     assert any("no entities selected" in m for m in result.messages)
     assert any("FileLimiter: moved" in m for m in result.messages)
@@ -680,6 +689,29 @@ def test_runner_split_abort_retries_and_succeeds(mock_classify, mock_advise, moc
 # ---------------------------------------------------------------------------
 
 
+def _run_with_mock_gen_and_assert(
+    mock_gen,
+    source: str,
+    extra_assertion: str | None = None,
+) -> None:
+    mock_gen.return_value = SplitResult(
+        new_files={"test_helpers.py": "def test_foo():\n    pass"},
+        original_source="# original\n",
+        abort=False,
+    )
+
+    result = run_file_limiter("tests/test_big.py", "", source, [], _CONFIG)
+
+    assert result.abort is False
+    if extra_assertion:
+        # The placement target passed to generate_file_splits must have been
+        # normalised — verify via the success message.
+        assert any("test_helpers.py" in m for m in result.messages)
+    else:
+        assert any("test_helpers.py" in m for m in result.messages)
+    return result
+
+
 @patch(_PATCH_GEN)
 @patch(_PATCH_ADVISE)
 @patch(_PATCH_CLASSIFY)
@@ -690,18 +722,10 @@ def test_runner_adds_test_prefix_to_new_files(mock_classify, mock_advise, mock_g
     entity = _make_entity("test_foo", 1, 2)
     mock_classify.return_value = _make_classified(entities=[entity])
     mock_advise.return_value = _plan_with(["test_foo"], "helpers.py")
-    mock_gen.return_value = SplitResult(
-        new_files={"test_helpers.py": "def test_foo():\n    pass"},
-        original_source="# original\n",
-        abort=False,
+    result = _run_with_mock_gen_and_assert(
+        mock_gen, source, extra_assertion="normalised"
     )
 
-    result = run_file_limiter("tests/test_big.py", "", source, [], _CONFIG)
-
-    assert result.abort is False
-    # The placement target passed to generate_file_splits must have been
-    # normalised — verify via the success message.
-    assert any("test_helpers.py" in m for m in result.messages)
     assert not any(
         "helpers.py" in m and "test_helpers.py" not in m for m in result.messages
     )
@@ -716,16 +740,7 @@ def test_runner_test_prefix_already_present(mock_classify, mock_advise, mock_gen
     entity = _make_entity("test_foo", 1, 2)
     mock_classify.return_value = _make_classified(entities=[entity])
     mock_advise.return_value = _plan_with(["test_foo"], "test_helpers.py")
-    mock_gen.return_value = SplitResult(
-        new_files={"test_helpers.py": "def test_foo():\n    pass"},
-        original_source="# original\n",
-        abort=False,
-    )
-
-    result = run_file_limiter("tests/test_big.py", "", source, [], _CONFIG)
-
-    assert result.abort is False
-    assert any("test_helpers.py" in m for m in result.messages)
+    result = _run_with_mock_gen_and_assert(mock_gen, source)
 
 
 @patch(_PATCH_GEN)
