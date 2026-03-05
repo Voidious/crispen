@@ -1,0 +1,37 @@
+import textwrap
+import libcst as cst
+from libcst.metadata import MetadataWrapper
+from crispen.refactors.duplicate_extractor import _SequenceCollector
+from tests.test_sequence_collection import _collect_sequences
+
+
+def test_sequence_collector_custom_max_seq_len():
+    # max_seq_len=2 means windows are at most 2 statements.
+    # With 4 statements each of weight 1, all 2-stmt windows have weight 2 <
+    # MIN_WEIGHT=3.  So no sequences pass the weight filter → sequences == [].
+    source = textwrap.dedent(
+        """\
+        def foo():
+            a = 1
+            b = 2
+            c = 3
+            d = 4
+        """
+    )
+    seqs = _collect_sequences(source, max_seq_len=2)
+    # No 3-stmt (or larger) windows generated; all ≤2-stmt windows fail weight check.
+    assert all(len(s.stmts) <= 2 for s in seqs)
+    assert seqs == []
+
+
+def test_sequence_collector_min_weight_filters_light_sequences():
+    # A single assignment has weight 1. With min_weight=2 it should be excluded.
+    source = "def f():\n    a = 1\n    b = 2\n"
+    source_lines = source.splitlines(keepends=True)
+    tree = cst.parse_module(source)
+
+    collector = _SequenceCollector(source_lines, max_seq_len=2, min_weight=2)
+    MetadataWrapper(tree).visit(collector)
+    # Single-statement sequences (weight=1) should be filtered out
+    single_stmt_seqs = [s for s in collector.sequences if len(s.stmts) == 1]
+    assert single_stmt_seqs == []
