@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from ..config import CrispenConfig
-from .advisor import GroupPlacement, advise_file_limiter
+from .advisor import GroupPlacement, advise_file_limiter, resolve_naming_conflicts
 from .classifier import classify_entities
 from .code_gen import SplitResult, generate_file_splits
 from .entity_parser import Entity, EntityKind
@@ -105,6 +105,51 @@ def _verify_preservation(
     return failures
 
 
+def _detect_naming_conflicts(
+    placements: List[GroupPlacement],
+    existing_files: frozenset,
+    existing_dirs: frozenset,
+) -> List[str]:
+    """Return naming conflict descriptions (empty = no conflicts).
+
+    A conflict arises when a flat module ``foo.py`` and a package directory
+    ``foo/`` would share the same Python import name, making them impossible
+    to import together.  Checks conflicts both within the plan itself and
+    against the existing filesystem.
+    """
+    file_stems: set = set()  # stems from flat *.py targets in the plan
+    dir_tops: set = set()  # top-level directory names from subdir targets
+
+    for p in placements:
+        parts = Path(p.target_file).parts
+        if len(parts) == 1:
+            file_stems.add(Path(parts[0]).stem)
+        else:
+            dir_tops.add(parts[0])
+
+    conflicts: List[str] = []
+
+    # Plan-vs-plan: same name used as both a flat file and a directory.
+    for stem in sorted(file_stems & dir_tops):
+        conflicts.append(f"'{stem}.py' and '{stem}/' directory both appear in the plan")
+
+    # Plan flat file vs. existing directory on disk.
+    for stem in sorted(file_stems):
+        if stem in existing_dirs:
+            conflicts.append(
+                f"target '{stem}.py' conflicts with existing directory '{stem}/'"
+            )
+
+    # Plan subdirectory vs. existing flat file on disk.
+    for top in sorted(dir_tops):
+        if f"{top}.py" in existing_files:
+            conflicts.append(
+                f"target '{top}/' directory conflicts with existing file '{top}.py'"
+            )
+
+    return conflicts
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -140,6 +185,9 @@ def run_file_limiter(
     source_name = Path(filepath).name
     existing_files: frozenset = frozenset(
         p.name for p in source_dir.glob("*.py") if p.name != source_name
+    )
+    existing_dirs: frozenset = frozenset(
+        p.name for p in source_dir.iterdir() if p.is_dir()
     )
 
     # Deterministic failure — retrying the LLM would not help.
@@ -217,6 +265,36 @@ def run_file_limiter(
                     name.startswith("test_") for name in p.group
                 ):
                     p.target_file = str(target.parent / ("test_" + target.name))
+
+        # Check for naming conflicts between flat modules and package directories.
+        # foo.py and foo/ share the same import name and cannot coexist.
+        conflicts = _detect_naming_conflicts(
+            plan.placements, existing_files, existing_dirs
+        )
+        if conflicts:
+            conflict_desc = "; ".join(conflicts)
+            resolved = resolve_naming_conflicts(
+                plan.placements,
+                classified,
+                filepath,
+                existing_files,
+                existing_dirs,
+                config,
+            )
+            if resolved is not None:
+                plan.placements = resolved  # fall through to generate_file_splits
+            else:
+                retry_msgs.append(
+                    f"SKIP {filepath} (FileLimiter): naming conflicts: {conflict_desc}"
+                )
+                last_abort = True
+                prev_placement_failure = (
+                    f"Your previous plan has naming conflicts: {conflict_desc}. "
+                    "A Python file 'foo.py' and a package directory 'foo/' share "
+                    "the same import name and cannot coexist. "
+                    "Please rename the conflicting targets."
+                )
+                continue
 
         split = generate_file_splits(classified, plan, post_source, filepath)
 
