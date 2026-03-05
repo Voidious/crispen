@@ -1,0 +1,426 @@
+from __future__ import annotations
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+from .advisor import FileLimiterPlan, GroupPlacement
+from .classifier import ClassifiedEntities
+from .dep_graph import find_sccs
+from .entity_parser import Entity, EntityKind
+from .imports import (
+    _add_re_exports,
+    _collect_external_imported_names,
+    _collect_name_loads,
+    _extract_import_info,
+    _find_cross_file_imports,
+    _find_needed_imports,
+    _import_line_numbers,
+    _prune_inline_redundant_imports,
+    _prune_unused_imports,
+)
+from .module_paths import _abs_package_for_dir
+from .split_models import SplitResult
+
+# Matches any line that is an import statement (plain or from-import).
+_IMPORT_LINE_RE = re.compile(r"^(import\s+|from\s+\S.*\s+import\s+)")
+
+# Matches a `from __future__ import …` line (with optional trailing newline).
+_FUTURE_IMPORT_LINE_RE = re.compile(r"^from __future__ import .*\n?", re.MULTILINE)
+
+
+def _remove_entity_lines(
+    source: str,
+    migrated_names: Set[str],
+    entity_map: Dict[str, Entity],
+    entity_source_map: Dict[str, str],
+) -> str:
+    """Return *source* with lines belonging to migrated entities removed.
+
+    For TOP_LEVEL entities, import statement lines are preserved in the
+    original file even when the entity is migrated: the remaining code may
+    still reference those imported names, and stdlib/third-party names
+    cannot be safely re-exported from a new module.
+    """
+    remove: Set[int] = set()
+    preserve: Set[int] = set()
+    for name in migrated_names:
+        entity = entity_map.get(name)
+        if entity is None:
+            continue
+        for ln in range(entity.start_line, entity.end_line + 1):
+            remove.add(ln)
+        if entity.kind == EntityKind.TOP_LEVEL:
+            preserve |= _import_line_numbers(entity, entity_source_map.get(name, ""))
+
+    lines = source.splitlines(keepends=True)
+    return "".join(
+        line for i, line in enumerate(lines, 1) if i not in remove or i in preserve
+    )
+
+
+def _topo_depth(graph: Dict[str, Set[str]]) -> Dict[str, int]:
+    """Return topological depth for each node in a DAG.
+
+    Depth 0 = leaf (no outgoing edges).  A node's depth is 1 + the maximum
+    depth of its dependencies.  All dependency nodes must be keys in *graph*.
+    On non-DAG inputs (cycles detected), returns 0 for every node as a safe
+    fallback so that callers degrade to arbitrary candidate ordering.
+    """
+    if any(len(s) > 1 for s in find_sccs(graph)):
+        return {node: 0 for node in graph}
+    depths: Dict[str, int] = {}
+
+    def dfs(node: str) -> int:
+        if node in depths:
+            return depths[node]
+        depths[node] = 1 + max((dfs(dep) for dep in graph[node]), default=-1)
+        return depths[node]
+
+    for node in graph:
+        dfs(node)
+    return depths
+
+
+def _extract_shared_helpers(
+    file_entity_names: Dict[str, List[str]],
+    entity_source_map: Dict[str, str],
+    entity_map: Dict[str, Entity],
+    classified: ClassifiedEntities,
+    name_to_target_file: Dict[str, str],
+    migrated_names: Set[str],
+    original_basename: str,
+) -> List[GroupPlacement]:
+    """Extract non-migrated functions/classes referenced by migrated entities.
+
+    When a migrated entity in new file F references a non-migrated function X
+    from the original O, the generated ``from .O import X`` combined with O's
+    re-export ``from .F import …`` creates a cycle O→F→O.
+
+    Fix: pull X (and all helpers X transitively depends on) into a new file
+    that uses them.  The destination is chosen using topological depth ordering:
+    the inter-file dependency graph is built from migrated-entity cross-references
+    first, then for each helper SCC the candidates (all files wanting the
+    helpers) are sorted by topological depth (deepest / most-downstream first).
+    For a DAG the deepest wanting file is always cycle-free on the first try;
+    for non-DAG inputs (pre-existing cycles) _topo_depth falls back to 0 for
+    all nodes and the loop exhausts all candidates via trial SCC analysis.
+    If no cycle-free placement exists the SCC is left in the original file and
+    the safety-net in :func:`generate_file_splits` will abort if the result is
+    unloadable.
+
+    Mutates *file_entity_names*, *migrated_names*, and *name_to_target_file*
+    in place.  Returns synthetic :class:`GroupPlacement` objects for the
+    extracted entities so that :func:`_add_re_exports` can re-import them from
+    their new location in the updated original source.
+    """
+    # Build defined-name → entity-name map for non-migrated FUNCTION/CLASS entities.
+    defined_to_entity: Dict[str, str] = {}
+    for entity in classified.entities:
+        if entity.name in migrated_names:
+            continue
+        if entity.kind not in (EntityKind.FUNCTION, EntityKind.CLASS):
+            continue
+        for defined_name in entity.names_defined:
+            if name_to_target_file.get(defined_name) == original_basename:
+                defined_to_entity[defined_name] = entity.name
+
+    # Collect directly-wanted helpers: entity_name → set of target_files that want it.
+    wanting: Dict[str, Set[str]] = {}
+    for target_file, ent_names in list(file_entity_names.items()):
+        for ent_name in ent_names:
+            src = entity_source_map.get(ent_name, "")
+            for ref_name in _collect_name_loads(src):
+                entity_name = defined_to_entity.get(ref_name)
+                if entity_name is not None:
+                    wanting.setdefault(entity_name, set()).add(target_file)
+
+    if not wanting:
+        return []
+
+    # Transitively expand wanting-sets to cover helpers referenced by
+    # already-wanted helpers, preventing O→new-file→O cycles.
+    # Re-queue a helper whenever its wanting-set gains new target files so that
+    # the propagation reaches all transitive dependents.
+    queue = list(wanting.keys())
+    idx = 0
+    while idx < len(queue):
+        entity_name = queue[idx]
+        idx += 1
+        src = entity_source_map.get(entity_name, "")
+        for ref_name in _collect_name_loads(src):
+            dep_name = defined_to_entity.get(ref_name)
+            if dep_name and wanting[entity_name] - wanting.get(dep_name, set()):
+                wanting.setdefault(dep_name, set()).update(wanting[entity_name])
+                queue.append(dep_name)
+
+    # SCC analysis on the sub-graph of wanted helpers to co-locate
+    # mutually-dependent helpers.
+    sub_graph: Dict[str, Set[str]] = {
+        name: {d for d in classified.graph.get(name, set()) if d in wanting}
+        for name in wanting
+    }
+    sccs = find_sccs(sub_graph)
+
+    # Build the initial inter-file dependency graph from migrated-entity
+    # cross-references (before any helper placement).  This is the baseline for
+    # the cycle-aware candidate selection below.
+    file_deps: Dict[str, Set[str]] = {f: set() for f in file_entity_names}
+    for target_file, ent_names in file_entity_names.items():
+        for ent_name in ent_names:
+            src = entity_source_map.get(ent_name, "")
+            for ref_name in _collect_name_loads(src):
+                dep_file = name_to_target_file.get(ref_name)
+                if (
+                    dep_file
+                    and dep_file != target_file
+                    and dep_file in file_entity_names
+                ):
+                    file_deps[target_file].add(dep_file)
+
+    synthetic_placements: List[GroupPlacement] = []
+    for scc in sccs:
+        # Union of wanting-sets across this helper SCC.
+        scc_wanting: Set[str] = set()
+        for name in scc:
+            scc_wanting.update(wanting.get(name, set()))
+
+        # Sort candidates by topological depth (deepest / most-downstream first).
+        # For a DAG the deepest wanting file is always cycle-free on the first try,
+        # eliminating trial-and-error.  Depths are recomputed after each placement
+        # because file_deps grows as helpers are extracted.
+        topo_depth = _topo_depth(file_deps)
+        candidates = sorted(scc_wanting, key=lambda t: topo_depth.get(t, 0))
+        chosen: Optional[str] = None
+        for candidate in candidates:
+            trial_deps: Dict[str, Set[str]] = {
+                f: set(deps) for f, deps in file_deps.items()
+            }
+            for wanting_file in scc_wanting:
+                if wanting_file != candidate:
+                    trial_deps[wanting_file].add(candidate)
+            for helper_name in scc:
+                src = entity_source_map.get(helper_name, "")
+                for ref_name in _collect_name_loads(src):
+                    dep_file = name_to_target_file.get(ref_name)
+                    if (
+                        dep_file
+                        and dep_file != candidate
+                        and dep_file in file_entity_names
+                    ):
+                        trial_deps[candidate].add(dep_file)
+            if not any(len(s) > 1 for s in find_sccs(trial_deps)):
+                chosen = candidate
+                break
+
+        if chosen is None:
+            continue  # No cycle-free placement — leave helpers in original file.
+
+        # Apply the chosen placement: update file_deps for subsequent SCC decisions.
+        for wanting_file in scc_wanting:
+            if wanting_file != chosen:
+                file_deps[wanting_file].add(chosen)
+        for helper_name in scc:
+            src = entity_source_map.get(helper_name, "")
+            for ref_name in _collect_name_loads(src):
+                dep_file = name_to_target_file.get(ref_name)
+                if dep_file and dep_file != chosen and dep_file in file_entity_names:
+                    file_deps[chosen].add(dep_file)
+
+        # Prepend extracted helpers so they appear before the functions that use them.
+        file_entity_names[chosen] = list(scc) + file_entity_names[chosen]
+        for entity_name in scc:
+            migrated_names.add(entity_name)
+            entity = entity_map[entity_name]
+            for defined_name in entity.names_defined:
+                name_to_target_file[defined_name] = chosen
+        synthetic_placements.append(GroupPlacement(group=list(scc), target_file=chosen))
+    return synthetic_placements
+
+
+def generate_file_splits(
+    classified: ClassifiedEntities,
+    plan: FileLimiterPlan,
+    post_source: str,
+    original_path: str,
+) -> SplitResult:
+    """Generate new file contents and the updated original source.
+
+    When *plan* is aborted or has no placements, returns :class:`SplitResult`
+    with the original source unchanged (``abort`` mirrors ``plan.abort``).
+    """
+    if plan.abort:
+        return SplitResult(
+            new_files={},
+            original_source=post_source,
+            abort=True,
+            abort_reason=plan.abort_reason,
+        )
+
+    if not plan.placements:
+        return SplitResult(new_files={}, original_source=post_source, abort=False)
+
+    lines = post_source.splitlines(keepends=True)
+    entity_map = {e.name: e for e in classified.entities}
+
+    # Build entity source map (name → stripped source string).
+    entity_source_map: Dict[str, str] = {}
+    for entity in classified.entities:
+        entity_source_map[entity.name] = "".join(
+            lines[entity.start_line - 1 : entity.end_line]
+        ).rstrip()
+
+    # All entity-defined names (used to limit import matching scope).
+    all_entity_names: Set[str] = {
+        name for e in classified.entities for name in e.names_defined
+    }
+
+    # Extract import info from post-refactor source.
+    import_infos = _extract_import_info(post_source)
+
+    # Placements whose target_file matches the original filename would create a
+    # self-referential import (e.g. `from .duplicate_extractor import Foo` inside
+    # duplicate_extractor.py).  Drop them — entities stay in the original file.
+    original_basename = Path(original_path).name
+    valid_placements = [
+        p for p in plan.placements if p.target_file != original_basename
+    ]
+
+    # Group placements by target file (preserving order for topo sort).
+    file_entity_names: Dict[str, List[str]] = {}
+    for placement in valid_placements:
+        file_entity_names.setdefault(placement.target_file, []).extend(placement.group)
+
+    # All migrated entity names.
+    migrated_names: Set[str] = {name for p in valid_placements for name in p.group}
+
+    # Build name → target-file map for cross-file import detection.
+    # Exclude import-derived names (_find_needed_imports handles those).
+    import_defined_names = {name for info in import_infos for name in info.names}
+    name_to_target_file: Dict[str, str] = {}
+    for target_file, ent_names in file_entity_names.items():
+        for ent_name in ent_names:
+            entity = entity_map.get(ent_name)
+            if entity:
+                for defined_name in entity.names_defined:
+                    if defined_name not in import_defined_names:
+                        name_to_target_file[defined_name] = target_file
+
+    # Also map names from non-migrated entities to the original file so that
+    # split files can import helpers (e.g. _run) that stayed behind.
+    for entity in classified.entities:
+        if entity.name not in migrated_names:
+            for defined_name in entity.names_defined:
+                if defined_name not in import_defined_names:
+                    name_to_target_file.setdefault(defined_name, original_basename)
+
+    # Extract non-migrated FUNCTION/CLASS entities referenced by migrated ones
+    # into the new files that use them, breaking O→F→O import cycles.
+    synthetic_placements = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        original_basename,
+    )
+
+    # Collect names that external files (outside the module being split) import
+    # from the original file.  Private symbols in this set must get a re-export
+    # proxy even though they are no longer referenced by the remaining source.
+    external_loads = _collect_external_imported_names(original_path)
+
+    # Detect circular imports.  Cycles can pass through the original file:
+    # a new file that imports a non-migrated name from the original can form a
+    # chain back to the original via the re-exports the original adds.
+    # Model the original as an explicit node in the dependency graph.
+    #
+    # Original's outgoing edges: it will re-export a migrated name when the
+    # name is public (no _/test_ prefix), referenced by a non-migrated entity,
+    # or imported by an external file (external_loads).
+    non_migrated_loads: Set[str] = set()
+    for ent_name, src in entity_source_map.items():
+        if ent_name not in migrated_names:
+            non_migrated_loads |= _collect_name_loads(src)
+
+    all_dep_nodes = set(file_entity_names.keys()) | {original_basename}
+    file_deps: Dict[str, Set[str]] = {node: set() for node in all_dep_nodes}
+    for target_file, ent_names in file_entity_names.items():
+        for ent_name in ent_names:
+            src = entity_source_map.get(ent_name, "")
+            for ref_name in _collect_name_loads(src):
+                dep_file = name_to_target_file.get(ref_name)
+                if dep_file and dep_file != target_file and dep_file in file_deps:
+                    file_deps[target_file].add(dep_file)
+    for placement in valid_placements + synthetic_placements:
+        for ent_name in placement.group:
+            entity = entity_map.get(ent_name)
+            if entity:
+                for defined_name in entity.names_defined:
+                    if (
+                        (
+                            not defined_name.startswith("_")
+                            and not defined_name.startswith("test_")
+                        )
+                        or defined_name in non_migrated_loads
+                        or defined_name in external_loads
+                    ):
+                        file_deps[original_basename].add(placement.target_file)
+                        break
+    if any(len(scc) > 1 for scc in find_sccs(file_deps)):
+        return SplitResult(
+            new_files={},
+            original_source=post_source,
+            abort=True,
+            abort_reason="proposed split would create circular file imports",
+        )
+
+    # Use absolute imports when the original file is a test file.  Pytest's
+    # default import mode loads test files as top-level modules (not package
+    # members), so relative imports like `from .helpers import foo` would
+    # raise ImportError at collection time.
+    abs_pkg: Optional[str] = None
+    if Path(original_path).name.startswith("test_"):
+        abs_pkg = _abs_package_for_dir(original_path)
+
+    # Generate new file contents.
+    new_files: Dict[str, str] = {}
+    for target_file, ent_names in file_entity_names.items():
+        needed = _find_needed_imports(
+            ent_names, entity_source_map, import_infos, all_entity_names
+        )
+        cross = _find_cross_file_imports(
+            ent_names,
+            entity_source_map,
+            name_to_target_file,
+            target_file,
+            abs_pkg=abs_pkg,
+        )
+        entity_srcs = [
+            _FUTURE_IMPORT_LINE_RE.sub("", src).rstrip()
+            for name in ent_names
+            if (src := entity_source_map.get(name))
+        ]
+        entity_srcs = [s for s in entity_srcs if s]
+        parts: List[str] = []
+        all_imports = needed + cross
+        if all_imports:
+            parts.append("\n".join(all_imports))
+        parts.extend(entity_srcs)
+        pruned = _prune_unused_imports("\n\n".join(parts) + "\n")
+        new_files[target_file] = _prune_inline_redundant_imports(pruned)
+
+    # Build updated original source.
+    updated = _remove_entity_lines(
+        post_source, migrated_names, entity_map, entity_source_map
+    )
+    updated = _prune_unused_imports(updated)
+    updated = _add_re_exports(
+        updated,
+        valid_placements + synthetic_placements,
+        entity_map,
+        entity_source_map,
+        external_loads=external_loads,
+        abs_pkg=abs_pkg,
+    )
+
+    return SplitResult(new_files=new_files, original_source=updated, abort=False)
