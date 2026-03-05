@@ -1,0 +1,22 @@
+from crispen.engine import _compute_qname, _file_to_module
+
+
+def test_file_to_module_regular_file(tmp_path):
+    f = tmp_path / "mypkg" / "service.py"
+    f.parent.mkdir()
+    f.write_text("x = 1\n")
+    assert _file_to_module(str(tmp_path), str(f)) == "mypkg.service"
+
+
+def test_file_to_module_init(tmp_path):
+    f = tmp_path / "mypkg" / "__init__.py"
+    f.parent.mkdir()
+    f.write_text("")
+    assert _file_to_module(str(tmp_path), str(f)) == "mypkg"
+
+
+def test_compute_qname(tmp_path):
+    f = tmp_path / "pkg" / "mod.py"
+    f.parent.mkdir()
+    f.write_text("")
+    assert _compute_qname(str(tmp_path), str(f), "my_func") == "pkg.mod.my_func"
