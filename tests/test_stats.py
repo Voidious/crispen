@@ -99,10 +99,15 @@ def test_count_lines_changed_no_difference():
 # ---------------------------------------------------------------------------
 
 
-def test_format_summary_with_files():
-    s = _filled()
+def format_and_join(factory):
+    s = factory()
     lines = s.format_summary()
     text = "\n".join(lines)
+    return text
+
+
+def test_format_summary_with_files():
+    text = format_and_join(_filled)
     assert "--- crispen summary ---" in text
     assert "if not/else:" in text
     assert "tuple to dataclass:" in text
@@ -125,7 +130,5 @@ def test_format_summary_with_files():
 
 
 def test_format_summary_no_files():
-    s = RunStats()
-    lines = s.format_summary()
-    text = "\n".join(lines)
+    text = format_and_join(RunStats)
     assert "files edited: none" in text

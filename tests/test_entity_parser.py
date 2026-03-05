@@ -166,12 +166,17 @@ def test_parse_syntax_error():
     assert parse_entities("def (invalid") == []
 
 
-def test_parse_single_function():
-    source = "def foo():\n    pass\n"
+def _parse_and_assert_single_function(source):
     entities = parse_entities(source)
     assert len(entities) == 1
     e = entities[0]
     assert e.kind == EntityKind.FUNCTION
+    return e
+
+
+def test_parse_single_function():
+    source = "def foo():\n    pass\n"
+    e = _parse_and_assert_single_function(source)
     assert e.name == "foo"
     assert e.start_line == 1
     assert e.end_line == 2
@@ -180,10 +185,7 @@ def test_parse_single_function():
 
 def test_parse_async_function():
     source = "async def bar():\n    pass\n"
-    entities = parse_entities(source)
-    assert len(entities) == 1
-    e = entities[0]
-    assert e.kind == EntityKind.FUNCTION
+    e = _parse_and_assert_single_function(source)
     assert e.name == "bar"
 
 
@@ -197,11 +199,16 @@ def test_parse_single_class():
     assert e.names_defined == ["Foo"]
 
 
-def test_parse_top_level_assignment():
-    entities = parse_entities("X = 1\n")
+def _assert_single_top_level_entity(entities):
     assert len(entities) == 1
     e = entities[0]
     assert e.kind == EntityKind.TOP_LEVEL
+    return e
+
+
+def test_parse_top_level_assignment():
+    entities = parse_entities("X = 1\n")
+    e = _assert_single_top_level_entity(entities)
     assert e.name == "_block_1"
     assert e.names_defined == ["X"]
     assert e.start_line == 1
@@ -210,9 +217,7 @@ def test_parse_top_level_assignment():
 
 def test_parse_imports_form_top_level_entity():
     entities = parse_entities("import os\nfrom sys import argv\n")
-    assert len(entities) == 1
-    e = entities[0]
-    assert e.kind == EntityKind.TOP_LEVEL
+    e = _assert_single_top_level_entity(entities)
     assert "os" in e.names_defined
     assert "argv" in e.names_defined
 
@@ -258,11 +263,16 @@ def test_parse_comment_separated_by_blank_not_attached():
     assert foo.start_line == 3
 
 
-def test_parse_decorated_function_uses_decorator_line():
-    source = "# Comment\n@decorator\ndef foo():\n    pass\n"
+def parse_and_get_first_entity(source):
     entities = parse_entities(source)
     assert len(entities) == 1
     e = entities[0]
+    return e
+
+
+def test_parse_decorated_function_uses_decorator_line():
+    source = "# Comment\n@decorator\ndef foo():\n    pass\n"
+    e = parse_and_get_first_entity(source)
     # comment is attached to decorator, so start at line 1
     assert e.start_line == 1
     assert e.name == "foo"
@@ -271,9 +281,7 @@ def test_parse_decorated_function_uses_decorator_line():
 
 def test_parse_decorated_class():
     source = "@decorator\nclass Foo:\n    pass\n"
-    entities = parse_entities(source)
-    assert len(entities) == 1
-    e = entities[0]
+    e = parse_and_get_first_entity(source)
     assert e.start_line == 1
     assert e.kind == EntityKind.CLASS
 

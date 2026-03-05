@@ -344,6 +344,14 @@ class _FunctionCollector(cst.CSTVisitor):
 # ---------------------------------------------------------------------------
 
 
+def _parse_source_and_init_set(source):
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    return tree
+
+
 def _collect_called_names(source: str) -> set:
     """Return a set of all names called (as functions) in *source*.
 
@@ -351,9 +359,8 @@ def _collect_called_names(source: str) -> set:
     called name: func.id for ast.Name callees, func.attr for ast.Attribute
     callees.  On SyntaxError, returns an empty set.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_source_and_init_set(source)
+    if tree is None:
         return set()
     names: set = set()
     for node in ast.walk(tree):
@@ -558,6 +565,16 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
+def _process_llm_result(result):
+    if result is not None:
+        return (
+            result["is_valid_duplicate"],
+            result.get("reason", ""),
+            result.get("extraction_notes", ""),
+        )
+    return False, "no tool response", ""  # pragma: no cover
+
+
 def _llm_veto(
     client,
     group: List[_SeqInfo],
@@ -592,13 +609,7 @@ def _llm_veto(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is not None:
-        return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
-        )
-    return False, "no tool response", ""  # pragma: no cover
+    return _process_llm_result(result)
 
 
 def _llm_extract(
@@ -767,13 +778,7 @@ def _llm_veto_func_match(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is not None:
-        return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
-        )
-    return False, "no tool response", ""  # pragma: no cover
+    return _process_llm_result(result)
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
@@ -1110,6 +1115,15 @@ def _pyflakes_new_undefined_names(original: str, candidate: str) -> set:
     return after.names - before.names
 
 
+def _parse_source_with_init_set(source: str, set_name: str):
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None, set()
+    init_set = set()
+    return tree, init_set
+
+
 def _missing_free_vars(
     block_src: str, call_srcs: List[str], helper_src: str, source: str
 ) -> set:
@@ -1136,12 +1150,9 @@ def _missing_free_vars(
     failure does not block the extraction — the later ``compile()`` guard will
     catch real syntax problems.
     """
-    try:
-        block_tree = ast.parse(textwrap.dedent(block_src))
-    except SyntaxError:
+    block_tree, reads = _parse_source_with_init_set(block_src, "reads")
+    if block_tree is None:
         return set()
-
-    reads: set = set()
     stores: set = set()
     for node in ast.walk(block_tree):
         if isinstance(node, ast.Name):
@@ -1158,9 +1169,8 @@ def _missing_free_vars(
     # parameters somewhere in the full source.  Module-level names that are
     # only ever read (e.g. imported functions, global constants) are in scope
     # from the helper definition too and do not need to be passed as args.
-    try:
-        source_tree = ast.parse(source)
-    except SyntaxError:
+    source_tree = _parse_source_and_init_set(source)
+    if source_tree is None:
         return set()
     source_locals: set = set()
     for node in ast.walk(source_tree):
@@ -1258,6 +1268,17 @@ def _replacement_steals_post_block_line(
     return False
 
 
+def _collect_import_aliases(node: ast.AST, target_set: set):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name.split(".")[0]
+            target_set.add(name)
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            target_set.add(name)
+
+
 def _helper_imports_local_name(helper_source: str, original_source: str) -> bool:
     """Return True if helper_source imports a name that is only a local in original.
 
@@ -1272,14 +1293,7 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
 
     helper_imports: set = set()
     for node in ast.walk(helper_tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                helper_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                helper_imports.add(name)
+        _collect_import_aliases(node, helper_imports)
 
     if not helper_imports:
         return False
@@ -1292,14 +1306,7 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
     # Names already imported at the top level of the original file.
     orig_top_imports: set = set()
     for node in orig_tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                orig_top_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                orig_top_imports.add(name)
+        _collect_import_aliases(node, orig_top_imports)
 
     new_helper_imports = helper_imports - orig_top_imports
     if not new_helper_imports:
@@ -1325,11 +1332,9 @@ def _names_assigned_in(block_source: str) -> set:
     Covers bare ``x = ...`` (ast.Assign) and augmented ``x += ...``
     (ast.AugAssign) statements only; other assignment forms are ignored.
     """
-    try:
-        tree = ast.parse(textwrap.dedent(block_source))
-    except SyntaxError:
+    tree, names = _parse_source_with_init_set(block_source, "names")
+    if tree is None:
         return set()
-    names: set = set()
     for node in tree.body:
         if isinstance(node, ast.Assign):
             for target in node.targets:

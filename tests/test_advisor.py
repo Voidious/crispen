@@ -97,11 +97,7 @@ def test_plan_api_key_error_propagates(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
-def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
-    """set_2 groups only: call 1 is skipped, call 2 assigns placement."""
+def _setup_mock_and_classified(mock_key, mock_client, mock_call):
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
     mock_call.return_value = {
@@ -111,6 +107,15 @@ def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
         entities=[_make_entity("foo", 1, 10)],
         set_2_groups=[["foo"]],
     )
+    return c, mock_call
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
+    """set_2 groups only: call 1 is skipped, call 2 assigns placement."""
+    c, mock_call = _setup_mock_and_classified(mock_key, mock_client, mock_call)
     plan = advise_file_limiter(c, "src/big.py", _CONFIG)
 
     assert plan.abort is False
@@ -126,6 +131,20 @@ def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
 # ---------------------------------------------------------------------------
 
 
+def _create_plan_and_assert_stay(entity_name: str, file_path: str, config) -> None:
+    c = _classified(
+        entities=[_make_entity(entity_name, 1, 10)],
+        set_3_groups=[[entity_name]],
+    )
+    plan = advise_file_limiter(c, file_path, config)
+
+    assert plan.abort is False
+    assert plan.set3_migrate == []
+    assert plan.placements == []
+
+    return plan
+
+
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
@@ -135,15 +154,7 @@ def test_plan_set3_all_stay_no_placement(mock_key, mock_client, mock_call):
     mock_client.return_value = MagicMock()
     mock_call.return_value = {"decisions": [{"group_id": 0, "action": "stay"}]}
 
-    c = _classified(
-        entities=[_make_entity("bar", 1, 10)],
-        set_3_groups=[["bar"]],
-    )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
-
-    assert plan.abort is False
-    assert plan.set3_migrate == []
-    assert plan.placements == []
+    _create_plan_and_assert_stay("bar", "src/big.py", _CONFIG)
     assert mock_call.call_count == 1  # only set3 advice call
 
 
@@ -262,14 +273,7 @@ def test_plan_set3_invalid_group_id_treated_as_stay(mock_key, mock_client, mock_
             {"group_id": 0, "action": "stay"},
         ]
     }
-    c = _classified(
-        entities=[_make_entity("bar", 1, 10)],
-        set_3_groups=[["bar"]],
-    )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
-    assert plan.abort is False
-    assert plan.set3_migrate == []
-    assert plan.placements == []
+    plan = _create_plan_and_assert_stay("bar", "src/big.py", _CONFIG)
 
 
 @patch(_PATCH_CALL)
@@ -485,16 +489,7 @@ def test_plan_placement_prev_failure_appended_to_prompt(
     mock_key, mock_client, mock_call
 ):
     """prev_placement_failure is appended to the placement prompt."""
-    mock_key.return_value = "key"
-    mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": 0, "target_file": "utils.py"}]
-    }
-
-    c = _classified(
-        entities=[_make_entity("foo", 1, 10)],
-        set_2_groups=[["foo"]],
-    )
+    c, mock_call = _setup_mock_and_classified(mock_key, mock_client, mock_call)
     advise_file_limiter(
         c, "src/big.py", _CONFIG, prev_placement_failure="sentinel text"
     )
@@ -727,14 +722,7 @@ def test_resolve_success(mock_key, mock_client, mock_call):
     assert mock_call.call_count == 1
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
-def test_resolve_llm_none_returns_none(mock_key, mock_client, mock_call):
-    """LLM returns None → resolve returns None."""
-    mock_key.return_value = "key"
-    mock_client.return_value = MagicMock()
-    mock_call.return_value = None
+def _call_resolve_naming_conflicts_and_assert_none():
     c = _classified()
     result = resolve_naming_conflicts(
         _CONFLICTING_PLACEMENTS,
@@ -745,6 +733,17 @@ def test_resolve_llm_none_returns_none(mock_key, mock_client, mock_call):
         CrispenConfig(file_limiter_retries=0),
     )
     assert result is None
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_resolve_llm_none_returns_none(mock_key, mock_client, mock_call):
+    """LLM returns None → resolve returns None."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = None
+    _call_resolve_naming_conflicts_and_assert_none()
 
 
 @patch(_PATCH_CALL)
@@ -761,16 +760,7 @@ def test_resolve_forbidden_target_returns_none(mock_key, mock_client, mock_call)
             {"group_id": 1, "target_file": "services.py"},
         ]
     }
-    c = _classified()
-    result = resolve_naming_conflicts(
-        _CONFLICTING_PLACEMENTS,
-        c,
-        "src/big.py",
-        frozenset(),
-        frozenset(),
-        CrispenConfig(file_limiter_retries=0),
-    )
-    assert result is None
+    _call_resolve_naming_conflicts_and_assert_none()
 
 
 @patch(_PATCH_CALL)
@@ -783,16 +773,7 @@ def test_resolve_incomplete_response_returns_none(mock_key, mock_client, mock_ca
     mock_call.return_value = {
         "placements": [{"group_id": 0, "target_file": "models.py"}]  # only 1 of 2
     }
-    c = _classified()
-    result = resolve_naming_conflicts(
-        _CONFLICTING_PLACEMENTS,
-        c,
-        "src/big.py",
-        frozenset(),
-        frozenset(),
-        CrispenConfig(file_limiter_retries=0),
-    )
-    assert result is None
+    _call_resolve_naming_conflicts_and_assert_none()
 
 
 @patch(_PATCH_CALL)
@@ -825,11 +806,7 @@ def test_resolve_retry_succeeds(mock_key, mock_client, mock_call):
     assert mock_call.call_count == 2
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
-def test_resolve_empty_forbidden_dir_stems(mock_key, mock_client, mock_call):
-    """existing_dirs empty → forbidden_dir_stems empty → branch False."""
+def _setup_mock_call_and_classified(mock_key, mock_client, mock_call):
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
     mock_call.return_value = {
@@ -839,6 +816,15 @@ def test_resolve_empty_forbidden_dir_stems(mock_key, mock_client, mock_call):
         ]
     }
     c = _classified()
+    return c
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_resolve_empty_forbidden_dir_stems(mock_key, mock_client, mock_call):
+    """existing_dirs empty → forbidden_dir_stems empty → branch False."""
+    c = _setup_mock_call_and_classified(mock_key, mock_client, mock_call)
     result = resolve_naming_conflicts(
         _CONFLICTING_PLACEMENTS,
         c,
@@ -855,15 +841,7 @@ def test_resolve_empty_forbidden_dir_stems(mock_key, mock_client, mock_call):
 @patch(_PATCH_KEY)
 def test_resolve_empty_existing_file_stems(mock_key, mock_client, mock_call):
     """existing_files=frozenset() → file_stems empty → if existing_file_stems: False."""
-    mock_key.return_value = "key"
-    mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [
-            {"group_id": 0, "target_file": "models.py"},
-            {"group_id": 1, "target_file": "services.py"},
-        ]
-    }
-    c = _classified()
+    c = _setup_mock_call_and_classified(mock_key, mock_client, mock_call)
     result = resolve_naming_conflicts(
         _CONFLICTING_PLACEMENTS,
         c,
@@ -888,16 +866,7 @@ def test_resolve_non_int_group_id(mock_key, mock_client, mock_call):
             {"group_id": 1, "target_file": "services.py"},
         ]
     }
-    c = _classified()
-    result = resolve_naming_conflicts(
-        _CONFLICTING_PLACEMENTS,
-        c,
-        "src/big.py",
-        frozenset(),
-        frozenset(),
-        CrispenConfig(file_limiter_retries=0),
-    )
-    assert result is None
+    _call_resolve_naming_conflicts_and_assert_none()
 
 
 @patch(_PATCH_CALL)
@@ -913,16 +882,7 @@ def test_resolve_out_of_range_group_id(mock_key, mock_client, mock_call):
             {"group_id": 1, "target_file": "services.py"},
         ]
     }
-    c = _classified()
-    result = resolve_naming_conflicts(
-        _CONFLICTING_PLACEMENTS,
-        c,
-        "src/big.py",
-        frozenset(),
-        frozenset(),
-        CrispenConfig(file_limiter_retries=0),
-    )
-    assert result is None
+    _call_resolve_naming_conflicts_and_assert_none()
 
 
 @patch(_PATCH_CALL)
@@ -938,16 +898,7 @@ def test_resolve_duplicate_group_id(mock_key, mock_client, mock_call):
             {"group_id": 0, "target_file": "other.py"},  # duplicate
         ]
     }
-    c = _classified()
-    result = resolve_naming_conflicts(
-        _CONFLICTING_PLACEMENTS,
-        c,
-        "src/big.py",
-        frozenset(),
-        frozenset(),
-        CrispenConfig(file_limiter_retries=0),
-    )
-    assert result is None
+    _call_resolve_naming_conflicts_and_assert_none()
 
 
 @patch(_PATCH_CALL)
@@ -963,13 +914,4 @@ def test_resolve_empty_target(mock_key, mock_client, mock_call):
             {"group_id": 1, "target_file": "services.py"},
         ]
     }
-    c = _classified()
-    result = resolve_naming_conflicts(
-        _CONFLICTING_PLACEMENTS,
-        c,
-        "src/big.py",
-        frozenset(),
-        frozenset(),
-        CrispenConfig(file_limiter_retries=0),
-    )
-    assert result is None
+    _call_resolve_naming_conflicts_and_assert_none()

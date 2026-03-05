@@ -155,6 +155,12 @@ def _detect_naming_conflicts(
 # ---------------------------------------------------------------------------
 
 
+def _append_skip_message(obj_with_reason, filepath, retry_msgs):
+    reason = f": {obj_with_reason.abort_reason}" if obj_with_reason.abort_reason else ""
+    retry_msgs.append(f"SKIP {filepath} (FileLimiter): file cannot be split{reason}")
+    return True
+
+
 def run_file_limiter(
     filepath: str,
     original_source: str,
@@ -203,6 +209,32 @@ def run_file_limiter(
     max_attempts = 1 + config.file_limiter_retries
     retry_msgs: List[str] = []
     last_abort: bool = True
+    return _run_file_limiter(
+        classified,
+        config,
+        existing_dirs,
+        existing_files,
+        filepath,
+        last_abort,
+        max_attempts,
+        post_source,
+        retry_msgs,
+        source_name,
+    )
+
+
+def _run_file_limiter(
+    classified,
+    config,
+    existing_dirs,
+    existing_files,
+    filepath,
+    last_abort,
+    max_attempts,
+    post_source,
+    retry_msgs,
+    source_name,
+):
     plan: Optional[object] = None
     split: Optional[SplitResult] = None
     prev_set3_failure: str = ""
@@ -219,11 +251,7 @@ def run_file_limiter(
         )
 
         if plan.abort:
-            reason = f": {plan.abort_reason}" if plan.abort_reason else ""
-            retry_msgs.append(
-                f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"
-            )
-            last_abort = True
+            last_abort = _append_skip_message(plan, filepath, retry_msgs)
             if "set-3 groups" in plan.abort_reason:
                 prev_set3_failure = (
                     "Your previous response was incomplete. "
@@ -299,11 +327,7 @@ def run_file_limiter(
         split = generate_file_splits(classified, plan, post_source, filepath)
 
         if split.abort:
-            reason = f": {split.abort_reason}" if split.abort_reason else ""
-            retry_msgs.append(
-                f"SKIP {filepath} (FileLimiter): file cannot be split{reason}"
-            )
-            last_abort = True
+            last_abort = _append_skip_message(split, filepath, retry_msgs)
             prev_assignments = "; ".join(
                 f"{', '.join(p.group)} \u2192 {p.target_file}" for p in plan.placements
             )
