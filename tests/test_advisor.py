@@ -10,7 +10,9 @@ from crispen.config import CrispenConfig
 from crispen.errors import CrispenAPIError
 from crispen.file_limiter.advisor import (
     _PLACEMENT_CHUNK_SIZE,
+    _build_group_mermaid,
     _find_conflicting_placement_indices,
+    _group_summary,
     advise_file_limiter,
     GroupPlacement,
     resolve_naming_conflicts,
@@ -24,14 +26,30 @@ from crispen.file_limiter.entity_parser import Entity, EntityKind
 # ---------------------------------------------------------------------------
 
 
-def _make_entity(name: str, start: int, end: int) -> Entity:
-    return Entity(EntityKind.FUNCTION, name, start, end, [name])
+def _make_entity(
+    name: str,
+    start: int,
+    end: int,
+    *,
+    docstring=None,
+    params=None,
+) -> Entity:
+    return Entity(
+        EntityKind.FUNCTION,
+        name,
+        start,
+        end,
+        [name],
+        docstring=docstring,
+        params=params or [],
+    )
 
 
 def _classified(
     *,
     entities=None,
     entity_class=None,
+    graph=None,
     set_1=None,
     set_2_groups=None,
     set_3_groups=None,
@@ -40,7 +58,7 @@ def _classified(
     return ClassifiedEntities(
         entities=entities or [],
         entity_class=entity_class or {},
-        graph={},
+        graph=graph if graph is not None else {},
         set_1=set_1 or [],
         set_2_groups=set_2_groups or [],
         set_3_groups=set_3_groups or [],
@@ -997,3 +1015,105 @@ def test_resolve_empty_target(mock_key, mock_client, mock_call):
         CrispenConfig(file_limiter_retries=0),
     )
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _group_summary — enriched descriptions
+# ---------------------------------------------------------------------------
+
+
+def test_group_summary_with_docstring_and_params():
+    """Entity with docstring and params → both appear in summary."""
+    ent = _make_entity(
+        "foo",
+        1,
+        10,
+        docstring="Parse the config file. More details here.",
+        params=["path: str", "strict: bool"],
+    )
+    summary = _group_summary(["foo"], {"foo": ent})
+    assert "foo (10 lines)" in summary
+    assert '"Parse the config file."' in summary
+    assert "params: path: str, strict: bool" in summary
+
+
+def test_group_summary_with_params_only():
+    """Entity with params but no docstring → params appear, no docstring quote."""
+    ent = _make_entity("bar", 1, 5, params=["x: int", "y"])
+    summary = _group_summary(["bar"], {"bar": ent})
+    assert "params: x: int, y" in summary
+    assert '"' not in summary
+
+
+def test_group_summary_docstring_no_period():
+    """Docstring with no period → full text used as first sentence."""
+    ent = _make_entity("baz", 1, 3, docstring="No period here")
+    summary = _group_summary(["baz"], {"baz": ent})
+    assert '"No period here"' in summary
+
+
+# ---------------------------------------------------------------------------
+# _build_group_mermaid
+# ---------------------------------------------------------------------------
+
+
+def test_build_group_mermaid_no_edges():
+    """Empty graph → no inter-group deps → returns empty string."""
+    c = _classified(entities=[], set_2_groups=[["foo"], ["bar"]])
+    result = _build_group_mermaid([["foo"], ["bar"]], c)
+    assert result == ""
+
+
+def test_build_group_mermaid_with_inter_group_dep():
+    """G0 depends on G1 → Mermaid text with that edge is returned."""
+    c = _classified(graph={"foo": {"bar"}, "bar": set()})
+    result = _build_group_mermaid([["foo"], ["bar"]], c)
+    assert "```mermaid" in result
+    assert "G0 --> G1" in result
+
+
+def test_build_group_mermaid_dep_outside_chunk():
+    """Dep to entity outside chunk → dep_gid is None → not added → empty."""
+    c = _classified(graph={"foo": {"external"}, "bar": set()})
+    result = _build_group_mermaid([["foo"], ["bar"]], c)
+    assert result == ""
+
+
+def test_build_group_mermaid_intra_group_dep():
+    """Dep within same SCC group → dep_gid == gid → not added as edge."""
+    # foo and baz are in the same group; foo depends on baz (intra-SCC edge)
+    c = _classified(graph={"foo": {"baz"}, "baz": {"foo"}, "bar": set()})
+    result = _build_group_mermaid([["foo", "baz"], ["bar"]], c)
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# Mermaid appears in placement prompt when deps exist
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_placement_prompt_includes_mermaid_when_deps_exist(
+    mock_key, mock_client, mock_call
+):
+    """When inter-group deps exist, Mermaid diagram is included in the prompt."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [
+            {"group_id": 0, "target_file": "utils.py"},
+            {"group_id": 1, "target_file": "models.py"},
+        ]
+    }
+    c = _classified(
+        entities=[_make_entity("foo", 1, 5), _make_entity("bar", 6, 10)],
+        set_2_groups=[["foo"], ["bar"]],
+        graph={"foo": {"bar"}, "bar": set()},
+    )
+    advise_file_limiter(c, "src/big.py", _CONFIG)
+
+    messages = mock_call.call_args[0][6]
+    assert "```mermaid" in messages[0]["content"]
+    assert "G0 --> G1" in messages[0]["content"]

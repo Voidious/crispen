@@ -7,8 +7,10 @@ import textwrap
 
 from crispen.file_limiter.entity_parser import (
     EntityKind,
+    _class_init_params,
     _collect_defined_names,
     _find_attached_comment_start,
+    _format_params,
     _target_names,
     parse_entities,
 )
@@ -118,6 +120,70 @@ def test_collect_import_from_with_asname():
 def test_collect_other_returns_empty():
     # del statement — not a definition
     assert _collect_defined_names(_first_stmt("del x")) == []
+
+
+# ---------------------------------------------------------------------------
+# _format_params
+# ---------------------------------------------------------------------------
+
+
+def _parse_args(source: str) -> ast.arguments:
+    return ast.parse(source).body[0].args
+
+
+def test_format_params_with_type_hints():
+    args = _parse_args("def f(x: int, y: str): pass")
+    assert _format_params(args) == ["x: int", "y: str"]
+
+
+def test_format_params_without_type_hints():
+    args = _parse_args("def f(a, b): pass")
+    assert _format_params(args) == ["a", "b"]
+
+
+def test_format_params_strips_self():
+    args = _parse_args("def f(self, x: int, y): pass")
+    assert _format_params(args) == ["x: int", "y"]
+
+
+def test_format_params_no_self_or_cls():
+    args = _parse_args("def f(a: str, b: int): pass")
+    assert _format_params(args) == ["a: str", "b: int"]
+
+
+def test_format_params_strips_cls():
+    args = _parse_args("def f(cls, x): pass")
+    assert _format_params(args) == ["x"]
+
+
+def test_format_params_truncates_to_max():
+    args = _parse_args("def f(a, b, c, d, e): pass")
+    assert _format_params(args) == ["a", "b", "c", "..."]
+
+
+def test_format_params_empty():
+    args = _parse_args("def f(): pass")
+    assert _format_params(args) == []
+
+
+# ---------------------------------------------------------------------------
+# _class_init_params
+# ---------------------------------------------------------------------------
+
+
+def test_class_init_params_with_init():
+    node = ast.parse("class Foo:\n    def __init__(self, x: int, y): pass").body[0]
+    assert _class_init_params(node) == ["x: int", "y"]
+
+
+def test_class_init_params_no_init():
+    node = ast.parse("class Foo:\n    def method(self): pass").body[0]
+    assert _class_init_params(node) == []
+
+
+def test_class_init_params_pass_body():
+    node = ast.parse("class Foo:\n    pass").body[0]
+    assert _class_init_params(node) == []
 
 
 # ---------------------------------------------------------------------------
@@ -310,3 +376,60 @@ def test_parse_top_level_block_names_defined():
     assert "X" in block.names_defined
     assert "a" in block.names_defined
     assert "b" in block.names_defined
+
+
+# ---------------------------------------------------------------------------
+# docstring and params fields
+# ---------------------------------------------------------------------------
+
+
+def test_parse_function_with_docstring():
+    source = (
+        'def foo(x: int, y):\n    """First sentence. Second sentence."""\n    pass\n'
+    )
+    entities = parse_entities(source)
+    e = entities[0]
+    assert e.docstring == "First sentence. Second sentence."
+    assert e.params == ["x: int", "y"]
+
+
+def test_parse_function_no_docstring():
+    source = "def foo(a, b, c):\n    pass\n"
+    entities = parse_entities(source)
+    e = entities[0]
+    assert e.docstring is None
+    assert e.params == ["a", "b", "c"]
+
+
+def test_parse_class_with_docstring_and_init():
+    source = textwrap.dedent(
+        """\
+        class Bar:
+            \"\"\"Bar class docstring.\"\"\"
+            def __init__(self, x: int, y: str):
+                pass
+        """
+    )
+    entities = parse_entities(source)
+    e = entities[0]
+    assert e.kind == EntityKind.CLASS
+    assert e.docstring == "Bar class docstring."
+    assert e.params == ["x: int", "y: str"]
+
+
+def test_parse_class_no_init():
+    source = "class Baz:\n    pass\n"
+    entities = parse_entities(source)
+    e = entities[0]
+    assert e.kind == EntityKind.CLASS
+    assert e.docstring is None
+    assert e.params == []
+
+
+def test_parse_top_level_block_no_docstring_no_params():
+    source = "X = 1\n"
+    entities = parse_entities(source)
+    e = entities[0]
+    assert e.kind == EntityKind.TOP_LEVEL
+    assert e.docstring is None
+    assert e.params == []

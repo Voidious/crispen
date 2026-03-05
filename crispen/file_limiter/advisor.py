@@ -158,10 +158,40 @@ def _group_summary(group: List[str], entity_map: Dict[str, Entity]) -> str:
         ent = entity_map.get(name)
         if ent:
             size = ent.end_line - ent.start_line + 1
-            parts.append(f"{name} ({size} lines)")
+            desc = f"{name} ({size} lines)"
+            extras = []
+            if ent.docstring:
+                flat = ent.docstring.replace("\n", " ")
+                idx = flat.find(". ")
+                first = flat[: idx + 1] if idx >= 0 else flat
+                extras.append(f'"{first}"')
+            if ent.params:
+                extras.append(f"params: {', '.join(ent.params)}")
+            if extras:
+                desc += " \u2014 " + "; ".join(extras)
+            parts.append(desc)
         else:
             parts.append(name)
     return ", ".join(parts)
+
+
+def _build_group_mermaid(chunk: List[List[str]], classified: ClassifiedEntities) -> str:
+    """Return a Mermaid graph showing inter-group dependencies, or '' if none."""
+    entity_to_gid = {name: gid for gid, group in enumerate(chunk) for name in group}
+    edges: set = set()
+    for gid, group in enumerate(chunk):
+        for entity_name in group:
+            for dep_name in classified.graph.get(entity_name, set()):
+                dep_gid = entity_to_gid.get(dep_name)
+                if dep_gid is not None and dep_gid != gid:
+                    edges.add((gid, dep_gid))
+    if not edges:
+        return ""
+    lines = ["```mermaid", "graph TD"]
+    for g_from, g_to in sorted(edges):
+        lines.append(f"    G{g_from} --> G{g_to}")
+    lines.append("```")
+    return "\n".join(lines)
 
 
 def _advise_set3(
@@ -284,6 +314,9 @@ def _assign_placements_chunk(
         "(e.g. 'helpers.py', 'models.py', 'extractors.py')."
         f"{exclude_section}"
     )
+    mermaid_text = _build_group_mermaid(chunk, classified)
+    if mermaid_text:
+        content += f"\n\nDependency graph between groups:\n{mermaid_text}"
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]

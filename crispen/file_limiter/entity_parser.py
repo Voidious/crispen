@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List
+from typing import List, Optional
 
 
 class EntityKind(Enum):
@@ -30,11 +30,43 @@ class Entity:
     start_line: int  # 1-indexed, includes preceding attached comments
     end_line: int  # 1-indexed, inclusive
     names_defined: List[str] = field(default_factory=list)
+    docstring: Optional[str] = None  # first docstring if present
+    params: List[str] = field(default_factory=list)  # up to 3 param descriptions
 
 
 # ---------------------------------------------------------------------------
 # Helpers used by parse_entities
 # ---------------------------------------------------------------------------
+
+
+def _format_params(args: ast.arguments, max_params: int = 3) -> List[str]:
+    """Return up to *max_params* formatted parameter strings, excluding self/cls.
+
+    Appends ``"..."`` when there are more parameters than *max_params*.
+    """
+    all_args = args.args
+    if all_args and all_args[0].arg in ("self", "cls"):
+        all_args = all_args[1:]
+    result = []
+    for arg in all_args[:max_params]:
+        if arg.annotation is not None:
+            result.append(f"{arg.arg}: {ast.unparse(arg.annotation)}")
+        else:
+            result.append(arg.arg)
+    if len(all_args) > max_params:
+        result.append("...")
+    return result
+
+
+def _class_init_params(node: ast.ClassDef) -> List[str]:
+    """Return the first 3 formatted params of __init__ (excluding self), or []."""
+    for item in node.body:
+        if (
+            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == "__init__"
+        ):
+            return _format_params(item.args)
+    return []
 
 
 def _target_names(target: ast.expr) -> List[str]:
@@ -150,11 +182,12 @@ def parse_entities(source: str) -> List[Entity]:
             else:
                 stmt_first_line = stmt.lineno
             comment_start = _find_attached_comment_start(lines, stmt_first_line)
-            kind = (
-                EntityKind.CLASS
-                if isinstance(stmt, ast.ClassDef)
-                else EntityKind.FUNCTION
-            )
+            if isinstance(stmt, ast.ClassDef):
+                kind = EntityKind.CLASS
+                params = _class_init_params(stmt)
+            else:
+                kind = EntityKind.FUNCTION
+                params = _format_params(stmt.args)
             entities.append(
                 Entity(
                     kind=kind,
@@ -162,6 +195,8 @@ def parse_entities(source: str) -> List[Entity]:
                     start_line=comment_start,
                     end_line=stmt.end_lineno,
                     names_defined=[stmt.name],
+                    docstring=ast.get_docstring(stmt),
+                    params=params,
                 )
             )
         else:
