@@ -166,12 +166,17 @@ def test_parse_syntax_error():
     assert parse_entities("def (invalid") == []
 
 
-def test_parse_single_function():
-    source = "def foo():\n    pass\n"
+def assert_single_function_entity(source: str):
     entities = parse_entities(source)
     assert len(entities) == 1
     e = entities[0]
     assert e.kind == EntityKind.FUNCTION
+    return e
+
+
+def test_parse_single_function():
+    source = "def foo():\n    pass\n"
+    e = assert_single_function_entity(source)
     assert e.name == "foo"
     assert e.start_line == 1
     assert e.end_line == 2
@@ -180,10 +185,7 @@ def test_parse_single_function():
 
 def test_parse_async_function():
     source = "async def bar():\n    pass\n"
-    entities = parse_entities(source)
-    assert len(entities) == 1
-    e = entities[0]
-    assert e.kind == EntityKind.FUNCTION
+    e = assert_single_function_entity(source)
     assert e.name == "bar"
 
 

@@ -49,6 +49,13 @@ _IMPORT_LINE_RE = re.compile(r"^(import\s+|from\s+\S.*\s+import\s+)")
 _FUTURE_IMPORT_LINE_RE = re.compile(r"^from __future__ import .*\n?", re.MULTILINE)
 
 
+def _parse_ast_or_none(src: str) -> Optional[ast.AST]:
+    try:
+        return ast.parse(src)
+    except SyntaxError:
+        return None
+
+
 def _import_derived_names(source: str) -> Set[str]:
     """Return names introduced solely by import statements in *source*.
 
@@ -56,9 +63,8 @@ def _import_derived_names(source: str) -> Set[str]:
     statements and cannot be re-exported from a new module the way
     assignment-defined names can.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_ast_or_none(source)
+    if tree is None:
         return set()
     names: Set[str] = set()
     for node in tree.body:
@@ -73,9 +79,8 @@ def _import_derived_names(source: str) -> Set[str]:
 
 def _collect_name_loads(source: str) -> Set[str]:
     """Return all Name loads referenced in *source*."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree = _parse_ast_or_none(source)
+    if tree is None:
         return set()
     names: Set[str] = set()
     for node in ast.walk(tree):
@@ -113,6 +118,16 @@ def _extract_import_info(source: str) -> List[ImportInfo]:
     return result
 
 
+def _gather_referenced_names_for_entities(
+    entity_names: List[str], entity_source_map: Dict[str, str]
+) -> Set[str]:
+    referenced: Set[str] = set()
+    for name in entity_names:
+        src = entity_source_map.get(name, "")
+        referenced |= _collect_name_loads(src)
+    return referenced
+
+
 def _find_needed_imports(
     entity_names: List[str],
     entity_source_map: Dict[str, str],
@@ -125,10 +140,7 @@ def _find_needed_imports(
     when any of the names they introduce appear in the entities' source.
     Duplicate import source strings are deduplicated.
     """
-    referenced: Set[str] = set()
-    for name in entity_names:
-        src = entity_source_map.get(name, "")
-        referenced |= _collect_name_loads(src)
+    referenced = _gather_referenced_names_for_entities(entity_names, entity_source_map)
 
     needed: List[str] = []
     seen: Set[str] = set()
@@ -187,10 +199,7 @@ def _find_cross_file_imports(
     absolute (e.g. ``from tests.constants import _CONST``), which is required
     for test files that pytest loads as top-level modules.
     """
-    referenced: Set[str] = set()
-    for name in entity_names:
-        src = entity_source_map.get(name, "")
-        referenced |= _collect_name_loads(src)
+    referenced = _gather_referenced_names_for_entities(entity_names, entity_source_map)
     from_files: Dict[str, List[str]] = {}  # source_file → names
     for ref_name in sorted(referenced):
         source_file = name_to_target_file.get(ref_name)
@@ -224,9 +233,8 @@ def _import_line_numbers(entity: Entity, entity_src: str) -> Set[int]:
     Used to preserve import lines in the original file when a TOP_LEVEL
     entity that mixes imports and assignments is migrated.
     """
-    try:
-        tree = ast.parse(entity_src)
-    except SyntaxError:
+    tree = _parse_ast_or_none(entity_src)
+    if tree is None:
         return set()
     result: Set[int] = set()
     for node in tree.body:
@@ -640,6 +648,15 @@ def _extract_shared_helpers(
     return synthetic_placements
 
 
+def _mark_import_lines_for_removal(line_map, node):
+    if not hasattr(node, "lineno") or not hasattr(node, "end_lineno"):
+        return
+    if node.lineno is None or node.end_lineno is None:
+        return
+    for ln in range(node.lineno, node.end_lineno + 1):
+        line_map[ln] = None
+
+
 def _prune_inline_redundant_imports(source: str) -> str:
     """Remove function-body imports that duplicate module-level imports.
 
@@ -707,9 +724,7 @@ def _prune_inline_redundant_imports(source: str) -> str:
         if len(kept) == len(stmt.names):
             continue  # no redundancy — nothing to remove
 
-        # Mark every line of this import for removal.
-        for ln in range(stmt.lineno, stmt.end_lineno + 1):
-            line_ops[ln] = None
+        _mark_import_lines_for_removal(line_ops, stmt)
 
         if kept:
             # Rebuild a narrowed import preserving original indentation.
@@ -782,9 +797,7 @@ def _prune_unused_imports(source: str) -> str:
         if len(kept) == len(node.names):
             continue  # nothing to prune
 
-        # Mark every line of this import for removal.
-        for ln in range(node.lineno, node.end_lineno + 1):
-            replacements[ln] = None
+        _mark_import_lines_for_removal(replacements, node)
 
         if not kept:
             continue  # fully unused — all lines already removed

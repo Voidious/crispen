@@ -54,20 +54,22 @@ def test_build_dep_graph_mutual_dependency():
     assert "a" in graph["b"]
 
 
-def test_build_dep_graph_self_reference_excluded():
-    # Recursive function: foo references itself — no self-loop.
-    source = "def foo(n):\n    return foo(n - 1)\n"
+def _assert_single_foo_empty_graph(source: str) -> None:
     entities = [_func("foo", 1, 2)]
     graph = build_dep_graph(entities, source)
     assert graph == {"foo": set()}
+
+
+def test_build_dep_graph_self_reference_excluded():
+    # Recursive function: foo references itself — no self-loop.
+    source = "def foo(n):\n    return foo(n - 1)\n"
+    _assert_single_foo_empty_graph(source)
 
 
 def test_build_dep_graph_external_name_no_edge():
     # Reference to a name not defined by any entity → no edge.
     source = "def foo():\n    os.getcwd()\n"
-    entities = [_func("foo", 1, 2)]
-    graph = build_dep_graph(entities, source)
-    assert graph == {"foo": set()}
+    _assert_single_foo_empty_graph(source)
 
 
 def test_build_dep_graph_syntax_error_returns_empty_edge_sets():
