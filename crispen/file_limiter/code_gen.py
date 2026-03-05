@@ -451,10 +451,8 @@ def _add_re_exports(
         noqa = [n for n in sorted_names if n in noqa_names]
         if used:
             export_stmts.append(f"from {prefix} import {', '.join(used)}\n")
-        if noqa:
-            export_stmts.append(
-                f"from {prefix} import {', '.join(noqa)}  # noqa F401\n"
-            )
+        for name in noqa:
+            export_stmts.append(f"from {prefix} import {name}  # noqa F401\n")
 
     lines = source.splitlines(keepends=True)
     last_import_line = 0
