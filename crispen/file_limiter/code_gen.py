@@ -351,7 +351,7 @@ def _collect_external_imported_names(original_path: str) -> Set[str]:
         # Compute this file's dotted module path for relative-import resolution.
         file_module = _module_path_from_file(project_root, py_file)
         file_pkg_parts = file_module.split(".")[:-1] if file_module else []
-        for node in tree.body:
+        for node in ast.walk(tree):
             if not isinstance(node, ast.ImportFrom):
                 continue
             if node.level == 0:
