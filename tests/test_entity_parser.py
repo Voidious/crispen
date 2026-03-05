@@ -166,12 +166,17 @@ def test_parse_syntax_error():
     assert parse_entities("def (invalid") == []
 
 
-def test_parse_single_function():
-    source = "def foo():\n    pass\n"
+def assert_single_function_entity(source: str):
     entities = parse_entities(source)
     assert len(entities) == 1
     e = entities[0]
     assert e.kind == EntityKind.FUNCTION
+    return e
+
+
+def test_parse_single_function():
+    source = "def foo():\n    pass\n"
+    e = assert_single_function_entity(source)
     assert e.name == "foo"
     assert e.start_line == 1
     assert e.end_line == 2
@@ -180,10 +185,7 @@ def test_parse_single_function():
 
 def test_parse_async_function():
     source = "async def bar():\n    pass\n"
-    entities = parse_entities(source)
-    assert len(entities) == 1
-    e = entities[0]
-    assert e.kind == EntityKind.FUNCTION
+    e = assert_single_function_entity(source)
     assert e.name == "bar"
 
 
@@ -197,11 +199,16 @@ def test_parse_single_class():
     assert e.names_defined == ["Foo"]
 
 
-def test_parse_top_level_assignment():
-    entities = parse_entities("X = 1\n")
+def assert_single_top_level_entity(entities):
     assert len(entities) == 1
     e = entities[0]
     assert e.kind == EntityKind.TOP_LEVEL
+    return e
+
+
+def test_parse_top_level_assignment():
+    entities = parse_entities("X = 1\n")
+    e = assert_single_top_level_entity(entities)
     assert e.name == "_block_1"
     assert e.names_defined == ["X"]
     assert e.start_line == 1
@@ -210,9 +217,7 @@ def test_parse_top_level_assignment():
 
 def test_parse_imports_form_top_level_entity():
     entities = parse_entities("import os\nfrom sys import argv\n")
-    assert len(entities) == 1
-    e = entities[0]
-    assert e.kind == EntityKind.TOP_LEVEL
+    e = assert_single_top_level_entity(entities)
     assert "os" in e.names_defined
     assert "argv" in e.names_defined
 

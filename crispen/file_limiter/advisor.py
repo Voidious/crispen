@@ -229,6 +229,15 @@ def _advise_set3(
     ]
 
 
+def _init_placements_and_ids(result):
+    if result is None:
+        return None
+
+    placements: List[GroupPlacement] = []
+    placed_ids: set = set()
+    return placements, placed_ids
+
+
 def _assign_placements_chunk(
     chunk: List[List[str]],
     classified: ClassifiedEntities,
@@ -299,11 +308,10 @@ def _assign_placements_chunk(
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
     )
-    if result is None:
+    init_vals = _init_placements_and_ids(result)
+    if init_vals is None:
         return None
-
-    placements: List[GroupPlacement] = []
-    placed_ids: set = set()
+    placements, placed_ids = init_vals
     for item in result.get("placements", []):
         gid = item.get("group_id")
         target = item.get("target_file", "")
@@ -437,11 +445,14 @@ def _rename_conflicting_chunk(
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
     )
-    if result is None:
-        return None
+    return _rename_conflicting_placements(chunk, forbidden_files, n_groups, result)
 
-    placements: List[GroupPlacement] = []
-    placed_ids: set = set()
+
+def _rename_conflicting_placements(chunk, forbidden_files, n_groups, result):
+    init_vals = _init_placements_and_ids(result)
+    if init_vals is None:
+        return None
+    placements, placed_ids = init_vals
     for item in result.get("placements", []):
         gid = item.get("group_id")
         target = item.get("target_file", "")
