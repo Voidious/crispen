@@ -604,6 +604,30 @@ def test_plan_chunked_placement_chunk_retry_succeeds(mock_key, mock_client, mock
     assert mock_call.call_count == 3  # chunk 1 (1) + chunk 2 (1 fail + 1 succeed)
 
 
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_plan_chunked_placement_zero_total_lines(mock_key, mock_client, mock_call):
+    """Groups whose names are absent from entity_map → total_lines==0 → fallback."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+
+    # Groups reference names not present in entity_map (entities=[]).
+    groups = [["orphan_a"], ["orphan_b"]]
+    mock_call.return_value = {
+        "placements": [
+            {"group_id": 0, "target_file": "a.py"},
+            {"group_id": 1, "target_file": "b.py"},
+        ]
+    }
+
+    c = _classified(entities=[], set_2_groups=groups)
+    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
+
+    assert plan.abort is False
+    assert len(plan.placements) == 2
+
+
 # ---------------------------------------------------------------------------
 # _find_conflicting_placement_indices
 # ---------------------------------------------------------------------------
