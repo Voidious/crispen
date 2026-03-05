@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -142,7 +143,7 @@ _RENAME_CONFLICTS_TOOL: dict = {
 # Maximum number of groups per placement LLM call.  Large files may have
 # dozens of groups; sending them all in one call frequently causes timeouts
 # or incomplete responses.  This limit keeps each call small and reliable.
-_PLACEMENT_CHUNK_SIZE = 20
+_PLACEMENT_CHUNK_SIZE = 100
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +248,7 @@ def _assign_placements_chunk(
     client: object,
     config: CrispenConfig,
     prev_failure: str = "",
+    min_files: int = 2,
 ) -> Optional[List[GroupPlacement]]:
     """Ask the LLM to assign filenames to one chunk of groups.
 
@@ -273,9 +275,9 @@ def _assign_placements_chunk(
     original_basename = Path(original_path).name
     content = (
         f"Assign each entity group to a target Python filename. "
-        f"The original file is '{original_path}'. "
-        "Each group will be written to a NEW file in the same directory "
-        "as the original.\n\n"
+        f"The original file is '{original_path}' and is being split — "
+        "each group must go to a file that does NOT already exist "
+        "(a new file created by this split).\n\n"
         f"Groups to place (you MUST return a target_file for every "
         f"group_id listed):\n{groups_text}\n\n"
         "Rules:\n"
@@ -284,8 +286,11 @@ def _assign_placements_chunk(
         f"- Use filenames relative to the same directory "
         f"(e.g. 'utils.py'). Do NOT use '{original_basename}' "
         "(the original file being split).\n"
-        "- Multiple groups may share the same target file if they are "
-        "semantically related.\n"
+        "- Multiple groups MAY share the same target file — place "
+        "semantically related groups together rather than giving each "
+        "its own file.\n"
+        f"- The set of target files across all placements should use "
+        f"at least {min_files} distinct filename(s).\n"
         "- Choose descriptive names based on what the entities do "
         "(e.g. 'helpers.py', 'models.py', 'extractors.py')."
         f"{exclude_section}"
@@ -492,9 +497,31 @@ def _assign_placements(
     restarting all chunks.  If any chunk fails all its attempts, ``None`` is
     returned immediately.
     """
+    entity_map = {e.name: e for e in classified.entities}
+    total_lines = sum(
+        entity_map[name].end_line - entity_map[name].start_line + 1
+        for group in groups_to_place
+        for name in group
+        if name in entity_map
+    )
+    min_files = max(2, -(-total_lines // config.max_file_lines))  # ceiling division
+
     all_placements: List[GroupPlacement] = []
     for chunk_start in range(0, len(groups_to_place), _PLACEMENT_CHUNK_SIZE):
         chunk = groups_to_place[chunk_start : chunk_start + _PLACEMENT_CHUNK_SIZE]
+        # Scale min_files to this chunk's share of total lines.  When
+        # total_lines is zero (all entities have zero-length ranges) fall
+        # back to the global value.
+        if total_lines > 0:
+            chunk_lines = sum(
+                entity_map[name].end_line - entity_map[name].start_line + 1
+                for group in chunk
+                for name in group
+                if name in entity_map
+            )
+            chunk_min_files = max(2, math.ceil(min_files * chunk_lines / total_lines))
+        else:
+            chunk_min_files = min_files
         chunk_placements: Optional[List[GroupPlacement]] = None
         for _ in range(1 + config.file_limiter_retries):
             chunk_placements = _assign_placements_chunk(
@@ -505,6 +532,7 @@ def _assign_placements(
                 client,
                 config,
                 prev_failure,
+                min_files=chunk_min_files,
             )
             if chunk_placements is not None:
                 break
