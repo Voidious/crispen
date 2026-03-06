@@ -685,6 +685,7 @@ def run_engine(
                 new_path.write_text(new_source, encoding="utf-8")
                 _stats.files_edited.append(str(new_path))
                 _stats.file_limiter_edits += 1
+                _stats.count_lines_changed("", new_source)
 
             state["source"] = fl_result.original_source
 
