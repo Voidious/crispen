@@ -28,6 +28,9 @@ class FileLimiterResult:
     verified_functions: int = 0
     verified_classes: int = 0
     verified_lines: int = 0
+    verified_function_names: set = field(default_factory=set)
+    verified_class_names: set = field(default_factory=set)
+    verified_entity_line_counts: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -58,13 +61,24 @@ def _strip_imports_by_line(src: str) -> str:
 
 
 class _VerifyResult:
-    __slots__ = ("failures", "verified_functions", "verified_classes", "verified_lines")
+    __slots__ = (
+        "failures",
+        "verified_functions",
+        "verified_classes",
+        "verified_lines",
+        "verified_function_names",
+        "verified_class_names",
+        "verified_entity_line_counts",
+    )
 
     def __init__(self) -> None:
         self.failures: List[str] = []
         self.verified_functions: int = 0
         self.verified_classes: int = 0
         self.verified_lines: int = 0
+        self.verified_function_names: set[str] = set()
+        self.verified_class_names: set[str] = set()
+        self.verified_entity_line_counts: dict[str, int] = {}
 
 
 def _verify_preservation(
@@ -124,11 +138,15 @@ def _verify_preservation(
         else:
             if entity.name not in name_to_file:
                 continue  # stayed in original; not a FileLimiter edit
+            n_lines = len(entity_no_imports.splitlines())
             if entity.kind == EntityKind.FUNCTION:
                 result.verified_functions += 1
+                result.verified_function_names.add(entity.name)
             if entity.kind == EntityKind.CLASS:
                 result.verified_classes += 1
-            result.verified_lines += len(entity_no_imports.splitlines())
+                result.verified_class_names.add(entity.name)
+            result.verified_lines += n_lines
+            result.verified_entity_line_counts[entity.name] = n_lines
 
     return result
 
@@ -492,4 +510,7 @@ def run_file_limiter(
         verified_functions=vr.verified_functions,
         verified_classes=vr.verified_classes,
         verified_lines=vr.verified_lines,
+        verified_function_names=vr.verified_function_names,
+        verified_class_names=vr.verified_class_names,
+        verified_entity_line_counts=vr.verified_entity_line_counts,
     )

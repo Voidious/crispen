@@ -650,6 +650,14 @@ def run_engine(
         # Pending queue for recursive FileLimiter processing: (filepath, source)
         # pairs for newly-created files that are still over the limit.
         _fl_recursive: List[Tuple[str, str]] = []
+        # Track the final content of each new file created by FileLimiter so
+        # lines_added/deleted counts reflect the net result, not interim states.
+        _fl_new_file_final: Dict[str, Optional[str]] = {}
+        # Deduplicate verified functions/classes across recursive passes so
+        # entities migrated more than once are not counted multiple times.
+        _fl_verified_func_names: Set[str] = set()
+        _fl_verified_class_names: Set[str] = set()
+        _fl_verified_entity_lines: Dict[str, int] = {}
 
         for filepath, state in per_file.items():
             if len(state["source"].splitlines()) <= config.max_file_lines:
@@ -668,9 +676,9 @@ def run_engine(
                 raise
 
             _stats.file_limiter_llm_calls += fl_result.llm_calls
-            _stats.file_limiter_functions_verified += fl_result.verified_functions
-            _stats.file_limiter_classes_verified += fl_result.verified_classes
-            _stats.file_limiter_lines_verified += fl_result.verified_lines
+            _fl_verified_func_names |= fl_result.verified_function_names
+            _fl_verified_class_names |= fl_result.verified_class_names
+            _fl_verified_entity_lines.update(fl_result.verified_entity_line_counts)
 
             if fl_result.messages:
                 state["msgs"].extend(fl_result.messages)
@@ -689,7 +697,7 @@ def run_engine(
                 new_path.write_text(new_source, encoding="utf-8")
                 _stats.files_edited.append(str(new_path))
                 _stats.file_limiter_edits += 1
-                _stats.count_lines_changed("", new_source)
+                _fl_new_file_final[str(new_path)] = new_source
                 if (
                     config.file_limiter_recursive
                     and len(new_source.splitlines()) > config.max_file_lines
@@ -729,9 +737,9 @@ def run_engine(
                 raise
 
             _stats.file_limiter_llm_calls += r_result.llm_calls
-            _stats.file_limiter_functions_verified += r_result.verified_functions
-            _stats.file_limiter_classes_verified += r_result.verified_classes
-            _stats.file_limiter_lines_verified += r_result.verified_lines
+            _fl_verified_func_names |= r_result.verified_function_names
+            _fl_verified_class_names |= r_result.verified_class_names
+            _fl_verified_entity_lines.update(r_result.verified_entity_line_counts)
 
             _recursive_msgs.extend(r_result.messages)
 
@@ -749,22 +757,27 @@ def run_engine(
                 new_path.write_text(new_source, encoding="utf-8")
                 _stats.files_edited.append(str(new_path))
                 _stats.file_limiter_edits += 1
-                _stats.count_lines_changed("", new_source)
+                _fl_new_file_final[str(new_path)] = new_source
                 if len(new_source.splitlines()) > config.max_file_lines:
                     _fl_recursive.append((str(new_path), new_source))
 
-            if r_result.original_source != r_source:
-                Path(r_path).write_text(r_result.original_source, encoding="utf-8")
-                _stats.count_lines_changed(r_source, r_result.original_source)
-
             # Subdir split of a recursively-processed file: delete the file
-            # that was replaced by a package __init__.py.
+            # that was replaced by a package __init__.py.  Handle before the
+            # rewrite check so we don't write-then-delete (and double-count lines).
             if r_result.subdir_name is not None and not Path(r_path).name.startswith(
                 "test_"
             ):
                 Path(r_path).unlink()
-                _stats.count_lines_changed(r_source, "")
+                _fl_new_file_final.pop(str(r_path), None)
+            elif r_result.original_source != r_source:
+                Path(r_path).write_text(r_result.original_source, encoding="utf-8")
+                _fl_new_file_final[str(r_path)] = r_result.original_source
 
+        for path, content in _fl_new_file_final.items():
+            _stats.count_lines_changed("", content)
+        _stats.file_limiter_functions_verified = len(_fl_verified_func_names)
+        _stats.file_limiter_classes_verified = len(_fl_verified_class_names)
+        _stats.file_limiter_lines_verified = sum(_fl_verified_entity_lines.values())
         yield from _recursive_msgs
 
     # ------------------------------------------------------------------ #
