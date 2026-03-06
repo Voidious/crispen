@@ -693,10 +693,12 @@ def run_engine(
             # now that service/__init__.py takes its place as the public entry
             # point.  state["source"] was reset to state["original"] above, so
             # the final write loop will see no diff and skip the (deleted) file.
+            # Count the original lines as deleted so stats stay accurate.
             if fl_result.subdir_name is not None and not Path(filepath).name.startswith(
                 "test_"
             ):
                 Path(filepath).unlink()
+                _stats.count_lines_changed(state["original"], "")
 
     # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #

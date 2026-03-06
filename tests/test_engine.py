@@ -1263,11 +1263,13 @@ def test_file_limiter_subdir_split_non_test_deletes_original(tmp_path):
         abort=False,
         subdir_name="service",
     )
+    s = RunStats()
     with patch(_FL_PATCH, return_value=success_result):
         list(
             run_engine(
                 {str(f): [(1, 1)]},
                 config=CrispenConfig(max_file_lines=5),
+                stats=s,
             )
         )
     # Original service.py must be deleted.
@@ -1279,6 +1281,8 @@ def test_file_limiter_subdir_split_non_test_deletes_original(tmp_path):
     assert (tmp_path / "service" / "utils.py").read_text(
         encoding="utf-8"
     ) == "# utils\n"
+    # All original lines must be counted as deleted so verified_lines ≤ lines_deleted.
+    assert s.lines_deleted == 10
 
 
 def test_file_limiter_subdir_split_test_keeps_original(tmp_path):
