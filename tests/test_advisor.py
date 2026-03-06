@@ -1223,10 +1223,11 @@ def test_advise_verbose_set3_and_placement(mock_key, mock_client, mock_call, cap
 
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
-def test_resolve_verbose(mock_client, mock_call, capsys):
+@patch(_PATCH_KEY)
+def test_resolve_verbose(mock_key, mock_client, mock_call, capsys):
     """verbose=True exercises the print + _counter branches in
     _rename_conflicting_chunk (with _counter passed to cover the increment)."""
-    mock_client.return_value = MagicMock()
+    mock_key.return_value = "key"
     # Both placements conflict (utils.py vs utils/io.py share stem "utils"),
     # so the chunk sent to LLM has 2 groups; return both renamed.
     mock_call.return_value = {
