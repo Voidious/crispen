@@ -1,0 +1,485 @@
+from __future__ import annotations
+from crispen.file_limiter.advisor import GroupPlacement
+from crispen.file_limiter.code_gen import (
+    _add_re_exports,
+    _collect_external_imported_names,
+    generate_file_splits,
+)
+from crispen.file_limiter.entity_parser import Entity, EntityKind
+from .test_code_gen_generation import _classified, _make_entity, _plan
+
+
+def test_add_re_exports_top_level_import_derived_names_not_re_exported():
+    # A TOP_LEVEL entity that includes import statements: the names introduced
+    # by those imports must NOT appear in re-exports because they are preserved
+    # in the original file by _remove_entity_lines, not moved to the new file.
+    source = "import os\n\nMY_CONST\n"  # MY_CONST still loaded
+    entity_src = "from typing import Dict\n\nMY_CONST = 42\n"
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, ["Dict", "MY_CONST"])
+    placement = GroupPlacement(group=["_block_1"], target_file="constants.py")
+    result = _add_re_exports(
+        source, [placement], {"_block_1": entity}, {"_block_1": entity_src}
+    )
+    assert "MY_CONST" in result  # assignment-defined name re-exported
+    assert "Dict" not in result  # import-derived name suppressed
+
+
+def test_add_re_exports_all_private_no_change():
+    # Private name not called anywhere in remaining source → no import added.
+    source = "import os\n\ndef _helper():\n    pass\n"
+    entity = _make_entity("_helper", 3, 4)
+    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"_helper": entity}, {})
+    assert result == source
+
+
+def test_add_re_exports_private_referenced_in_source():
+    # Private name still called in remaining source → import is added.
+    source = "import os\n\n_helper()\n"
+    entity = _make_entity("_helper", 3, 3)
+    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"_helper": entity}, {})
+    assert "from .utils import _helper" in result
+
+
+def test_add_re_exports_public_inserted_after_imports():
+    source = "import os\n\ndef foo():\n    pass\n"
+    entity = _make_entity("foo", 3, 4)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
+    assert "from .utils import foo" in result
+    # Re-export line should come after "import os"
+    lines = result.splitlines()
+    import_idx = next(i for i, l in enumerate(lines) if "import os" in l)
+    reexport_idx = next(i for i, l in enumerate(lines) if "from .utils import foo" in l)
+    assert reexport_idx > import_idx
+
+
+def test_add_re_exports_no_import_in_source():
+    # No imports in source → re-export inserted at beginning.
+    source = "\ndef foo():\n    pass\n"
+    entity = _make_entity("foo", 2, 3)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
+    assert "from .utils import foo" in result
+
+
+def test_add_re_exports_from_import_line():
+    # "from pathlib import Path" should be detected as an import line.
+    source = "from pathlib import Path\n\ndef foo():\n    pass\n"
+    entity = _make_entity("foo", 3, 4)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
+    lines = result.splitlines()
+    from_import_idx = next(
+        i for i, l in enumerate(lines) if "from pathlib import Path" in l
+    )
+    reexport_idx = next(i for i, l in enumerate(lines) if "from .utils import foo" in l)
+    assert reexport_idx > from_import_idx
+
+
+def test_add_re_exports_multiple_targets_sorted():
+    source = "import os\n"
+    e1 = _make_entity("foo", 1, 2)
+    e2 = _make_entity("bar", 3, 4)
+    placements = [
+        GroupPlacement(group=["foo"], target_file="b_module.py"),
+        GroupPlacement(group=["bar"], target_file="a_module.py"),
+    ]
+    result = _add_re_exports(source, placements, {"foo": e1, "bar": e2}, {})
+    # a_module comes before b_module (sorted)
+    a_idx = result.index("a_module")
+    b_idx = result.index("b_module")
+    assert a_idx < b_idx
+
+
+def test_add_re_exports_mixed_public_private():
+    source = "import os\n"
+    entity_map = {
+        "pub": _make_entity("pub", 1, 2),
+        "_priv": _make_entity("_priv", 3, 4),
+    }
+    placement = GroupPlacement(group=["pub", "_priv"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], entity_map, {})
+    # Only "pub" in re-export, not "_priv"
+    assert "pub" in result
+    assert "_priv" not in result
+
+
+def test_add_re_exports_test_function_not_re_exported():
+    # test_ functions must never get a proxy import — pytest would discover and
+    # run them twice (once from the original file, once from the new file).
+    source = "import os\n"
+    entity = _make_entity("test_something", 1, 3)
+    placement = GroupPlacement(group=["test_something"], target_file="tests/helpers.py")
+    result = _add_re_exports(source, [placement], {"test_something": entity}, {})
+    assert result == source
+
+
+def test_add_re_exports_test_function_re_exported_when_referenced():
+    # If something in the remaining source actually calls test_something (unusual
+    # but possible), the proxy import is still added.
+    source = "import os\n\ntest_something()\n"
+    entity = _make_entity("test_something", 1, 3)
+    placement = GroupPlacement(group=["test_something"], target_file="tests/helpers.py")
+    result = _add_re_exports(source, [placement], {"test_something": entity}, {})
+    assert "from .tests.helpers import test_something" in result
+
+
+def test_add_re_exports_top_level_block_private_names_referenced():
+    # TOP_LEVEL block entity name (_block_1) differs from its defined names.
+    # Both defined names are still loaded in remaining source → re-imported.
+    source = "import os\n\n_DUP_SOURCE\n_DUP_RANGES\n"
+    entity = Entity(
+        EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_DUP_SOURCE", "_DUP_RANGES"]
+    )
+    placement = GroupPlacement(group=["_block_1"], target_file="test_helpers.py")
+    result = _add_re_exports(source, [placement], {"_block_1": entity}, {})
+    assert "from .test_helpers import _DUP_RANGES, _DUP_SOURCE" in result
+
+
+def test_add_re_exports_entity_not_in_map_falls_back_to_entity_name():
+    # Entity name in group is missing from entity_map → falls back to entity name.
+    source = "import os\n\nghost()\n"  # 'ghost' is still referenced
+    placement = GroupPlacement(group=["ghost"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {}, {})
+    assert "from .utils import ghost" in result
+
+
+def test_add_re_exports_top_level_block_private_names_not_referenced():
+    # TOP_LEVEL block entity whose defined name is private and not used → no import.
+    source = "import os\n"
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
+    placement = GroupPlacement(group=["_block_1"], target_file="constants.py")
+    result = _add_re_exports(source, [placement], {"_block_1": entity}, {})
+    assert result == source
+
+
+def test_add_re_exports_indented_local_import_not_treated_as_last_import():
+    # Functions with local (indented) imports must not cause re-exports to be
+    # inserted inside the function body.  The re-export should appear after the
+    # top-level "import os" line, not after the indented "from x import y".
+    source = (
+        "import os\n"
+        "\n"
+        "def foo():\n"
+        "    from unittest.mock import MagicMock\n"
+        "    MagicMock()\n"
+        "\n"
+        "def bar():\n"
+        "    pass\n"
+    )
+    entity = _make_entity("baz", 7, 8)
+    placement = GroupPlacement(group=["baz"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"baz": entity}, {})
+    # Re-export must appear immediately after "import os", not inside foo().
+    lines = result.splitlines()
+    os_idx = next(i for i, l in enumerate(lines) if l == "import os")
+    reexport_idx = next(i for i, l in enumerate(lines) if "from .utils import baz" in l)
+    assert reexport_idx == os_idx + 1
+    # The function body must remain intact (local import line must still be there).
+    assert "    from unittest.mock import MagicMock" in result
+
+
+def test_add_re_exports_syntax_error_returns_source_unchanged():
+    # If the source has a SyntaxError, _add_re_exports cannot determine where
+    # to insert re-exports and must return the source unchanged.
+    source = "import os\ndef (invalid\n"
+    entity = _make_entity("baz", 1, 1)
+    placement = GroupPlacement(group=["baz"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"baz": entity}, {})
+    assert result == source
+
+
+def test_add_re_exports_abs_pkg_package_prefix():
+    # abs_pkg="tests" → absolute import: "from tests.utils import foo"
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"foo": entity}, {}, abs_pkg="tests")
+    assert "from tests.utils import foo" in result
+    assert "from .utils import foo" not in result
+
+
+def test_add_re_exports_abs_pkg_root_level():
+    # abs_pkg="" → root-level absolute import: "from utils import foo"
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"foo": entity}, {}, abs_pkg="")
+    assert "from utils import foo" in result
+    assert "from .utils import foo" not in result
+
+
+def test_collect_external_imported_names_relative_path():
+    # Non-absolute path → empty set (no scan).
+    assert _collect_external_imported_names("relative/path.py") == set()
+
+
+def test_collect_external_imported_names_nonexistent_file(tmp_path):
+    # Absolute but non-existent → empty set.
+    assert _collect_external_imported_names(str(tmp_path / "ghost.py")) == set()
+
+
+def test_collect_external_imported_names_no_project_root(tmp_path):
+    # File exists but no pyproject.toml/.git above it → empty set.
+    f = tmp_path / "module.py"
+    f.write_text("x = 1\n")
+    # tmp_path is under /tmp which typically has no project markers.
+    result = _collect_external_imported_names(str(f))
+    # May or may not find a root depending on environment; we just verify no crash.
+    assert isinstance(result, set)
+
+
+def test_collect_external_imported_names_absolute_import(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    mod = pkg / "utils.py"
+    mod.write_text("def _helper():\n    pass\n")
+    caller = tmp_path / "tests" / "test_utils.py"
+    caller.parent.mkdir()
+    caller.write_text("from mypkg.utils import _helper\n")
+    result = _collect_external_imported_names(str(mod))
+    assert "_helper" in result
+
+
+def test_collect_external_imported_names_relative_import(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    mod = pkg / "utils.py"
+    mod.write_text("def _helper():\n    pass\n")
+    sibling = pkg / "other.py"
+    sibling.write_text("from .utils import _helper\n")
+    result = _collect_external_imported_names(str(mod))
+    assert "_helper" in result
+
+
+def test_collect_external_imported_names_self_excluded(tmp_path):
+    # The file being scanned is excluded from the search.
+    (tmp_path / "pyproject.toml").write_text("")
+    mod = tmp_path / "module.py"
+    mod.write_text("from module import _x\n")  # self-referential (ignored)
+    result = _collect_external_imported_names(str(mod))
+    assert "_x" not in result
+
+
+def test_collect_external_imported_names_syntax_error_skipped(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("")
+    mod = tmp_path / "module.py"
+    mod.write_text("def _helper(): pass\n")
+    bad = tmp_path / "bad.py"
+    bad.write_text("def (invalid\n")
+    good = tmp_path / "good.py"
+    good.write_text("from module import _helper\n")
+    result = _collect_external_imported_names(str(mod))
+    assert "_helper" in result
+
+
+def test_collect_external_imported_names_non_matching_import_ignored(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("")
+    mod = tmp_path / "module.py"
+    mod.write_text("def _helper(): pass\n")
+    other = tmp_path / "other.py"
+    other.write_text("from different_module import _helper\n")
+    result = _collect_external_imported_names(str(mod))
+    assert "_helper" not in result
+
+
+def test_collect_external_imported_names_non_importfrom_nodes_skipped(tmp_path):
+    # Caller file contains a plain `import` statement (not ImportFrom) mixed
+    # with a matching `from … import`.  The plain import must be skipped without
+    # crashing, and the matching ImportFrom still contributes to the result.
+    (tmp_path / "pyproject.toml").write_text("")
+    mod = tmp_path / "module.py"
+    mod.write_text("def _helper(): pass\n")
+    caller = tmp_path / "caller.py"
+    caller.write_text("import os\nfrom module import _helper\n")
+    result = _collect_external_imported_names(str(mod))
+    assert "_helper" in result
+
+
+def test_collect_external_imported_names_deep_relative_import(tmp_path):
+    # Two-level relative import: `from ..utils import _helper`
+    (tmp_path / "pyproject.toml").write_text("")
+    mod = tmp_path / "utils.py"
+    mod.write_text("def _helper(): pass\n")
+    sub = tmp_path / "pkg" / "sub" / "caller.py"
+    sub.parent.mkdir(parents=True)
+    sub.write_text("from ...utils import _helper\n")
+    result = _collect_external_imported_names(str(mod))
+    assert "_helper" in result
+
+
+def test_collect_external_imported_names_relative_level_too_deep(tmp_path):
+    # Relative import that goes above the project root → skipped without crash.
+    (tmp_path / "pyproject.toml").write_text("")
+    mod = tmp_path / "utils.py"
+    mod.write_text("def _helper(): pass\n")
+    # A file at the top level trying to go up 5 packages (impossible).
+    top = tmp_path / "top.py"
+    top.write_text("from .....utils import _helper\n")
+    result = _collect_external_imported_names(str(mod))
+    # The over-deep import is silently skipped; no crash.
+    assert isinstance(result, set)
+
+
+def test_add_re_exports_private_in_external_loads():
+    # Private name not referenced in remaining source but present in external_loads
+    # → re-export proxy IS added so the external caller continues to work.
+    source = "import os\n"
+    entity = _make_entity("_helper", 1, 2)
+    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"_helper": entity}, {}, external_loads={"_helper"}
+    )
+    assert "from .utils import _helper" in result
+
+
+def test_add_re_exports_test_function_in_external_loads_not_re_exported():
+    # test_ functions must never get a proxy even when listed in external_loads,
+    # because pytest would discover and run them twice.
+    source = "import os\n"
+    entity = _make_entity("test_something", 1, 2)
+    placement = GroupPlacement(group=["test_something"], target_file="helpers.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"test_something": entity},
+        {},
+        external_loads={"test_something"},
+    )
+    assert result == source
+
+
+def test_generate_private_entity_reexported_when_external_caller(tmp_path):
+    # Private entity is re-exported when an external file imports it.
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    mod = pkg / "big.py"
+    mod.write_text("def _helper():\n    pass\n")
+    caller = tmp_path / "tests" / "test_big.py"
+    caller.parent.mkdir()
+    caller.write_text("from mypkg.big import _helper\n")
+
+    source = "def _helper():\n    pass\n"
+    entity = _make_entity("_helper", 1, 2)
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["_helper"], target_file="private.py")])
+
+    result = generate_file_splits(c, plan, source, str(mod))
+
+    assert "from .private import _helper" in result.original_source
+
+
+def test_add_re_exports_private_external_only_gets_noqa():
+    # Private name in external_loads but NOT in remaining source → fmt: skip # noqa comment.
+    source = "import os\n"
+    entity = _make_entity("_helper", 1, 2)
+    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"_helper": entity}, {}, external_loads={"_helper"}
+    )
+    assert "from .utils import _helper  # fmt: skip # noqa: F401, E501" in result
+
+
+def test_add_re_exports_private_in_still_loaded_no_noqa():
+    # Private name referenced in remaining source → re-export without noqa.
+    source = "import os\n\n_helper()\n"
+    entity = _make_entity("_helper", 3, 3)
+    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"_helper": entity}, {})
+    assert "from .utils import _helper\n" in result
+    assert "# noqa" not in result
+
+
+def test_add_re_exports_public_not_in_still_loaded_gets_noqa():
+    # Public name migrated but not referenced in remaining source → fmt: skip # noqa.
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
+    assert "from .utils import foo  # fmt: skip # noqa: F401, E501" in result
+
+
+def test_add_re_exports_public_in_still_loaded_no_noqa():
+    # Public name still referenced in remaining source → re-export without noqa.
+    source = "import os\n\nfoo()\n"
+    entity = _make_entity("foo", 3, 3)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
+    assert "from .utils import foo\n" in result
+    assert "# noqa" not in result
+
+
+def test_add_re_exports_multiple_noqa_each_on_own_line():
+    # Two names both need noqa → one import line each so Black can't break the comment.
+    source = "import os\n"
+    entity = _make_entity("_block", 3, 4, ["_a", "_b"])
+    placement = GroupPlacement(group=["_block"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"_block": entity},
+        {},
+        external_loads={"_a", "_b"},
+    )
+    lines = result.splitlines()
+    noqa_lines = [line for line in lines if "# fmt: skip # noqa: F401, E501" in line]
+    assert len(noqa_lines) == 2
+    names = {line.split("import")[1].split("#")[0].strip() for line in noqa_lines}
+    assert names == {"_a", "_b"}
+
+
+def test_add_re_exports_mixed_splits_into_two_lines():
+    # One entity defines two names: one in still_loaded, one purely re-exported.
+    # They must appear on separate lines so noqa doesn't suppress used-name warnings.
+    source = "import os\n\n_used()\n"
+    entity = _make_entity("_block", 3, 4, ["_used", "_reexport"])
+    placement = GroupPlacement(group=["_block"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"_block": entity},
+        {},
+        external_loads={"_used", "_reexport"},
+    )
+    lines = result.splitlines()
+    noqa_lines = [line for line in lines if "# fmt: skip # noqa: F401, E501" in line]
+    plain_lines = [
+        line
+        for line in lines
+        if "from .utils import" in line and "# fmt: skip" not in line
+    ]
+    assert len(noqa_lines) == 1
+    assert "_reexport" in noqa_lines[0]
+    assert "_used" not in noqa_lines[0]
+    assert len(plain_lines) == 1
+    assert "_used" in plain_lines[0]
+
+
+def test_add_re_exports_relative_from_uses_relative_prefix():
+    # When relative_from is set, imports are computed via _relative_import_prefix
+    # rather than _target_module_name, so "service/__init__.py" → ".utils"
+    # (not ".service.utils").
+    source = "# stayed\n"
+    entity = _make_entity("Foo", 1, 1)
+    placements = [GroupPlacement(group=["Foo"], target_file="service/utils.py")]
+    entity_map = {"Foo": entity}
+    entity_source_map = {"Foo": "class Foo: pass"}
+
+    result = _add_re_exports(
+        source,
+        placements,
+        entity_map,
+        entity_source_map,
+        relative_from="service/__init__.py",
+    )
+
+    assert "from .utils import Foo" in result
+    # Must NOT use the fully-qualified form that would be wrong from __init__.py.
+    assert "from .service.utils" not in result
