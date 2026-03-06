@@ -46,7 +46,8 @@ def test_main_prints_summary(capsys):
         if stats is not None:
             stats.if_not_else = 2
             stats.files_edited.append("foo.py")
-            stats.lines_changed = 4
+            stats.lines_added = 3
+            stats.lines_deleted = 1
         return iter(["foo.py: IfNotElse: flipped if/else at line 1"])
 
     with patch("sys.stdin", StringIO("some diff text")):
@@ -57,4 +58,5 @@ def test_main_prints_summary(capsys):
     assert "--- crispen summary ---" in out
     assert "if not/else:" in out
     assert "files edited (1): foo.py" in out
-    assert "lines changed: 4" in out
+    assert "lines added:           3" in out
+    assert "lines deleted:         1" in out

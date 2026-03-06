@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -37,6 +38,7 @@ class FileLimiterPlan:
     # True if planning failed and the file should not be split.
     abort: bool
     abort_reason: str = ""  # human-readable explanation when abort=True
+    llm_calls: int = 0  # number of LLM API calls made during planning
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +202,8 @@ def _advise_set3(
     client: object,
     config: CrispenConfig,
     prev_failure: str = "",
+    verbose: bool = False,
+    _counter: Optional[List[int]] = None,
 ) -> Optional[List[List[str]]]:
     """Ask the LLM which Set 3 groups should migrate. Returns None on failure."""
     entity_map = {e.name: e for e in classified.entities}
@@ -230,6 +234,15 @@ def _advise_set3(
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
     max_tokens = max(512, 20 + n_groups * 15)
+    if verbose:
+        print(
+            f"crispen: FileLimiter: asking LLM whether to migrate"
+            f" {n_groups} set-3 group(s) in '{original_path}'",
+            file=sys.stderr,
+            flush=True,
+        )
+    if _counter is not None:
+        _counter[0] += 1
     result = call_with_tool(
         client,
         config.provider,
@@ -268,6 +281,8 @@ def _assign_placements_chunk(
     config: CrispenConfig,
     prev_failure: str = "",
     min_files: int = 2,
+    verbose: bool = False,
+    _counter: Optional[List[int]] = None,
 ) -> Optional[List[GroupPlacement]]:
     """Ask the LLM to assign filenames to one chunk of groups.
 
@@ -327,6 +342,15 @@ def _assign_placements_chunk(
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
     max_tokens = max(512, 20 + n_groups * 20)
+    if verbose:
+        print(
+            f"crispen: FileLimiter: asking LLM to assign file placements"
+            f" for {n_groups} group(s) in '{original_path}'",
+            file=sys.stderr,
+            flush=True,
+        )
+    if _counter is not None:
+        _counter[0] += 1
     result = call_with_tool(
         client,
         config.provider,
@@ -405,6 +429,8 @@ def _rename_conflicting_chunk(
     client: object,
     config: CrispenConfig,
     prev_failure: str = "",
+    verbose: bool = False,
+    _counter: Optional[List[int]] = None,
 ) -> Optional[List[GroupPlacement]]:
     """Ask the LLM to rename conflicting placements in *chunk*.
 
@@ -465,6 +491,15 @@ def _rename_conflicting_chunk(
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
     max_tokens = max(512, 20 + n_groups * 20)
+    if verbose:
+        print(
+            f"crispen: FileLimiter: asking LLM to resolve naming conflicts"
+            f" for {n_groups} group(s) in '{original_path}'",
+            file=sys.stderr,
+            flush=True,
+        )
+    if _counter is not None:
+        _counter[0] += 1
     result = call_with_tool(
         client,
         config.provider,
@@ -511,6 +546,8 @@ def _assign_placements(
     client: object,
     config: CrispenConfig,
     prev_failure: str = "",
+    verbose: bool = False,
+    _counter: Optional[List[int]] = None,
 ) -> Optional[List[GroupPlacement]]:
     """Ask the LLM to assign filenames to each group. Returns None on failure.
 
@@ -557,6 +594,8 @@ def _assign_placements(
                 config,
                 prev_failure,
                 min_files=chunk_min_files,
+                verbose=verbose,
+                _counter=_counter,
             )
             if chunk_placements is not None:
                 break
@@ -578,6 +617,8 @@ def resolve_naming_conflicts(
     existing_files: frozenset,
     existing_dirs: frozenset,
     config: CrispenConfig,
+    verbose: bool = False,
+    _counter: Optional[List[int]] = None,
 ) -> Optional[List[GroupPlacement]]:
     """Attempt a targeted rename of only the placements with naming conflicts.
 
@@ -627,6 +668,8 @@ def resolve_naming_conflicts(
                 client,
                 config,
                 prev_failure=prev_failure,
+                verbose=verbose,
+                _counter=_counter,
             )
             if chunk_result is not None:
                 break
@@ -653,6 +696,7 @@ def advise_file_limiter(
     existing_files: frozenset = frozenset(),
     prev_set3_failure: str = "",
     prev_placement_failure: str = "",
+    verbose: bool = False,
 ) -> FileLimiterPlan:
     """Ask the LLM to plan entity placement across new files.
 
@@ -675,11 +719,19 @@ def advise_file_limiter(
         config.provider, api_key, timeout=config.api_timeout, base_url=config.base_url
     )
 
+    counter: List[int] = [0]
+
     # Call 1: advise Set 3 groups (only if set_3 is non-empty).
     set3_migrate: List[List[str]] = []
     if classified.set_3_groups:
         result = _advise_set3(
-            classified, original_path, client, config, prev_failure=prev_set3_failure
+            classified,
+            original_path,
+            client,
+            config,
+            prev_failure=prev_set3_failure,
+            verbose=verbose,
+            _counter=counter,
         )
         if result is None:
             return FileLimiterPlan(
@@ -687,13 +739,19 @@ def advise_file_limiter(
                 placements=[],
                 abort=True,
                 abort_reason="LLM failed to plan set-3 groups",
+                llm_calls=counter[0],
             )
         set3_migrate = result
 
     # Call 2: assign filenames for set_2 + migrating set_3.
     groups_to_place = classified.set_2_groups + set3_migrate
     if not groups_to_place:
-        return FileLimiterPlan(set3_migrate=set3_migrate, placements=[], abort=False)
+        return FileLimiterPlan(
+            set3_migrate=set3_migrate,
+            placements=[],
+            abort=False,
+            llm_calls=counter[0],
+        )
 
     placements = _assign_placements(
         groups_to_place,
@@ -703,6 +761,8 @@ def advise_file_limiter(
         client,
         config,
         prev_failure=prev_placement_failure,
+        verbose=verbose,
+        _counter=counter,
     )
     if placements is None:
         return FileLimiterPlan(
@@ -710,8 +770,12 @@ def advise_file_limiter(
             placements=[],
             abort=True,
             abort_reason="LLM failed to assign file placements",
+            llm_calls=counter[0],
         )
 
     return FileLimiterPlan(
-        set3_migrate=set3_migrate, placements=placements, abort=False
+        set3_migrate=set3_migrate,
+        placements=placements,
+        abort=False,
+        llm_calls=counter[0],
     )

@@ -1057,7 +1057,7 @@ def test_run_engine_stats_populated(tmp_path):
     list(run_engine({str(f): [(1, 4)]}, config=CrispenConfig(), stats=s))
     assert s.if_not_else == 1
     assert s.files_edited == [str(f)]
-    assert s.lines_changed > 0
+    assert s.lines_added + s.lines_deleted > 0
 
 
 def test_run_engine_stats_none_default(tmp_path):

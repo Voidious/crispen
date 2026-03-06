@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +24,10 @@ class FileLimiterResult:
     messages: List[str] = field(default_factory=list)
     abort: bool = False
     subdir_name: Optional[str] = None  # set when files go into a subdirectory
+    llm_calls: int = 0
+    verified_functions: int = 0
+    verified_classes: int = 0
+    verified_lines: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +185,7 @@ def run_file_limiter(
     post_source: str,
     diff_ranges: List[Tuple[int, int]],
     config: CrispenConfig,
+    verbose: bool = False,
 ) -> FileLimiterResult:
     """Run all FileLimiter phases on a single file.
 
@@ -199,6 +205,13 @@ def run_file_limiter(
     cannot be split or verification fails.  :class:`CrispenAPIError` from
     the LLM is propagated to the caller.
     """
+    if verbose:
+        print(
+            f"crispen: FileLimiter: analyzing '{filepath}'",
+            file=sys.stderr,
+            flush=True,
+        )
+
     classified = classify_entities(original_source, post_source, diff_ranges)
     source_dir = Path(filepath).parent
     source_name = Path(filepath).name
@@ -208,6 +221,16 @@ def run_file_limiter(
     existing_dirs: frozenset = frozenset(
         p.name for p in source_dir.iterdir() if p.is_dir()
     )
+
+    if verbose:
+        n_set2 = len(classified.set_2_groups)
+        n_set3 = len(classified.set_3_groups)
+        print(
+            f"crispen: FileLimiter:   {n_set2} movable group(s),"
+            f" {n_set3} modified group(s)",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # ---- Subdir-split detection ----
     is_test = source_name.startswith("test_")
@@ -249,6 +272,9 @@ def run_file_limiter(
     split: Optional[SplitResult] = None
     prev_set3_failure: str = ""
     prev_placement_failure: str = ""
+    total_llm_calls: int = 0
+    # Mutable counter shared with resolve_naming_conflicts LLM calls.
+    resolve_counter: List[int] = [0]
 
     for _attempt in range(max_attempts):
         plan = advise_file_limiter(
@@ -258,7 +284,9 @@ def run_file_limiter(
             existing_files,
             prev_set3_failure=prev_set3_failure,
             prev_placement_failure=prev_placement_failure,
+            verbose=verbose,
         )
+        total_llm_calls += plan.llm_calls
 
         if plan.abort:
             reason = f": {plan.abort_reason}" if plan.abort_reason else ""
@@ -297,6 +325,7 @@ def run_file_limiter(
                 new_files={},
                 abort=False,
                 messages=[],
+                llm_calls=total_llm_calls,
             )
 
         # Apply test_ prefix so pytest can discover moved test files.
@@ -329,7 +358,11 @@ def run_file_limiter(
                 existing_files,
                 existing_dirs,
                 config,
+                verbose=verbose,
+                _counter=resolve_counter,
             )
+            total_llm_calls += resolve_counter[0]
+            resolve_counter[0] = 0
             if resolved is not None:
                 plan.placements = resolved  # fall through to generate_file_splits
             else:
@@ -373,6 +406,7 @@ def run_file_limiter(
             new_files={},
             messages=retry_msgs,
             abort=last_abort,
+            llm_calls=total_llm_calls,
         )
 
     # For non-test subdir splits, redirect the post-split "original" source to
@@ -381,6 +415,13 @@ def run_file_limiter(
     if subdir_name is not None and not is_test:
         split.new_files[f"{subdir_name}/__init__.py"] = split.original_source
         split.original_source = original_source
+
+    if verbose:
+        print(
+            f"crispen: FileLimiter: verifying entity preservation in '{filepath}'",
+            file=sys.stderr,
+            flush=True,
+        )
 
     failures = _verify_preservation(
         classified.entities, split, post_source, plan.placements
@@ -392,7 +433,27 @@ def run_file_limiter(
             new_files={},
             messages=[f"SKIP {filepath} (FileLimiter): verification failed\n{detail}"],
             abort=True,
+            llm_calls=total_llm_calls,
         )
+
+    # Count entities that passed verification (non-TOP_LEVEL, non-empty).
+    post_lines = post_source.splitlines(keepends=True)
+    verified_functions = 0
+    verified_classes = 0
+    verified_lines = 0
+    for entity in classified.entities:
+        if entity.kind == EntityKind.TOP_LEVEL:
+            continue
+        entity_src = "".join(
+            post_lines[entity.start_line - 1 : entity.end_line]
+        ).rstrip()
+        if not entity_src:
+            continue
+        if entity.kind == EntityKind.FUNCTION:
+            verified_functions += 1
+        if entity.kind == EntityKind.CLASS:
+            verified_classes += 1
+        verified_lines += entity.end_line - entity.start_line + 1
 
     msgs = [
         f"{filepath}: FileLimiter: moved {', '.join(p.group)} \u2192 {p.target_file}"
@@ -404,4 +465,8 @@ def run_file_limiter(
         messages=retry_msgs + msgs,
         abort=False,
         subdir_name=subdir_name,
+        llm_calls=total_llm_calls,
+        verified_functions=verified_functions,
+        verified_classes=verified_classes,
+        verified_lines=verified_lines,
     )

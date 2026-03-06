@@ -658,9 +658,15 @@ def run_engine(
                     post_source=state["source"],
                     diff_ranges=state["ranges"],
                     config=config,
+                    verbose=verbose,
                 )
             except CrispenAPIError:
                 raise
+
+            _stats.file_limiter_llm_calls += fl_result.llm_calls
+            _stats.file_limiter_functions_verified += fl_result.verified_functions
+            _stats.file_limiter_classes_verified += fl_result.verified_classes
+            _stats.file_limiter_lines_verified += fl_result.verified_lines
 
             if fl_result.messages:
                 state["msgs"].extend(fl_result.messages)
@@ -678,6 +684,7 @@ def run_engine(
                         init_py.write_text("", encoding="utf-8")
                 new_path.write_text(new_source, encoding="utf-8")
                 _stats.files_edited.append(str(new_path))
+                _stats.file_limiter_edits += 1
 
             state["source"] = fl_result.original_source
 
