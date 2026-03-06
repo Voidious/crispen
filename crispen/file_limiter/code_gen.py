@@ -378,6 +378,7 @@ def _add_re_exports(
     entity_source_map: Dict[str, str],
     external_loads: Set[str] = frozenset(),
     abs_pkg: Optional[str] = None,
+    relative_from: Optional[str] = None,
 ) -> str:
     """Add ``from .module import name`` imports for migrated entities.
 
@@ -386,6 +387,12 @@ def _add_re_exports(
     re-imported when the remaining *source* still references them, or when
     they appear in *external_loads* (names imported from the original module
     by other files in the project).
+
+    When *relative_from* is set (e.g. ``"service/__init__.py"``), import
+    prefixes are computed via :func:`_relative_import_prefix` so that
+    re-exports from a package ``__init__.py`` reference sibling modules
+    correctly (e.g. ``from .utils import Foo`` instead of
+    ``from .service.utils import Foo``).
 
     Import-derived names (names introduced by ``import`` / ``from … import``
     statements inside a TOP_LEVEL entity) are never re-exported: they were
@@ -401,7 +408,17 @@ def _add_re_exports(
     # These need "# noqa F401" to suppress flake8 false positives.
     noqa_names: Set[str] = set()
     for placement in placements:
-        module = _target_module_name(placement.target_file)
+        # Compute the import prefix for this placement's target file.
+        if relative_from is not None:
+            import_prefix = _relative_import_prefix(
+                relative_from, placement.target_file
+            )
+        elif abs_pkg is not None:
+            module = _target_module_name(placement.target_file)
+            import_prefix = f"{abs_pkg}.{module}" if abs_pkg else module
+        else:
+            module = _target_module_name(placement.target_file)
+            import_prefix = f".{module}"
         to_import: List[str] = []
         for entity_name in placement.group:
             if entity_name in entity_map:
@@ -425,7 +442,7 @@ def _add_re_exports(
                     if defined_name not in still_loaded:
                         noqa_names.add(defined_name)
         if to_import:
-            re_exports.setdefault(module, []).extend(to_import)
+            re_exports.setdefault(import_prefix, []).extend(to_import)
 
     if not re_exports:
         return source
@@ -435,11 +452,7 @@ def _add_re_exports(
     # does not flag it as an unused import.  Split mixed imports into two lines
     # so that the noqa comment does not suppress warnings for used names.
     export_stmts: List[str] = []
-    for module, names in sorted(re_exports.items()):
-        if abs_pkg is not None:
-            prefix = f"{abs_pkg}.{module}" if abs_pkg else module
-        else:
-            prefix = f".{module}"
+    for prefix, names in sorted(re_exports.items()):
         sorted_names = sorted(names)
         used = [n for n in sorted_names if n not in noqa_names]
         noqa = [n for n in sorted_names if n in noqa_names]
@@ -822,11 +835,17 @@ def generate_file_splits(
     plan: FileLimiterPlan,
     post_source: str,
     original_path: str,
+    subdir_name: Optional[str] = None,
 ) -> SplitResult:
     """Generate new file contents and the updated original source.
 
     When *plan* is aborted or has no placements, returns :class:`SplitResult`
     with the original source unchanged (``abort`` mirrors ``plan.abort``).
+
+    When *subdir_name* is set (e.g. ``"service"``), the file is being split
+    into a package subdirectory.  The "original" file is treated as
+    ``service/__init__.py`` for dependency-graph and import-prefix purposes,
+    so cross-file imports within the package use correct relative paths.
     """
     if plan.abort:
         return SplitResult(
@@ -860,7 +879,11 @@ def generate_file_splits(
     # Placements whose target_file matches the original filename would create a
     # self-referential import (e.g. `from .duplicate_extractor import Foo` inside
     # duplicate_extractor.py).  Drop them — entities stay in the original file.
-    original_basename = Path(original_path).name
+    # In subdir-split mode the "original" is the package __init__.py; use that
+    # name throughout so dependency-graph edges and import prefixes are correct.
+    original_basename = (
+        f"{subdir_name}/__init__.py" if subdir_name else Path(original_path).name
+    )
     valid_placements = [
         p for p in plan.placements if p.target_file != original_basename
     ]
@@ -963,6 +986,10 @@ def generate_file_splits(
     if Path(original_path).name.startswith("test_"):
         abs_pkg = _abs_package_for_dir(original_path)
 
+    # In subdir-split mode, new files live inside a package subdirectory and
+    # can use relative imports for cross-file references within that package.
+    abs_pkg_for_new_files: Optional[str] = None if subdir_name else abs_pkg
+
     # Generate new file contents.
     new_files: Dict[str, str] = {}
     for target_file, ent_names in file_entity_names.items():
@@ -974,7 +1001,7 @@ def generate_file_splits(
             entity_source_map,
             name_to_target_file,
             target_file,
-            abs_pkg=abs_pkg,
+            abs_pkg=abs_pkg_for_new_files,
         )
         entity_srcs = [
             _FUTURE_IMPORT_LINE_RE.sub("", src).rstrip()
@@ -995,6 +1022,14 @@ def generate_file_splits(
         post_source, migrated_names, entity_map, entity_source_map
     )
     updated = _prune_unused_imports(updated)
+    # For non-test subdir splits, re-exports from the __init__.py use relative
+    # import prefixes computed from inside the package (e.g. ".utils" not
+    # ".service.utils").  For test files the original keeps existing abs_pkg
+    # behaviour so pytest can find the re-exported symbols.
+    is_test_file = Path(original_path).name.startswith("test_")
+    relative_from: Optional[str] = (
+        f"{subdir_name}/__init__.py" if (subdir_name and not is_test_file) else None
+    )
     updated = _add_re_exports(
         updated,
         valid_placements + synthetic_placements,
@@ -1002,6 +1037,7 @@ def generate_file_splits(
         entity_source_map,
         external_loads=external_loads,
         abs_pkg=abs_pkg,
+        relative_from=relative_from,
     )
 
     return SplitResult(new_files=new_files, original_source=updated, abort=False)

@@ -1249,6 +1249,62 @@ def test_file_limiter_existing_init_not_overwritten(tmp_path):
     assert (helpers / "__init__.py").read_text(encoding="utf-8") == "# existing\n"
 
 
+def test_file_limiter_subdir_split_non_test_deletes_original(tmp_path):
+    """Non-test subdir split → original file deleted; __init__.py gets split content."""
+    f = tmp_path / "service.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+    success_result = FileLimiterResult(
+        original_source=f.read_text(encoding="utf-8"),  # reset to original → no write
+        new_files={
+            "service/__init__.py": "# init\n",
+            "service/utils.py": "# utils\n",
+        },
+        messages=[f"{f}: FileLimiter: moved foo → service/utils.py"],
+        abort=False,
+        subdir_name="service",
+    )
+    with patch(_FL_PATCH, return_value=success_result):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5),
+            )
+        )
+    # Original service.py must be deleted.
+    assert not f.exists()
+    # Package files must exist.
+    assert (tmp_path / "service" / "__init__.py").read_text(
+        encoding="utf-8"
+    ) == "# init\n"
+    assert (tmp_path / "service" / "utils.py").read_text(
+        encoding="utf-8"
+    ) == "# utils\n"
+
+
+def test_file_limiter_subdir_split_test_keeps_original(tmp_path):
+    """Test subdir split → original test file kept (not deleted)."""
+    f = tmp_path / "test_service.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+    re_export_src = "# re-exports\n"
+    success_result = FileLimiterResult(
+        original_source=re_export_src,
+        new_files={"service/test_utils.py": "# test utils\n"},
+        messages=[],
+        abort=False,
+        subdir_name="service",
+    )
+    with patch(_FL_PATCH, return_value=success_result):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5),
+            )
+        )
+    # Original test file must still exist (with re-export content written back).
+    assert f.exists()
+    assert f.read_text(encoding="utf-8") == re_export_src
+
+
 def test_file_limiter_api_error_propagates(tmp_path):
     """CrispenAPIError from FileLimiter propagates out of run_engine."""
     f = tmp_path / "big.py"

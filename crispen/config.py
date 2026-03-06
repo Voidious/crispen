@@ -66,6 +66,17 @@ class CrispenConfig:
     # total attempts.  Deterministic failures (single-SCC abort) are not retried.
     file_limiter_retries: int = 2
 
+    # When True and the diff covers every line of the file (whole-file add or
+    # replacement), all new files created by FileLimiter are placed in a
+    # subdirectory named after the source module (e.g. service/*.py for
+    # service.py, or service/*.py for test_service.py after stripping the
+    # leading test_ prefix).  For non-test files a package __init__.py is
+    # generated in the subdirectory that re-exports the public API so callers
+    # do not need to be updated.  For test files the original file keeps
+    # re-export stubs; the new package directory is created alongside it.
+    # Aborted if the target subdirectory already exists.
+    file_limiter_subdir_split: bool = True
+
     # Refactor allow-list: if non-empty, only the named refactors are run.
     # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
     # "tuple_dataclass", "file_limiter", "match_function".

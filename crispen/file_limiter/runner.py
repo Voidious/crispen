@@ -22,6 +22,7 @@ class FileLimiterResult:
     new_files: Dict[str, str]  # {relative_path: source_code}
     messages: List[str] = field(default_factory=list)
     abort: bool = False
+    subdir_name: Optional[str] = None  # set when files go into a subdirectory
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +104,24 @@ def _verify_preservation(
             )
 
     return failures
+
+
+def _is_whole_file_diff(diff_ranges: List[Tuple[int, int]], n_lines: int) -> bool:
+    """Return True if *diff_ranges* cover every line from 1 to *n_lines*.
+
+    A "whole file" diff occurs when the diff adds or replaces every line —
+    e.g. when a file is brand-new or completely rewritten.  In this case
+    FileLimiter can redirect all output to a subdirectory package instead of
+    placing sibling files next to the original.
+    """
+    if not diff_ranges or n_lines == 0:
+        return False
+    covered_end = 0
+    for start, end in sorted(diff_ranges):
+        if start > covered_end + 1:
+            return False  # gap — some lines are not in the diff
+        covered_end = max(covered_end, end)
+    return covered_end >= n_lines
 
 
 def _detect_naming_conflicts(
@@ -190,6 +209,29 @@ def run_file_limiter(
         p.name for p in source_dir.iterdir() if p.is_dir()
     )
 
+    # ---- Subdir-split detection ----
+    is_test = source_name.startswith("test_")
+    subdir_name: Optional[str] = None
+    if config.file_limiter_subdir_split:
+        n_lines = len(post_source.splitlines())
+        if _is_whole_file_diff(diff_ranges, n_lines):
+            stem = Path(source_name).stem
+            subdir_name = stem[5:] if stem.startswith("test_") else stem
+            subdir_path = source_dir / subdir_name
+            if subdir_path.exists():
+                return FileLimiterResult(
+                    original_source=post_source,
+                    new_files={},
+                    messages=[
+                        f"SKIP {filepath} (FileLimiter): target subdirectory"
+                        f" '{subdir_name}/' already exists"
+                    ],
+                    abort=True,
+                )
+            # Brand-new directory: no pre-existing files or dirs to conflict with.
+            existing_files = frozenset()
+            existing_dirs = frozenset()
+
     # Deterministic failure — retrying the LLM would not help.
     if classified.abort:
         reason = f": {classified.abort_reason}" if classified.abort_reason else ""
@@ -266,6 +308,13 @@ def run_file_limiter(
                 ):
                     p.target_file = str(target.parent / ("test_" + target.name))
 
+        # In subdir-split mode, prefix all target files with the subdirectory.
+        # This happens after the test_ prefix so names like "test_utils.py"
+        # become "service/test_utils.py".
+        if subdir_name is not None:
+            for p in plan.placements:
+                p.target_file = f"{subdir_name}/{p.target_file}"
+
         # Check for naming conflicts between flat modules and package directories.
         # foo.py and foo/ share the same import name and cannot coexist.
         conflicts = _detect_naming_conflicts(
@@ -296,7 +345,9 @@ def run_file_limiter(
                 )
                 continue
 
-        split = generate_file_splits(classified, plan, post_source, filepath)
+        split = generate_file_splits(
+            classified, plan, post_source, filepath, subdir_name=subdir_name
+        )
 
         if split.abort:
             reason = f": {split.abort_reason}" if split.abort_reason else ""
@@ -324,6 +375,13 @@ def run_file_limiter(
             abort=last_abort,
         )
 
+    # For non-test subdir splits, redirect the post-split "original" source to
+    # service/__init__.py and leave service.py untouched (it is shadowed by the
+    # new package).  For test files the original test_*.py keeps re-export stubs.
+    if subdir_name is not None and not is_test:
+        split.new_files[f"{subdir_name}/__init__.py"] = split.original_source
+        split.original_source = original_source
+
     failures = _verify_preservation(
         classified.entities, split, post_source, plan.placements
     )
@@ -345,4 +403,5 @@ def run_file_limiter(
         new_files=split.new_files,
         messages=retry_msgs + msgs,
         abort=False,
+        subdir_name=subdir_name,
     )

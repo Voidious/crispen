@@ -681,6 +681,15 @@ def run_engine(
 
             state["source"] = fl_result.original_source
 
+            # For non-test whole-file subdir splits, delete the original file
+            # now that service/__init__.py takes its place as the public entry
+            # point.  state["source"] was reset to state["original"] above, so
+            # the final write loop will see no diff and skip the (deleted) file.
+            if fl_result.subdir_name is not None and not Path(filepath).name.startswith(
+                "test_"
+            ):
+                Path(filepath).unlink()
+
     # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #
     # ------------------------------------------------------------------ #
