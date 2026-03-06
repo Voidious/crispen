@@ -307,6 +307,7 @@ def run_file_limiter(
             prev_set3_failure=prev_set3_failure,
             prev_placement_failure=prev_placement_failure,
             verbose=verbose,
+            subdir_name=subdir_name,
         )
         total_llm_calls += plan.llm_calls
 

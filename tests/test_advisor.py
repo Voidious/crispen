@@ -1220,3 +1220,29 @@ def test_assign_placements_chunk_no_counter(mock_client, mock_call):
     )
     assert result is not None
     assert result[0].target_file == "utils.py"
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_assign_placements_chunk_subdir_name(mock_client, mock_call):
+    """subdir_name is included in the prompt and suppresses the plain directory rule."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [{"group_id": 0, "target_file": "detection_flow.py"}]
+    }
+    c = _classified(entities=[_make_entity("foo", 1, 5)])
+    result = _assign_placements_chunk(
+        [["foo"]],
+        c,
+        "tests/test_duplicate_extractor.py",
+        frozenset(),
+        mock_client(),
+        _CONFIG,
+        subdir_name="duplicate_extractor",
+    )
+    assert result is not None
+    assert result[0].target_file == "detection_flow.py"
+    # The prompt should mention the subdirectory and warn against repeating its name.
+    prompt = mock_call.call_args[0][6][0]["content"]
+    assert "duplicate_extractor/" in prompt
+    assert "do not repeat" in prompt.lower()

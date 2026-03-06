@@ -283,6 +283,7 @@ def _assign_placements_chunk(
     min_files: int = 2,
     verbose: bool = False,
     _counter: Optional[List[int]] = None,
+    subdir_name: Optional[str] = None,
 ) -> Optional[List[GroupPlacement]]:
     """Ask the LLM to assign filenames to one chunk of groups.
 
@@ -307,6 +308,21 @@ def _assign_placements_chunk(
 
     n_groups = len(chunk)
     original_basename = Path(original_path).name
+    if subdir_name:
+        placement_rule = (
+            f"- All target files will be placed inside the new "
+            f"'{subdir_name}/' subdirectory, so filenames should be "
+            f"relative to that subdirectory (e.g. 'utils.py'). "
+            f"Do NOT repeat '{subdir_name}' in the filename — "
+            f"it is already provided by the directory. "
+            f"Do NOT use '{original_basename}' (the original file being split).\n"
+        )
+    else:
+        placement_rule = (
+            f"- Use filenames relative to the same directory "
+            f"(e.g. 'utils.py'). Do NOT use '{original_basename}' "
+            "(the original file being split).\n"
+        )
     content = (
         f"Assign each entity group to a target Python filename. "
         f"The original file is '{original_path}' and is being split because "
@@ -318,9 +334,7 @@ def _assign_placements_chunk(
         "Rules:\n"
         f"- You MUST assign a target_file to ALL {n_groups} group(s). "
         "Missing any group_id will cause the split to fail.\n"
-        f"- Use filenames relative to the same directory "
-        f"(e.g. 'utils.py'). Do NOT use '{original_basename}' "
-        "(the original file being split).\n"
+        f"{placement_rule}"
         "- Multiple groups MAY share the same target file — place "
         "semantically related groups together rather than giving each "
         "its own file.\n"
@@ -548,6 +562,7 @@ def _assign_placements(
     prev_failure: str = "",
     verbose: bool = False,
     _counter: Optional[List[int]] = None,
+    subdir_name: Optional[str] = None,
 ) -> Optional[List[GroupPlacement]]:
     """Ask the LLM to assign filenames to each group. Returns None on failure.
 
@@ -596,6 +611,7 @@ def _assign_placements(
                 min_files=chunk_min_files,
                 verbose=verbose,
                 _counter=_counter,
+                subdir_name=subdir_name,
             )
             if chunk_placements is not None:
                 break
@@ -697,6 +713,7 @@ def advise_file_limiter(
     prev_set3_failure: str = "",
     prev_placement_failure: str = "",
     verbose: bool = False,
+    subdir_name: Optional[str] = None,
 ) -> FileLimiterPlan:
     """Ask the LLM to plan entity placement across new files.
 
@@ -763,6 +780,7 @@ def advise_file_limiter(
         prev_failure=prev_placement_failure,
         verbose=verbose,
         _counter=counter,
+        subdir_name=subdir_name,
     )
     if placements is None:
         return FileLimiterPlan(
