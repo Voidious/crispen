@@ -1,0 +1,37 @@
+import textwrap
+from unittest.mock import patch
+from crispen.refactors.duplicate_extractor import DuplicateExtractor
+
+
+def test_no_source_no_analysis():
+    de = DuplicateExtractor([(1, 5)])
+    assert de._new_source is None
+    assert de.get_rewritten_source() is None
+
+
+def test_no_duplicates_no_llm_calls(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    source = textwrap.dedent(
+        """\
+        def foo():
+            x = a + b
+            y = x * 2
+
+        def bar():
+            if condition:
+                result = value
+            else:
+                result = other
+        """
+    )
+    # Structurally different blocks → no duplicate group → no API calls needed
+    de = DuplicateExtractor([(6, 9)], source=source)
+    assert de._new_source is None
+
+
+def test_parse_error_in_analyze(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic.Anthropic"):
+        # Invalid Python: _analyze should return silently
+        de = DuplicateExtractor([(1, 1)], source="def f(: pass")
+    assert de._new_source is None
