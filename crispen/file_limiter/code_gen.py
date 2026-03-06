@@ -842,6 +842,65 @@ def _prune_unused_imports(source: str) -> str:
     return "".join(result)
 
 
+def _strip_top_level_import_lines(src: str) -> str:
+    """Return *src* with all top-level import statements removed.
+
+    Uses AST to locate the exact line range of each import node, correctly
+    handling multi-line imports.  Returns *src* unchanged when it cannot be
+    parsed as Python.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+    remove: Set[int] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for ln in range(node.lineno, node.end_lineno + 1):
+                remove.add(ln)
+    if not remove:
+        return src
+    lines = src.splitlines(keepends=True)
+    return "".join(line for i, line in enumerate(lines, 1) if i not in remove)
+
+
+def _extract_module_docstring(source: str) -> Optional[str]:
+    """Return the module-level docstring source text, or None if absent."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    if not (
+        tree.body
+        and isinstance(tree.body[0], ast.Expr)
+        and isinstance(tree.body[0].value, ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+    ):
+        return None
+    node = tree.body[0]
+    lines = source.splitlines(keepends=True)
+    return "".join(lines[node.lineno - 1 : node.end_lineno]).rstrip()
+
+
+def _strip_module_docstring(src: str) -> str:
+    """Return *src* with the leading module-level docstring removed."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+    if not (
+        tree.body
+        and isinstance(tree.body[0], ast.Expr)
+        and isinstance(tree.body[0].value, ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+    ):
+        return src
+    node = tree.body[0]
+    remove = set(range(node.lineno, node.end_lineno + 1))
+    lines = src.splitlines(keepends=True)
+    return "".join(line for i, line in enumerate(lines, 1) if i not in remove)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1022,11 +1081,24 @@ def generate_file_splits(
             target_file,
             abs_pkg=abs_pkg_for_new_files,
         )
-        entity_srcs = [
-            _FUTURE_IMPORT_LINE_RE.sub("", src).rstrip()
-            for name in ent_names
-            if (src := entity_source_map.get(name))
-        ]
+        entity_srcs = []
+        for _ent_name in ent_names:
+            _src = entity_source_map.get(_ent_name)
+            if _src is None:
+                continue
+            _entity = entity_map.get(_ent_name)
+            if _entity and _entity.kind == EntityKind.TOP_LEVEL:
+                # Imports are emitted separately by _find_needed_imports; strip
+                # them from the entity body to prevent duplicate import stmts.
+                _src = _strip_top_level_import_lines(_src)
+                if subdir_name is not None:
+                    # In subdir-split mode the module docstring belongs in
+                    # __init__.py rather than in one of the child modules.
+                    _src = _strip_module_docstring(_src)
+            else:
+                _src = _FUTURE_IMPORT_LINE_RE.sub("", _src)
+            _src = _src.rstrip()
+            entity_srcs.append(_src)
         entity_srcs = [s for s in entity_srcs if s]
         parts: List[str] = []
         all_imports = needed + cross
@@ -1054,6 +1126,18 @@ def generate_file_splits(
     # are already computed from the __init__.py's perspective and are correct.
     if subdir_name is not None and not is_test_file:
         updated = _bump_relative_imports(updated)
+    if subdir_name is not None:
+        # If the original file had a module docstring and it was migrated away,
+        # place it in subdir/__init__.py in both cases: for non-test splits
+        # the docstring is prepended to `updated` which runner.py redirects to
+        # __init__.py; for test splits it is written directly to __init__.py
+        # (runner.py does not redirect `updated` for test files).
+        _module_doc = _extract_module_docstring(post_source)
+        if _module_doc and not _extract_module_docstring(updated):
+            if is_test_file:
+                new_files[f"{subdir_name}/__init__.py"] = _module_doc + "\n"
+            else:
+                updated = _module_doc + "\n\n" + updated
     relative_from: Optional[str] = (
         f"{subdir_name}/__init__.py" if (subdir_name and not is_test_file) else None
     )

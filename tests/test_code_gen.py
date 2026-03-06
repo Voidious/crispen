@@ -14,6 +14,7 @@ from crispen.file_limiter.code_gen import (
     _collect_external_imported_names,
     _collect_name_loads,
     _extract_import_info,
+    _extract_module_docstring,
     _extract_shared_helpers,
     _find_cross_file_imports,
     _find_needed_imports,
@@ -25,6 +26,8 @@ from crispen.file_limiter.code_gen import (
     _prune_unused_imports,
     _relative_import_prefix,
     _remove_entity_lines,
+    _strip_module_docstring,
+    _strip_top_level_import_lines,
     _target_module_name,
     _topo_depth,
     generate_file_splits,
@@ -2406,3 +2409,223 @@ def test_generate_file_splits_subdir_bumps_init_imports():
     assert "from ..base import Base" in init_src
     assert "from .. import llm_client" not in init_src
     assert "from .base import Base" not in init_src
+
+
+# ---------------------------------------------------------------------------
+# _strip_top_level_import_lines
+# ---------------------------------------------------------------------------
+
+
+def test_strip_top_level_import_lines_removes_imports():
+    src = "import os\nfrom typing import List\n\n_CONST = 1\n"
+    result = _strip_top_level_import_lines(src)
+    assert "import os" not in result
+    assert "from typing import List" not in result
+    assert "_CONST = 1" in result
+
+
+def test_strip_top_level_import_lines_no_imports():
+    src = "_CONST = 1\n"
+    assert _strip_top_level_import_lines(src) == src
+
+
+def test_strip_top_level_import_lines_syntax_error():
+    src = "def (\n"
+    assert _strip_top_level_import_lines(src) == src
+
+
+# ---------------------------------------------------------------------------
+# _extract_module_docstring
+# ---------------------------------------------------------------------------
+
+
+def test_extract_module_docstring_present():
+    src = '"""My module."""\n\nimport os\n'
+    assert _extract_module_docstring(src) == '"""My module."""'
+
+
+def test_extract_module_docstring_absent():
+    src = "import os\n\ndef foo():\n    pass\n"
+    assert _extract_module_docstring(src) is None
+
+
+def test_extract_module_docstring_syntax_error():
+    assert _extract_module_docstring("def (\n") is None
+
+
+def test_extract_module_docstring_non_string_expr():
+    # First statement is an expression but not a string constant.
+    src = "1 + 1\n\ndef foo():\n    pass\n"
+    assert _extract_module_docstring(src) is None
+
+
+# ---------------------------------------------------------------------------
+# _strip_module_docstring
+# ---------------------------------------------------------------------------
+
+
+def test_strip_module_docstring_removes_docstring():
+    src = '"""My module."""\n\n_CONST = 1\n'
+    result = _strip_module_docstring(src)
+    assert '"""My module."""' not in result
+    assert "_CONST = 1" in result
+
+
+def test_strip_module_docstring_no_docstring():
+    src = "_CONST = 1\n"
+    assert _strip_module_docstring(src) == src
+
+
+def test_strip_module_docstring_syntax_error():
+    src = "def (\n"
+    assert _strip_module_docstring(src) == src
+
+
+# ---------------------------------------------------------------------------
+# generate_file_splits — TOP_LEVEL entity import deduplication
+# ---------------------------------------------------------------------------
+
+
+def test_generate_top_level_entity_imports_not_duplicated():
+    # When a TOP_LEVEL entity source contains regular imports (e.g. `import os`)
+    # those must NOT appear twice in the generated file: once from
+    # _find_needed_imports and again from the entity source itself.
+    source = "import os\n\n_CONST = os.sep\n\ndef foo():\n    return os.getcwd()\n"
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, ["os", "_CONST"])
+    e_foo = _make_entity("foo", 5, 6)
+    c = _classified(entities=[e_block, e_foo])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1", "foo"], target_file="utils.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    new_src = result.new_files["utils.py"]
+    assert new_src.count("import os") == 1
+
+
+# ---------------------------------------------------------------------------
+# generate_file_splits — module docstring placement in subdir-split mode
+# ---------------------------------------------------------------------------
+
+
+def test_generate_subdir_module_docstring_goes_to_init():
+    # In subdir-split mode the module docstring belongs in __init__.py, not
+    # in the split-off child module.  Migrate the preamble entity (_block_1)
+    # along with foo so the docstring is removed from the original source,
+    # triggering the restore-to-__init__ logic.
+    source = textwrap.dedent(
+        """\
+        \"\"\"Top-level module doc.\"\"\"
+
+        import os
+
+        def foo():
+            return os.sep
+
+        def bar():
+            return foo()
+        """
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, ["os"])
+    e_foo = _make_entity("foo", 5, 6)
+    e_bar = _make_entity("bar", 8, 9)
+    c = _classified(entities=[e_block, e_foo, e_bar])
+    plan = _plan(
+        [GroupPlacement(group=["_block_1", "foo"], target_file="pkg/helpers.py")]
+    )
+
+    result = generate_file_splits(c, plan, source, "pkg.py", subdir_name="pkg")
+
+    assert not result.abort
+    init_src = result.original_source
+    helpers_src = result.new_files["pkg/helpers.py"]
+    # Docstring belongs in __init__.py.
+    assert '"""Top-level module doc."""' in init_src
+    # Docstring must NOT appear in the child module.
+    assert '"""Top-level module doc."""' not in helpers_src
+
+
+def test_generate_subdir_docstring_already_in_init_not_duplicated():
+    # If the TOP_LEVEL entity stays in the original (not migrated), the
+    # docstring remains in the updated source and must not be prepended again.
+    source = textwrap.dedent(
+        """\
+        \"\"\"Top-level module doc.\"\"\"
+
+        _CONST = 1
+
+        def stayed():
+            return _CONST
+
+        def migrated():
+            pass
+        """
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, ["_CONST"])
+    e_stayed = _make_entity("stayed", 5, 6)
+    e_migrated = _make_entity("migrated", 8, 9)
+    c = _classified(entities=[e_block, e_stayed, e_migrated])
+    plan = _plan([GroupPlacement(group=["migrated"], target_file="pkg/helpers.py")])
+
+    result = generate_file_splits(c, plan, source, "pkg.py", subdir_name="pkg")
+
+    assert not result.abort
+    init_src = result.original_source
+    assert init_src.count('"""Top-level module doc."""') == 1
+
+
+def test_generate_subdir_module_docstring_goes_to_test_init():
+    # For test-file subdir splits the module docstring goes into
+    # subdir/__init__.py, not into the re-export stub file.
+    source = textwrap.dedent(
+        """\
+        \"\"\"Tests for the runner module.\"\"\"
+
+        import os
+
+        def test_foo():
+            return os.sep
+
+        def test_bar():
+            return test_foo()
+        """
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, ["os"])
+    e_foo = _make_entity("test_foo", 5, 6)
+    e_bar = _make_entity("test_bar", 8, 9)
+    c = _classified(entities=[e_block, e_foo, e_bar])
+    plan = _plan(
+        [GroupPlacement(group=["_block_1", "test_foo"], target_file="svc/test_foo.py")]
+    )
+
+    result = generate_file_splits(
+        c, plan, source, "tests/test_svc.py", subdir_name="svc"
+    )
+
+    assert not result.abort
+    init_src = result.new_files["svc/__init__.py"]
+    child_src = result.new_files["svc/test_foo.py"]
+    updated_src = result.original_source
+    # Docstring belongs in __init__.py.
+    assert '"""Tests for the runner module."""' in init_src
+    # Docstring must NOT appear in the child test file or the stub file.
+    assert '"""Tests for the runner module."""' not in child_src
+    assert '"""Tests for the runner module."""' not in updated_src
+
+
+def test_generate_subdir_docstring_not_stripped_from_non_subdir_split():
+    # Outside subdir-split mode, a TOP_LEVEL entity's docstring is preserved
+    # in the new file (only imports are stripped, not docstrings).
+    source = '"""Module doc."""\n\nimport os\n\ndef foo():\n    return os.sep\n'
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, ["os"])
+    e_foo = _make_entity("foo", 5, 6)
+    c = _classified(entities=[e_block, e_foo])
+    plan = _plan([GroupPlacement(group=["_block_1", "foo"], target_file="utils.py")])
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    new_src = result.new_files["utils.py"]
+    assert '"""Module doc."""' in new_src
