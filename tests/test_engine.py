@@ -1323,6 +1323,279 @@ def test_file_limiter_api_error_propagates(tmp_path):
             )
 
 
+def test_file_limiter_recursive_splits_new_file(tmp_path):
+    """When a new file from FileLimiter is over the limit, it is recursively split."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    # First call: original file → creates "chunk.py" which is still over the limit.
+    first_result = FileLimiterResult(
+        original_source="# reduced original\n",
+        new_files={"chunk.py": "".join(f"x_{i} = {i}\n" for i in range(10))},
+        messages=[f"{f}: FileLimiter: moved vars → chunk.py"],
+        abort=False,
+    )
+    # Second call (recursive): chunk.py → creates "chunk_a.py" and "chunk_b.py".
+    second_result = FileLimiterResult(
+        original_source="# reduced chunk\n",
+        new_files={"chunk_a.py": "# a\n", "chunk_b.py": "# b\n"},
+        messages=[str(tmp_path / "chunk.py") + ": FileLimiter: moved → chunk_a/b"],
+        abort=False,
+    )
+
+    call_count = 0
+
+    def _fl_side_effect(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return first_result
+        return second_result
+
+    with patch(_FL_PATCH, side_effect=_fl_side_effect):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5, file_limiter_recursive=True),
+            )
+        )
+
+    assert call_count == 2
+    # Messages from the recursive call are yielded.
+    assert any("chunk_a/b" in m for m in msgs)
+    # Recursive split wrote additional files.
+    assert (tmp_path / "chunk_a.py").exists()
+    assert (tmp_path / "chunk_b.py").exists()
+    # chunk.py was updated with the reduced source from the recursive split.
+    assert (tmp_path / "chunk.py").read_text(encoding="utf-8") == "# reduced chunk\n"
+
+
+def test_file_limiter_recursive_disabled(tmp_path):
+    """file_limiter_recursive=False skips recursive processing of new files."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"chunk.py": oversized},
+        messages=[],
+        abort=False,
+    )
+
+    call_count = 0
+
+    def _fl_side_effect(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        return first_result
+
+    with patch(_FL_PATCH, side_effect=_fl_side_effect):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5, file_limiter_recursive=False),
+            )
+        )
+
+    # Only one call: recursive processing was disabled.
+    assert call_count == 1
+
+
+def test_file_limiter_recursive_abort_stops_recursion(tmp_path):
+    """Recursive call that aborts does not enqueue further files."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"chunk.py": oversized},
+        messages=[],
+        abort=False,
+    )
+    abort_result = FileLimiterResult(
+        original_source=oversized,
+        new_files={},
+        messages=["SKIP chunk.py (FileLimiter): cannot be split"],
+        abort=True,
+    )
+
+    side_effects = [first_result, abort_result]
+
+    with patch(_FL_PATCH, side_effect=side_effects):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5, file_limiter_recursive=True),
+            )
+        )
+
+    assert any("cannot be split" in m for m in msgs)
+
+
+def test_file_limiter_recursive_api_error_propagates(tmp_path):
+    """CrispenAPIError during recursive FileLimiter call propagates out."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"chunk.py": oversized},
+        messages=[],
+        abort=False,
+    )
+
+    side_effects = [first_result, CrispenAPIError("rate limit")]
+
+    with patch(_FL_PATCH, side_effect=side_effects):
+        with pytest.raises(CrispenAPIError, match="rate limit"):
+            list(
+                run_engine(
+                    {str(f): [(1, 1)]},
+                    config=CrispenConfig(max_file_lines=5, file_limiter_recursive=True),
+                )
+            )
+
+
+def test_file_limiter_recursive_creates_nested_init(tmp_path):
+    """Recursive FileLimiter creating a file in a subdirectory creates __init__.py."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"chunk.py": oversized},
+        messages=[],
+        abort=False,
+    )
+    # Recursive call creates a file in a subdirectory.
+    second_result = FileLimiterResult(
+        original_source="# reduced chunk\n",
+        new_files={"sub/part.py": "# part\n"},
+        messages=[],
+        abort=False,
+    )
+
+    with patch(_FL_PATCH, side_effect=[first_result, second_result]):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5, file_limiter_recursive=True),
+            )
+        )
+
+    assert (tmp_path / "sub" / "part.py").exists()
+    assert (tmp_path / "sub" / "__init__.py").exists()
+
+
+def test_file_limiter_recursive_chains(tmp_path):
+    """A file created by a recursive call that is still over the limit is re-queued."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"chunk.py": oversized},
+        messages=[],
+        abort=False,
+    )
+    # chunk.py recursive call itself creates another oversized file.
+    second_result = FileLimiterResult(
+        original_source="# reduced chunk\n",
+        new_files={"chunk2.py": oversized},
+        messages=[],
+        abort=False,
+    )
+    third_result = FileLimiterResult(
+        original_source="# reduced chunk2\n",
+        new_files={},
+        messages=[],
+        abort=True,
+    )
+
+    with patch(_FL_PATCH, side_effect=[first_result, second_result, third_result]):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5, file_limiter_recursive=True),
+            )
+        )
+
+    assert (tmp_path / "chunk.py").exists()
+    assert (tmp_path / "chunk2.py").exists()
+
+
+def test_file_limiter_recursive_source_unchanged(tmp_path):
+    """Recursive result with same original_source does not rewrite the file."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"chunk.py": oversized},
+        messages=[],
+        abort=False,
+    )
+    # Recursive call: original_source equals the input source → no rewrite.
+    second_result = FileLimiterResult(
+        original_source=oversized,  # same as what was written
+        new_files={"part.py": "# part\n"},
+        messages=[],
+        abort=False,
+    )
+
+    with patch(_FL_PATCH, side_effect=[first_result, second_result]):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5, file_limiter_recursive=True),
+            )
+        )
+
+    # chunk.py content is the oversized source (unchanged); the engine did not
+    # rewrite it because original_source == r_source.
+    assert (tmp_path / "chunk.py").read_text(encoding="utf-8") == oversized
+
+
+def test_file_limiter_recursive_subdir_split_deletes_file(tmp_path):
+    """Recursive FileLimiter subdir split on a non-test file deletes the file."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"chunk.py": oversized},
+        messages=[],
+        abort=False,
+    )
+    # Recursive call triggers subdir split: chunk.py → chunk/ package.
+    second_result = FileLimiterResult(
+        original_source=oversized,
+        new_files={"chunk/__init__.py": "# init\n", "chunk/utils.py": "# utils\n"},
+        messages=[],
+        abort=False,
+        subdir_name="chunk",
+    )
+
+    with patch(_FL_PATCH, side_effect=[first_result, second_result]):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5, file_limiter_recursive=True),
+            )
+        )
+
+    # chunk.py was deleted because subdir_name is set and it's not a test file.
+    assert not (tmp_path / "chunk.py").exists()
+    assert (tmp_path / "chunk" / "__init__.py").exists()
+
+
 # ---------------------------------------------------------------------------
 # _should_run
 # ---------------------------------------------------------------------------

@@ -535,6 +535,152 @@ def test_runner_no_migration_retries_and_succeeds(mock_classify, mock_advise, mo
 
 
 # ---------------------------------------------------------------------------
+# run_file_limiter — single-file placement guard
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Helpers for single-file guard tests (subdir-split mode)
+# ---------------------------------------------------------------------------
+
+# A two-line source whose diff_ranges covers the whole file, triggering subdir
+# split for "big.py" → subdir_name="big".  Path("big") must not exist on disk.
+_SUBDIR_SRC = "x = 1\ny = 2\n"
+_SUBDIR_RANGES = [(1, 2)]
+
+
+def _plan_two_same_target() -> FileLimiterPlan:
+    """Two groups, both assigned to the same target file."""
+    return FileLimiterPlan(
+        set3_migrate=[],
+        placements=[
+            GroupPlacement(group=["foo"], target_file="utils.py"),
+            GroupPlacement(group=["bar"], target_file="utils.py"),
+        ],
+        abort=False,
+    )
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_all_in_one_file_subdir_retries_and_fails(
+    mock_classify, mock_advise, mock_gen
+):
+    # Subdir split + all groups → same file → guard triggers every attempt.
+    mock_classify.return_value = _make_classified()
+    mock_advise.return_value = _plan_two_same_target()
+    cfg = CrispenConfig(file_limiter_retries=0)
+
+    result = run_file_limiter("big.py", "", _SUBDIR_SRC, _SUBDIR_RANGES, cfg)
+
+    assert result.abort is False
+    assert any("single file" in m for m in result.messages)
+    mock_gen.assert_not_called()
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_all_in_one_file_subdir_retries_and_succeeds(
+    mock_classify, mock_advise, mock_gen
+):
+    # Subdir split: first attempt all in one file, second splits into two.
+    entity1 = _make_entity("foo", 1, 1)
+    entity2 = _make_entity("bar", 2, 2)
+    mock_classify.return_value = _make_classified(entities=[entity1, entity2])
+    mock_advise.side_effect = [
+        _plan_two_same_target(),
+        FileLimiterPlan(
+            set3_migrate=[],
+            placements=[
+                GroupPlacement(group=["foo"], target_file="utils.py"),
+                GroupPlacement(group=["bar"], target_file="helpers.py"),
+            ],
+            abort=False,
+        ),
+    ]
+    mock_gen.return_value = SplitResult(
+        new_files={
+            "big/utils.py": "x = 1",
+            "big/helpers.py": "y = 2",
+        },
+        original_source=_SUBDIR_SRC,
+        abort=False,
+    )
+    cfg = CrispenConfig(file_limiter_retries=1)
+
+    result = run_file_limiter("big.py", "", _SUBDIR_SRC, _SUBDIR_RANGES, cfg)
+
+    assert result.abort is False
+    assert any("single file" in m for m in result.messages)
+    assert any("FileLimiter: moved" in m for m in result.messages)
+    assert mock_advise.call_args_list[1].kwargs["prev_placement_failure"] != ""
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_all_in_one_file_non_subdir_allowed(
+    mock_classify, mock_advise, mock_gen
+):
+    # Non-subdir split: all groups → same file is always fine.
+    entity1 = _make_entity("foo", 1, 2)
+    entity2 = _make_entity("bar", 3, 4)
+    mock_classify.return_value = _make_classified(entities=[entity1, entity2])
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[],
+        placements=[
+            GroupPlacement(group=["foo"], target_file="utils.py"),
+            GroupPlacement(group=["bar"], target_file="utils.py"),
+        ],
+        abort=False,
+    )
+    mock_gen.return_value = SplitResult(
+        new_files={"utils.py": "def foo():\n    pass\ndef bar():\n    pass"},
+        original_source="# reduced\n",
+        abort=False,
+    )
+
+    # diff_ranges=[] → not a whole-file diff → subdir_name=None → guard inactive.
+    result = run_file_limiter(
+        "big.py",
+        "",
+        "def foo():\n    pass\ndef bar():\n    pass\n",
+        [],
+        _CONFIG_NO_RETRY,
+    )
+
+    assert result.abort is False
+    assert not any("single file" in m for m in result.messages)
+    mock_gen.assert_called_once()
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_single_group_one_file_subdir_allowed(
+    mock_classify, mock_advise, mock_gen
+):
+    # Subdir split with only 1 group: 1 placement → 1 file is always valid.
+    entity = _make_entity("foo", 1, 1)
+    mock_classify.return_value = _make_classified(entities=[entity])
+    mock_advise.return_value = _plan_with(["foo"], "utils.py")
+    mock_gen.return_value = SplitResult(
+        new_files={"big/utils.py": "x = 1"},
+        original_source=_SUBDIR_SRC,
+        abort=False,
+    )
+    cfg = CrispenConfig(file_limiter_retries=0)
+
+    result = run_file_limiter("big.py", "", _SUBDIR_SRC, _SUBDIR_RANGES, cfg)
+
+    assert result.abort is False
+    assert not any("single file" in m for m in result.messages)
+    mock_gen.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # run_file_limiter — verification fails path
 # ---------------------------------------------------------------------------
 

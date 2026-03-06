@@ -66,6 +66,13 @@ class CrispenConfig:
     # total attempts.  Deterministic failures (single-SCC abort) are not retried.
     file_limiter_retries: int = 2
 
+    # When True, any new file created by FileLimiter that still exceeds
+    # max_file_lines is passed through FileLimiter again recursively.  The
+    # recursion terminates naturally: each pass either reduces the file below
+    # the limit, produces an abort (file cannot be split), or generates no
+    # further new files over the limit.
+    file_limiter_recursive: bool = True
+
     # When True and the diff covers every line of the file (whole-file add or
     # replacement), all new files created by FileLimiter are placed in a
     # subdirectory named after the source module (e.g. service/*.py for

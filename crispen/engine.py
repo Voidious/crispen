@@ -647,6 +647,10 @@ def run_engine(
     # Phase 3 — FileLimiter: split files exceeding max_file_lines        #
     # ------------------------------------------------------------------ #
     if config.max_file_lines > 0 and _should_run("file_limiter", config):
+        # Pending queue for recursive FileLimiter processing: (filepath, source)
+        # pairs for newly-created files that are still over the limit.
+        _fl_recursive: List[Tuple[str, str]] = []
+
         for filepath, state in per_file.items():
             if len(state["source"].splitlines()) <= config.max_file_lines:
                 continue
@@ -686,6 +690,11 @@ def run_engine(
                 _stats.files_edited.append(str(new_path))
                 _stats.file_limiter_edits += 1
                 _stats.count_lines_changed("", new_source)
+                if (
+                    config.file_limiter_recursive
+                    and len(new_source.splitlines()) > config.max_file_lines
+                ):
+                    _fl_recursive.append((str(new_path), new_source))
 
             state["source"] = fl_result.original_source
 
@@ -699,6 +708,64 @@ def run_engine(
             ):
                 Path(filepath).unlink()
                 _stats.count_lines_changed(state["original"], "")
+
+        # Recursive pass: process any newly-created files that are still over
+        # the limit.  Each iteration may enqueue further files; the loop ends
+        # when no oversized new files remain.
+        _recursive_msgs: List[str] = []
+        while _fl_recursive:
+            r_path, r_source = _fl_recursive.pop(0)
+            n_lines = len(r_source.splitlines())
+            try:
+                r_result = run_file_limiter(
+                    filepath=r_path,
+                    original_source="",
+                    post_source=r_source,
+                    diff_ranges=[(1, n_lines)],
+                    config=config,
+                    verbose=verbose,
+                )
+            except CrispenAPIError:
+                raise
+
+            _stats.file_limiter_llm_calls += r_result.llm_calls
+            _stats.file_limiter_functions_verified += r_result.verified_functions
+            _stats.file_limiter_classes_verified += r_result.verified_classes
+            _stats.file_limiter_lines_verified += r_result.verified_lines
+
+            _recursive_msgs.extend(r_result.messages)
+
+            if r_result.abort or not r_result.new_files:
+                continue
+
+            r_dir = Path(r_path).parent
+            for rel_path, new_source in r_result.new_files.items():
+                new_path = r_dir / rel_path
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                if new_path.parent != r_dir:
+                    init_py = new_path.parent / "__init__.py"
+                    if not init_py.exists():
+                        init_py.write_text("", encoding="utf-8")
+                new_path.write_text(new_source, encoding="utf-8")
+                _stats.files_edited.append(str(new_path))
+                _stats.file_limiter_edits += 1
+                _stats.count_lines_changed("", new_source)
+                if len(new_source.splitlines()) > config.max_file_lines:
+                    _fl_recursive.append((str(new_path), new_source))
+
+            if r_result.original_source != r_source:
+                Path(r_path).write_text(r_result.original_source, encoding="utf-8")
+                _stats.count_lines_changed(r_source, r_result.original_source)
+
+            # Subdir split of a recursively-processed file: delete the file
+            # that was replaced by a package __init__.py.
+            if r_result.subdir_name is not None and not Path(r_path).name.startswith(
+                "test_"
+            ):
+                Path(r_path).unlink()
+                _stats.count_lines_changed(r_source, "")
+
+        yield from _recursive_msgs
 
     # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #

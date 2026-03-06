@@ -443,6 +443,7 @@ Configuration:
 - `max_file_lines` — file line count threshold (default: 1000). Set to `0` to disable.
 - `file_limiter_subdir_split` — use a subdirectory for whole-file diffs (default: `true`).
 - `file_limiter_retries` — additional LLM retry attempts on failure (default: 2).
+- `file_limiter_recursive` — recursively split newly-created files that are still over the limit (default: `true`).
 
 ## Architecture
 

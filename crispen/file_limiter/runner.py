@@ -401,6 +401,27 @@ def run_file_limiter(
                 )
                 continue
 
+        # Guard: in subdir-split mode every entity in the file is being
+        # redistributed.  If 2+ groups all land in the same single new file,
+        # the split is a no-op — the original is deleted and everything ends
+        # up in one place, unchanged.  Require at least 2 distinct targets.
+        # (In non-subdir mode only new/modified entities migrate; the
+        # original retains its other entities, so a single target is fine.)
+        if subdir_name is not None and len(plan.placements) > 1:
+            unique_targets = {p.target_file for p in plan.placements}
+            if len(unique_targets) == 1:
+                retry_msgs.append(
+                    f"SKIP {filepath} (FileLimiter):"
+                    " all groups assigned to a single file"
+                )
+                last_abort = False
+                prev_placement_failure = (
+                    "Your previous response assigned all groups to the same target "
+                    "file. You MUST distribute groups across at least 2 distinct "
+                    "files."
+                )
+                continue
+
         split = generate_file_splits(
             classified, plan, post_source, filepath, subdir_name=subdir_name
         )
