@@ -1890,19 +1890,19 @@ def test_generate_private_entity_reexported_when_external_caller(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _add_re_exports — # noqa F401 for pure re-export imports
+# _add_re_exports — # fmt: skip # noqa: F401, E501 for pure re-export imports
 # ---------------------------------------------------------------------------
 
 
 def test_add_re_exports_private_external_only_gets_noqa():
-    # Private name in external_loads but NOT in remaining source → noqa F401 comment.
+    # Private name in external_loads but NOT in remaining source → fmt: skip # noqa comment.
     source = "import os\n"
     entity = _make_entity("_helper", 1, 2)
     placement = GroupPlacement(group=["_helper"], target_file="utils.py")
     result = _add_re_exports(
         source, [placement], {"_helper": entity}, {}, external_loads={"_helper"}
     )
-    assert "from .utils import _helper  # noqa F401" in result
+    assert "from .utils import _helper  # fmt: skip # noqa: F401, E501" in result
 
 
 def test_add_re_exports_private_in_still_loaded_no_noqa():
@@ -1916,12 +1916,12 @@ def test_add_re_exports_private_in_still_loaded_no_noqa():
 
 
 def test_add_re_exports_public_not_in_still_loaded_gets_noqa():
-    # Public name migrated but not referenced in remaining source → noqa F401.
+    # Public name migrated but not referenced in remaining source → fmt: skip # noqa.
     source = "import os\n"
     entity = _make_entity("foo", 1, 2)
     placement = GroupPlacement(group=["foo"], target_file="utils.py")
     result = _add_re_exports(source, [placement], {"foo": entity}, {})
-    assert "from .utils import foo  # noqa F401" in result
+    assert "from .utils import foo  # fmt: skip # noqa: F401, E501" in result
 
 
 def test_add_re_exports_public_in_still_loaded_no_noqa():
@@ -1947,7 +1947,7 @@ def test_add_re_exports_multiple_noqa_each_on_own_line():
         external_loads={"_a", "_b"},
     )
     lines = result.splitlines()
-    noqa_lines = [line for line in lines if "# noqa F401" in line]
+    noqa_lines = [line for line in lines if "# fmt: skip # noqa: F401, E501" in line]
     assert len(noqa_lines) == 2
     names = {line.split("import")[1].split("#")[0].strip() for line in noqa_lines}
     assert names == {"_a", "_b"}
@@ -1967,8 +1967,12 @@ def test_add_re_exports_mixed_splits_into_two_lines():
         external_loads={"_used", "_reexport"},
     )
     lines = result.splitlines()
-    noqa_lines = [l for l in lines if "# noqa F401" in l]
-    plain_lines = [l for l in lines if "from .utils import" in l and "# noqa" not in l]
+    noqa_lines = [line for line in lines if "# fmt: skip # noqa: F401, E501" in line]
+    plain_lines = [
+        line
+        for line in lines
+        if "from .utils import" in line and "# fmt: skip" not in line
+    ]
     assert len(noqa_lines) == 1
     assert "_reexport" in noqa_lines[0]
     assert "_used" not in noqa_lines[0]

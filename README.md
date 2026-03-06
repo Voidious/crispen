@@ -409,8 +409,8 @@ def export_csv(records, path):
 ```python
 # service.py (updated, with re-exports)
 import json
-from .models import Config, DataStore  # noqa F401
-from .utils import export_csv, fetch_records  # noqa F401
+from .models import Config, DataStore  # fmt: skip # noqa: F401, E501
+from .utils import export_csv, fetch_records  # fmt: skip # noqa: F401, E501
 ```
 
 ```python

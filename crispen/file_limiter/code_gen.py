@@ -422,7 +422,7 @@ def _add_re_exports(
     still_loaded = _collect_name_loads(source)
     re_exports: Dict[str, List[str]] = {}
     # Names added solely for external re-export (not referenced in remaining source).
-    # These need "# noqa F401" to suppress flake8 false positives.
+    # These need "# fmt: skip # noqa: F401, E501" to suppress flake8 false positives.
     noqa_names: Set[str] = set()
     for placement in placements:
         # Compute the import prefix for this placement's target file.
@@ -465,9 +465,10 @@ def _add_re_exports(
         return source
 
     # Build export statements.  When a name is only there for external re-export
-    # (not referenced in the remaining source), add "# noqa F401" so flake8
-    # does not flag it as an unused import.  Split mixed imports into two lines
-    # so that the noqa comment does not suppress warnings for used names.
+    # (not referenced in the remaining source), add "# fmt: skip # noqa: F401, E501"
+    # so flake8 does not flag it as an unused import and Black does not reformat
+    # the line (which would break the noqa directive).  Split mixed imports into
+    # two lines so that the noqa comment does not suppress warnings for used names.
     export_stmts: List[str] = []
     for prefix, names in sorted(re_exports.items()):
         sorted_names = sorted(names)
@@ -476,7 +477,9 @@ def _add_re_exports(
         if used:
             export_stmts.append(f"from {prefix} import {', '.join(used)}\n")
         for name in noqa:
-            export_stmts.append(f"from {prefix} import {name}  # noqa F401\n")
+            export_stmts.append(
+                f"from {prefix} import {name}  # fmt: skip # noqa: F401, E501\n"
+            )
 
     lines = source.splitlines(keepends=True)
     last_import_line = 0
