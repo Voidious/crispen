@@ -294,7 +294,8 @@ def _assign_placements_chunk(
     original_basename = Path(original_path).name
     content = (
         f"Assign each entity group to a target Python filename. "
-        f"The original file is '{original_path}' and is being split — "
+        f"The original file is '{original_path}' and is being split because "
+        f"it exceeds the {config.max_file_lines}-line limit — "
         "each group must go to a file that does NOT already exist "
         "(a new file created by this split).\n\n"
         f"Groups to place (you MUST return a target_file for every "
@@ -308,6 +309,11 @@ def _assign_placements_chunk(
         "- Multiple groups MAY share the same target file — place "
         "semantically related groups together rather than giving each "
         "its own file.\n"
+        "- PREFER FEWER, BROADER FILES. Group loosely-related entities "
+        "under a shared name like 'utils.py' or 'misc.py' instead of "
+        "creating a separate file for every small group. Only create a "
+        "dedicated file when a group is large or has a clearly distinct "
+        "purpose that warrants its own module.\n"
         f"- The set of target files across all placements should use "
         f"at least {min_files} distinct filename(s).\n"
         "- Choose descriptive names based on what the entities do "
