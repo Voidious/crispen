@@ -55,8 +55,21 @@ model = "claude-sonnet-4-6"
 # Useful for LM Studio on a non-default port, or other self-hosted endpoints.
 # base_url = "http://localhost:1234/v1"
 
+# HTTP timeout in seconds for each LLM API call (default: 60.0).
+# Raise this when using slow local models.
+# api_timeout = 60.0
+
 # FunctionSplitter: max function body lines before splitting (default: 75)
 max_function_length = 75
+
+# FileLimiter: max file lines before splitting into sibling files (default: 1000).
+# Set to 0 to disable FileLimiter entirely.
+max_file_lines = 1000
+
+# FileLimiter: when the diff covers every line of the file (whole-file add or
+# replacement), place new files in a subdirectory named after the module
+# (e.g. service/*.py for service.py). Default: true.
+file_limiter_subdir_split = true
 
 # Tuple Return to Dataclass: min tuple element count to trigger replacement (default: 4)
 min_tuple_size = 4
@@ -77,6 +90,17 @@ helper_docstrings = false
 # Retry counts for extraction and LLM verification failures
 extraction_retries = 2
 llm_verify_retries = 2
+
+# FileLimiter: additional retry attempts after an LLM-related failure (default: 2)
+file_limiter_retries = 2
+
+# Run only specific refactors (default: run all).
+# Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
+# "tuple_dataclass", "file_limiter"
+# enabled_refactors = ["function_splitter", "file_limiter"]
+
+# Always skip specific refactors (ignored when enabled_refactors is set).
+# disabled_refactors = ["file_limiter"]
 ```
 
 ### API Keys
@@ -346,6 +370,80 @@ Configuration:
 - `max_function_length` — maximum allowed body lines (default: 75).
 - `helper_docstrings` — whether to include a docstring in extracted helper functions (default: `false`).
 
+---
+
+### 6. File limiter
+
+**Splits files that exceed the line-count limit into smaller sibling modules.**
+
+When a file in the diff exceeds `max_file_lines` (default: 1000) after all other refactors have run, crispen splits it. It classifies every top-level entity by whether it was added, modified, or left unchanged by the diff, builds a dependency graph to find groups that can safely move together, and asks the LLM to assign each group to a new file. The original file is updated with `from .module import name` re-exports so existing callers are unaffected.
+
+The algorithm:
+1. Parse all top-level entities (functions, classes, and statement blocks) from the post-refactor source.
+2. Classify each entity as **NEW** (added by the diff), **MODIFIED** (existed before and changed), or **UNMODIFIED** (existed before and unchanged).
+3. Build a name-reference dependency graph and compute strongly connected components (SCCs). Entities in the same SCC must be moved together.
+4. SCCs containing any **UNMODIFIED** entity must stay (Set 1). SCCs of **NEW** entities can be freely moved (Set 2). SCCs of purely **MODIFIED** entities may be migrated (Set 3) — the LLM decides which.
+5. Ask the LLM to assign each movable SCC group to a target filename. Groups with related purposes may share a file.
+6. Generate the new files, add `from .module import name` re-exports to the original, and verify every entity's source is preserved before writing.
+
+**Whole-file mode (subdir split):** When the diff covers every line of the file — e.g. a brand-new file — crispen places the new sibling files in a subdirectory named after the module (e.g. `service/*.py` for `service.py`). For non-test files, a `service/__init__.py` is generated that re-exports the public API so callers need no updates. For test files, the original `test_service.py` keeps re-export stubs so pytest can still find the tests.
+
+**Before** (`service.py`, 1200 lines):
+```python
+import json
+
+class Config:
+    # ... 80 lines ...
+
+class DataStore:
+    # ... 200 lines ...
+
+def fetch_records(store, query):
+    # ... 60 lines ...
+
+def export_csv(records, path):
+    # ... 40 lines ...
+```
+
+**After:**
+```python
+# service.py (updated, with re-exports)
+import json
+from .models import Config, DataStore  # noqa F401
+from .utils import export_csv, fetch_records  # noqa F401
+```
+
+```python
+# service/models.py (new file)
+import json
+
+class Config:
+    # ... 80 lines ...
+
+class DataStore:
+    # ... 200 lines ...
+```
+
+```python
+# service/utils.py (new file)
+from .models import DataStore
+
+def fetch_records(store, query):
+    # ... 60 lines ...
+
+def export_csv(records, path):
+    # ... 40 lines ...
+```
+
+Safety checks applied before writing:
+- Every entity's source (minus import lines) must appear verbatim in the combined output.
+- The proposed split must not introduce circular file imports.
+
+Configuration:
+- `max_file_lines` — file line count threshold (default: 1000). Set to `0` to disable.
+- `file_limiter_subdir_split` — use a subdirectory for whole-file diffs (default: `true`).
+- `file_limiter_retries` — additional LLM retry attempts on failure (default: 2).
+
 ## Architecture
 
 ```
@@ -358,13 +456,21 @@ crispen/cli.py         # Entry point: reads stdin, calls parse_diff then run_eng
         │
         └── crispen/engine.py        # Loads files, runs all refactors, writes back
                 │
-                └── crispen/refactors/
-                        ├── base.py                # Refactor base class (libcst.CSTTransformer)
-                        ├── if_not_else.py         # if not x: A else B  →  if x: B else A
-                        ├── tuple_dataclass.py     # Large tuple returns → @dataclass
-                        ├── caller_updater.py      # Update tuple-unpacking call sites
-                        ├── duplicate_extractor.py # Extract duplicate blocks
-                        └── function_splitter.py   # Split oversized functions
+                ├── crispen/refactors/
+                │       ├── base.py                # Refactor base class (libcst.CSTTransformer)
+                │       ├── if_not_else.py         # if not x: A else B  →  if x: B else A
+                │       ├── tuple_dataclass.py     # Large tuple returns → @dataclass
+                │       ├── caller_updater.py      # Update tuple-unpacking call sites
+                │       ├── duplicate_extractor.py # Extract duplicate blocks
+                │       └── function_splitter.py   # Split oversized functions
+                │
+                └── crispen/file_limiter/
+                        ├── runner.py              # Orchestrates FileLimiter phases
+                        ├── classifier.py          # Classify entities (Set 1/2/3)
+                        ├── advisor.py             # LLM placement planner
+                        ├── code_gen.py            # Generate split file contents
+                        ├── entity_parser.py       # Parse top-level entities
+                        └── dep_graph.py           # Dependency graph + SCC finder
 ```
 
 ### Adding a new refactor

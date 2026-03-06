@@ -1,0 +1,11 @@
+--- a/input.py
++++ b/input.py
+@@ -6,0 +7,8 @@
++
++
++def normalize_name(text):
++    return text.strip().lower()
++
++
++def validate_record(record):
++    return "name" in record and "value" in record
