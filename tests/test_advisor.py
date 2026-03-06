@@ -79,9 +79,9 @@ def _propose_ok(*filenames: str) -> dict:
 
 
 _CONFIG = CrispenConfig()
-_PATCH_KEY = "crispen.file_limiter.advisor.get_api_key"
-_PATCH_CLIENT = "crispen.file_limiter.advisor.make_client"
-_PATCH_CALL = "crispen.file_limiter.advisor.call_with_tool"
+_PATCH_KEY = "crispen.file_limiter.advisor.planning_workflow.get_api_key"
+_PATCH_CLIENT = "crispen.file_limiter.advisor.planning_workflow.make_client"
+_PATCH_CALL = "crispen.file_limiter.advisor.planning_workflow.call_with_tool"
 
 
 # ---------------------------------------------------------------------------

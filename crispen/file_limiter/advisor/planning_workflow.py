@@ -1,21 +1,12 @@
-"""LLM advisor for FileLimiter: plans entity migration to new files."""
-
 from __future__ import annotations
-
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-from ..config import CrispenConfig
-from ..llm_client import call_with_tool, get_api_key, make_client
-from .classifier import ClassifiedEntities
-from .entity_parser import Entity
-
-
-# ---------------------------------------------------------------------------
-# Public data classes
-# ---------------------------------------------------------------------------
+from ...config import CrispenConfig
+from ...llm_client import call_with_tool, get_api_key, make_client
+from ..classifier import ClassifiedEntities
+from ..entity_parser import Entity
 
 
 @dataclass
@@ -38,11 +29,6 @@ class FileLimiterPlan:
     abort: bool
     abort_reason: str = ""  # human-readable explanation when abort=True
     llm_calls: int = 0  # number of LLM API calls made during planning
-
-
-# ---------------------------------------------------------------------------
-# LLM tool schemas
-# ---------------------------------------------------------------------------
 
 
 _SET3_TOOL: dict = {
@@ -177,11 +163,6 @@ _PROPOSE_FILES_TOOL: dict = {
 # dozens of groups; sending them all in one call frequently causes timeouts
 # or incomplete responses.  This limit keeps each call small and reliable.
 _PLACEMENT_CHUNK_SIZE = 100
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _group_summary(group: List[str], entity_map: Dict[str, Entity]) -> str:
@@ -921,11 +902,6 @@ def _assign_placements(
     )
 
     return all_placements
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def resolve_naming_conflicts(
