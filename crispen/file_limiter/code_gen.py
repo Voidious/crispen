@@ -48,6 +48,9 @@ _IMPORT_LINE_RE = re.compile(r"^(import\s+|from\s+\S.*\s+import\s+)")
 # Matches a `from __future__ import …` line (with optional trailing newline).
 _FUTURE_IMPORT_LINE_RE = re.compile(r"^from __future__ import .*\n?", re.MULTILINE)
 
+# Matches the leading dots of a relative import (``from .foo`` or ``from ..``).
+_REL_IMPORT_RE = re.compile(r"^from (\.+)", re.MULTILINE)
+
 
 def _import_derived_names(source: str) -> Set[str]:
     """Return names introduced solely by import statements in *source*.
@@ -140,6 +143,20 @@ def _find_needed_imports(
             seen.add(info.source)
 
     return needed
+
+
+def _bump_relative_imports(source: str) -> str:
+    """Increment the level of every relative import in *source* by one.
+
+    Used when file content is moved one directory level deeper, e.g. when the
+    source originally written for ``pkg/module.py`` becomes the content of
+    ``pkg/module/__init__.py``, or when new files go into a subdirectory
+    package instead of sitting next to the original file.
+
+    ``from .foo`` → ``from ..foo``, ``from ..bar`` → ``from ...bar``, etc.
+    Absolute imports are not affected.
+    """
+    return _REL_IMPORT_RE.sub(lambda m: f"from .{m.group(1)}", source)
 
 
 def _relative_import_prefix(from_file: str, to_file: str) -> str:
@@ -996,6 +1013,8 @@ def generate_file_splits(
         needed = _find_needed_imports(
             ent_names, entity_source_map, import_infos, all_entity_names
         )
+        if subdir_name is not None:
+            needed = [_bump_relative_imports(s) for s in needed]
         cross = _find_cross_file_imports(
             ent_names,
             entity_source_map,
@@ -1027,6 +1046,14 @@ def generate_file_splits(
     # ".service.utils").  For test files the original keeps existing abs_pkg
     # behaviour so pytest can find the re-exported symbols.
     is_test_file = Path(original_path).name.startswith("test_")
+    # In a non-test subdir split the updated source becomes subdir/__init__.py,
+    # which sits one directory level deeper than the original file.  Any
+    # relative imports it still contains (e.g. ``from .. import llm_client``
+    # or ``from .base import Foo``) therefore need one extra dot so they keep
+    # pointing at the same modules.  Re-exports added by _add_re_exports below
+    # are already computed from the __init__.py's perspective and are correct.
+    if subdir_name is not None and not is_test_file:
+        updated = _bump_relative_imports(updated)
     relative_from: Optional[str] = (
         f"{subdir_name}/__init__.py" if (subdir_name and not is_test_file) else None
     )
