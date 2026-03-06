@@ -460,16 +460,22 @@ def test_file_limiter_set2_split(mock_anthropic, tmp_path):
     mock_client = MagicMock()
     mock_anthropic.Anthropic.return_value = mock_client
     mock_anthropic.APIError = Exception
-    # One LLM call: assign_file_placements for the two Set-2 groups.
-    mock_client.messages.create.return_value = _make_fl_response(
-        "assign_file_placements",
-        {
-            "placements": [
-                {"group_id": 0, "target_file": "utils.py"},
-                {"group_id": 1, "target_file": "utils.py"},
-            ]
-        },
-    )
+    # Two LLM calls: propose output files, then assign_file_placements.
+    mock_client.messages.create.side_effect = [
+        _make_fl_response(
+            "propose_output_files",
+            {"files": [{"filename": "utils.py", "description": "utility helpers"}]},
+        ),
+        _make_fl_response(
+            "assign_file_placements",
+            {
+                "placements": [
+                    {"group_id": 0, "target_file": "utils.py"},
+                    {"group_id": 1, "target_file": "utils.py"},
+                ]
+            },
+        ),
+    ]
 
     with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
         result = run_file_limiter(

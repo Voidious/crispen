@@ -13,8 +13,11 @@ from crispen.file_limiter.advisor import (
     _advise_set3,
     _assign_placements_chunk,
     _build_group_mermaid,
+    _compute_projected_lines,
     _find_conflicting_placement_indices,
     _group_summary,
+    _propose_files_step,
+    _refine_merge_tiny,
     advise_file_limiter,
     GroupPlacement,
     resolve_naming_conflicts,
@@ -66,6 +69,13 @@ def _classified(
         set_3_groups=set_3_groups or [],
         abort=abort,
     )
+
+
+def _propose_ok(*filenames: str) -> dict:
+    """Return a valid propose_output_files LLM response for the given filenames."""
+    return {
+        "files": [{"filename": f, "description": "auto-generated"} for f in filenames]
+    }
 
 
 _CONFIG = CrispenConfig()
@@ -121,12 +131,13 @@ def test_plan_api_key_error_propagates(monkeypatch):
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
-    """set_2 groups only: call 1 is skipped, call 2 assigns placement."""
+    """set_2 groups only: no set3 call; propose + assign = 2 LLM calls."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": 0, "target_file": "utils.py"}]
-    }
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": 0, "target_file": "utils.py"}]},
+    ]
     c = _classified(
         entities=[_make_entity("foo", 1, 10)],
         set_2_groups=[["foo"]],
@@ -138,7 +149,9 @@ def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
     assert len(plan.placements) == 1
     assert plan.placements[0].group == ["foo"]
     assert plan.placements[0].target_file == "utils.py"
-    assert mock_call.call_count == 1  # only placement call
+    assert (
+        mock_call.call_count == 2
+    )  # propose + assign (no refinement: only 1 tiny file)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +163,7 @@ def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_all_stay_no_placement(mock_key, mock_client, mock_call):
-    """All Set 3 groups stay → no placement call, empty plan."""
+    """All Set 3 groups stay → no propose/assign call, empty plan."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
     mock_call.return_value = {"decisions": [{"group_id": 0, "action": "stay"}]}
@@ -171,11 +184,12 @@ def test_plan_set3_all_stay_no_placement(mock_key, mock_client, mock_call):
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_migrate(mock_key, mock_client, mock_call):
-    """Set 3 group migrates → two LLM calls, placement returned."""
+    """Set 3 group migrates → set3 + propose + assign = 3 LLM calls."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
     mock_call.side_effect = [
         {"decisions": [{"group_id": 0, "action": "migrate"}]},
+        _propose_ok("helpers.py"),
         {"placements": [{"group_id": 0, "target_file": "helpers.py"}]},
     ]
     c = _classified(
@@ -189,7 +203,7 @@ def test_plan_set3_migrate(mock_key, mock_client, mock_call):
     assert len(plan.placements) == 1
     assert plan.placements[0].group == ["bar"]
     assert plan.placements[0].target_file == "helpers.py"
-    assert mock_call.call_count == 2
+    assert mock_call.call_count == 3
 
 
 @patch(_PATCH_CALL)
@@ -201,6 +215,7 @@ def test_plan_set2_and_set3_migrate(mock_key, mock_client, mock_call):
     mock_client.return_value = MagicMock()
     mock_call.side_effect = [
         {"decisions": [{"group_id": 0, "action": "migrate"}]},
+        _propose_ok("new_stuff.py", "changed.py"),
         {
             "placements": [
                 {"group_id": 0, "target_file": "new_stuff.py"},
@@ -248,13 +263,14 @@ def test_plan_set3_call_returns_none_aborts(mock_key, mock_client, mock_call):
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_placement_call_returns_none_aborts(mock_key, mock_client, mock_call):
-    """Placement chunk exhausts all per-chunk retries → abort."""
+    """Propose succeeds then assignment chunk exhausts retries → abort."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    # file_limiter_retries=0 → 1 attempt per chunk; set3 call + 1 placement attempt.
+    # file_limiter_retries=0 → 1 attempt for propose, 1 attempt for assign.
     mock_call.side_effect = [
         {"decisions": [{"group_id": 0, "action": "migrate"}]},
-        None,
+        _propose_ok("helpers.py"),
+        None,  # assignment fails
     ]
     c = _classified(
         entities=[_make_entity("bar", 1, 10)],
@@ -327,7 +343,7 @@ def test_plan_set3_unknown_action_treated_as_stay(mock_key, mock_client, mock_ca
 
 
 # ---------------------------------------------------------------------------
-# Invalid LLM responses — placement
+# Invalid LLM responses — placement assignment
 # ---------------------------------------------------------------------------
 
 
@@ -338,15 +354,16 @@ def test_plan_placement_incomplete_aborts(mock_key, mock_client, mock_call):
     """Placement missing some group_ids → len mismatch → abort."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    # Two groups but only one placement returned.
-    mock_call.return_value = {
-        "placements": [{"group_id": 0, "target_file": "utils.py"}]
-    }
+    # Two groups but only one placement returned; retries=0 → immediate abort.
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": 0, "target_file": "utils.py"}]},
+    ]
     c = _classified(
         entities=[_make_entity("foo", 1, 5), _make_entity("bar", 6, 10)],
         set_2_groups=[["foo"], ["bar"]],
     )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
+    plan = advise_file_limiter(c, "src/big.py", CrispenConfig(file_limiter_retries=0))
     assert plan.abort is True
 
 
@@ -357,17 +374,20 @@ def test_plan_placement_duplicate_group_id_aborts(mock_key, mock_client, mock_ca
     """Duplicate group_id in placement → only first counted → len mismatch → abort."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [
-            {"group_id": 0, "target_file": "utils.py"},
-            {"group_id": 0, "target_file": "other.py"},  # duplicate
-        ]
-    }
+    mock_call.side_effect = [
+        _propose_ok("utils.py", "other.py"),
+        {
+            "placements": [
+                {"group_id": 0, "target_file": "utils.py"},
+                {"group_id": 0, "target_file": "other.py"},  # duplicate
+            ]
+        },
+    ]
     c = _classified(
         entities=[_make_entity("foo", 1, 5), _make_entity("bar", 6, 10)],
         set_2_groups=[["foo"], ["bar"]],
     )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
+    plan = advise_file_limiter(c, "src/big.py", CrispenConfig(file_limiter_retries=0))
     assert plan.abort is True
 
 
@@ -378,12 +398,15 @@ def test_plan_placement_empty_target_aborts(mock_key, mock_client, mock_call):
     """Empty target_file → falsy check fails → treated as missing → abort."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    mock_call.return_value = {"placements": [{"group_id": 0, "target_file": ""}]}
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": 0, "target_file": ""}]},
+    ]
     c = _classified(
         entities=[_make_entity("foo", 1, 5)],
         set_2_groups=[["foo"]],
     )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
+    plan = advise_file_limiter(c, "src/big.py", CrispenConfig(file_limiter_retries=0))
     assert plan.abort is True
 
 
@@ -394,14 +417,15 @@ def test_plan_placement_out_of_range_group_id_aborts(mock_key, mock_client, mock
     """Out-of-range group_id in placement → skipped → len mismatch → abort."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": 99, "target_file": "utils.py"}]
-    }
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": 99, "target_file": "utils.py"}]},
+    ]
     c = _classified(
         entities=[_make_entity("foo", 1, 5)],
         set_2_groups=[["foo"]],
     )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
+    plan = advise_file_limiter(c, "src/big.py", CrispenConfig(file_limiter_retries=0))
     assert plan.abort is True
 
 
@@ -412,38 +436,46 @@ def test_plan_placement_non_int_group_id_aborts(mock_key, mock_client, mock_call
     """Non-integer group_id in placement → isinstance check fails → abort."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": "zero", "target_file": "utils.py"}]
-    }
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": "zero", "target_file": "utils.py"}]},
+    ]
     c = _classified(
         entities=[_make_entity("foo", 1, 5)],
         set_2_groups=[["foo"]],
     )
-    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
+    plan = advise_file_limiter(c, "src/big.py", CrispenConfig(file_limiter_retries=0))
     assert plan.abort is True
 
 
 # ---------------------------------------------------------------------------
-# Placement targets an existing file → abort
+# Placement target not in proposed list → abort
 # ---------------------------------------------------------------------------
 
 
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
-def test_plan_placement_targets_existing_file_aborts(mock_key, mock_client, mock_call):
-    """LLM suggests a target that already exists on disk → abort."""
+def test_plan_placement_targets_outside_proposed_aborts(
+    mock_key, mock_client, mock_call
+):
+    """LLM returns target not in proposed list → constrained check fails → abort."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": 0, "target_file": "existing.py"}]
-    }
+    # Propose "utils.py" but assignment tries to use "existing.py" (not proposed).
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": 0, "target_file": "existing.py"}]},
+    ]
     c = _classified(
         entities=[_make_entity("foo", 1, 5)],
         set_2_groups=[["foo"]],
     )
     plan = advise_file_limiter(
-        c, "src/big.py", _CONFIG, existing_files=frozenset({"existing.py"})
+        c,
+        "src/big.py",
+        CrispenConfig(file_limiter_retries=0),
+        existing_files=frozenset({"existing.py"}),
     )
     assert plan.abort is True
 
@@ -460,9 +492,10 @@ def test_plan_entity_not_in_entity_map(mock_key, mock_client, mock_call):
     """Group contains name absent from entity list → falls back to name-only display."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": 0, "target_file": "utils.py"}]
-    }
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": 0, "target_file": "utils.py"}]},
+    ]
     # "ghost" is not in entities list, so entity_map lookup fails.
     c = _classified(
         entities=[],
@@ -504,12 +537,13 @@ def test_plan_set3_prev_failure_appended_to_prompt(mock_key, mock_client, mock_c
 def test_plan_placement_prev_failure_appended_to_prompt(
     mock_key, mock_client, mock_call
 ):
-    """prev_placement_failure is appended to the placement prompt."""
+    """prev_placement_failure is appended to the assignment prompt (last call)."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": 0, "target_file": "utils.py"}]
-    }
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": 0, "target_file": "utils.py"}]},
+    ]
 
     c = _classified(
         entities=[_make_entity("foo", 1, 10)],
@@ -519,8 +553,8 @@ def test_plan_placement_prev_failure_appended_to_prompt(
         c, "src/big.py", _CONFIG, prev_placement_failure="sentinel text"
     )
 
-    # set_2_groups only: only the placement call fires (call_count == 1)
-    assert mock_call.call_count == 1
+    assert mock_call.call_count == 2  # propose + assign
+    # The assign call is the last call; it receives prev_placement_failure.
     messages = mock_call.call_args[0][6]
     assert "sentinel text" in messages[0]["content"]
 
@@ -534,7 +568,7 @@ def test_plan_placement_prev_failure_appended_to_prompt(
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_chunked_placement_makes_multiple_calls(mock_key, mock_client, mock_call):
-    """More than _PLACEMENT_CHUNK_SIZE set-2 groups → multiple placement calls."""
+    """More than _PLACEMENT_CHUNK_SIZE groups → propose + multiple assign calls."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
 
@@ -546,22 +580,31 @@ def test_plan_chunked_placement_makes_multiple_calls(mock_key, mock_client, mock
     # First chunk returns placements for group_ids 0..CHUNK_SIZE-1.
     first_chunk_response = {
         "placements": [
-            {"group_id": j, "target_file": f"file_{j}.py"}
+            {"group_id": j, "target_file": "file_a.py"}
             for j in range(_PLACEMENT_CHUNK_SIZE)
         ]
     }
-    # Second chunk has 1 group (group_id 0).
-    second_chunk_response = {"placements": [{"group_id": 0, "target_file": "last.py"}]}
+    # Second chunk has 1 group (group_id 0) → goes to file_b.py (tiny, 2 lines).
+    second_chunk_response = {
+        "placements": [{"group_id": 0, "target_file": "file_b.py"}]
+    }
+    # Refinement: file_b.py is tiny (2 lines < 200), reassign to file_a.py.
+    refine_response = {"placements": [{"group_id": 0, "target_file": "file_a.py"}]}
 
-    mock_call.side_effect = [first_chunk_response, second_chunk_response]
+    mock_call.side_effect = [
+        _propose_ok("file_a.py", "file_b.py"),
+        first_chunk_response,
+        second_chunk_response,
+        refine_response,
+    ]
 
     c = _classified(entities=entities, set_2_groups=groups)
     plan = advise_file_limiter(c, "src/big.py", _CONFIG)
 
     assert plan.abort is False
     assert len(plan.placements) == n
-    # Two placement calls were made (no set-3 call since set_3_groups is empty).
-    assert mock_call.call_count == 2
+    # propose + chunk1 + chunk2 + refine = 4 calls.
+    assert mock_call.call_count == 4
 
 
 @patch(_PATCH_CALL)
@@ -580,21 +623,26 @@ def test_plan_chunked_placement_second_chunk_fails_aborts(
 
     first_chunk_response = {
         "placements": [
-            {"group_id": j, "target_file": f"file_{j}.py"}
+            {"group_id": j, "target_file": "file_a.py"}
             for j in range(_PLACEMENT_CHUNK_SIZE)
         ]
     }
 
     cfg = CrispenConfig(file_limiter_retries=1)  # 2 attempts per chunk
-    # First chunk succeeds; second chunk fails both attempts.
-    mock_call.side_effect = [first_chunk_response, None, None]
+    # propose + chunk 1 (1 call) + chunk 2 (2 failed attempts) = 4 calls.
+    mock_call.side_effect = [
+        _propose_ok("file_a.py", "file_b.py"),
+        first_chunk_response,
+        None,
+        None,
+    ]
 
     c = _classified(entities=entities, set_2_groups=groups)
     plan = advise_file_limiter(c, "src/big.py", cfg)
 
     assert plan.abort is True
     assert "LLM failed to assign file placements" in plan.abort_reason
-    assert mock_call.call_count == 3  # chunk 1 (1 call) + chunk 2 (2 failed attempts)
+    assert mock_call.call_count == 4  # propose + chunk1 + 2 failed chunk2 attempts
 
 
 @patch(_PATCH_CALL)
@@ -611,22 +659,32 @@ def test_plan_chunked_placement_chunk_retry_succeeds(mock_key, mock_client, mock
 
     first_chunk_response = {
         "placements": [
-            {"group_id": j, "target_file": f"file_{j}.py"}
+            {"group_id": j, "target_file": "file_a.py"}
             for j in range(_PLACEMENT_CHUNK_SIZE)
         ]
     }
-    second_chunk_response = {"placements": [{"group_id": 0, "target_file": "last.py"}]}
+    second_chunk_response = {
+        "placements": [{"group_id": 0, "target_file": "file_b.py"}]
+    }
+    # Refinement: file_b.py is tiny, reassign to file_a.py.
+    refine_response = {"placements": [{"group_id": 0, "target_file": "file_a.py"}]}
 
     cfg = CrispenConfig(file_limiter_retries=1)  # 2 attempts per chunk
-    # First chunk succeeds; second chunk fails once then succeeds.
-    mock_call.side_effect = [first_chunk_response, None, second_chunk_response]
+    # propose + chunk1 + chunk2 (fail) + chunk2 (succeed) + refine = 5 calls.
+    mock_call.side_effect = [
+        _propose_ok("file_a.py", "file_b.py"),
+        first_chunk_response,
+        None,
+        second_chunk_response,
+        refine_response,
+    ]
 
     c = _classified(entities=entities, set_2_groups=groups)
     plan = advise_file_limiter(c, "src/big.py", cfg)
 
     assert plan.abort is False
     assert len(plan.placements) == n
-    assert mock_call.call_count == 3  # chunk 1 (1) + chunk 2 (1 fail + 1 succeed)
+    assert mock_call.call_count == 5
 
 
 @patch(_PATCH_CALL)
@@ -638,19 +696,24 @@ def test_plan_chunked_placement_zero_total_lines(mock_key, mock_client, mock_cal
     mock_client.return_value = MagicMock()
 
     # Groups reference names not present in entity_map (entities=[]).
+    # Projected lines = 0 for all files → no tiny files → no refinement.
     groups = [["orphan_a"], ["orphan_b"]]
-    mock_call.return_value = {
-        "placements": [
-            {"group_id": 0, "target_file": "a.py"},
-            {"group_id": 1, "target_file": "b.py"},
-        ]
-    }
+    mock_call.side_effect = [
+        _propose_ok("a.py", "b.py"),
+        {
+            "placements": [
+                {"group_id": 0, "target_file": "a.py"},
+                {"group_id": 1, "target_file": "b.py"},
+            ]
+        },
+    ]
 
     c = _classified(entities=[], set_2_groups=groups)
     plan = advise_file_limiter(c, "src/big.py", _CONFIG)
 
     assert plan.abort is False
     assert len(plan.placements) == 2
+    assert mock_call.call_count == 2  # propose + assign (no refinement)
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +764,7 @@ def test_find_conflicting_idx_no_conflict():
 # ---------------------------------------------------------------------------
 # resolve_naming_conflicts — helpers shared by the block below
 # ---------------------------------------------------------------------------
+
 
 _CONFLICTING_PLACEMENTS = [
     GroupPlacement(group=["foo"], target_file="utils.py"),  # plan-vs-plan conflict
@@ -1090,7 +1154,7 @@ def test_build_group_mermaid_intra_group_dep():
 
 
 # ---------------------------------------------------------------------------
-# Mermaid appears in placement prompt when deps exist
+# Mermaid appears in assignment prompt when deps exist
 # ---------------------------------------------------------------------------
 
 
@@ -1100,15 +1164,18 @@ def test_build_group_mermaid_intra_group_dep():
 def test_placement_prompt_includes_mermaid_when_deps_exist(
     mock_key, mock_client, mock_call
 ):
-    """When inter-group deps exist, Mermaid diagram is included in the prompt."""
+    """Inter-group deps exist → Mermaid diagram included in the assignment prompt."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [
-            {"group_id": 0, "target_file": "utils.py"},
-            {"group_id": 1, "target_file": "models.py"},
-        ]
-    }
+    mock_call.side_effect = [
+        _propose_ok("utils.py", "models.py"),
+        {
+            "placements": [
+                {"group_id": 0, "target_file": "utils.py"},
+                {"group_id": 1, "target_file": "models.py"},
+            ]
+        },
+    ]
     c = _classified(
         entities=[_make_entity("foo", 1, 5), _make_entity("bar", 6, 10)],
         set_2_groups=[["foo"], ["bar"]],
@@ -1116,6 +1183,7 @@ def test_placement_prompt_includes_mermaid_when_deps_exist(
     )
     advise_file_limiter(c, "src/big.py", _CONFIG)
 
+    # The assignment call is the last call; it has the Mermaid diagram.
     messages = mock_call.call_args[0][6]
     assert "```mermaid" in messages[0]["content"]
     assert "G0 --> G1" in messages[0]["content"]
@@ -1130,13 +1198,14 @@ def test_placement_prompt_includes_mermaid_when_deps_exist(
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_advise_verbose_set3_and_placement(mock_key, mock_client, mock_call, capsys):
-    """verbose=True exercises the print + _counter branches in _advise_set3
-    and _assign_placements_chunk."""
+    """verbose=True exercises the print + _counter branches in _advise_set3,
+    _propose_files_step, and _assign_placements_chunk."""
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
-    # First call → set-3 decision; second call → placement.
+    # set3 call → propose call → assign call.
     mock_call.side_effect = [
         {"decisions": [{"group_id": 0, "action": "migrate"}]},
+        _propose_ok("utils.py"),
         {"placements": [{"group_id": 0, "target_file": "utils.py"}]},
     ]
     c = _classified(
@@ -1146,7 +1215,7 @@ def test_advise_verbose_set3_and_placement(mock_key, mock_client, mock_call, cap
     plan = advise_file_limiter(c, "src/big.py", _CONFIG, verbose=True)
 
     assert plan.abort is False
-    assert plan.llm_calls == 2
+    assert plan.llm_calls == 3
     err = capsys.readouterr().err
     assert "set-3 group" in err
     assert "file placements" in err
@@ -1154,11 +1223,9 @@ def test_advise_verbose_set3_and_placement(mock_key, mock_client, mock_call, cap
 
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
-def test_resolve_verbose(mock_key, mock_client, mock_call, capsys):
+def test_resolve_verbose(mock_client, mock_call, capsys):
     """verbose=True exercises the print + _counter branches in
     _rename_conflicting_chunk (with _counter passed to cover the increment)."""
-    mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
     # Both placements conflict (utils.py vs utils/io.py share stem "utils"),
     # so the chunk sent to LLM has 2 groups; return both renamed.
@@ -1246,3 +1313,595 @@ def test_assign_placements_chunk_subdir_name(mock_client, mock_call):
     prompt = mock_call.call_args[0][6][0]["content"]
     assert "duplicate_extractor/" in prompt
     assert "do not repeat" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# _assign_placements_chunk — constrained mode (proposed_files provided)
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_assign_placements_chunk_constrained_success(mock_client, mock_call):
+    """Constrained mode: target in proposed_filenames → placement accepted."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [{"group_id": 0, "target_file": "utils.py"}]
+    }
+    c = _classified(entities=[_make_entity("foo", 1, 5)])
+    proposed = [("utils.py", "general utilities"), ("models.py", "data models")]
+    result = _assign_placements_chunk(
+        [["foo"]],
+        c,
+        "src/big.py",
+        frozenset(),
+        mock_client(),
+        _CONFIG,
+        proposed_files=proposed,
+    )
+    assert result is not None
+    assert result[0].target_file == "utils.py"
+    # Prompt should list proposed files and instruct constrained choice.
+    prompt = mock_call.call_args[0][6][0]["content"]
+    assert "Proposed output files" in prompt
+    assert "utils.py" in prompt
+    assert "models.py" in prompt
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_assign_placements_chunk_constrained_invalid_target(mock_client, mock_call):
+    """Constrained mode: target not in proposed_filenames → immediate None return."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [{"group_id": 0, "target_file": "rogue_file.py"}]
+    }
+    c = _classified(entities=[_make_entity("foo", 1, 5)])
+    proposed = [("utils.py", "general utilities")]
+    result = _assign_placements_chunk(
+        [["foo"]],
+        c,
+        "src/big.py",
+        frozenset(),
+        mock_client(),
+        _CONFIG,
+        proposed_files=proposed,
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _propose_files_step — unit tests
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_success(mock_client, mock_call):
+    """Basic success: valid filenames are returned."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [
+            {"filename": "utils.py", "description": "utility functions"},
+            {"filename": "models.py", "description": "data models"},
+        ]
+    }
+    c = _classified(entities=[_make_entity("foo", 1, 50)])
+    result = _propose_files_step(
+        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+    )
+    assert result is not None
+    assert len(result) == 2
+    assert result[0] == ("utils.py", "utility functions")
+    assert result[1] == ("models.py", "data models")
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_llm_none(mock_client, mock_call):
+    """call_with_tool returns None → _propose_files_step returns None."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = None
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+    )
+    assert result is None
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_empty_files_list(mock_client, mock_call):
+    """LLM returns empty files list → returns None (not proposed)."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {"files": []}
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+    )
+    assert result is None
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_strips_existing_files(mock_client, mock_call):
+    """Filename in existing_files is stripped; remaining valid ones returned."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [
+            {"filename": "taken.py", "description": "already exists"},
+            {"filename": "utils.py", "description": "new file"},
+        ]
+    }
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]],
+        c,
+        "src/big.py",
+        2,
+        frozenset({"taken.py"}),
+        mock_client(),
+        _CONFIG,
+    )
+    assert result is not None
+    assert len(result) == 1
+    assert result[0][0] == "utils.py"
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_all_in_existing_files(mock_client, mock_call):
+    """All proposed filenames are in existing_files → stripped → returns None."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [{"filename": "taken.py", "description": "existing"}]
+    }
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]],
+        c,
+        "src/big.py",
+        2,
+        frozenset({"taken.py"}),
+        mock_client(),
+        _CONFIG,
+    )
+    assert result is None
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_strips_duplicates(mock_client, mock_call):
+    """Duplicate filenames are stripped; only first occurrence kept."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [
+            {"filename": "utils.py", "description": "first"},
+            {"filename": "utils.py", "description": "duplicate"},
+        ]
+    }
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+    )
+    assert result is not None
+    assert len(result) == 1
+    assert result[0] == ("utils.py", "first")
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_strips_empty_filename(mock_client, mock_call):
+    """Empty filename string is skipped; valid ones returned."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [
+            {"filename": "", "description": "empty"},
+            {"filename": "utils.py", "description": "valid"},
+        ]
+    }
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+    )
+    assert result is not None
+    assert len(result) == 1
+    assert result[0][0] == "utils.py"
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_verbose(mock_client, mock_call, capsys):
+    """verbose=True prints propose message to stderr and increments counter."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [{"filename": "utils.py", "description": "utilities"}]
+    }
+    c = _classified()
+    counter = [0]
+    result = _propose_files_step(
+        [["foo"]],
+        c,
+        "src/big.py",
+        2,
+        frozenset(),
+        mock_client(),
+        _CONFIG,
+        verbose=True,
+        _counter=counter,
+    )
+    assert result is not None
+    assert counter[0] == 1
+    err = capsys.readouterr().err
+    assert "propose" in err.lower()
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_no_counter(mock_client, mock_call):
+    """_counter=None covers the None-counter branch (no increment)."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [{"filename": "utils.py", "description": "utilities"}]
+    }
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+    )
+    assert result is not None
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_subdir_name(mock_client, mock_call):
+    """subdir_name triggers the subdir placement_rule branch in the prompt."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [{"filename": "handlers.py", "description": "request handlers"}]
+    }
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]],
+        c,
+        "src/service.py",
+        2,
+        frozenset(),
+        mock_client(),
+        _CONFIG,
+        subdir_name="service",
+    )
+    assert result is not None
+    prompt = mock_call.call_args[0][6][0]["content"]
+    assert "service/" in prompt
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_no_existing_files(mock_client, mock_call):
+    """existing_files=frozenset() → exclude_section empty (branch False)."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [{"filename": "utils.py", "description": "utilities"}]
+    }
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+    )
+    prompt = mock_call.call_args[0][6][0]["content"]
+    assert "already exist" not in prompt
+    assert result is not None
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_with_existing_files(mock_client, mock_call):
+    """existing_files non-empty → exclude_section added to prompt (branch True)."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [{"filename": "utils.py", "description": "utilities"}]
+    }
+    c = _classified()
+    result = _propose_files_step(
+        [["foo"]],
+        c,
+        "src/big.py",
+        2,
+        frozenset({"other.py"}),
+        mock_client(),
+        _CONFIG,
+    )
+    prompt = mock_call.call_args[0][6][0]["content"]
+    assert "already exist" in prompt
+    assert result is not None
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_propose_files_step_prev_failure(mock_client, mock_call):
+    """prev_failure is appended to the propose prompt."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "files": [{"filename": "utils.py", "description": "utilities"}]
+    }
+    c = _classified()
+    _propose_files_step(
+        [["foo"]],
+        c,
+        "src/big.py",
+        2,
+        frozenset(),
+        mock_client(),
+        _CONFIG,
+        prev_failure="sentinel_propose_failure",
+    )
+    prompt = mock_call.call_args[0][6][0]["content"]
+    assert "sentinel_propose_failure" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _compute_projected_lines — unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_compute_projected_lines_basic():
+    """Entities found in map → lines counted per target file."""
+    entity_a = _make_entity("func_a", 1, 50)  # 50 lines
+    entity_b = _make_entity("func_b", 51, 100)  # 50 lines
+    entity_map = {"func_a": entity_a, "func_b": entity_b}
+    placements = [
+        GroupPlacement(group=["func_a"], target_file="utils.py"),
+        GroupPlacement(group=["func_b"], target_file="utils.py"),
+    ]
+    projected = _compute_projected_lines(placements, entity_map)
+    assert projected == {"utils.py": 100}
+
+
+def test_compute_projected_lines_unknown_entity():
+    """Entity name not in map → no lines added for that entity (skipped)."""
+    entity_map = {}  # nothing in the map
+    placements = [GroupPlacement(group=["ghost"], target_file="utils.py")]
+    projected = _compute_projected_lines(placements, entity_map)
+    assert projected == {}
+
+
+def test_compute_projected_lines_multiple_files():
+    """Entities across multiple target files → separate line counts."""
+    entity_a = _make_entity("func_a", 1, 100)  # 100 lines
+    entity_b = _make_entity("func_b", 101, 200)  # 100 lines
+    entity_map = {"func_a": entity_a, "func_b": entity_b}
+    placements = [
+        GroupPlacement(group=["func_a"], target_file="module_a.py"),
+        GroupPlacement(group=["func_b"], target_file="module_b.py"),
+    ]
+    projected = _compute_projected_lines(placements, entity_map)
+    assert projected == {"module_a.py": 100, "module_b.py": 100}
+
+
+# ---------------------------------------------------------------------------
+# _refine_merge_tiny — unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_refine_merge_tiny_no_tiny_files():
+    """All projected files are above the tiny threshold → no merge, return unchanged."""
+    # Entity with 300 lines is well above min_size (200 for 1000-line limit).
+    entity = _make_entity("large_func", 1, 300)
+    c = _classified(entities=[entity])
+    placements = [GroupPlacement(group=["large_func"], target_file="utils.py")]
+    proposed_files = [("utils.py", "large functions"), ("models.py", "models")]
+
+    result = _refine_merge_tiny(
+        placements, proposed_files, c, "src/big.py", MagicMock(), _CONFIG
+    )
+    assert result == placements
+    assert result is not placements
+
+
+def test_refine_merge_tiny_no_ok_proposed():
+    """All proposed files are tiny → ok_proposed is empty → return unchanged."""
+    # Two tiny entities, both below threshold.
+    entity_a = _make_entity("tiny_a", 1, 10)
+    entity_b = _make_entity("tiny_b", 11, 20)
+    c = _classified(entities=[entity_a, entity_b])
+    placements = [
+        GroupPlacement(group=["tiny_a"], target_file="a.py"),
+        GroupPlacement(group=["tiny_b"], target_file="b.py"),
+    ]
+    proposed_files = [("a.py", "tiny a"), ("b.py", "tiny b")]
+    # Both files are tiny (10 and 10 lines < 200); no ok_proposed → no merge.
+
+    result = _refine_merge_tiny(
+        placements, proposed_files, c, "src/big.py", MagicMock(), _CONFIG
+    )
+    assert result == placements
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_refine_merge_tiny_success(mock_client, mock_call):
+    """Tiny file group is merged into a larger file successfully."""
+    mock_client.return_value = MagicMock()
+    # LLM reassigns the tiny group to the large file.
+    mock_call.return_value = {
+        "placements": [{"group_id": 0, "target_file": "large.py"}]
+    }
+
+    entity_small = _make_entity("small_func", 1, 10)  # 10 lines (tiny)
+    entity_large = _make_entity("large_func", 11, 310)  # 300 lines (not tiny)
+    c = _classified(entities=[entity_small, entity_large])
+
+    placements = [
+        GroupPlacement(group=["small_func"], target_file="small.py"),
+        GroupPlacement(group=["large_func"], target_file="large.py"),
+    ]
+    proposed_files = [("small.py", "small"), ("large.py", "large")]
+    # small.py: 10 lines (tiny <200); large.py: 300 lines (not tiny).
+    # ok_proposed = [("large.py", "large")]; refinement merges small.py into large.py.
+
+    result = _refine_merge_tiny(
+        placements, proposed_files, c, "src/big.py", mock_client(), _CONFIG
+    )
+    assert len(result) == 2
+    # small_func should now be in large.py.
+    small_placement = next(r for r in result if "small_func" in r.group)
+    assert small_placement.target_file == "large.py"
+    # large_func remains in large.py.
+    large_placement = next(r for r in result if "large_func" in r.group)
+    assert large_placement.target_file == "large.py"
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_refine_merge_tiny_llm_fails(mock_client, mock_call):
+    """Reassignment LLM returns None → original placements returned (best-effort)."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = None  # LLM fails
+
+    entity_small = _make_entity("small_func", 1, 10)
+    entity_large = _make_entity("large_func", 11, 310)
+    c = _classified(entities=[entity_small, entity_large])
+
+    placements = [
+        GroupPlacement(group=["small_func"], target_file="small.py"),
+        GroupPlacement(group=["large_func"], target_file="large.py"),
+    ]
+    proposed_files = [("small.py", "small"), ("large.py", "large")]
+
+    result = _refine_merge_tiny(
+        placements, proposed_files, c, "src/big.py", mock_client(), _CONFIG
+    )
+    # Best-effort: return original placements unchanged.
+    assert len(result) == 2
+    assert result[0].target_file == "small.py"
+    assert result[1].target_file == "large.py"
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_refine_merge_tiny_verbose(mock_client, mock_call, capsys):
+    """verbose=True prints the refining message to stderr."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [{"group_id": 0, "target_file": "large.py"}]
+    }
+
+    entity_small = _make_entity("small_func", 1, 10)
+    entity_large = _make_entity("large_func", 11, 310)
+    c = _classified(entities=[entity_small, entity_large])
+
+    placements = [
+        GroupPlacement(group=["small_func"], target_file="small.py"),
+        GroupPlacement(group=["large_func"], target_file="large.py"),
+    ]
+    proposed_files = [("small.py", "small"), ("large.py", "large")]
+
+    _refine_merge_tiny(
+        placements,
+        proposed_files,
+        c,
+        "src/big.py",
+        mock_client(),
+        _CONFIG,
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "refining" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap: free-form _assign_placements_chunk with existing_files
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_assign_placements_chunk_existing_files_exclude_section(mock_client, mock_call):
+    """Free-form mode with non-empty existing_files builds the exclude section."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [{"group_id": 0, "target_file": "helpers.py"}]
+    }
+    entity = _make_entity("foo", 1, 10)
+    c = _classified(entities=[entity], set_2_groups=[["foo"]])
+    result = _assign_placements_chunk(
+        [["foo"]],
+        c,
+        "src/big.py",
+        frozenset({"existing.py"}),  # non-empty existing_files
+        mock_client(),
+        _CONFIG,
+        proposed_files=None,  # free-form mode
+    )
+    assert result is not None
+    assert result[0].target_file == "helpers.py"
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_assign_placements_chunk_target_in_existing_files_returns_none(
+    mock_client, mock_call
+):
+    """Free-form mode: target_file in existing_files → return None (line 589)."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [{"group_id": 0, "target_file": "existing.py"}]
+    }
+    entity = _make_entity("foo", 1, 10)
+    c = _classified(entities=[entity], set_2_groups=[["foo"]])
+    result = _assign_placements_chunk(
+        [["foo"]],
+        c,
+        "src/big.py",
+        frozenset({"existing.py"}),  # target collides with existing file
+        mock_client(),
+        _CONFIG,
+        proposed_files=None,  # free-form mode
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap: propose retry loop in _assign_placements
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_propose_retry_succeeds_on_second_attempt(mock_key, mock_client, mock_call):
+    """Propose returns None once, then succeeds on retry (lines 862->882, 878)."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    entity = _make_entity("foo", 1, 50)
+    c = _classified(entities=[entity], set_2_groups=[["foo"]])
+    mock_call.side_effect = [
+        None,  # propose fails first attempt
+        _propose_ok("helpers.py"),  # propose succeeds on retry
+        {"placements": [{"group_id": 0, "target_file": "helpers.py"}]},  # assign
+        # no refinement: 50 lines is not tiny (>= 200 is fine, 50 < 200 but only file)
+    ]
+    plan = advise_file_limiter(
+        c,
+        "src/big.py",
+        CrispenConfig(file_limiter_retries=1),  # allow 1 retry
+    )
+    assert plan.abort is False
+    assert plan.placements[0].target_file == "helpers.py"
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_propose_all_retries_exhausted_aborts(mock_key, mock_client, mock_call):
+    """All propose retries fail → _assign_placements returns None → abort (line 883)."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    entity = _make_entity("foo", 1, 50)
+    c = _classified(entities=[entity], set_2_groups=[["foo"]])
+    mock_call.return_value = None  # propose always fails
+    plan = advise_file_limiter(
+        c,
+        "src/big.py",
+        CrispenConfig(file_limiter_retries=0),  # no retries
+    )
+    assert plan.abort is True
