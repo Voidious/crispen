@@ -91,6 +91,8 @@ def _good_split(entity_name: str = "foo", target: str = "utils.py") -> SplitResu
 
 
 def test_verify_entity_source_in_original():
+    # Entity that stayed in the original file — passes verification but is not
+    # counted (it wasn't a FileLimiter edit).
     post_source = "def foo():\n    pass\n"
     entity = _make_entity("foo", 1, 2)
     split = SplitResult(
@@ -98,10 +100,14 @@ def test_verify_entity_source_in_original():
         original_source="def foo():\n    pass\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source, []) == []
+    vr = _verify_preservation([entity], split, post_source, [])
+    assert vr.failures == []
+    assert vr.verified_functions == 0
+    assert vr.verified_lines == 0
 
 
 def test_verify_entity_source_in_new_file():
+    # Entity that was migrated — passes verification and is counted.
     post_source = "def foo():\n    pass\n"
     entity = _make_entity("foo", 1, 2)
     split = SplitResult(
@@ -109,7 +115,11 @@ def test_verify_entity_source_in_new_file():
         original_source="# original\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source, []) == []
+    placements = [GroupPlacement(group=["foo"], target_file="utils.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    assert vr.verified_functions == 1
+    assert vr.verified_lines == 2  # "def foo():\n    pass" → 2 lines matched
 
 
 def test_verify_entity_source_missing():
@@ -120,11 +130,12 @@ def test_verify_entity_source_missing():
         original_source="# nothing relevant\n",
         abort=False,
     )
-    failures = _verify_preservation([entity], split, post_source, [])
-    assert len(failures) == 1
-    assert "'foo'" in failures[0]
-    assert "1" in failures[0]  # start line
-    assert "2" in failures[0]  # end line
+    vr = _verify_preservation([entity], split, post_source, [])
+    assert len(vr.failures) == 1
+    assert "'foo'" in vr.failures[0]
+    assert "1" in vr.failures[0]  # start line
+    assert "2" in vr.failures[0]  # end line
+    assert vr.verified_lines == 0
 
 
 def test_verify_entity_source_missing_long():
@@ -136,9 +147,9 @@ def test_verify_entity_source_missing_long():
         original_source="# nothing relevant\n",
         abort=False,
     )
-    failures = _verify_preservation([entity], split, post_source, [])
-    assert len(failures) == 1
-    assert "..." in failures[0]
+    vr = _verify_preservation([entity], split, post_source, [])
+    assert len(vr.failures) == 1
+    assert "..." in vr.failures[0]
 
 
 def test_verify_empty_entity_source_skipped():
@@ -150,7 +161,9 @@ def test_verify_empty_entity_source_skipped():
         original_source="# completely different",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source, []) == []
+    vr = _verify_preservation([entity], split, post_source, [])
+    assert vr.failures == []
+    assert vr.verified_lines == 0
 
 
 def test_verify_top_level_entity_skipped():
@@ -163,7 +176,9 @@ def test_verify_top_level_entity_skipped():
         original_source="# completely different",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source, []) == []
+    vr = _verify_preservation([entity], split, post_source, [])
+    assert vr.failures == []
+    assert vr.verified_lines == 0
 
 
 def test_verify_annotation_migrated():
@@ -176,10 +191,10 @@ def test_verify_annotation_migrated():
         abort=False,
     )
     placements = [GroupPlacement(group=["foo"], target_file="utils.py")]
-    failures = _verify_preservation([entity], split, post_source, placements)
-    assert len(failures) == 1
-    assert "migrated" in failures[0]
-    assert "utils.py" in failures[0]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert len(vr.failures) == 1
+    assert "migrated" in vr.failures[0]
+    assert "utils.py" in vr.failures[0]
 
 
 def test_verify_annotation_stayed():
@@ -191,14 +206,15 @@ def test_verify_annotation_stayed():
         original_source="# empty",
         abort=False,
     )
-    failures = _verify_preservation([entity], split, post_source, [])
-    assert len(failures) == 1
-    assert "stayed in original" in failures[0]
+    vr = _verify_preservation([entity], split, post_source, [])
+    assert len(vr.failures) == 1
+    assert "stayed in original" in vr.failures[0]
 
 
 def test_verify_pruned_inline_import_passes():
     # Entity has an inline import; the new file has it pruned to a top-level one.
     # Both sides are stripped before comparison, so the match succeeds.
+    # verified_lines counts only the non-import lines of the migrated entity.
     post_source = "def foo():\n    import os\n    return os.getcwd()\n"
     entity = _make_entity("foo", 1, 3)
     split = SplitResult(
@@ -206,7 +222,11 @@ def test_verify_pruned_inline_import_passes():
         original_source="# original\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source, []) == []
+    placements = [GroupPlacement(group=["foo"], target_file="utils.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    # "def foo():\n    return os.getcwd()" → 2 lines (import stripped)
+    assert vr.verified_lines == 2
 
 
 def test_verify_inline_import_not_pruned_also_passes():
@@ -219,7 +239,10 @@ def test_verify_inline_import_not_pruned_also_passes():
         original_source="# original\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source, []) == []
+    placements = [GroupPlacement(group=["foo"], target_file="utils.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    assert vr.verified_lines == 2
 
 
 def test_verify_multiline_import_stripped():
@@ -241,7 +264,11 @@ def test_verify_multiline_import_stripped():
         original_source="# original\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source, []) == []
+    placements = [GroupPlacement(group=["foo"], target_file="utils.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    # "def foo():\n    return getcwd()" → 2 lines (4-line import stripped)
+    assert vr.verified_lines == 2
 
 
 def test_verify_async_def_entity_passes():
@@ -253,7 +280,10 @@ def test_verify_async_def_entity_passes():
         original_source="# original\n",
         abort=False,
     )
-    assert _verify_preservation([entity], split, post_source, []) == []
+    placements = [GroupPlacement(group=["foo"], target_file="utils.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    assert vr.verified_lines == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1215,22 +1245,30 @@ def test_runner_success_with_top_level_entity(mock_classify, mock_advise, mock_g
 @patch(_PATCH_ADVISE)
 @patch(_PATCH_CLASSIFY)
 def test_runner_success_with_empty_entity_source(mock_classify, mock_advise, mock_gen):
-    """Entities whose source is blank after rstrip are skipped in the count."""
-    source = "def foo():\n    pass\n\n"
-    # Entity spanning only a blank line → rstrip → "" → skipped.
+    """Entities whose source is blank after rstrip are skipped in the count.
+
+    Also covers verification of an entity that stays in the original file
+    (stays_entity is verified and counted alongside migrated entities).
+    """
+    source = "def foo():\n    pass\n\ndef bar():\n    pass\n"
+    # blank_entity has empty source → skipped. foo migrated; bar stays in original.
     blank_entity = _make_entity("_block_1", 3, 3)
     func_entity = _make_entity("foo", 1, 2)
-    mock_classify.return_value = _make_classified(entities=[func_entity, blank_entity])
+    stays_entity = _make_entity("bar", 4, 5)
+    mock_classify.return_value = _make_classified(
+        entities=[func_entity, blank_entity, stays_entity]
+    )
     mock_advise.return_value = _plan_with(["foo"], "utils.py")
     mock_gen.return_value = SplitResult(
         new_files={"utils.py": "def foo():\n    pass"},
-        original_source="# original\n",
+        original_source="def bar():\n    pass\n",
         abort=False,
     )
 
     result = run_file_limiter("big.py", "", source, [], _CONFIG)
 
     assert result.abort is False
-    # blank_entity is skipped; foo counts.
+    # blank_entity: empty source → skipped. bar: stays in original → not counted.
+    # Only foo (migrated) counts.
     assert result.verified_functions == 1
     assert result.verified_lines == 2

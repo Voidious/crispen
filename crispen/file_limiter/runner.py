@@ -57,13 +57,23 @@ def _strip_imports_by_line(src: str) -> str:
     return "".join(ln_text for i, ln_text in enumerate(lines, 1) if i not in remove)
 
 
+class _VerifyResult:
+    __slots__ = ("failures", "verified_functions", "verified_classes", "verified_lines")
+
+    def __init__(self) -> None:
+        self.failures: List[str] = []
+        self.verified_functions: int = 0
+        self.verified_classes: int = 0
+        self.verified_lines: int = 0
+
+
 def _verify_preservation(
     entities: List[Entity],
     split: SplitResult,
     post_source: str,
     placements: List[GroupPlacement],
-) -> List[str]:
-    """Return a list of failure descriptions (empty = all entities preserved).
+) -> _VerifyResult:
+    """Return verification results including failures and matched-line counts.
 
     Checks that each entity's source (minus import statements) is present in
     the import-stripped combined output (original + new files).
@@ -78,6 +88,10 @@ def _verify_preservation(
 
     Each failure is annotated with where the entity was expected to appear:
     ``migrated → <target>`` or ``stayed in original``.
+
+    ``verified_lines`` counts the import-stripped lines of migrated entities
+    that were successfully matched via substring comparison — confirming that
+    the split preserved the moved code.
     """
     lines = post_source.splitlines(keepends=True)
     combined_no_imports = _strip_imports_by_line(split.original_source)
@@ -86,7 +100,7 @@ def _verify_preservation(
     name_to_file: Dict[str, str] = {
         name: p.target_file for p in placements for name in p.group
     }
-    failures: List[str] = []
+    result = _VerifyResult()
 
     for entity in entities:
         if entity.kind == EntityKind.TOP_LEVEL:
@@ -102,13 +116,21 @@ def _verify_preservation(
                 preview += "\n    ..."
             target = name_to_file.get(entity.name)
             loc = f"migrated \u2192 {target}" if target else "stayed in original"
-            failures.append(
+            result.failures.append(
                 f"  entity {entity.name!r} ({entity.kind.value},"
                 f" lines {entity.start_line}\u2013{entity.end_line}) [{loc}]:\n"
                 f"    {preview}"
             )
+        else:
+            if entity.name not in name_to_file:
+                continue  # stayed in original; not a FileLimiter edit
+            if entity.kind == EntityKind.FUNCTION:
+                result.verified_functions += 1
+            if entity.kind == EntityKind.CLASS:
+                result.verified_classes += 1
+            result.verified_lines += len(entity_no_imports.splitlines())
 
-    return failures
+    return result
 
 
 def _is_whole_file_diff(diff_ranges: List[Tuple[int, int]], n_lines: int) -> bool:
@@ -423,11 +445,9 @@ def run_file_limiter(
             flush=True,
         )
 
-    failures = _verify_preservation(
-        classified.entities, split, post_source, plan.placements
-    )
-    if failures:
-        detail = "\n".join(failures)
+    vr = _verify_preservation(classified.entities, split, post_source, plan.placements)
+    if vr.failures:
+        detail = "\n".join(vr.failures)
         return FileLimiterResult(
             original_source=post_source,
             new_files={},
@@ -435,25 +455,6 @@ def run_file_limiter(
             abort=True,
             llm_calls=total_llm_calls,
         )
-
-    # Count entities that passed verification (non-TOP_LEVEL, non-empty).
-    post_lines = post_source.splitlines(keepends=True)
-    verified_functions = 0
-    verified_classes = 0
-    verified_lines = 0
-    for entity in classified.entities:
-        if entity.kind == EntityKind.TOP_LEVEL:
-            continue
-        entity_src = "".join(
-            post_lines[entity.start_line - 1 : entity.end_line]
-        ).rstrip()
-        if not entity_src:
-            continue
-        if entity.kind == EntityKind.FUNCTION:
-            verified_functions += 1
-        if entity.kind == EntityKind.CLASS:
-            verified_classes += 1
-        verified_lines += entity.end_line - entity.start_line + 1
 
     msgs = [
         f"{filepath}: FileLimiter: moved {', '.join(p.group)} \u2192 {p.target_file}"
@@ -466,7 +467,7 @@ def run_file_limiter(
         abort=False,
         subdir_name=subdir_name,
         llm_calls=total_llm_calls,
-        verified_functions=verified_functions,
-        verified_classes=verified_classes,
-        verified_lines=verified_lines,
+        verified_functions=vr.verified_functions,
+        verified_classes=vr.verified_classes,
+        verified_lines=vr.verified_lines,
     )
