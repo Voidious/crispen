@@ -680,10 +680,9 @@ def test_runner_all_in_one_file_non_subdir_allowed(
 def test_runner_single_group_subdir_aborts_silently(
     mock_classify, mock_advise, mock_gen
 ):
-    # Subdir split with only 1 group and original_source=="" (recursive engine
-    # pass): moving the single group would just rename the file, not split it,
-    # causing infinite recursive processing.  Abort immediately without calling
-    # the LLM.
+    # Subdir split with only 1 group: moving it would just rename the file,
+    # not split it, causing infinite subdirectory nesting across runs.
+    # Abort immediately without calling the LLM.
     entity = _make_entity("foo", 1, 1)
     mock_classify.return_value = ClassifiedEntities(
         entities=[entity],
@@ -696,7 +695,6 @@ def test_runner_single_group_subdir_aborts_silently(
     )
     cfg = CrispenConfig(file_limiter_retries=0)
 
-    # original_source="" matches the recursive engine call signature.
     result = run_file_limiter("big.py", "", _SUBDIR_SRC, _SUBDIR_RANGES, cfg)
 
     assert result.abort is True
@@ -1399,19 +1397,39 @@ def test_runner_subdir_split_disabled(mock_classify, tmp_path):
 def test_runner_subdir_split_non_test_success(mock_classify, mock_advise, mock_gen):
     # Whole-file diff on a non-test file → placements get subdir prefix,
     # original_source is unchanged, and __init__.py carries the split content.
-    source = "def foo():\n    pass\n"
-    entity = _make_entity("foo", 1, 2)
-    mock_classify.return_value = _make_classified(entities=[entity])
+    source = "def foo():\n    pass\ndef bar():\n    pass\n"
+    entity1 = _make_entity("foo", 1, 2)
+    entity2 = _make_entity("bar", 3, 4)
+    # Two groups required so the n_groups > 1 subdir guard doesn't fire.
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[entity1, entity2],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[["foo"], ["bar"]],
+        set_3_groups=[],
+        abort=False,
+    )
     # LLM returns flat filenames (no subdir prefix yet).
-    mock_advise.return_value = _plan_with(["foo"], "utils.py")
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[],
+        placements=[
+            GroupPlacement(group=["foo"], target_file="utils.py"),
+            GroupPlacement(group=["bar"], target_file="helpers.py"),
+        ],
+        abort=False,
+    )
     mock_gen.return_value = SplitResult(
-        new_files={"service/utils.py": "def foo():\n    pass"},
+        new_files={
+            "service/utils.py": "def foo():\n    pass",
+            "service/helpers.py": "def bar():\n    pass",
+        },
         original_source="# init content\n",
         abort=False,
     )
 
     cfg = CrispenConfig(file_limiter_subdir_split=True)
-    result = run_file_limiter("service.py", source, source, [(1, 2)], cfg)
+    result = run_file_limiter("service.py", source, source, [(1, 4)], cfg)
 
     assert result.abort is False
     # service/__init__.py carries the post-split original source.
@@ -1432,18 +1450,38 @@ def test_runner_subdir_split_test_file_keeps_original(
 ):
     # Whole-file diff on a test file → placements get subdir prefix but
     # original_source (re-export stubs in test_service.py) is written back.
-    source = "def test_foo():\n    pass\n"
-    entity = _make_entity("test_foo", 1, 2)
-    mock_classify.return_value = _make_classified(entities=[entity])
-    mock_advise.return_value = _plan_with(["test_foo"], "helpers.py")
+    source = "def test_foo():\n    pass\ndef test_bar():\n    pass\n"
+    entity1 = _make_entity("test_foo", 1, 2)
+    entity2 = _make_entity("test_bar", 3, 4)
+    # Two groups required so the n_groups > 1 subdir guard doesn't fire.
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[entity1, entity2],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[["test_foo"], ["test_bar"]],
+        set_3_groups=[],
+        abort=False,
+    )
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[],
+        placements=[
+            GroupPlacement(group=["test_foo"], target_file="helpers.py"),
+            GroupPlacement(group=["test_bar"], target_file="extras.py"),
+        ],
+        abort=False,
+    )
     mock_gen.return_value = SplitResult(
-        new_files={"service/test_helpers.py": "def test_foo():\n    pass"},
+        new_files={
+            "service/test_helpers.py": "def test_foo():\n    pass",
+            "service/test_extras.py": "def test_bar():\n    pass",
+        },
         original_source="# re-export stubs\n",
         abort=False,
     )
 
     cfg = CrispenConfig(file_limiter_subdir_split=True)
-    result = run_file_limiter("tests/test_service.py", source, source, [(1, 2)], cfg)
+    result = run_file_limiter("tests/test_service.py", source, source, [(1, 4)], cfg)
 
     assert result.abort is False
     # No __init__.py injected for test files.
@@ -1460,18 +1498,38 @@ def test_runner_subdir_split_strips_test_prefix_from_stem(
     mock_classify, mock_advise, mock_gen
 ):
     # test_big.py → subdir "big/" (strip "test_" prefix from stem).
-    source = "def test_foo():\n    pass\n"
-    entity = _make_entity("test_foo", 1, 2)
-    mock_classify.return_value = _make_classified(entities=[entity])
-    mock_advise.return_value = _plan_with(["test_foo"], "helpers.py")
+    source = "def test_foo():\n    pass\ndef test_bar():\n    pass\n"
+    entity1 = _make_entity("test_foo", 1, 2)
+    entity2 = _make_entity("test_bar", 3, 4)
+    # Two groups required so the n_groups > 1 subdir guard doesn't fire.
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[entity1, entity2],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[["test_foo"], ["test_bar"]],
+        set_3_groups=[],
+        abort=False,
+    )
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[],
+        placements=[
+            GroupPlacement(group=["test_foo"], target_file="helpers.py"),
+            GroupPlacement(group=["test_bar"], target_file="extras.py"),
+        ],
+        abort=False,
+    )
     mock_gen.return_value = SplitResult(
-        new_files={"big/test_helpers.py": "def test_foo():\n    pass"},
+        new_files={
+            "big/test_helpers.py": "def test_foo():\n    pass",
+            "big/test_extras.py": "def test_bar():\n    pass",
+        },
         original_source="# stubs\n",
         abort=False,
     )
 
     cfg = CrispenConfig(file_limiter_subdir_split=True)
-    result = run_file_limiter("tests/test_big.py", source, source, [(1, 2)], cfg)
+    result = run_file_limiter("tests/test_big.py", source, source, [(1, 4)], cfg)
 
     assert result.abort is False
     assert result.subdir_name == "big"
