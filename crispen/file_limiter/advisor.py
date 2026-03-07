@@ -574,6 +574,8 @@ def _assign_placements_chunk(
     for item in result.get("placements", []):
         gid = item.get("group_id")
         target = item.get("target_file", "")
+        if subdir_name and target.startswith(subdir_name + "/"):
+            target = target[len(subdir_name) + 1 :]
         if (
             isinstance(gid, int)
             and 0 <= gid < len(chunk)

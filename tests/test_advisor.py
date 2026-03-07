@@ -1316,6 +1316,30 @@ def test_assign_placements_chunk_subdir_name(mock_client, mock_call):
     assert "do not repeat" in prompt.lower()
 
 
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_assign_placements_chunk_strips_subdir_prefix(mock_client, mock_call):
+    """LLM returns 'subdir/file.py' — the leading subdir/ should be stripped."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [
+            {"group_id": 0, "target_file": "duplicate_extractor/detection_flow.py"}
+        ]
+    }
+    c = _classified(entities=[_make_entity("foo", 1, 5)])
+    result = _assign_placements_chunk(
+        [["foo"]],
+        c,
+        "tests/test_duplicate_extractor.py",
+        frozenset(),
+        mock_client(),
+        _CONFIG,
+        subdir_name="duplicate_extractor",
+    )
+    assert result is not None
+    assert result[0].target_file == "detection_flow.py"
+
+
 # ---------------------------------------------------------------------------
 # _assign_placements_chunk — constrained mode (proposed_files provided)
 # ---------------------------------------------------------------------------
