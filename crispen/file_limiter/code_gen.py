@@ -180,10 +180,17 @@ def _relative_import_prefix(from_file: str, to_file: str) -> str:
         _relative_import_prefix("utils.py", "helpers.py")          → ".helpers"
         _relative_import_prefix("sub/a.py", "helpers/b.py")        → "..helpers.b"
         _relative_import_prefix("sub/a.py", "sub/b.py")            → ".b"
+        _relative_import_prefix("a.py", "__init__.py")             → "."
+        _relative_import_prefix("sub/a.py", "sub/__init__.py")     → "."
     """
+    to_path = Path(to_file)
     from_parts = Path(from_file).parent.parts  # () for top-level files
-    to_module_parts = Path(to_file).with_suffix("").parts  # ("helpers", "b")
-    to_dir_parts = Path(to_file).parent.parts  # ("helpers",)
+    # __init__.py represents the package itself, not a submodule named "__init__".
+    if to_path.stem == "__init__":
+        to_module_parts = to_path.parent.parts
+    else:
+        to_module_parts = to_path.with_suffix("").parts  # ("helpers", "b")
+    to_dir_parts = to_path.parent.parts  # ("helpers",)
 
     # Length of the common directory prefix between from_dir and to_dir.
     common_len = 0
@@ -282,10 +289,14 @@ def _merge_from_imports(imports: List[str]) -> List[str]:
 def _target_module_name(target_file: str) -> str:
     """Convert a relative target filename to a dotted module name.
 
-    ``"utils.py"`` → ``"utils"``, ``"helpers/io.py"`` → ``"helpers.io"``.
+    ``"utils.py"`` → ``"utils"``, ``"helpers/io.py"`` → ``"helpers.io"``,
+    ``"pkg/__init__.py"`` → ``"pkg"`` (package, not ``"pkg.__init__"``).
     """
     path = Path(target_file)
-    parts = list(path.with_suffix("").parts)
+    if path.stem == "__init__":
+        parts = list(path.parent.parts)
+    else:
+        parts = list(path.with_suffix("").parts)
     return ".".join(parts)
 
 

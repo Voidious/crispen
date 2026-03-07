@@ -230,6 +230,11 @@ def test_target_module_name_nested():
     assert _target_module_name("helpers/io.py") == "helpers.io"
 
 
+def test_target_module_name_init():
+    # __init__.py represents the package, not a "__init__" submodule.
+    assert _target_module_name("pkg/__init__.py") == "pkg"
+
+
 # ---------------------------------------------------------------------------
 # _remove_entity_lines
 # ---------------------------------------------------------------------------
@@ -825,6 +830,16 @@ def test_relative_import_prefix_same_subdir():
 def test_relative_import_prefix_to_nested():
     # to_file is in a subdirectory of root while from_file is at root.
     assert _relative_import_prefix("a.py", "helpers/b.py") == ".helpers.b"
+
+
+def test_relative_import_prefix_to_init_same_dir():
+    # to_file is __init__.py in the same directory → "." (the package itself).
+    assert _relative_import_prefix("a.py", "__init__.py") == "."
+
+
+def test_relative_import_prefix_to_init_same_subdir():
+    # Both in sub/, to_file is sub/__init__.py → "." (the package itself).
+    assert _relative_import_prefix("sub/a.py", "sub/__init__.py") == "."
 
 
 def test_find_cross_file_imports_cross_directory():
