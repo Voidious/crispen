@@ -316,6 +316,24 @@ def run_file_limiter(
             abort=True,
         )
 
+    # In subdir-split mode every entity is redistributed across new files.
+    # With only one group, any plan routes all content into a single new file —
+    # an effective rename, not a split.  When the file was already created by a
+    # previous FileLimiter pass (original_source == "", the recursive engine
+    # signature), this creates infinite recursion: the new file also has one
+    # group with a whole-file diff and would be subdir-split forever.
+    # Abort immediately for such recursive single-group cases; no LLM calls needed.
+    if subdir_name is not None and not original_source:
+        n_groups = len(classified.set_2_groups) + len(classified.set_3_groups)
+        if n_groups <= 1:
+            return FileLimiterResult(
+                original_source=post_source,
+                new_files={},
+                abort=True,
+                messages=[],
+                llm_calls=0,
+            )
+
     max_attempts = 1 + config.file_limiter_retries
     retry_msgs: List[str] = []
     last_abort: bool = True

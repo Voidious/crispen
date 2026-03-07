@@ -568,7 +568,16 @@ def test_runner_all_in_one_file_subdir_retries_and_fails(
     mock_classify, mock_advise, mock_gen
 ):
     # Subdir split + all groups → same file → guard triggers every attempt.
-    mock_classify.return_value = _make_classified()
+    # Two groups required so the n_groups > 1 pre-loop check doesn't fire first.
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[_make_entity("foo", 1, 1), _make_entity("bar", 2, 2)],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[["foo"], ["bar"]],
+        set_3_groups=[],
+        abort=False,
+    )
     mock_advise.return_value = _plan_two_same_target()
     cfg = CrispenConfig(file_limiter_retries=0)
 
@@ -588,7 +597,16 @@ def test_runner_all_in_one_file_subdir_retries_and_succeeds(
     # Subdir split: first attempt all in one file, second splits into two.
     entity1 = _make_entity("foo", 1, 1)
     entity2 = _make_entity("bar", 2, 2)
-    mock_classify.return_value = _make_classified(entities=[entity1, entity2])
+    # Two groups required so the n_groups > 1 pre-loop check doesn't fire first.
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[entity1, entity2],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[["foo"], ["bar"]],
+        set_3_groups=[],
+        abort=False,
+    )
     mock_advise.side_effect = [
         _plan_two_same_target(),
         FileLimiterPlan(
@@ -659,25 +677,32 @@ def test_runner_all_in_one_file_non_subdir_allowed(
 @patch(_PATCH_GEN)
 @patch(_PATCH_ADVISE)
 @patch(_PATCH_CLASSIFY)
-def test_runner_single_group_one_file_subdir_allowed(
+def test_runner_single_group_subdir_aborts_silently(
     mock_classify, mock_advise, mock_gen
 ):
-    # Subdir split with only 1 group: 1 placement → 1 file is always valid.
+    # Subdir split with only 1 group and original_source=="" (recursive engine
+    # pass): moving the single group would just rename the file, not split it,
+    # causing infinite recursive processing.  Abort immediately without calling
+    # the LLM.
     entity = _make_entity("foo", 1, 1)
-    mock_classify.return_value = _make_classified(entities=[entity])
-    mock_advise.return_value = _plan_with(["foo"], "utils.py")
-    mock_gen.return_value = SplitResult(
-        new_files={"big/utils.py": "x = 1"},
-        original_source=_SUBDIR_SRC,
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[entity],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[["foo"]],
+        set_3_groups=[],
         abort=False,
     )
     cfg = CrispenConfig(file_limiter_retries=0)
 
+    # original_source="" matches the recursive engine call signature.
     result = run_file_limiter("big.py", "", _SUBDIR_SRC, _SUBDIR_RANGES, cfg)
 
-    assert result.abort is False
-    assert not any("single file" in m for m in result.messages)
-    mock_gen.assert_called_once()
+    assert result.abort is True
+    assert result.messages == []
+    mock_advise.assert_not_called()
+    mock_gen.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
