@@ -1276,6 +1276,26 @@ def test_advise_set3_no_counter(mock_client, mock_call):
 
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
+def test_advise_set3_with_dep_graph(mock_client, mock_call):
+    """_advise_set3 with inter-group dependencies includes mermaid graph in prompt."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {"decisions": [{"group_id": 0, "action": "migrate"}]}
+    # graph["foo"] = {"bar"} means foo depends on bar → two groups have an edge
+    c = _classified(
+        entities=[_make_entity("foo", 1, 5), _make_entity("bar", 6, 10)],
+        graph={"foo": {"bar"}},
+        set_3_groups=[["foo"], ["bar"]],
+    )
+    counter = [0]
+    result = _advise_set3(c, "big.py", mock_client(), _CONFIG, _counter=counter)
+    assert result == [["foo"]]
+    # Verify the mermaid graph was injected into the prompt.
+    prompt = mock_call.call_args[0][6][0]["content"]
+    assert "graph TD" in prompt
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
 def test_assign_placements_chunk_no_counter(mock_client, mock_call):
     """_assign_placements_chunk without _counter covers the None-counter branch."""
     mock_client.return_value = MagicMock()

@@ -259,6 +259,7 @@ def _advise_set3(
         group_lines.append(f"  [{idx}]: {summary}")
     groups_text = "\n".join(group_lines)
 
+    mermaid_text = _build_group_mermaid(classified.set_3_groups, classified)
     n_groups = len(classified.set_3_groups)
     content = (
         f"The file '{original_path}' is over the maximum line limit and MUST "
@@ -274,8 +275,20 @@ def _advise_set3(
         "public API entry-point of the module and callers import it by name "
         "from this specific file). If ALL groups stay, no split will occur "
         "and the file will remain over the limit, which is not acceptable.\n\n"
+        "CIRCULAR IMPORT CONSTRAINT: A migrated group cannot safely reference "
+        "names defined by groups that stay in the original — this creates a "
+        "circular import (the new file imports from the original while the "
+        "original also imports from the new file). You cannot migrate group A "
+        "if any group that A depends on is staying. To migrate A, either also "
+        "migrate everything A depends on (to the same or a compatible file), "
+        "or keep A in the original. Migrating a dependency while leaving the "
+        "dependent in the original is always safe. Groups with no outgoing "
+        "arrows in the dependency graph (leaf groups) can always be migrated "
+        "independently.\n\n"
         "For each group, return 'migrate' (preferred) or 'stay' (exceptional)."
     )
+    if mermaid_text:
+        content += f"\n\nDependency graph between groups:\n{mermaid_text}"
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
@@ -345,6 +358,7 @@ def _propose_files_step(
         group_lines.append(f"  [{idx}]: {summary}")
     groups_text = "\n".join(group_lines)
 
+    mermaid_text = _build_group_mermaid(groups_to_place, classified)
     exclude_section = ""
     if existing_files:
         file_list = "\n".join(f"  - {f}" for f in sorted(existing_files))
@@ -389,6 +403,13 @@ def _propose_files_step(
         "'utils.py' or 'misc.py'."
         f"{exclude_section}"
     )
+    if mermaid_text:
+        content += (
+            "\n\nDependency graph between groups — groups connected by arrows "
+            "have inter-dependencies. Prefer file names that reflect these "
+            "clusters; mutually-dependent groups must land in the same file "
+            "to avoid circular imports:\n" + mermaid_text
+        )
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]

@@ -513,6 +513,15 @@ def run_file_limiter(
                 f"Your previous assignments ({prev_assignments}) caused circular "
                 "file imports. Please choose different target filenames."
             )
+            prev_set3_failure = (
+                "Your previous migrate/stay decisions contributed to circular "
+                "file imports. Remember: you cannot migrate group A if any "
+                "group A depends on is staying in the original — A's new file "
+                "would import from the original while the original also imports "
+                "from A's file. Check the dependency graph and keep groups "
+                "that depend on staying groups in the original, or migrate "
+                "them together with their dependencies."
+            )
             continue
 
         # Success — keep retry_msgs so callers can see which attempts failed.
