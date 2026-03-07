@@ -228,6 +228,48 @@ def _find_cross_file_imports(
     return result
 
 
+_FROM_IMPORT_RE = re.compile(r"^(from\s+\S+)\s+import\s+(.*)")
+
+
+def _merge_from_imports(imports: List[str]) -> List[str]:
+    """Merge ``from X import …`` lines that share the same module prefix.
+
+    When multiple entities each contribute a ``from X import`` for the same
+    module but with different name subsets, the naive per-entity approach
+    produces duplicate imports such as::
+
+        from .conversion import lua_to_python, python_to_lua
+        from .conversion import lua_to_python_preserve_wrapped, python_to_lua
+
+    This function collapses them into a single statement per prefix, with
+    names sorted and deduplicated::
+
+        from .conversion import lua_to_python, lua_to_python_preserve_wrapped, python_to_lua  # noqa: E501
+
+    Plain ``import X`` statements are preserved unchanged and appended after
+    the merged from-imports.
+    """
+    from_map: Dict[str, List[str]] = {}
+    order: List[str] = []  # first-seen order of prefixes
+    plain: List[str] = []
+    for imp in imports:
+        m = _FROM_IMPORT_RE.match(imp)
+        if not m:
+            plain.append(imp)
+            continue
+        prefix = m.group(1)
+        names = [n.strip() for n in m.group(2).split(",") if n.strip()]
+        if prefix not in from_map:
+            from_map[prefix] = []
+            order.append(prefix)
+        from_map[prefix].extend(names)
+    result = []
+    for prefix in order:
+        unique = sorted(dict.fromkeys(from_map[prefix]))
+        result.append(f"{prefix} import {', '.join(unique)}")
+    return result + plain
+
+
 def _target_module_name(target_file: str) -> str:
     """Convert a relative target filename to a dotted module name.
 
@@ -1415,7 +1457,7 @@ def generate_file_splits(
             entity_srcs.append(_src)
         entity_srcs = [s for s in entity_srcs if s]
         parts: List[str] = []
-        all_imports = needed + top_cross
+        all_imports = _merge_from_imports(needed + top_cross)
         if all_imports:
             parts.append("\n".join(all_imports))
         parts.extend(entity_srcs)

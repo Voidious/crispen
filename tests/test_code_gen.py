@@ -27,6 +27,7 @@ from crispen.file_limiter.code_gen import (
     _inject_inline_imports,
     _inject_inline_test_imports_original,
     _is_test_name,
+    _merge_from_imports,
     _module_path_from_file,
     _prune_inline_redundant_imports,
     _prune_unused_imports,
@@ -825,6 +826,38 @@ def test_find_cross_file_imports_cross_directory():
 
 
 # ---------------------------------------------------------------------------
+# _merge_from_imports
+# ---------------------------------------------------------------------------
+
+
+def test_merge_from_imports_no_overlap():
+    imports = ["from .a import x", "from .b import y"]
+    assert _merge_from_imports(imports) == ["from .a import x", "from .b import y"]
+
+
+def test_merge_from_imports_overlapping():
+    imports = ["from .conv import A, C", "from .conv import B, C"]
+    result = _merge_from_imports(imports)
+    assert result == ["from .conv import A, B, C"]
+
+
+def test_merge_from_imports_deduplicates_names():
+    imports = ["from .m import foo, bar", "from .m import bar, baz"]
+    result = _merge_from_imports(imports)
+    assert result == ["from .m import bar, baz, foo"]
+
+
+def test_merge_from_imports_preserves_plain_imports():
+    imports = ["import os", "from .m import x", "import sys"]
+    result = _merge_from_imports(imports)
+    assert result == ["from .m import x", "import os", "import sys"]
+
+
+def test_merge_from_imports_empty():
+    assert _merge_from_imports([]) == []
+
+
+# ---------------------------------------------------------------------------
 # generate_file_splits — cross-file import integration
 # ---------------------------------------------------------------------------
 
@@ -850,6 +883,51 @@ def test_generate_cross_file_import():
     # constants.py should NOT have a cross-import (it defines _CONST, not uses it)
     const_src = result.new_files["constants.py"]
     assert "from .fn_module" not in const_src
+
+
+def test_generate_cross_file_import_no_duplicate_names():
+    # Two entities (fn_a and fn_b) migrate to the same new file.
+    # fn_a uses X and Z from helpers; fn_b uses Y and Z from helpers.
+    # The new file must get exactly one merged import with X, Y, Z —
+    # not two overlapping imports that both include Z (F811 redefinition).
+    source = textwrap.dedent(
+        """\
+        X = 1
+        Y = 2
+        Z = 3
+
+        def fn_a():
+            return X + Z
+
+        def fn_b():
+            return Y + Z
+        """
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, ["X", "Y", "Z"])
+    e_a = _make_entity("fn_a", 5, 6)
+    e_b = _make_entity("fn_b", 8, 9)
+    c = _classified(entities=[e_block, e_a, e_b])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1"], target_file="constants.py"),
+            GroupPlacement(group=["fn_a", "fn_b"], target_file="funcs.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    funcs_src = result.new_files["funcs.py"]
+    # Both fn_a and fn_b are present
+    assert "def fn_a" in funcs_src
+    assert "def fn_b" in funcs_src
+    # Only ONE import from constants, with X, Y, Z each appearing exactly once
+    import_lines = [
+        ln for ln in funcs_src.splitlines() if "from .constants import" in ln
+    ]
+    assert len(import_lines) == 1, f"Expected 1 import line, got: {import_lines}"
+    assert import_lines[0].count("X") == 1
+    assert import_lines[0].count("Y") == 1
+    assert import_lines[0].count("Z") == 1
 
 
 def test_generate_non_migrated_helper_extracted_to_new_file():
