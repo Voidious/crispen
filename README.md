@@ -71,6 +71,12 @@ max_file_lines = 1000
 # (e.g. service/*.py for service.py). Default: true.
 file_limiter_subdir_split = true
 
+# FileLimiter: route pytest fixtures split out of test files to conftest.py
+# instead of a regular sibling module, so pytest auto-discovers them without
+# any import in the original file (avoids F401/F811 flake8 warnings).
+# Set to false if not using pytest or using custom fixture decorators. Default: true.
+file_limiter_pytest_conftest = true
+
 # Tuple Return to Dataclass: min tuple element count to trigger replacement (default: 4)
 min_tuple_size = 4
 
@@ -444,6 +450,7 @@ Configuration:
 - `file_limiter_subdir_split` — use a subdirectory for whole-file diffs (default: `true`).
 - `file_limiter_retries` — additional LLM retry attempts on failure (default: 2).
 - `file_limiter_recursive` — recursively split newly-created files that are still over the limit (default: `true`).
+- `file_limiter_pytest_conftest` — route fixtures split out of test files to `conftest.py` so pytest auto-discovers them without imports (avoids F401/F811 warnings). Set to `false` if not using pytest or using custom fixture decorators (default: `true`).
 
 ## Architecture
 

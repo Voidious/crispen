@@ -788,6 +788,26 @@ def test_runner_success(mock_classify, mock_advise, mock_gen):
     assert any("utils.py" in m for m in result.messages)
 
 
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_passes_pytest_conftest_to_generate(
+    mock_classify, mock_advise, mock_gen
+):
+    # Verify config.file_limiter_pytest_conftest is forwarded to generate_file_splits.
+    source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    mock_classify.return_value = _make_classified(entities=[entity])
+    mock_advise.return_value = _plan_with(["foo"], "utils.py")
+    mock_gen.return_value = _good_split()
+
+    config_false = CrispenConfig(file_limiter_pytest_conftest=False)
+    run_file_limiter("big.py", "", source, [], config_false)
+
+    _, call_kwargs = mock_gen.call_args
+    assert call_kwargs.get("pytest_conftest") is False
+
+
 # ---------------------------------------------------------------------------
 # run_file_limiter — cycle abort path (split.abort=True)
 # ---------------------------------------------------------------------------

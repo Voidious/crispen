@@ -38,6 +38,7 @@ llm_verify_retries = 2
 file_limiter_retries = 2
 file_limiter_recursive = true
 file_limiter_subdir_split = true
+file_limiter_pytest_conftest = true
 
 [tool.pytest.ini_options]
 addopts = "--cov=crispen --cov-branch --cov-fail-under=100"

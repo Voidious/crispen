@@ -143,6 +143,11 @@ def test_load_config_all_options(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_file_limiter_pytest_conftest_default():
+    cfg = CrispenConfig()
+    assert cfg.file_limiter_pytest_conftest is True
+
+
 def test_refactor_filter_defaults():
     cfg = CrispenConfig()
     assert cfg.enabled_refactors == []

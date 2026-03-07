@@ -84,6 +84,16 @@ class CrispenConfig:
     # Aborted if the target subdirectory already exists.
     file_limiter_subdir_split: bool = True
 
+    # When True, pytest fixtures (functions decorated with @pytest.fixture or
+    # @fixture) that are split out of a test file are routed to conftest.py in
+    # the same directory instead of a regular sibling module.  pytest
+    # auto-discovers fixtures from conftest.py, so no import is needed in the
+    # original test file — eliminating the F401 "imported but unused" and F811
+    # "redefinition of unused" flake8 warnings that arise when a fixture name
+    # also appears as a test function parameter.  Set to False if you are not
+    # using pytest or if your project manages fixtures in a non-standard way.
+    file_limiter_pytest_conftest: bool = True
+
     # Refactor allow-list: if non-empty, only the named refactors are run.
     # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
     # "tuple_dataclass", "file_limiter", "match_function".

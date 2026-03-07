@@ -500,7 +500,12 @@ def run_file_limiter(
             original_target_files = plan.original_target_files
 
         split = generate_file_splits(
-            classified, plan, post_source, filepath, subdir_name=subdir_name
+            classified,
+            plan,
+            post_source,
+            filepath,
+            subdir_name=subdir_name,
+            pytest_conftest=config.file_limiter_pytest_conftest,
         )
 
         if split.abort:

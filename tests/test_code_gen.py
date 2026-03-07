@@ -26,6 +26,7 @@ from crispen.file_limiter.code_gen import (
     _import_line_numbers,
     _inject_inline_imports,
     _inject_inline_test_imports_original,
+    _is_pytest_fixture,
     _is_test_name,
     _merge_from_imports,
     _module_path_from_file,
@@ -2812,6 +2813,59 @@ def test_is_test_name_non_test():
 
 
 # ---------------------------------------------------------------------------
+# _is_pytest_fixture
+# ---------------------------------------------------------------------------
+
+
+def test_is_pytest_fixture_syntax_error():
+    assert _is_pytest_fixture("def (") is False
+
+
+def test_is_pytest_fixture_empty_body():
+    # Empty source → empty tree body → not a fixture.
+    assert _is_pytest_fixture("") is False
+
+
+def test_is_pytest_fixture_class_node():
+    # Class definition is not a FunctionDef → returns False.
+    assert _is_pytest_fixture("class Foo:\n    pass\n") is False
+
+
+def test_is_pytest_fixture_no_decorator():
+    assert _is_pytest_fixture("def client():\n    pass\n") is False
+
+
+def test_is_pytest_fixture_bare_name():
+    # @fixture (plain name, no call)
+    src = "@fixture\ndef client():\n    pass\n"
+    assert _is_pytest_fixture(src) is True
+
+
+def test_is_pytest_fixture_bare_name_called():
+    # @fixture() (called with no args)
+    src = "@fixture()\ndef client():\n    pass\n"
+    assert _is_pytest_fixture(src) is True
+
+
+def test_is_pytest_fixture_attribute():
+    # @pytest.fixture (attribute access, no call)
+    src = "@pytest.fixture\ndef client():\n    pass\n"
+    assert _is_pytest_fixture(src) is True
+
+
+def test_is_pytest_fixture_attribute_called():
+    # @pytest.fixture(scope="session")
+    src = '@pytest.fixture(scope="session")\ndef client():\n    pass\n'
+    assert _is_pytest_fixture(src) is True
+
+
+def test_is_pytest_fixture_non_matching_decorator():
+    # @other_decorator — Name but id != "fixture"; not an Attribute.
+    src = "@other_decorator\ndef client():\n    pass\n"
+    assert _is_pytest_fixture(src) is False
+
+
+# ---------------------------------------------------------------------------
 # _split_cross_imports_by_test
 # ---------------------------------------------------------------------------
 
@@ -3351,3 +3405,102 @@ def test_generate_cross_import_dedup_across_entities():
     workers = result.new_files["workers.py"]
     # "from .helpers import helper" should appear exactly once.
     assert workers.count("import helper") == 1
+
+
+# ---------------------------------------------------------------------------
+# generate_file_splits — pytest conftest routing
+# ---------------------------------------------------------------------------
+
+
+def test_generate_pytest_conftest_disabled_no_conftest():
+    # Default (pytest_conftest=False): fixture goes to assigned file, re-exported.
+    src = "@pytest.fixture\ndef client():\n    pass\n"
+    entity = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["client"], target_file="fixtures.py")])
+
+    result = generate_file_splits(c, plan, src, "test_big.py")
+
+    assert "fixtures.py" in result.new_files
+    assert "conftest.py" not in result.new_files
+    assert "client" in result.new_files["fixtures.py"]
+
+
+def test_generate_pytest_conftest_fixture_goes_to_conftest():
+    # With pytest_conftest=True, fixture entity lands in conftest.py, not the
+    # LLM-assigned file, and no re-export import appears in the original.
+    src = "@pytest.fixture\ndef client():\n    pass\n"
+    entity = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["client"], target_file="fixtures.py")])
+
+    result = generate_file_splits(c, plan, src, "test_big.py", pytest_conftest=True)
+
+    assert "conftest.py" in result.new_files
+    assert "def client():" in result.new_files["conftest.py"]
+    # No import of client back into the original (no F401/F811).
+    assert "import client" not in result.original_source
+    # The LLM-assigned file is dropped (all entities redirected).
+    assert "fixtures.py" not in result.new_files
+
+
+def test_generate_pytest_conftest_mixed_group_splits():
+    # Fixture goes to conftest.py; non-fixture stays in the assigned file.
+    src = textwrap.dedent(
+        """\
+        @pytest.fixture
+        def client():
+            pass
+
+        def helper():
+            pass
+        """
+    )
+    e_client = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    e_helper = Entity(EntityKind.FUNCTION, "helper", 5, 6, ["helper"])
+    c = _classified(entities=[e_client, e_helper])
+    plan = _plan([GroupPlacement(group=["client", "helper"], target_file="support.py")])
+
+    result = generate_file_splits(c, plan, src, "test_big.py", pytest_conftest=True)
+
+    assert "conftest.py" in result.new_files
+    assert "def client():" in result.new_files["conftest.py"]
+    assert "support.py" in result.new_files
+    assert "def helper():" in result.new_files["support.py"]
+    assert "import client" not in result.original_source
+
+
+def test_generate_pytest_conftest_no_fixtures_no_conftest():
+    # pytest_conftest=True but no fixture entities → no conftest.py created.
+    src = "def helper():\n    pass\n"
+    entity = Entity(EntityKind.FUNCTION, "helper", 1, 2, ["helper"])
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["helper"], target_file="support.py")])
+
+    result = generate_file_splits(c, plan, src, "test_big.py", pytest_conftest=True)
+
+    assert "conftest.py" not in result.new_files
+    assert "support.py" in result.new_files
+
+
+def test_generate_pytest_conftest_prepends_existing(tmp_path):
+    # When conftest.py already exists on disk, its content is prepended.
+    existing = tmp_path / "conftest.py"
+    existing.write_text(
+        "# existing fixture\ndef prior():\n    pass\n", encoding="utf-8"
+    )
+
+    src = "@pytest.fixture\ndef client():\n    pass\n"
+    entity = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["client"], target_file="fixtures.py")])
+    original_path = str(tmp_path / "test_big.py")
+
+    result = generate_file_splits(c, plan, src, original_path, pytest_conftest=True)
+
+    conftest_src = result.new_files["conftest.py"]
+    assert "# existing fixture" in conftest_src
+    assert "def prior():" in conftest_src
+    assert "def client():" in conftest_src
+    # Existing content should come first.
+    assert conftest_src.index("prior") < conftest_src.index("client")

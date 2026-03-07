@@ -994,6 +994,28 @@ def _is_test_name(name: str) -> bool:
     return name.startswith("Test") or name.startswith("test_")
 
 
+def _is_pytest_fixture(entity_src: str) -> bool:
+    """Return True if *entity_src* defines a function with a @pytest.fixture decorator.
+
+    Handles all common forms: ``@fixture``, ``@fixture()``, ``@pytest.fixture``,
+    and ``@pytest.fixture(scope=...)``.
+    """
+    try:
+        tree = ast.parse(entity_src)
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                # Unwrap call forms like @pytest.fixture(...) to get the base reference.
+                ref = dec.func if isinstance(dec, ast.Call) else dec
+                if isinstance(ref, ast.Name) and ref.id == "fixture":
+                    return True
+                if isinstance(ref, ast.Attribute) and ref.attr == "fixture":
+                    return True
+    return False
+
+
 def _split_cross_imports_by_test(
     imports: List[str],
 ) -> Tuple[List[str], List[str]]:
@@ -1217,6 +1239,7 @@ def generate_file_splits(
     post_source: str,
     original_path: str,
     subdir_name: Optional[str] = None,
+    pytest_conftest: bool = False,
 ) -> SplitResult:
     """Generate new file contents and the updated original source.
 
@@ -1227,6 +1250,13 @@ def generate_file_splits(
     into a package subdirectory.  The "original" file is treated as
     ``service/__init__.py`` for dependency-graph and import-prefix purposes,
     so cross-file imports within the package use correct relative paths.
+
+    When *pytest_conftest* is True, any entity decorated with
+    ``@pytest.fixture`` (or ``@fixture``) is redirected to ``conftest.py``
+    instead of the LLM-assigned target file.  pytest auto-discovers fixtures
+    from ``conftest.py``, so no re-export import is added to the original
+    file — eliminating both the F401 and F811 flake8 warnings that arise
+    when a fixture name is used as a test function parameter.
     """
     if plan.abort:
         return SplitResult(
@@ -1296,6 +1326,34 @@ def generate_file_splits(
         if p.target_file != original_basename
         and not any(name in main_sticky for name in p.group)
     ]
+
+    # --- Pytest conftest routing ---
+    # When enabled, entities decorated with @pytest.fixture are redirected to
+    # conftest.py instead of the LLM-assigned target file.  pytest discovers
+    # fixtures from conftest.py automatically, so no re-export import is added
+    # to the original file — eliminating the F401/F811 flake8 false positives.
+    fixture_entity_names: Set[str] = set()
+    if pytest_conftest:
+        conftest_group: List[str] = []
+        new_valid: List[GroupPlacement] = []
+        for p in valid_placements:
+            non_fixture: List[str] = []
+            for name in p.group:
+                src = entity_source_map.get(name, "")
+                if src and _is_pytest_fixture(src):
+                    fixture_entity_names.add(name)
+                    conftest_group.append(name)
+                else:
+                    non_fixture.append(name)
+            if non_fixture:
+                new_valid.append(
+                    GroupPlacement(group=non_fixture, target_file=p.target_file)
+                )
+        if conftest_group:
+            new_valid.append(
+                GroupPlacement(group=conftest_group, target_file="conftest.py")
+            )
+        valid_placements = new_valid
 
     # Group placements by target file (preserving order for topo sort).
     file_entity_names: Dict[str, List[str]] = {}
@@ -1464,6 +1522,16 @@ def generate_file_splits(
         pruned = _prune_unused_imports("\n\n".join(parts) + "\n")
         new_files[target_file] = _prune_inline_redundant_imports(pruned)
 
+    # If an existing conftest.py is present on disk, prepend it so the
+    # generated file does not overwrite fixtures already defined there.
+    if "conftest.py" in new_files:
+        existing_conftest = Path(original_path).parent / "conftest.py"
+        if existing_conftest.exists():
+            prior = existing_conftest.read_text(encoding="utf-8")
+            new_files["conftest.py"] = (
+                prior.rstrip() + "\n\n\n" + new_files["conftest.py"]
+            )
+
     # Build updated original source.
     updated = _remove_entity_lines(
         post_source, migrated_names, entity_map, entity_source_map
@@ -1497,9 +1565,16 @@ def generate_file_splits(
     relative_from: Optional[str] = (
         f"{subdir_name}/__init__.py" if (subdir_name and not is_test_file) else None
     )
+    # Exclude conftest.py from re-exports: fixtures there are auto-discovered
+    # by pytest and must not be imported back into the original test file.
+    re_export_placements = [
+        p
+        for p in valid_placements + synthetic_placements
+        if p.target_file != "conftest.py"
+    ]
     updated = _add_re_exports(
         updated,
-        valid_placements + synthetic_placements,
+        re_export_placements,
         entity_map,
         entity_source_map,
         external_loads=external_loads,
