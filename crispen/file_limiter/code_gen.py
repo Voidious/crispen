@@ -6,7 +6,7 @@ import ast
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from .advisor import FileLimiterPlan, GroupPlacement
 from .classifier import ClassifiedEntities
@@ -473,6 +473,12 @@ def _add_re_exports(
                 entity_source_map.get(entity_name, "")
             )
             for defined_name in defined:
+                # Test-named symbols (Test* / test_*) are never re-exported at
+                # module level: _inject_inline_test_imports_original injects
+                # them inside function/class bodies to prevent pytest from
+                # discovering the same test twice.
+                if _is_test_name(defined_name):
+                    continue
                 if (
                     (
                         not defined_name.startswith("_")
@@ -932,6 +938,233 @@ def _strip_module_docstring(src: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# __main__ handling
+# ---------------------------------------------------------------------------
+
+
+def _is_test_name(name: str) -> bool:
+    """Return True if *name* matches pytest's test-discovery patterns.
+
+    Pytest collects classes named ``Test*`` and functions named ``test_*``.
+    Importing such names at module level in a test file causes every test
+    inside to be discovered — and run — a second time.
+    """
+    return name.startswith("Test") or name.startswith("test_")
+
+
+def _split_cross_imports_by_test(
+    imports: List[str],
+) -> Tuple[List[str], List[str]]:
+    """Split cross-file import statements into (non_test, test_named) groups.
+
+    Import statements that name pytest-discoverable symbols (``Test*`` or
+    ``test_*``) are returned as inline imports so callers can inject them
+    into function/class bodies rather than emitting them at module level.
+    Mixed imports (some test, some non-test names) are split into two
+    separate statements.
+    """
+    non_test: List[str] = []
+    test_named: List[str] = []
+    for imp in imports:
+        m = re.match(r"^(from\s+\S+\s+import\s+)(.*)", imp)
+        if not m:
+            non_test.append(imp)
+            continue
+        prefix = m.group(1)
+        names = [n.strip() for n in m.group(2).split(",")]
+        t_names = sorted(n for n in names if _is_test_name(n))
+        nt_names = sorted(n for n in names if not _is_test_name(n))
+        if t_names:
+            test_named.append(f"{prefix}{', '.join(t_names)}")
+        if nt_names:
+            non_test.append(f"{prefix}{', '.join(nt_names)}")
+    return non_test, test_named
+
+
+def _inject_inline_imports(entity_src: str, imports: List[str]) -> str:
+    """Inject *imports* at the top of a function or class body in *entity_src*.
+
+    The imports are inserted after any leading docstring.  Returns
+    *entity_src* unchanged when it cannot be parsed or the top-level node
+    is not a function or class (TOP_LEVEL entities have no body scope).
+    """
+    if not imports:
+        return entity_src
+    try:
+        tree = ast.parse(entity_src)
+    except SyntaxError:
+        return entity_src
+    if not tree.body:
+        return entity_src
+    top = tree.body[0]
+    if not isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return entity_src
+    first_stmt = top.body[0]
+    insert_line = first_stmt.lineno
+    if (
+        isinstance(first_stmt, ast.Expr)
+        and isinstance(first_stmt.value, ast.Constant)
+        and isinstance(first_stmt.value.value, str)
+        and len(top.body) > 1
+    ):
+        insert_line = top.body[1].lineno
+    lines = entity_src.splitlines(keepends=True)
+    body_line = lines[insert_line - 1]
+    indent = body_line[: len(body_line) - len(body_line.lstrip())]
+    import_lines = [f"{indent}{imp}\n" for imp in imports]
+    return "".join(lines[: insert_line - 1] + import_lines + lines[insert_line - 1 :])
+
+
+def _find_main_block_entity(
+    entities: List[Entity],
+    entity_source_map: Dict[str, str],
+) -> Optional[str]:
+    """Return the entity name of the ``if __name__ == '__main__':`` block.
+
+    Returns ``None`` when no such block is present.
+    """
+    for entity in entities:
+        if entity.kind != EntityKind.TOP_LEVEL:
+            continue
+        src = entity_source_map.get(entity.name, "")
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if (
+                isinstance(node, ast.If)
+                and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name)
+                and node.test.left.id == "__name__"
+                and len(node.test.ops) == 1
+                and isinstance(node.test.ops[0], ast.Eq)
+                and len(node.test.comparators) == 1
+                and isinstance(node.test.comparators[0], ast.Constant)
+                and node.test.comparators[0].value == "__main__"
+            ):
+                return entity.name
+    return None
+
+
+def _find_main_direct_callees(
+    main_src: str, function_entity_names: Set[str]
+) -> Set[str]:
+    """Return function entity names called directly in the ``__main__`` block.
+
+    Only names that appear in *function_entity_names* (i.e. are defined as
+    top-level FUNCTION entities in the same file) are returned, so the
+    caller can keep those functions sticky to the original file alongside
+    the ``__main__`` block.
+    """
+    try:
+        tree = ast.parse(main_src)
+    except SyntaxError:
+        return set()
+    callees: Set[str] = set()
+    for node in tree.body:
+        if not (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "__main__"
+        ):
+            continue
+        for subnode in ast.walk(node):
+            if (
+                isinstance(subnode, ast.Call)
+                and isinstance(subnode.func, ast.Name)
+                and subnode.func.id in function_entity_names
+            ):
+                callees.add(subnode.func.id)
+    return callees
+
+
+def _inject_inline_test_imports_original(
+    source: str,
+    migrated_test_symbols: Dict[str, str],
+    abs_pkg: Optional[str],
+    original_basename: str,
+) -> str:
+    """Inject inline imports for migrated test-named symbols into function/class bodies.
+
+    After a split, test-named symbols (``Test*`` / ``test_*``) that were
+    migrated to new files are not re-exported at module level (to avoid
+    pytest double-discovery).  This function finds every top-level
+    function or class in *source* that still references such symbols and
+    injects the required ``from … import …`` statement at the top of
+    each body, after any docstring.
+
+    *migrated_test_symbols* maps each migrated test name to its target
+    file (relative path).  *abs_pkg* and *original_basename* are used to
+    build the correct import prefix (absolute for test files, relative
+    otherwise).
+    """
+    if not migrated_test_symbols:
+        return source
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    lines = source.splitlines(keepends=True)
+    # Maps 1-based line number → list of import lines to insert before it.
+    insertions: Dict[int, List[str]] = {}
+
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body_names: Set[str] = set()
+        for subnode in ast.walk(node):
+            if isinstance(subnode, ast.Name) and isinstance(subnode.ctx, ast.Load):
+                body_names.add(subnode.id)
+        needed: Dict[str, List[str]] = {}
+        for name in body_names:
+            tfile = migrated_test_symbols.get(name)
+            if tfile:
+                needed.setdefault(tfile, []).append(name)
+        if not needed:
+            continue
+        import_stmts: List[str] = []
+        for tfile, names in sorted(needed.items()):
+            if abs_pkg is not None:
+                mod = _target_module_name(tfile)
+                prefix = f"{abs_pkg}.{mod}" if abs_pkg else mod
+            else:
+                prefix = _relative_import_prefix(original_basename, tfile)
+            import_stmts.append(f"from {prefix} import {', '.join(sorted(names))}")
+        first_stmt = node.body[0]
+        insert_line = first_stmt.lineno
+        if (
+            isinstance(first_stmt, ast.Expr)
+            and isinstance(first_stmt.value, ast.Constant)
+            and isinstance(first_stmt.value.value, str)
+            and len(node.body) > 1
+        ):
+            insert_line = node.body[1].lineno
+        body_line = lines[insert_line - 1]
+        indent = body_line[: len(body_line) - len(body_line.lstrip())]
+        insertions.setdefault(insert_line, [])
+        insertions[insert_line] = [f"{indent}{s}\n" for s in import_stmts] + insertions[
+            insert_line
+        ]
+
+    if not insertions:
+        return source
+    result: List[str] = []
+    for i, line in enumerate(lines, 1):
+        if i in insertions:
+            result.extend(insertions[i])
+        result.append(line)
+    return "".join(result)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -964,6 +1197,13 @@ def generate_file_splits(
     if not plan.placements:
         return SplitResult(new_files={}, original_source=post_source, abort=False)
 
+    # Detect shebang on line 1 so it can be stripped from new files and
+    # preserved (or restored) at the top of the original.
+    shebang: Optional[str] = None
+    if post_source.startswith("#!"):
+        nl = post_source.find("\n")
+        shebang = post_source[: nl + 1] if nl != -1 else post_source + "\n"
+
     lines = post_source.splitlines(keepends=True)
     entity_map = {e.name: e for e in classified.entities}
 
@@ -990,8 +1230,29 @@ def generate_file_splits(
     original_basename = (
         f"{subdir_name}/__init__.py" if subdir_name else Path(original_path).name
     )
+    # Identify the __main__ block and any functions it calls directly.
+    # These stay in the original file unconditionally: the __main__ block
+    # is an entry point the user expects to keep working, and its direct
+    # callees must live in the same file to avoid module-level test-class
+    # imports that would cause pytest double-discovery.
+    main_entity = _find_main_block_entity(classified.entities, entity_source_map)
+    main_sticky: Set[str] = set()
+    if main_entity is not None:
+        main_sticky.add(main_entity)
+        function_entity_names = {
+            e.name for e in classified.entities if e.kind == EntityKind.FUNCTION
+        }
+        main_sticky.update(
+            _find_main_direct_callees(
+                entity_source_map.get(main_entity, ""), function_entity_names
+            )
+        )
+
     valid_placements = [
-        p for p in plan.placements if p.target_file != original_basename
+        p
+        for p in plan.placements
+        if p.target_file != original_basename
+        and not any(name in main_sticky for name in p.group)
     ]
 
     # Group placements by target file (preserving order for topo sort).
@@ -1105,14 +1366,9 @@ def generate_file_splits(
         if subdir_name is not None:
             depth = len(Path(target_file).parts) - 1
             needed = [_bump_relative_imports(s, depth) for s in needed]
-        cross = _find_cross_file_imports(
-            ent_names,
-            entity_source_map,
-            name_to_target_file,
-            target_file,
-            abs_pkg=abs_pkg_for_new_files,
-        )
         entity_srcs = []
+        top_cross: List[str] = []
+        seen_top_cross: Set[str] = set()
         for _ent_name in ent_names:
             _src = entity_source_map.get(_ent_name)
             if _src is None:
@@ -1128,11 +1384,38 @@ def generate_file_splits(
                     _src = _strip_module_docstring(_src)
             else:
                 _src = _FUTURE_IMPORT_LINE_RE.sub("", _src)
+            # Strip shebang from any entity that begins on line 1 of the
+            # original source — it must not appear in generated new files.
+            if shebang and _entity and _entity.start_line == 1:
+                nl = _src.find("\n")
+                _src = _src[nl + 1 :] if nl != -1 else ""
             _src = _src.rstrip()
+            # Compute cross-file imports for this entity and split off any
+            # test-named symbols (Test* / test_*) to be injected inline.
+            entity_cross = _find_cross_file_imports(
+                [_ent_name],
+                entity_source_map,
+                name_to_target_file,
+                target_file,
+                abs_pkg=abs_pkg_for_new_files,
+            )
+            ent_top_cross, ent_test_imports = _split_cross_imports_by_test(entity_cross)
+            for imp in ent_top_cross:
+                if imp not in seen_top_cross:
+                    seen_top_cross.add(imp)
+                    top_cross.append(imp)
+            if ent_test_imports and _entity and _entity.kind != EntityKind.TOP_LEVEL:
+                _src = _inject_inline_imports(_src, ent_test_imports)
+            else:
+                # TOP_LEVEL entity: no body scope, fall back to module level.
+                for imp in ent_test_imports:
+                    if imp not in seen_top_cross:
+                        seen_top_cross.add(imp)
+                        top_cross.append(imp)
             entity_srcs.append(_src)
         entity_srcs = [s for s in entity_srcs if s]
         parts: List[str] = []
-        all_imports = needed + cross
+        all_imports = needed + top_cross
         if all_imports:
             parts.append("\n".join(all_imports))
         parts.extend(entity_srcs)
@@ -1181,5 +1464,22 @@ def generate_file_splits(
         abs_pkg=abs_pkg,
         relative_from=relative_from,
     )
+
+    # For non-migrated entities that reference test-named symbols now living
+    # in new files: _add_re_exports intentionally skips re-exporting them
+    # (to avoid double-discovery), so inject those imports inline instead.
+    migrated_test_symbols = {
+        name: tfile
+        for name, tfile in name_to_target_file.items()
+        if tfile != original_basename and _is_test_name(name)
+    }
+    updated = _inject_inline_test_imports_original(
+        updated, migrated_test_symbols, abs_pkg, original_basename
+    )
+
+    # Restore shebang at line 1 of the original.  It may have been removed
+    # by _remove_entity_lines if the entity owning line 1 was migrated.
+    if shebang and not updated.startswith("#!"):
+        updated = shebang + updated
 
     return SplitResult(new_files=new_files, original_source=updated, abort=False)

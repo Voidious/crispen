@@ -18,15 +18,21 @@ from crispen.file_limiter.code_gen import (
     _extract_module_docstring,
     _extract_shared_helpers,
     _find_cross_file_imports,
+    _find_main_block_entity,
+    _find_main_direct_callees,
     _find_needed_imports,
     _find_project_root,
     _import_derived_names,
     _import_line_numbers,
+    _inject_inline_imports,
+    _inject_inline_test_imports_original,
+    _is_test_name,
     _module_path_from_file,
     _prune_inline_redundant_imports,
     _prune_unused_imports,
     _relative_import_prefix,
     _remove_entity_lines,
+    _split_cross_imports_by_test,
     _strip_module_docstring,
     _strip_top_level_import_lines,
     _target_module_name,
@@ -428,14 +434,15 @@ def test_add_re_exports_test_function_not_re_exported():
     assert result == source
 
 
-def test_add_re_exports_test_function_re_exported_when_referenced():
-    # If something in the remaining source actually calls test_something (unusual
-    # but possible), the proxy import is still added.
+def test_add_re_exports_test_function_never_re_exported_even_when_referenced():
+    # test_* names are never re-exported at module level even when the
+    # remaining source references them — _inject_inline_test_imports_original
+    # handles those cases inline to prevent pytest double-discovery.
     source = "import os\n\ntest_something()\n"
     entity = _make_entity("test_something", 1, 3)
     placement = GroupPlacement(group=["test_something"], target_file="tests/helpers.py")
     result = _add_re_exports(source, [placement], {"test_something": entity}, {})
-    assert "from .tests.helpers import test_something" in result
+    assert "from .tests.helpers import test_something" not in result
 
 
 def test_class_has_test_methods_true():
@@ -466,8 +473,10 @@ def test_add_re_exports_test_class_not_re_exported():
     assert result == source
 
 
-def test_add_re_exports_test_class_re_exported_when_referenced():
-    # If the class name is still loaded in the remaining source, re-import it.
+def test_add_re_exports_test_class_never_re_exported_even_when_referenced():
+    # Test-named symbols are never re-exported at module level even when
+    # referenced in remaining source — _inject_inline_test_imports_original
+    # handles them inline to prevent pytest double-discovery.
     source = "import os\n\nTestFoo()\n"
     entity = Entity(EntityKind.CLASS, "TestFoo", 1, 5, ["TestFoo"])
     entity_src = "class TestFoo:\n    def test_bar(self): pass\n"
@@ -475,7 +484,7 @@ def test_add_re_exports_test_class_re_exported_when_referenced():
     result = _add_re_exports(
         source, [placement], {"TestFoo": entity}, {"TestFoo": entity_src}
     )
-    assert "from .tests.helpers import TestFoo" in result
+    assert "from .tests.helpers import TestFoo" not in result
 
 
 def test_add_re_exports_top_level_block_private_names_referenced():
@@ -2703,3 +2712,564 @@ def test_generate_subdir_docstring_not_stripped_from_non_subdir_split():
 
     new_src = result.new_files["utils.py"]
     assert '"""Module doc."""' in new_src
+
+
+# ---------------------------------------------------------------------------
+# _is_test_name
+# ---------------------------------------------------------------------------
+
+
+def test_is_test_name_test_class():
+    assert _is_test_name("TestFoo") is True
+
+
+def test_is_test_name_test_function():
+    assert _is_test_name("test_bar") is True
+
+
+def test_is_test_name_non_test():
+    assert _is_test_name("helper") is False
+    assert _is_test_name("Foo") is False
+    assert _is_test_name("_test_private") is False
+
+
+# ---------------------------------------------------------------------------
+# _split_cross_imports_by_test
+# ---------------------------------------------------------------------------
+
+
+def test_split_cross_imports_by_test_pure_non_test():
+    non_test, test_named = _split_cross_imports_by_test(["from .foo import helper"])
+    assert non_test == ["from .foo import helper"]
+    assert test_named == []
+
+
+def test_split_cross_imports_by_test_pure_test():
+    non_test, test_named = _split_cross_imports_by_test(
+        ["from .foo import TestFoo, test_bar"]
+    )
+    assert non_test == []
+    assert test_named == ["from .foo import TestFoo, test_bar"]
+
+
+def test_split_cross_imports_by_test_mixed():
+    non_test, test_named = _split_cross_imports_by_test(
+        ["from .foo import TestFoo, helper, test_bar"]
+    )
+    assert non_test == ["from .foo import helper"]
+    assert test_named == ["from .foo import TestFoo, test_bar"]
+
+
+def test_split_cross_imports_by_test_plain_import_passthrough():
+    # Plain "import x" lines (no "from") pass through to non_test unchanged.
+    non_test, test_named = _split_cross_imports_by_test(["import os"])
+    assert non_test == ["import os"]
+    assert test_named == []
+
+
+# ---------------------------------------------------------------------------
+# _inject_inline_imports
+# ---------------------------------------------------------------------------
+
+
+def test_inject_inline_imports_into_function():
+    src = "def foo():\n    return 1\n"
+    result = _inject_inline_imports(src, ["from .bar import Baz"])
+    assert result == "def foo():\n    from .bar import Baz\n    return 1\n"
+
+
+def test_inject_inline_imports_skips_docstring():
+    src = 'def foo():\n    """Doc."""\n    return 1\n'
+    result = _inject_inline_imports(src, ["from .bar import Baz"])
+    assert (
+        result == 'def foo():\n    """Doc."""\n    from .bar import Baz\n    return 1\n'
+    )
+
+
+def test_inject_inline_imports_into_class():
+    src = "class Foo:\n    x = 1\n"
+    result = _inject_inline_imports(src, ["from .bar import Baz"])
+    assert result == "class Foo:\n    from .bar import Baz\n    x = 1\n"
+
+
+def test_inject_inline_imports_toplevel_noop():
+    # TOP_LEVEL entity (bare if-statement): no body scope, returns unchanged.
+    src = "if True:\n    pass\n"
+    result = _inject_inline_imports(src, ["from .bar import Baz"])
+    assert result == src
+
+
+def test_inject_inline_imports_empty_list_noop():
+    src = "def foo():\n    pass\n"
+    assert _inject_inline_imports(src, []) == src
+
+
+def test_inject_inline_imports_syntax_error_noop():
+    src = "def (invalid"
+    assert _inject_inline_imports(src, ["from .x import Y"]) == src
+
+
+def test_inject_inline_imports_empty_source_noop():
+    # Empty source parses to empty tree.body — returns unchanged.
+    assert _inject_inline_imports("", ["from .x import Y"]) == ""
+
+
+def test_inject_inline_imports_only_docstring_injects_after():
+    # Function with only a docstring — inserts after docstring (at body[0] line)
+    # since len(body) == 1.
+    src = 'def foo():\n    """Only doc."""\n'
+    result = _inject_inline_imports(src, ["from .bar import Baz"])
+    assert result == 'def foo():\n    from .bar import Baz\n    """Only doc."""\n'
+
+
+# ---------------------------------------------------------------------------
+# _find_main_block_entity
+# ---------------------------------------------------------------------------
+
+
+def test_find_main_block_entity_present():
+    from crispen.file_limiter.entity_parser import parse_entities
+
+    source = textwrap.dedent(
+        """\
+        def run():
+            pass
+
+        if __name__ == "__main__":
+            run()
+        """
+    )
+    entities = parse_entities(source)
+    esmap = {e.name: source.splitlines(keepends=True) for e in entities}
+    # Rebuild entity_source_map properly
+    lines = source.splitlines(keepends=True)
+    esmap = {
+        e.name: "".join(lines[e.start_line - 1 : e.end_line]).rstrip() for e in entities
+    }
+    result = _find_main_block_entity(entities, esmap)
+    assert result is not None
+    assert result.startswith("_block_")
+
+
+def test_find_main_block_entity_absent():
+    from crispen.file_limiter.entity_parser import parse_entities
+
+    source = "def foo():\n    pass\n"
+    entities = parse_entities(source)
+    lines = source.splitlines(keepends=True)
+    esmap = {
+        e.name: "".join(lines[e.start_line - 1 : e.end_line]).rstrip() for e in entities
+    }
+    assert _find_main_block_entity(entities, esmap) is None
+
+
+def test_find_main_block_entity_syntax_error_skipped():
+    from crispen.file_limiter.entity_parser import Entity, EntityKind
+
+    # Entity whose source is invalid Python: should be skipped gracefully.
+    entity = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, [])
+    result = _find_main_block_entity([entity], {"_block_1": "def (invalid"})
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _find_main_direct_callees
+# ---------------------------------------------------------------------------
+
+
+def test_find_main_direct_callees_basic():
+    src = 'if __name__ == "__main__":\n    run_tests()\n'
+    callees = _find_main_direct_callees(src, {"run_tests", "other"})
+    assert callees == {"run_tests"}
+
+
+def test_find_main_direct_callees_not_in_entity_names():
+    src = 'if __name__ == "__main__":\n    unknown()\n'
+    callees = _find_main_direct_callees(src, {"run_tests"})
+    assert callees == set()
+
+
+def test_find_main_direct_callees_syntax_error():
+    assert _find_main_direct_callees("def (invalid", {"foo"}) == set()
+
+
+def test_find_main_direct_callees_no_main_block():
+    src = "run_tests()\n"
+    assert _find_main_direct_callees(src, {"run_tests"}) == set()
+
+
+# ---------------------------------------------------------------------------
+# _inject_inline_test_imports_original
+# ---------------------------------------------------------------------------
+
+
+def test_inject_inline_test_imports_original_basic():
+    source = textwrap.dedent(
+        """\
+        def runner():
+            TestFoo()
+        """
+    )
+    migrated = {"TestFoo": "sub/test_foo.py"}
+    result = _inject_inline_test_imports_original(
+        source, migrated, abs_pkg="pkg.tests", original_basename="test_orig.py"
+    )
+    assert "from pkg.tests.sub.test_foo import TestFoo" in result
+    # Import appears inside the function body, not before the def line.
+    lines = result.splitlines()
+    def_idx = next(i for i, l in enumerate(lines) if l.startswith("def runner"))
+    import_idx = next(i for i, l in enumerate(lines) if "import TestFoo" in l)
+    assert import_idx > def_idx
+
+
+def test_inject_inline_test_imports_original_skips_docstring():
+    source = textwrap.dedent(
+        """\
+        def runner():
+            \"\"\"Run tests.\"\"\"
+            TestFoo()
+        """
+    )
+    migrated = {"TestFoo": "sub/test_foo.py"}
+    result = _inject_inline_test_imports_original(
+        source, migrated, abs_pkg="tests", original_basename="test_orig.py"
+    )
+    lines = result.splitlines()
+    doc_idx = next(i for i, l in enumerate(lines) if '"""Run tests."""' in l)
+    import_idx = next(i for i, l in enumerate(lines) if "import TestFoo" in l)
+    assert import_idx > doc_idx
+
+
+def test_inject_inline_test_imports_original_no_reference():
+    source = "def runner():\n    pass\n"
+    migrated = {"TestFoo": "sub/test_foo.py"}
+    result = _inject_inline_test_imports_original(
+        source, migrated, abs_pkg="tests", original_basename="test_orig.py"
+    )
+    assert result == source
+
+
+def test_inject_inline_test_imports_original_empty_map():
+    source = "def runner():\n    TestFoo()\n"
+    result = _inject_inline_test_imports_original(
+        source, {}, abs_pkg="tests", original_basename="test_orig.py"
+    )
+    assert result == source
+
+
+def test_inject_inline_test_imports_original_syntax_error():
+    result = _inject_inline_test_imports_original(
+        "def (invalid",
+        {"TestFoo": "sub/test_foo.py"},
+        abs_pkg="tests",
+        original_basename="test_orig.py",
+    )
+    assert result == "def (invalid"
+
+
+def test_inject_inline_test_imports_original_relative_import():
+    source = "def runner():\n    TestFoo()\n"
+    migrated = {"TestFoo": "sub/test_foo.py"}
+    result = _inject_inline_test_imports_original(
+        source, migrated, abs_pkg=None, original_basename="test_orig.py"
+    )
+    assert "from .sub.test_foo import TestFoo" in result
+
+
+def test_inject_inline_test_imports_original_unreferenced_symbol_skipped():
+    # Function references `helper` (not test-named) and `other_func`, neither
+    # of which is in migrated_test_symbols — the false branch of `if tfile:`.
+    source = "def runner():\n    helper()\n    other_func()\n"
+    migrated = {"TestFoo": "sub/test_foo.py"}
+    result = _inject_inline_test_imports_original(
+        source, migrated, abs_pkg="tests", original_basename="test_orig.py"
+    )
+    assert result == source
+
+
+# ---------------------------------------------------------------------------
+# generate_file_splits — shebang handling
+# ---------------------------------------------------------------------------
+
+
+def test_generate_shebang_stripped_from_new_file():
+    # Shebang on line 1 should NOT appear in generated new files.
+    source = "#!/usr/bin/env python3\n\ndef foo():\n    pass\n\ndef bar():\n    foo()\n"
+    e_foo = Entity(EntityKind.FUNCTION, "foo", 3, 4, ["foo"])
+    e_bar = Entity(EntityKind.FUNCTION, "bar", 6, 7, ["bar"])
+    c = _classified(entities=[e_foo, e_bar])
+    plan = _plan([GroupPlacement(group=["bar"], target_file="helpers.py")])
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    assert "#!/usr/bin/env python3" not in result.new_files["helpers.py"]
+
+
+def test_generate_shebang_preserved_in_original_when_entity_migrated():
+    # When the entity owning line 1 (with shebang comment) is migrated,
+    # the shebang must be restored at the top of the original file.
+    source = "#!/usr/bin/env python3\ndef foo():\n    pass\n\ndef bar():\n    pass\n"
+    e_foo = Entity(EntityKind.FUNCTION, "foo", 1, 3, ["foo"])
+    e_bar = Entity(EntityKind.FUNCTION, "bar", 5, 6, ["bar"])
+    c = _classified(entities=[e_foo, e_bar])
+    plan = _plan([GroupPlacement(group=["foo"], target_file="helpers.py")])
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    assert result.original_source.startswith("#!/usr/bin/env python3\n")
+    assert "#!/usr/bin/env python3" not in result.new_files["helpers.py"]
+
+
+def test_generate_shebang_preserved_when_not_migrated():
+    # When the shebang entity stays in the original, shebang remains at top.
+    source = "#!/usr/bin/env python3\ndef foo():\n    pass\n\ndef bar():\n    pass\n"
+    e_foo = Entity(EntityKind.FUNCTION, "foo", 1, 3, ["foo"])
+    e_bar = Entity(EntityKind.FUNCTION, "bar", 5, 6, ["bar"])
+    c = _classified(entities=[e_foo, e_bar])
+    plan = _plan([GroupPlacement(group=["bar"], target_file="helpers.py")])
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    assert result.original_source.startswith("#!/usr/bin/env python3\n")
+
+
+# ---------------------------------------------------------------------------
+# generate_file_splits — __main__ sticky behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_generate_main_block_stays_in_original():
+    source = textwrap.dedent(
+        """\
+        def run():
+            pass
+
+        def other():
+            pass
+
+        if __name__ == "__main__":
+            run()
+        """
+    )
+    e_run = Entity(EntityKind.FUNCTION, "run", 1, 2, ["run"])
+    e_other = Entity(EntityKind.FUNCTION, "other", 4, 5, ["other"])
+    e_main = Entity(EntityKind.TOP_LEVEL, "_block_7", 7, 8, [])
+    c = _classified(entities=[e_run, e_other, e_main])
+    # Plan tries to migrate run + __main__ block and other.
+    plan = _plan(
+        [
+            GroupPlacement(group=["run", "_block_7"], target_file="helpers.py"),
+            GroupPlacement(group=["other"], target_file="helpers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    # __main__ block stays in original.
+    assert 'if __name__ == "__main__"' in result.original_source
+    assert 'if __name__ == "__main__"' not in result.new_files.get("helpers.py", "")
+
+
+def test_generate_main_callee_stays_in_original():
+    source = textwrap.dedent(
+        """\
+        def run():
+            pass
+
+        def other():
+            pass
+
+        if __name__ == "__main__":
+            run()
+        """
+    )
+    e_run = Entity(EntityKind.FUNCTION, "run", 1, 2, ["run"])
+    e_other = Entity(EntityKind.FUNCTION, "other", 4, 5, ["other"])
+    e_main = Entity(EntityKind.TOP_LEVEL, "_block_7", 7, 8, [])
+    c = _classified(entities=[e_run, e_other, e_main])
+    # Plan tries to migrate run (the direct callee of __main__).
+    plan = _plan(
+        [
+            GroupPlacement(group=["run"], target_file="helpers.py"),
+            GroupPlacement(group=["other"], target_file="helpers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    # run() is a direct __main__ callee — must stay in original.
+    assert "def run():" in result.original_source
+    # other() is not a callee — may be migrated.
+    assert "helpers.py" in result.new_files
+
+
+# ---------------------------------------------------------------------------
+# generate_file_splits — test-named symbol inline imports
+# ---------------------------------------------------------------------------
+
+
+def test_generate_test_named_cross_import_inlined():
+    # TestHelper migrates to helpers.py; runner stays in original and
+    # references TestHelper — the import must be injected inside runner's body.
+    source = textwrap.dedent(
+        """\
+        class TestHelper:
+            def test_x(self):
+                pass
+
+        def runner():
+            TestHelper()
+        """
+    )
+    e_cls = Entity(EntityKind.CLASS, "TestHelper", 1, 3, ["TestHelper"])
+    e_run = Entity(EntityKind.FUNCTION, "runner", 5, 6, ["runner"])
+    c = _classified(entities=[e_cls, e_run])
+    plan = _plan([GroupPlacement(group=["TestHelper"], target_file="helpers.py")])
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    orig = result.original_source
+    # No module-level re-export of TestHelper.
+    lines = orig.splitlines()
+    top_level_import_lines = [
+        ln for ln in lines if ln.startswith("from") and "TestHelper" in ln
+    ]
+    assert top_level_import_lines == []
+    # Import appears inside runner's body.
+    assert "    from .helpers import TestHelper" in orig
+
+
+def test_generate_test_named_inline_not_applied_to_toplevel_entity():
+    # A TOP_LEVEL entity referencing a test-named symbol falls back to
+    # module-level import since it has no body scope to inject into.
+    source = textwrap.dedent(
+        """\
+        class TestHelper:
+            def test_x(self):
+                pass
+
+        _inst = TestHelper()
+        """
+    )
+    e_cls = Entity(EntityKind.CLASS, "TestHelper", 1, 3, ["TestHelper"])
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_5", 5, 5, ["_inst"])
+    c = _classified(entities=[e_cls, e_block])
+    plan = _plan(
+        [GroupPlacement(group=["TestHelper", "_block_5"], target_file="helpers.py")]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    # TestHelper and _block_5 were migrated together — no cross-file issue here.
+    # Test just ensures no crash and the file is produced.
+    assert "helpers.py" in result.new_files
+
+
+def test_generate_test_named_inlined_in_function_in_new_file():
+    # TestA goes to file_a.py; func_b (which calls TestA) goes to file_b.py.
+    # The cross-file import of TestA into file_b.py should be injected inline
+    # inside func_b's body rather than at the top of file_b.py.
+    source = textwrap.dedent(
+        """\
+        class TestA:
+            def test_x(self):
+                pass
+
+        def func_b():
+            TestA()
+        """
+    )
+    e_a = Entity(EntityKind.CLASS, "TestA", 1, 3, ["TestA"])
+    e_b = Entity(EntityKind.FUNCTION, "func_b", 5, 6, ["func_b"])
+    c = _classified(entities=[e_a, e_b])
+    plan = _plan(
+        [
+            GroupPlacement(group=["TestA"], target_file="file_a.py"),
+            GroupPlacement(group=["func_b"], target_file="file_b.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    file_b = result.new_files["file_b.py"]
+    lines = file_b.splitlines()
+    # No module-level import of TestA.
+    assert not any(ln.startswith("from") and "TestA" in ln for ln in lines)
+    # Inline import inside func_b.
+    assert "    from .file_a import TestA" in file_b
+
+
+def test_generate_toplevel_entity_in_new_file_test_import_falls_back_to_module_level():
+    # A TOP_LEVEL entity in a new file that references a test-named symbol
+    # from another new file: no function body to inject into, falls back to
+    # module-level import.  Two TOP_LEVEL entities referencing the same
+    # test name exercise the dedup path on the second.
+    source = textwrap.dedent(
+        """\
+        class TestA:
+            def test_x(self):
+                pass
+
+        _inst1 = TestA()
+
+        def _sep():
+            pass
+
+        _inst2 = TestA()
+        """
+    )
+    e_a = Entity(EntityKind.CLASS, "TestA", 1, 3, ["TestA"])
+    e_b1 = Entity(EntityKind.TOP_LEVEL, "_block_5", 5, 5, ["_inst1"])
+    e_sep = Entity(EntityKind.FUNCTION, "_sep", 7, 8, ["_sep"])
+    e_b2 = Entity(EntityKind.TOP_LEVEL, "_block_10", 10, 10, ["_inst2"])
+    c = _classified(entities=[e_a, e_b1, e_sep, e_b2])
+    plan = _plan(
+        [
+            GroupPlacement(group=["TestA"], target_file="file_a.py"),
+            GroupPlacement(
+                group=["_block_5", "_sep", "_block_10"], target_file="file_b.py"
+            ),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    file_b = result.new_files["file_b.py"]
+    # Module-level import is acceptable for TOP_LEVEL entities (no body scope).
+    assert "TestA" in file_b
+    # Dedup: the same import appears only once despite two TOP_LEVEL entities
+    # both referencing TestA.
+    assert file_b.count("import TestA") == 1
+
+
+def test_generate_cross_import_dedup_across_entities():
+    # helper goes to helpers.py; foo and bar both go to workers.py and both
+    # reference helper — the cross-file import should appear once (dedup).
+    source = textwrap.dedent(
+        """\
+        def helper():
+            pass
+
+        def foo():
+            helper()
+
+        def bar():
+            helper()
+        """
+    )
+    e_h = Entity(EntityKind.FUNCTION, "helper", 1, 2, ["helper"])
+    e_foo = Entity(EntityKind.FUNCTION, "foo", 4, 5, ["foo"])
+    e_bar = Entity(EntityKind.FUNCTION, "bar", 7, 8, ["bar"])
+    c = _classified(entities=[e_h, e_foo, e_bar])
+    plan = _plan(
+        [
+            GroupPlacement(group=["helper"], target_file="helpers.py"),
+            GroupPlacement(group=["foo", "bar"], target_file="workers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    workers = result.new_files["workers.py"]
+    # "from .helpers import helper" should appear exactly once.
+    assert workers.count("import helper") == 1
