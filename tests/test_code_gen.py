@@ -2500,6 +2500,28 @@ def test_generate_file_splits_subdir_name_cross_file_uses_relative():
     assert "from .helpers import helper" in test_src
 
 
+def test_generate_file_splits_test_subdir_nonmigrated_imports_from_original():
+    # Non-migrated names (e.g. module-level constants) stay in the original
+    # test file, not in __init__.py.  A new subfile that references them should
+    # get "from ..test_svc import _CONFIG", not "from . import _CONFIG".
+    source = "_CONFIG = 'val'\n\ndef test_fn():\n    return _CONFIG\n"
+    # Use TOP_LEVEL kind so _extract_shared_helpers does not pull _CONFIG into
+    # the new file (it only extracts FUNCTION/CLASS entities).
+    e_config = Entity(EntityKind.TOP_LEVEL, "_CONFIG", 1, 1, ["_CONFIG"])
+    e_test = _make_entity("test_fn", 3, 4)
+    c = _classified(entities=[e_config, e_test])
+    plan = _plan([GroupPlacement(group=["test_fn"], target_file="svc/test_fns.py")])
+
+    result = generate_file_splits(
+        c, plan, source, "tests/test_svc.py", subdir_name="svc"
+    )
+
+    assert not result.abort
+    test_src = result.new_files["svc/test_fns.py"]
+    assert "from ..test_svc import _CONFIG" in test_src
+    assert "from . import _CONFIG" not in test_src
+
+
 # ---------------------------------------------------------------------------
 # _bump_relative_imports
 # ---------------------------------------------------------------------------

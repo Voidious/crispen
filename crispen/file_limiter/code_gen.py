@@ -1322,6 +1322,15 @@ def generate_file_splits(
     original_basename = (
         f"{subdir_name}/__init__.py" if subdir_name else Path(original_path).name
     )
+    is_test_file = Path(original_path).name.startswith("test_")
+    # For test-file subdir splits the original test file stays on disk (runner.py
+    # does not redirect it to __init__.py), so non-migrated names still live in
+    # the original file (e.g. "test_runner.py"), not in the package __init__.py.
+    non_migrated_home = (
+        Path(original_path).name
+        if (subdir_name and is_test_file)
+        else original_basename
+    )
     # Identify the __main__ block and any functions it calls directly.
     # These stay in the original file unconditionally: the __main__ block
     # is an entry point the user expects to keep working, and its direct
@@ -1401,7 +1410,7 @@ def generate_file_splits(
         if entity.name not in migrated_names:
             for defined_name in entity.names_defined:
                 if defined_name not in import_defined_names:
-                    name_to_target_file.setdefault(defined_name, original_basename)
+                    name_to_target_file.setdefault(defined_name, non_migrated_home)
 
     # Extract non-migrated FUNCTION/CLASS entities referenced by migrated ones
     # into the new files that use them, breaking O→F→O import cycles.
@@ -1412,7 +1421,7 @@ def generate_file_splits(
         classified,
         name_to_target_file,
         migrated_names,
-        original_basename,
+        non_migrated_home,
     )
 
     # Collect names that external files (outside the module being split) import
@@ -1561,7 +1570,6 @@ def generate_file_splits(
     # import prefixes computed from inside the package (e.g. ".utils" not
     # ".service.utils").  For test files the original keeps existing abs_pkg
     # behaviour so pytest can find the re-exported symbols.
-    is_test_file = Path(original_path).name.startswith("test_")
     # In a non-test subdir split the updated source becomes subdir/__init__.py,
     # which sits one directory level deeper than the original file.  Any
     # relative imports it still contains (e.g. ``from .. import llm_client``
