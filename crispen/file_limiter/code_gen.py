@@ -391,6 +391,26 @@ def _collect_external_imported_names(original_path: str) -> Set[str]:
     return result
 
 
+def _class_has_test_methods(entity_src: str) -> bool:
+    """Return True if *entity_src* defines a class with any ``test_`` methods.
+
+    Used to suppress re-exports of test classes: pytest discovers test classes
+    by scanning the filesystem, so re-exporting them from the original file
+    causes every test inside to run twice.
+    """
+    try:
+        tree = ast.parse(entity_src)
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if item.name.startswith("test_"):
+                        return True
+    return False
+
+
 def _add_re_exports(
     source: str,
     placements: List[GroupPlacement],
@@ -449,11 +469,15 @@ def _add_re_exports(
                     defined = [n for n in defined if n not in skip]
             else:
                 defined = [entity_name]
+            is_test_class = entity_name in entity_map and _class_has_test_methods(
+                entity_source_map.get(entity_name, "")
+            )
             for defined_name in defined:
                 if (
                     (
                         not defined_name.startswith("_")
                         and not defined_name.startswith("test_")
+                        and not is_test_class
                     )
                     or defined_name in still_loaded
                     or (defined_name.startswith("_") and defined_name in external_loads)

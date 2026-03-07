@@ -11,6 +11,7 @@ from crispen.file_limiter.code_gen import (
     _abs_package_for_dir,
     _add_re_exports,
     _bump_relative_imports,
+    _class_has_test_methods,
     _collect_external_imported_names,
     _collect_name_loads,
     _extract_import_info,
@@ -435,6 +436,46 @@ def test_add_re_exports_test_function_re_exported_when_referenced():
     placement = GroupPlacement(group=["test_something"], target_file="tests/helpers.py")
     result = _add_re_exports(source, [placement], {"test_something": entity}, {})
     assert "from .tests.helpers import test_something" in result
+
+
+def test_class_has_test_methods_true():
+    src = "class TestFoo:\n    def test_bar(self): pass\n"
+    assert _class_has_test_methods(src) is True
+
+
+def test_class_has_test_methods_false():
+    src = "class Helper:\n    def run(self): pass\n"
+    assert _class_has_test_methods(src) is False
+
+
+def test_class_has_test_methods_syntax_error():
+    assert _class_has_test_methods("def (") is False
+
+
+def test_add_re_exports_test_class_not_re_exported():
+    # A class that contains test_ methods must not be re-exported — pytest
+    # would discover it via the original file and the new file, running every
+    # test twice.
+    source = "import os\n"
+    entity = Entity(EntityKind.CLASS, "TestFoo", 1, 5, ["TestFoo"])
+    entity_src = "class TestFoo:\n    def test_bar(self): pass\n"
+    placement = GroupPlacement(group=["TestFoo"], target_file="tests/helpers.py")
+    result = _add_re_exports(
+        source, [placement], {"TestFoo": entity}, {"TestFoo": entity_src}
+    )
+    assert result == source
+
+
+def test_add_re_exports_test_class_re_exported_when_referenced():
+    # If the class name is still loaded in the remaining source, re-import it.
+    source = "import os\n\nTestFoo()\n"
+    entity = Entity(EntityKind.CLASS, "TestFoo", 1, 5, ["TestFoo"])
+    entity_src = "class TestFoo:\n    def test_bar(self): pass\n"
+    placement = GroupPlacement(group=["TestFoo"], target_file="tests/helpers.py")
+    result = _add_re_exports(
+        source, [placement], {"TestFoo": entity}, {"TestFoo": entity_src}
+    )
+    assert "from .tests.helpers import TestFoo" in result
 
 
 def test_add_re_exports_top_level_block_private_names_referenced():
