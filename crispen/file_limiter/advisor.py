@@ -38,6 +38,7 @@ class FileLimiterPlan:
     abort: bool
     abort_reason: str = ""  # human-readable explanation when abort=True
     llm_calls: int = 0  # number of LLM API calls made during planning
+    original_target_files: int = 0  # computed target file count (before bonus)
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +828,7 @@ def _assign_placements(
     verbose: bool = False,
     _counter: Optional[List[int]] = None,
     subdir_name: Optional[str] = None,
+    target_files: int = 2,
 ) -> Optional[List[GroupPlacement]]:
     """Ask the LLM to assign filenames to each group. Returns None on failure.
 
@@ -846,17 +848,6 @@ def _assign_placements(
     groups each, each with its own retry budget.  If any chunk fails all its
     attempts, ``None`` is returned immediately.
     """
-    entity_map = {e.name: e for e in classified.entities}
-    total_lines = sum(
-        entity_map[name].end_line - entity_map[name].start_line + 1
-        for group in groups_to_place
-        for name in group
-        if name in entity_map
-    )
-    target_files = (
-        max(2, -(-(2 * total_lines) // config.max_file_lines)) if total_lines > 0 else 2
-    )
-
     # Step 1: Propose output file set.
     proposed_files: Optional[List[Tuple[str, str]]] = None
     prev_propose_failure = ""
@@ -1018,6 +1009,7 @@ def advise_file_limiter(
     prev_placement_failure: str = "",
     verbose: bool = False,
     subdir_name: Optional[str] = None,
+    target_files_bonus: int = 0,
 ) -> FileLimiterPlan:
     """Ask the LLM to plan entity placement across new files.
 
@@ -1074,6 +1066,18 @@ def advise_file_limiter(
             llm_calls=counter[0],
         )
 
+    entity_map = {e.name: e for e in classified.entities}
+    total_lines = sum(
+        entity_map[name].end_line - entity_map[name].start_line + 1
+        for group in groups_to_place
+        for name in group
+        if name in entity_map
+    )
+    original_target = (
+        max(2, -(-(2 * total_lines) // config.max_file_lines)) if total_lines > 0 else 2
+    )
+    effective_target = original_target + target_files_bonus
+
     placements = _assign_placements(
         groups_to_place,
         classified,
@@ -1085,6 +1089,7 @@ def advise_file_limiter(
         verbose=verbose,
         _counter=counter,
         subdir_name=subdir_name,
+        target_files=effective_target,
     )
     if placements is None:
         return FileLimiterPlan(
@@ -1100,4 +1105,5 @@ def advise_file_limiter(
         placements=placements,
         abort=False,
         llm_calls=counter[0],
+        original_target_files=original_target,
     )

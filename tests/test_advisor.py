@@ -155,6 +155,59 @@ def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
 
 
 # ---------------------------------------------------------------------------
+# original_target_files and target_files_bonus
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_plan_original_target_files_set(mock_key, mock_client, mock_call):
+    """original_target_files is set in the returned plan."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": 0, "target_file": "utils.py"}]},
+    ]
+    # foo spans 10 lines → total_lines=10, original_target = max(2, ceil(20/1000)) = 2.
+    c = _classified(
+        entities=[_make_entity("foo", 1, 10)],
+        set_2_groups=[["foo"]],
+    )
+    plan = advise_file_limiter(c, "src/big.py", _CONFIG)
+
+    assert plan.abort is False
+    assert plan.original_target_files == 2
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_plan_target_files_bonus_added_to_propose_prompt(
+    mock_key, mock_client, mock_call
+):
+    """target_files_bonus is added to the computed target in the propose prompt."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    mock_call.side_effect = [
+        _propose_ok("utils.py"),
+        {"placements": [{"group_id": 0, "target_file": "utils.py"}]},
+    ]
+    c = _classified(
+        entities=[_make_entity("foo", 1, 10)],
+        set_2_groups=[["foo"]],
+    )
+    # original_target=2, bonus=3 → effective_target=5.
+    advise_file_limiter(c, "src/big.py", _CONFIG, target_files_bonus=3)
+
+    # First call is the propose step — its messages content must mention 5.
+    propose_messages = mock_call.call_args_list[0].args[6]  # messages arg
+    propose_content = propose_messages[0]["content"]
+    assert "approximately 5 output file(s)" in propose_content
+
+
+# ---------------------------------------------------------------------------
 # Set 3 — stay and migrate paths
 # ---------------------------------------------------------------------------
 
