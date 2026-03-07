@@ -1323,6 +1323,25 @@ def test_runner_subdir_split_dir_exists_aborts(mock_classify, tmp_path):
 
 
 @patch(_PATCH_CLASSIFY)
+def test_runner_subdir_split_sibling_py_aborts(mock_classify, tmp_path):
+    mock_classify.return_value = _make_classified()
+    # Create a sibling 'service.py' alongside the source file — the intended
+    # subdirectory 'service/' would shadow it.
+    (tmp_path / "service.py").write_text("# helper\n")
+    filepath = str(tmp_path / "test_service.py")
+
+    source = "def test_foo():\n    pass\n"
+    # Whole-file diff: ranges cover all 2 lines.
+    cfg = CrispenConfig(file_limiter_subdir_split=True)
+    result = run_file_limiter(filepath, source, source, [(1, 2)], cfg)
+
+    assert result.abort is True
+    assert result.new_files == {}
+    assert any("shadow" in m for m in result.messages)
+    assert any("service/" in m for m in result.messages)
+
+
+@patch(_PATCH_CLASSIFY)
 def test_runner_subdir_split_disabled(mock_classify, tmp_path):
     # file_limiter_subdir_split=False — subdir detection is skipped entirely.
     mock_classify.return_value = ClassifiedEntities(

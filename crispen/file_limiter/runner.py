@@ -291,6 +291,17 @@ def run_file_limiter(
                     ],
                     abort=True,
                 )
+            sibling_py = source_dir / f"{subdir_name}.py"
+            if sibling_py.exists():
+                return FileLimiterResult(
+                    original_source=post_source,
+                    new_files={},
+                    messages=[
+                        f"SKIP {filepath} (FileLimiter): target subdirectory"
+                        f" '{subdir_name}/' would shadow existing '{subdir_name}.py'"
+                    ],
+                    abort=True,
+                )
             # Brand-new directory: no pre-existing files or dirs to conflict with.
             existing_files = frozenset()
             existing_dirs = frozenset()
