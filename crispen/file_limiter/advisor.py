@@ -38,7 +38,6 @@ class FileLimiterPlan:
     abort: bool
     abort_reason: str = ""  # human-readable explanation when abort=True
     llm_calls: int = 0  # number of LLM API calls made during planning
-    original_target_files: int = 0  # computed target file count (before bonus)
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +535,10 @@ def _assign_placements_chunk(
             f"{exclude_section}"
         )
 
+    content += (
+        "\n\nAvoid creating circular dependencies between output files — "
+        "assignments will be validated and retried if circular imports are detected."
+    )
     mermaid_text = _build_group_mermaid(chunk, classified)
     if mermaid_text:
         content += f"\n\nDependency graph between groups:\n{mermaid_text}"
@@ -1009,7 +1012,6 @@ def advise_file_limiter(
     prev_placement_failure: str = "",
     verbose: bool = False,
     subdir_name: Optional[str] = None,
-    target_files_bonus: int = 0,
 ) -> FileLimiterPlan:
     """Ask the LLM to plan entity placement across new files.
 
@@ -1076,8 +1078,6 @@ def advise_file_limiter(
     original_target = (
         max(2, -(-(2 * total_lines) // config.max_file_lines)) if total_lines > 0 else 2
     )
-    effective_target = original_target + target_files_bonus
-
     placements = _assign_placements(
         groups_to_place,
         classified,
@@ -1089,7 +1089,7 @@ def advise_file_limiter(
         verbose=verbose,
         _counter=counter,
         subdir_name=subdir_name,
-        target_files=effective_target,
+        target_files=original_target,
     )
     if placements is None:
         return FileLimiterPlan(
@@ -1105,5 +1105,4 @@ def advise_file_limiter(
         placements=placements,
         abort=False,
         llm_calls=counter[0],
-        original_target_files=original_target,
     )

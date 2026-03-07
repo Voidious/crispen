@@ -366,10 +366,6 @@ def run_file_limiter(
     total_llm_calls: int = 0
     # Mutable counter shared with resolve_naming_conflicts LLM calls.
     resolve_counter: List[int] = [0]
-    # Target-file-count bonus: increases by 25% of original (min 1) on each
-    # circular-import retry so the LLM is nudged toward finer splits.
-    circular_target_bonus: int = 0
-    original_target_files: int = 0  # captured from first successful plan
 
     for _attempt in range(max_attempts):
         plan = advise_file_limiter(
@@ -381,7 +377,6 @@ def run_file_limiter(
             prev_placement_failure=prev_placement_failure,
             verbose=verbose,
             subdir_name=subdir_name,
-            target_files_bonus=circular_target_bonus,
         )
         total_llm_calls += plan.llm_calls
 
@@ -496,9 +491,6 @@ def run_file_limiter(
                 )
                 continue
 
-        if original_target_files == 0 and plan.original_target_files > 0:
-            original_target_files = plan.original_target_files
-
         split = generate_file_splits(
             classified,
             plan,
@@ -521,8 +513,6 @@ def run_file_limiter(
                 f"Your previous assignments ({prev_assignments}) caused circular "
                 "file imports. Please choose different target filenames."
             )
-            per_step = max(1, round(0.25 * max(original_target_files, 2)))
-            circular_target_bonus += per_step
             continue
 
         # Success — keep retry_msgs so callers can see which attempts failed.
