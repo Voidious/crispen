@@ -145,18 +145,21 @@ def _find_needed_imports(
     return needed
 
 
-def _bump_relative_imports(source: str) -> str:
-    """Increment the level of every relative import in *source* by one.
+def _bump_relative_imports(source: str, n: int = 1) -> str:
+    """Increment the level of every relative import in *source* by *n*.
 
-    Used when file content is moved one directory level deeper, e.g. when the
+    Used when file content is moved directory levels deeper, e.g. when the
     source originally written for ``pkg/module.py`` becomes the content of
     ``pkg/module/__init__.py``, or when new files go into a subdirectory
     package instead of sitting next to the original file.
 
-    ``from .foo`` → ``from ..foo``, ``from ..bar`` → ``from ...bar``, etc.
+    With n=1: ``from .foo`` → ``from ..foo``, ``from ..bar`` → ``from ...bar``.
+    With n=2: ``from .foo`` → ``from ...foo``, etc.
     Absolute imports are not affected.
     """
-    return _REL_IMPORT_RE.sub(lambda m: f"from .{m.group(1)}", source)
+    for _ in range(n):
+        source = _REL_IMPORT_RE.sub(lambda m: f"from .{m.group(1)}", source)
+    return source
 
 
 def _relative_import_prefix(from_file: str, to_file: str) -> str:
@@ -1076,7 +1079,8 @@ def generate_file_splits(
             ent_names, entity_source_map, import_infos, all_entity_names
         )
         if subdir_name is not None:
-            needed = [_bump_relative_imports(s) for s in needed]
+            depth = len(Path(target_file).parts) - 1
+            needed = [_bump_relative_imports(s, depth) for s in needed]
         cross = _find_cross_file_imports(
             ent_names,
             entity_source_map,

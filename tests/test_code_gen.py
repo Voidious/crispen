@@ -2370,6 +2370,15 @@ def test_bump_relative_imports_multiline():
     assert "import sys" in result
 
 
+def test_bump_relative_imports_n_two():
+    assert _bump_relative_imports("from .. import foo", n=2) == "from .... import foo"
+
+
+def test_bump_relative_imports_n_zero():
+    src = "from .foo import bar"
+    assert _bump_relative_imports(src, n=0) == src
+
+
 # generate_file_splits — subdir_name bumps relative imports
 
 
@@ -2413,6 +2422,26 @@ def test_generate_file_splits_subdir_bumps_init_imports():
     assert "from ..base import Base" in init_src
     assert "from .. import llm_client" not in init_src
     assert "from .base import Base" not in init_src
+
+
+def test_generate_file_splits_subdir_bumps_two_levels_deep():
+    # When the LLM places a new file two directories deep (e.g.
+    # "pkg/pkg/core.py"), relative imports must be bumped by 2 dots, not 1.
+    # This matches the real-world scenario where subdir_name="pkg" but the
+    # advisor proposes "pkg/pkg/core.py" as a target.
+    source = "from .. import llm_client\n\ndef func():\n    return llm_client\n"
+    e_func = _make_entity("func", 3, 4)
+    c = _classified(entities=[e_func])
+    plan = _plan([GroupPlacement(group=["func"], target_file="pkg/pkg/core.py")])
+
+    result = generate_file_splits(c, plan, source, "pkg.py", subdir_name="pkg")
+
+    assert not result.abort
+    core_src = result.new_files["pkg/pkg/core.py"]
+    # 2 levels deep → original ".." becomes "...." (4 dots)
+    assert "from .... import llm_client" in core_src
+    assert "from .. import llm_client" not in core_src
+    assert "from ... import llm_client" not in core_src
 
 
 # ---------------------------------------------------------------------------
