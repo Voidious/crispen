@@ -1,0 +1,461 @@
+from __future__ import annotations
+import textwrap
+from unittest.mock import patch
+import libcst as cst
+import pytest
+from crispen.refactors.function_splitter import (
+    _ApiTimeout,
+    _has_nested_funcdef,
+    _has_yield,
+    _run_with_timeout,
+    FunctionSplitter,
+)
+from .test_function_analysis import _make_long_func
+from .test_parsing_and_helpers import _make_mock_response
+
+
+def test_has_yield_simple():
+    src = "def gen():\n    yield 1\n"
+    func = cst.parse_module(src).body[0]
+    assert _has_yield(func) is True
+
+
+def test_has_yield_from():
+    src = "def gen():\n    yield from [1, 2]\n"
+    func = cst.parse_module(src).body[0]
+    assert _has_yield(func) is True
+
+
+def test_has_yield_none():
+    src = "def foo():\n    return 1\n"
+    func = cst.parse_module(src).body[0]
+    assert _has_yield(func) is False
+
+
+def test_has_yield_nested_not_counted():
+    src = textwrap.dedent(
+        """\
+        def foo():
+            def inner():
+                yield 1
+            return inner
+    """
+    )
+    func = cst.parse_module(src).body[0]
+    # yield is inside nested function, should not count
+    assert _has_yield(func) is False
+
+
+def test_has_nested_funcdef_with_nested():
+    src = textwrap.dedent(
+        """\
+        def outer():
+            x = 1
+            def inner():
+                return x
+            return inner
+    """
+    )
+    func = cst.parse_module(src).body[0]
+    assert _has_nested_funcdef(func) is True
+
+
+def test_has_nested_funcdef_without_nested():
+    src = "def foo():\n    x = 1\n    return x\n"
+    func = cst.parse_module(src).body[0]
+    assert _has_nested_funcdef(func) is False
+
+
+def test_has_nested_funcdef_first_stmt():
+    # Nested funcdef is the very first statement in the body
+    src = textwrap.dedent(
+        """\
+        def outer():
+            def inner():
+                pass
+            return inner()
+    """
+    )
+    func = cst.parse_module(src).body[0]
+    assert _has_nested_funcdef(func) is True
+
+
+def test_run_with_timeout_success():
+    result = _run_with_timeout(lambda x: x * 2, 5, 21)
+    assert result == 42
+
+
+def test_run_with_timeout_exceeds():
+    import time
+
+    with pytest.raises(_ApiTimeout):
+        _run_with_timeout(lambda: time.sleep(10), timeout=0.05)
+
+
+def test_function_splitter_under_limits_no_op():
+    # A small function should not be split
+    src = "def small():\n    x = 1\n    return x\n"
+    splitter = FunctionSplitter([(1, 10)], source=src, verbose=False)
+    assert splitter.get_rewritten_source() is None
+
+
+def test_function_splitter_parse_error_no_crash():
+    # Invalid source should not crash
+    splitter = FunctionSplitter([(1, 10)], source="def f(\n  !!invalid", verbose=False)
+    assert splitter.get_rewritten_source() is None
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_over_line_limit(mock_anthropic):
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["process_tail"])
+    )
+    src = _make_long_func(80)
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)],
+            source=src,
+            verbose=False,
+            max_lines=50,
+        )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    compile(result, "<test>", "exec")
+    assert "_process_tail" in result
+    assert "return _process_tail(" in result
+    assert len(splitter.changes_made) >= 1
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_nested_funcdef_not_split(mock_anthropic):
+    # A long function containing a nested funcdef should never be split,
+    # even if it far exceeds the line limit.  Splitting across a closure
+    # boundary produces cascading re-splits and semantically fragile helpers.
+    lines = ["def func_with_closure():\n"]
+    for i in range(80):
+        lines.append(f"    a{i} = {i}\n")
+    lines.append("    def inner():\n")
+    lines.append("        return 0\n")
+    lines.append("    return inner()\n")
+    src = "".join(lines)
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=10
+        )
+
+    assert splitter.get_rewritten_source() is None
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_async_skipped(mock_anthropic):
+    # Async functions should not be split
+    src = (
+        "async def foo():\n"
+        + "".join(f"    a{i} = {i}\n" for i in range(80))
+        + "    return 0\n"
+    )
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=10
+        )
+
+    assert splitter.get_rewritten_source() is None
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_generator_skipped(mock_anthropic):
+    # Generator functions should not be split
+    src = (
+        "def gen():\n"
+        + "".join(f"    a{i} = {i}\n" for i in range(80))
+        + "    yield 0\n"
+    )
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=10
+        )
+
+    assert splitter.get_rewritten_source() is None
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_llm_fallback_on_api_error(mock_anthropic):
+    # API key not set → get_api_key raises CrispenAPIError → fallback names used
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["tail"])
+    )
+    src = _make_long_func(60, "my_func")
+
+    # No ANTHROPIC_API_KEY → get_api_key raises → fallback to "my_func_helper"
+    with patch.dict("os.environ", {}, clear=True):
+        # Remove any existing API key
+        import os
+
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=30
+        )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    compile(result, "<test>", "exec")
+    # Fallback name used: "my_func_helper"
+    assert "_my_func_helper" in result
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_recursive_split(mock_anthropic):
+    # With small max_lines and broad changed_ranges, triggers multiple iterations
+    # First call names helper for first function, second call for helper
+    mock_anthropic.Anthropic.return_value.messages.create.side_effect = [
+        _make_mock_response(["part1"]),
+        _make_mock_response(["part2"]),
+        _make_mock_response(["part3"]),
+    ]
+
+    # 13 body statements → with max_lines=5, needs multiple splits
+    src = _make_long_func(13, "func")
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)],  # broad range covers all helpers too
+            source=src,
+            verbose=False,
+            max_lines=5,
+        )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    compile(result, "<test>", "exec")
+    # Multiple splits occurred
+    assert len(splitter.changes_made) >= 2
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_syntax_error_in_output_is_skipped(mock_anthropic):
+    # If the assembled edit is invalid Python, the change is not applied
+    # We simulate this by making _generate_call return something invalid
+    # Instead, test the path via a function with 1-stmt body (no valid split)
+    src = "def foo():\n    x = 1\n"  # only 1 stmt → can't split
+    splitter = FunctionSplitter([(1, 10)], source=src, verbose=False, max_lines=0)
+    # body lines=1 > 0=max_lines → tries to split but len(body_stmts)=1 < 2 → skip
+    assert splitter.get_rewritten_source() is None
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_no_valid_split_skipped(mock_anthropic):
+    # max_lines=1 → even a head with 1 stmt (+return call=2) > max_lines=1
+    # So no valid splits → no change
+    src = _make_long_func(5, "foo")
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter([(1, 1000)], source=src, verbose=False, max_lines=1)
+
+    assert splitter.get_rewritten_source() is None
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_with_helper_docstrings(mock_anthropic):
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["process"])
+    )
+    src = _make_long_func(80)
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)],
+            source=src,
+            verbose=False,
+            max_lines=50,
+            helper_docstrings=True,
+        )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    assert '"""' in result
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_class_method(mock_anthropic):
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["tail_work"])
+    )
+    lines = ["class Foo:\n", "    def method(self):\n"]
+    for i in range(80):
+        lines.append(f"        a{i} = {i}\n")
+    lines.append("        return 0\n")
+    src = "".join(lines)
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)],
+            source=src,
+            verbose=False,
+            max_lines=50,
+        )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    compile(result, "<test>", "exec")
+    # Class methods use staticmethod and ClassName._ call
+    assert "@staticmethod" in result
+    assert "Foo._tail_work(" in result
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_llm_timeout_fallback(mock_anthropic):
+    # LLM call times out → fallback names
+
+    mock_anthropic.Anthropic.return_value.messages.create.side_effect = _ApiTimeout(
+        "timed out"
+    )
+    src = _make_long_func(60, "slow_func")
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)],
+            source=src,
+            verbose=False,
+            max_lines=30,
+        )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    compile(result, "<test>", "exec")
+    # Fallback name "slow_func_helper" used
+    assert "_slow_func_helper" in result
+
+
+def test_function_splitter_empty_source():
+    """FunctionSplitter created with no source does nothing."""
+    splitter = FunctionSplitter([(1, 10)])
+    assert splitter.get_rewritten_source() is None
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_max_iterations_loop_exhausted(mock_anthropic):
+    """Loop runs to completion (no break) when max iterations reached."""
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["helper"])
+    )
+    src = _make_long_func(80, "foo")
+
+    # Patch _MAX_SPLIT_ITERATIONS to 1 → loop runs exactly once without breaking
+    # (break only occurs at START of next iteration when tasks=[])
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        with patch("crispen.refactors.function_splitter._MAX_SPLIT_ITERATIONS", 1):
+            splitter = FunctionSplitter(
+                [(1, 1000)], source=src, verbose=False, max_lines=50
+            )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    assert len(splitter.changes_made) == 1
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_syntax_error_in_generated_output(mock_anthropic):
+    """If assembled output fails compile(), the change is not applied."""
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["helper"])
+    )
+    src = _make_long_func(80, "foo")
+
+    import builtins as _builtins
+
+    orig_compile = _builtins.compile
+
+    def _selective_compile(source, filename, mode, *args, **kwargs):
+        if filename == "<string>":
+            raise SyntaxError("mocked error for test")
+        return orig_compile(source, filename, mode, *args, **kwargs)
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        with patch("builtins.compile", side_effect=_selective_compile):
+            splitter = FunctionSplitter(
+                [(1, 1000)], source=src, verbose=False, max_lines=50
+            )
+
+    assert splitter.get_rewritten_source() is None
+
+
+@patch(
+    "crispen.refactors.function_splitter._has_new_undefined_names", return_value=True
+)
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_pyflakes_rejects_output(mock_anthropic, mock_has_undef):
+    """If pyflakes detects new undefined names in output, the split is not applied."""
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["helper"])
+    )
+    src = _make_long_func(80, "foo")
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=50
+        )
+
+    # Pyflakes check returned True → split not applied
+    assert splitter.get_rewritten_source() is None
+
+
+def test_engine_includes_function_splitter_no_op(tmp_path):
+    """FunctionSplitter is in _REFACTORS and runs without error for simple files."""
+    from crispen.engine import run_engine
+    from crispen.config import CrispenConfig
+
+    py_file = tmp_path / "sample.py"
+    py_file.write_text("def foo():\n    return 1\n")
+    config = CrispenConfig(max_function_length=75)
+    msgs = list(run_engine({str(py_file): [(1, 2)]}, verbose=False, config=config))
+    # No split needed — no messages expected (or just no errors)
+    assert all("FunctionSplitter" not in m for m in msgs)
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_method_self_needed_uses_instance_method(mock_anthropic):
+    """When every tail needs self, split into a regular instance method helper."""
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["tail_work"])
+    )
+    lines = ["class Foo:\n", "    def method(self):\n"]
+    for i in range(40):
+        lines.append(f"        a{i} = self.val + {i}\n")
+    lines.append("        return 0\n")
+    src = "".join(lines)
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=20
+        )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    compile(result, "<test>", "exec")
+    assert "@staticmethod" not in result
+    assert "return self._tail_work(" in result
+    assert "def _tail_work(self" in result
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_skips_name_collision(mock_anthropic):
+    """Helper name colliding with an existing function causes the task to be dropped."""
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["helper"])  # would produce _helper
+    )
+    # _helper already exists; the LLM would name the extracted helper "helper"
+    existing = "def _helper():\n    pass\n\n\n"
+    src = existing + _make_long_func(80)
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=50
+        )
+
+    # collision detected → task dropped → no rewrite
+    assert splitter.get_rewritten_source() is None
