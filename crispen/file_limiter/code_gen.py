@@ -109,7 +109,16 @@ def _extract_import_info(source: str) -> List[ImportInfo]:
             names = [
                 alias.asname if alias.asname else alias.name for alias in node.names
             ]
-            src = "".join(lines[node.lineno - 1 : node.end_lineno]).rstrip()
+            # Reconstruct as a normalized single-line import so that
+            # multi-line parenthesized imports (e.g. ``from X import (\n
+            # Y,\n Z,\n)``) don't break _merge_from_imports, whose regex
+            # only matches the first line.
+            dots = "." * (node.level or 0)
+            mod = node.module or ""
+            alias_strs = [
+                f"{a.name} as {a.asname}" if a.asname else a.name for a in node.names
+            ]
+            src = f"from {dots}{mod} import {', '.join(alias_strs)}"
             is_future = node.module == "__future__"
             result.append(ImportInfo(names=names, source=src, is_future=is_future))
 

@@ -152,6 +152,18 @@ def test_extract_import_info_multiple():
     assert len(infos) == 2
 
 
+def test_extract_import_info_multiline_parens_normalized():
+    # Multi-line parenthesized from-import must be normalized to a single line
+    # so that _merge_from_imports can process it without producing malformed output.
+    source = "from pathlib import (\n    Path,\n    PurePath,\n)\n"
+    infos = _extract_import_info(source)
+    assert len(infos) == 1
+    assert infos[0].source == "from pathlib import Path, PurePath"
+    assert "\n" not in infos[0].source
+    assert "Path" in infos[0].names
+    assert "PurePath" in infos[0].names
+
+
 # ---------------------------------------------------------------------------
 # _find_needed_imports
 # ---------------------------------------------------------------------------
