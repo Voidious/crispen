@@ -292,7 +292,7 @@ def run_file_limiter(
                     abort=True,
                 )
             sibling_py = source_dir / f"{subdir_name}.py"
-            if sibling_py.exists():
+            if sibling_py.name != source_name and sibling_py.exists():
                 return FileLimiterResult(
                     original_source=post_source,
                     new_files={},
