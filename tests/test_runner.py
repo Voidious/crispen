@@ -318,6 +318,35 @@ def test_strip_imports_syntax_error_returns_unchanged():
 
 
 # ---------------------------------------------------------------------------
+# run_file_limiter — dashed parent directory early-return
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_CLASSIFY)
+def test_runner_dashed_parent_dir_skips(mock_classify):
+    # A filepath whose parent contains a dash must be skipped immediately,
+    # before classify_entities is ever called.
+    result = run_file_limiter(
+        "tests/cross-engine/test_lever.py", "", "x = 1\n", [(1, 1)], _CONFIG
+    )
+    assert result.abort is True
+    assert "cross-engine" in result.messages[0]
+    assert "dash" in result.messages[0]
+    mock_classify.assert_not_called()
+
+
+@patch(_PATCH_CLASSIFY)
+def test_runner_dashed_parent_dir_deep_skips(mock_classify):
+    # Dash anywhere in the ancestor chain (not just the immediate parent).
+    result = run_file_limiter(
+        "src/my-pkg/sub/module.py", "", "x = 1\n", [(1, 1)], _CONFIG
+    )
+    assert result.abort is True
+    assert "my-pkg" in result.messages[0]
+    mock_classify.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # run_file_limiter — classified.abort early-return (no retry)
 # ---------------------------------------------------------------------------
 

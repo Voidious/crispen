@@ -252,6 +252,30 @@ def run_file_limiter(
             flush=True,
         )
 
+    # Reject files inside directories whose names contain dashes.  Dashes are
+    # illegal in Python package names, so any import we generate for a new
+    # sibling or sub-package would produce a SyntaxError.  The user must rename
+    # the offending directory before FileLimiter can act on this file.
+    # Only check relative paths — git diff always produces relative paths in
+    # production; absolute paths (e.g. from tests using tmp_path) may have
+    # system directories with dashes that are not Python packages.
+    dashed = (
+        [p for p in Path(filepath).parent.parts if "-" in p]
+        if not Path(filepath).is_absolute()
+        else []
+    )
+    if dashed:
+        return FileLimiterResult(
+            original_source=post_source,
+            new_files={},
+            messages=[
+                f"SKIP {filepath} (FileLimiter): parent directory"
+                f" '{dashed[0]}' contains a dash, which is invalid in a"
+                " Python package name — rename the directory first"
+            ],
+            abort=True,
+        )
+
     classified = classify_entities(original_source, post_source, diff_ranges)
     source_dir = Path(filepath).parent
     source_name = Path(filepath).name
