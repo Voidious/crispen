@@ -706,13 +706,19 @@ def run_engine(
 
             state["source"] = fl_result.original_source
 
-            # For non-test whole-file subdir splits, delete the original file
-            # now that service/__init__.py takes its place as the public entry
-            # point.  state["source"] was reset to state["original"] above, so
-            # the final write loop will see no diff and skip the (deleted) file.
-            # Count the original lines as deleted so stats stay accurate.
-            if fl_result.subdir_name is not None and not Path(filepath).name.startswith(
-                "test_"
+            # For non-test whole-file subdir splits (without __main__), delete
+            # the original file now that service/__init__.py takes its place as
+            # the public entry point.  state["source"] was reset to
+            # state["original"] above, so the final write loop will see no diff
+            # and skip the (deleted) file.  Count the original lines as deleted
+            # so stats stay accurate.
+            # When has_main is True the original file is kept on disk as the
+            # runnable script entry point; the engine's write loop will update
+            # it with the re-export stubs from fl_result.original_source.
+            if (
+                fl_result.subdir_name is not None
+                and not Path(filepath).name.startswith("test_")
+                and not fl_result.has_main
             ):
                 Path(filepath).unlink()
                 _stats.count_lines_changed(state["original"], "")
@@ -764,8 +770,11 @@ def run_engine(
             # Subdir split of a recursively-processed file: delete the file
             # that was replaced by a package __init__.py.  Handle before the
             # rewrite check so we don't write-then-delete (and double-count lines).
-            if r_result.subdir_name is not None and not Path(r_path).name.startswith(
-                "test_"
+            # Skip deletion when has_main is True (original kept as entry point).
+            if (
+                r_result.subdir_name is not None
+                and not Path(r_path).name.startswith("test_")
+                and not r_result.has_main
             ):
                 Path(r_path).unlink()
                 _fl_new_file_final.pop(str(r_path), None)

@@ -1413,6 +1413,7 @@ def generate_file_splits(
     original_path: str,
     subdir_name: Optional[str] = None,
     pytest_conftest: bool = False,
+    has_main: bool = False,
 ) -> SplitResult:
     """Generate new file contents and the updated original source.
 
@@ -1473,7 +1474,9 @@ def generate_file_splits(
     # In subdir-split mode the "original" is the package __init__.py; use that
     # name throughout so dependency-graph edges and import prefixes are correct.
     original_basename = (
-        f"{subdir_name}/__init__.py" if subdir_name else Path(original_path).name
+        f"{subdir_name}/__init__.py"
+        if subdir_name and not has_main
+        else Path(original_path).name
     )
     is_test_file = Path(original_path).name.startswith("test_")
     # For test-file subdir splits the original test file stays on disk (runner.py
@@ -1737,7 +1740,7 @@ def generate_file_splits(
     # or ``from .base import Foo``) therefore need one extra dot so they keep
     # pointing at the same modules.  Re-exports added by _add_re_exports below
     # are already computed from the __init__.py's perspective and are correct.
-    if subdir_name is not None and not is_test_file:
+    if subdir_name is not None and not is_test_file and not has_main:
         updated = _bump_relative_imports(updated)
     if subdir_name is not None:
         # If the original file had a module docstring and it was migrated away,
@@ -1752,7 +1755,9 @@ def generate_file_splits(
             else:
                 updated = _module_doc + "\n\n" + updated
     relative_from: Optional[str] = (
-        f"{subdir_name}/__init__.py" if (subdir_name and not is_test_file) else None
+        f"{subdir_name}/__init__.py"
+        if (subdir_name and not is_test_file and not has_main)
+        else None
     )
     # Exclude conftest.py from re-exports: fixtures there are auto-discovered
     # by pytest and must not be imported back into the original test file.

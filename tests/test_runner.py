@@ -10,7 +10,9 @@ from crispen.file_limiter.classifier import ClassifiedEntities
 from crispen.file_limiter.code_gen import SplitResult
 from crispen.file_limiter.entity_parser import Entity, EntityKind
 from crispen.file_limiter.runner import (
+    _MAIN_SUBDIR_SUFFIXES,
     _detect_naming_conflicts,
+    _has_main_block,
     _is_whole_file_diff,
     _strip_imports_by_line,
     _verify_preservation,
@@ -1243,6 +1245,24 @@ def test_is_whole_file_diff_overshoots():
 
 
 # ---------------------------------------------------------------------------
+# _has_main_block
+# ---------------------------------------------------------------------------
+
+
+def test_has_main_block_detects_dunder_main():
+    src = "def foo():\n    pass\n\nif __name__ == '__main__':\n    foo()\n"
+    assert _has_main_block(src) is True
+
+
+def test_has_main_block_no_main():
+    assert _has_main_block("def foo():\n    pass\n") is False
+
+
+def test_has_main_block_syntax_error():
+    assert _has_main_block("def (:\n") is False
+
+
+# ---------------------------------------------------------------------------
 # run_file_limiter — subdir-split: directory already exists
 # ---------------------------------------------------------------------------
 
@@ -1456,6 +1476,140 @@ def test_runner_subdir_split_strips_test_prefix_from_stem(
     assert result.subdir_name == "big"
     # "helpers.py" → test_ prefix → "test_helpers.py" → "big/test_helpers.py".
     assert any("big/test_helpers.py" in m for m in result.messages)
+
+
+# ---------------------------------------------------------------------------
+# run_file_limiter — subdir-split: has_main keeps original and uses _lib suffix
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_subdir_split_has_main_uses_lib_suffix(
+    mock_classify, mock_advise, mock_gen, tmp_path
+):
+    # Non-test file with __main__: subdir uses "_lib" suffix, original_source
+    # is the split content (re-export stubs + __main__), and has_main=True.
+    # No blank lines between entities so entity ranges don't pick up leading \n.
+    source = (
+        "def foo():\n    pass\n"
+        "def bar():\n    pass\n"
+        "if __name__ == '__main__':\n    foo()\n"
+    )
+    entity1 = _make_entity("foo", 1, 2)
+    entity2 = _make_entity("bar", 3, 4)
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[entity1, entity2],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[["foo"], ["bar"]],
+        set_3_groups=[],
+        abort=False,
+    )
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[],
+        placements=[
+            GroupPlacement(group=["foo"], target_file="utils.py"),
+            GroupPlacement(group=["bar"], target_file="helpers.py"),
+        ],
+        abort=False,
+    )
+    mock_gen.return_value = SplitResult(
+        new_files={
+            "service_lib/utils.py": "def foo():\n    pass",
+            "service_lib/helpers.py": "def bar():\n    pass",
+        },
+        original_source=(
+            "from service_lib.utils import foo\n\n"
+            "if __name__ == '__main__':\n    foo()\n"
+        ),
+        abort=False,
+    )
+
+    cfg = CrispenConfig(file_limiter_subdir_split=True)
+    filepath = str(tmp_path / "service.py")
+    result = run_file_limiter(filepath, source, source, [(1, 6)], cfg)
+
+    assert result.abort is False
+    assert result.has_main is True
+    assert result.subdir_name == "service_lib"
+    # original_source keeps the split content (re-exports + __main__), not reset.
+    assert "__main__" in result.original_source
+    # No __init__.py injected: original file stays as the entry point.
+    assert "service_lib/__init__.py" not in result.new_files
+    assert any("service_lib/utils.py" in m for m in result.messages)
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_subdir_split_has_main_fallback_suffix(
+    mock_classify, mock_advise, mock_gen, tmp_path
+):
+    # When service_lib/ already exists, fall back to the next suffix (_helpers).
+    source = (
+        "def foo():\n    pass\n"
+        "def bar():\n    pass\n"
+        "if __name__ == '__main__':\n    foo()\n"
+    )
+    (tmp_path / "service_lib").mkdir()
+    entity1 = _make_entity("foo", 1, 2)
+    entity2 = _make_entity("bar", 3, 4)
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[entity1, entity2],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[["foo"], ["bar"]],
+        set_3_groups=[],
+        abort=False,
+    )
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[],
+        placements=[
+            GroupPlacement(group=["foo"], target_file="utils.py"),
+            GroupPlacement(group=["bar"], target_file="helpers.py"),
+        ],
+        abort=False,
+    )
+    mock_gen.return_value = SplitResult(
+        new_files={
+            "service_helpers/utils.py": "def foo():\n    pass",
+            "service_helpers/helpers.py": "def bar():\n    pass",
+        },
+        original_source="# stubs\n",
+        abort=False,
+    )
+
+    cfg = CrispenConfig(file_limiter_subdir_split=True)
+    filepath = str(tmp_path / "service.py")
+    result = run_file_limiter(filepath, source, source, [(1, 6)], cfg)
+
+    assert result.abort is False
+    assert result.subdir_name == "service_helpers"
+    assert result.has_main is True
+
+
+@patch(_PATCH_CLASSIFY)
+def test_runner_subdir_split_has_main_all_suffixes_conflict_aborts(
+    mock_classify, tmp_path
+):
+    # All _lib/_helpers/etc. directories already exist → abort with a clear message.
+    source = "def foo():\n    pass\n\nif __name__ == '__main__':\n    foo()\n"
+    for suffix in _MAIN_SUBDIR_SUFFIXES:
+        (tmp_path / f"service{suffix}").mkdir()
+    mock_classify.return_value = _make_classified()
+
+    cfg = CrispenConfig(file_limiter_subdir_split=True)
+    filepath = str(tmp_path / "service.py")
+    result = run_file_limiter(filepath, source, source, [(1, 5)], cfg)
+
+    assert result.abort is True
+    assert result.new_files == {}
+    assert any("__main__" in m for m in result.messages)
+    assert any("conflict" in m for m in result.messages)
 
 
 # ---------------------------------------------------------------------------

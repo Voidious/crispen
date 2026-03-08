@@ -24,6 +24,7 @@ class FileLimiterResult:
     messages: List[str] = field(default_factory=list)
     abort: bool = False
     subdir_name: Optional[str] = None  # set when files go into a subdirectory
+    has_main: bool = False  # True when file has __main__ and original is kept
     llm_calls: int = 0
     verified_functions: int = 0
     verified_classes: int = 0
@@ -31,6 +32,44 @@ class FileLimiterResult:
     verified_function_names: set = field(default_factory=set)
     verified_class_names: set = field(default_factory=set)
     verified_entity_line_counts: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# __main__ subdir-split helpers
+# ---------------------------------------------------------------------------
+
+# Suffixes tried in order when a non-test file with ``if __name__ == '__main__':``
+# needs a subdirectory name.  The original file is kept on disk (it is the
+# script entry point), so the subdir must not share the file's stem name.
+_MAIN_SUBDIR_SUFFIXES: List[str] = [
+    "_lib",
+    "_helpers",
+    "_impl",
+    "_internals",
+    "_support",
+]
+
+
+def _has_main_block(source: str) -> bool:
+    """Return True if *source* contains an ``if __name__ == '__main__':`` block."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "__main__"
+        ):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -299,33 +338,61 @@ def run_file_limiter(
     # ---- Subdir-split detection ----
     is_test = source_name.startswith("test_")
     subdir_name: Optional[str] = None
+    has_main: bool = False
     if config.file_limiter_subdir_split:
         n_lines = len(post_source.splitlines())
         if _is_whole_file_diff(diff_ranges, n_lines):
             stem = Path(source_name).stem
-            subdir_name = stem[5:] if stem.startswith("test_") else stem
-            subdir_path = source_dir / subdir_name
-            if subdir_path.exists():
-                return FileLimiterResult(
-                    original_source=post_source,
-                    new_files={},
-                    messages=[
-                        f"SKIP {filepath} (FileLimiter): target subdirectory"
-                        f" '{subdir_name}/' already exists"
-                    ],
-                    abort=True,
-                )
-            sibling_py = source_dir / f"{subdir_name}.py"
-            if sibling_py.name != source_name and sibling_py.exists():
-                return FileLimiterResult(
-                    original_source=post_source,
-                    new_files={},
-                    messages=[
-                        f"SKIP {filepath} (FileLimiter): target subdirectory"
-                        f" '{subdir_name}/' would shadow existing '{subdir_name}.py'"
-                    ],
-                    abort=True,
-                )
+            if not is_test and _has_main_block(post_source):
+                # File has __main__: keep original on disk as the entry point.
+                # Use a suffixed subdirectory name so it doesn't conflict with
+                # the original module name (having both service.py and service/
+                # in the same directory is confusing and unusual).
+                has_main = True
+                for suffix in _MAIN_SUBDIR_SUFFIXES:
+                    candidate = f"{stem}{suffix}"
+                    if (
+                        not (source_dir / candidate).exists()
+                        and not (source_dir / f"{candidate}.py").exists()
+                    ):
+                        subdir_name = candidate
+                        break
+                if subdir_name is None:
+                    tried = ", ".join(f"'{stem}{s}'" for s in _MAIN_SUBDIR_SUFFIXES)
+                    return FileLimiterResult(
+                        original_source=post_source,
+                        new_files={},
+                        messages=[
+                            f"SKIP {filepath} (FileLimiter): file has __main__ but"
+                            f" all candidate subdirectory names conflict ({tried})"
+                        ],
+                        abort=True,
+                    )
+            else:
+                subdir_name = stem[5:] if stem.startswith("test_") else stem
+                subdir_path = source_dir / subdir_name
+                if subdir_path.exists():
+                    return FileLimiterResult(
+                        original_source=post_source,
+                        new_files={},
+                        messages=[
+                            f"SKIP {filepath} (FileLimiter): target subdirectory"
+                            f" '{subdir_name}/' already exists"
+                        ],
+                        abort=True,
+                    )
+                sibling_py = source_dir / f"{subdir_name}.py"
+                if sibling_py.name != source_name and sibling_py.exists():
+                    return FileLimiterResult(
+                        original_source=post_source,
+                        new_files={},
+                        messages=[
+                            f"SKIP {filepath} (FileLimiter): target subdirectory"
+                            f" '{subdir_name}/' would shadow existing"
+                            f" '{subdir_name}.py'"
+                        ],
+                        abort=True,
+                    )
             # Brand-new directory: no pre-existing files or dirs to conflict with.
             existing_files = frozenset()
             existing_dirs = frozenset()
@@ -498,6 +565,7 @@ def run_file_limiter(
             filepath,
             subdir_name=subdir_name,
             pytest_conftest=config.file_limiter_pytest_conftest,
+            has_main=has_main,
         )
 
         if split.abort:
@@ -536,10 +604,14 @@ def run_file_limiter(
             llm_calls=total_llm_calls,
         )
 
-    # For non-test subdir splits, redirect the post-split "original" source to
-    # service/__init__.py and leave service.py untouched (it is shadowed by the
-    # new package).  For test files the original test_*.py keeps re-export stubs.
-    if subdir_name is not None and not is_test:
+    # For non-test subdir splits without __main__: redirect the post-split
+    # "original" source to service/__init__.py so the new package is the public
+    # entry point, then leave service.py untouched for deletion by the engine.
+    # For files with __main__: the original file must remain as the runnable
+    # script, so we keep split.original_source in place (it already contains
+    # the __main__ block and re-export stubs) and skip the __init__.py redirect.
+    # For test files the original test_*.py always keeps re-export stubs.
+    if subdir_name is not None and not is_test and not has_main:
         split.new_files[f"{subdir_name}/__init__.py"] = split.original_source
         split.original_source = original_source
 
@@ -571,6 +643,7 @@ def run_file_limiter(
         messages=retry_msgs + msgs,
         abort=False,
         subdir_name=subdir_name,
+        has_main=has_main,
         llm_calls=total_llm_calls,
         verified_functions=vr.verified_functions,
         verified_classes=vr.verified_classes,

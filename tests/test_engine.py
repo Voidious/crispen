@@ -1309,6 +1309,39 @@ def test_file_limiter_subdir_split_test_keeps_original(tmp_path):
     assert f.read_text(encoding="utf-8") == re_export_src
 
 
+def test_file_limiter_subdir_split_has_main_keeps_original(tmp_path):
+    """Non-test subdir split with has_main → original file kept and updated."""
+    f = tmp_path / "service.py"
+    original_src = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(original_src, encoding="utf-8")
+    re_export_src = (
+        "from service_lib.utils import foo\n\nif __name__ == '__main__':\n    foo()\n"
+    )
+    success_result = FileLimiterResult(
+        original_source=re_export_src,
+        new_files={"service_lib/utils.py": "def foo():\n    pass\n"},
+        messages=[],
+        abort=False,
+        subdir_name="service_lib",
+        has_main=True,
+    )
+    with patch(_FL_PATCH, return_value=success_result):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5),
+            )
+        )
+    # Original service.py must still exist (not deleted).
+    assert f.exists()
+    # It should be updated with the re-export stubs + __main__.
+    assert f.read_text(encoding="utf-8") == re_export_src
+    # New subdir file must exist.
+    assert (tmp_path / "service_lib" / "utils.py").read_text(encoding="utf-8") == (
+        "def foo():\n    pass\n"
+    )
+
+
 def test_file_limiter_api_error_propagates(tmp_path):
     """CrispenAPIError from FileLimiter propagates out of run_engine."""
     f = tmp_path / "big.py"

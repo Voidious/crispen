@@ -2624,6 +2624,26 @@ def test_generate_file_splits_test_subdir_nonmigrated_imports_from_original():
     assert "from . import _CONFIG" not in test_src
 
 
+def test_generate_file_splits_has_main_uses_filename_as_original_basename():
+    # When has_main=True, original_basename is the flat filename ("service.py"),
+    # not "service_lib/__init__.py".  Re-exports in the original file reference
+    # the subdir modules directly (e.g. "from service_lib.utils import foo").
+    source = "def foo():\n    pass\n\nif __name__ == '__main__':\n    foo()\n"
+    e_foo = _make_entity("foo", 1, 2)
+    c = _classified(entities=[e_foo])
+    plan = _plan([GroupPlacement(group=["foo"], target_file="service_lib/utils.py")])
+
+    result = generate_file_splits(
+        c, plan, source, "service.py", subdir_name="service_lib", has_main=True
+    )
+
+    assert not result.abort
+    # Re-export in original file uses the subdir module path.
+    assert "service_lib" in result.original_source
+    # No __init__.py is created by code_gen (the runner handles that decision).
+    assert "service_lib/__init__.py" not in result.new_files
+
+
 # ---------------------------------------------------------------------------
 # _bump_relative_imports
 # ---------------------------------------------------------------------------
