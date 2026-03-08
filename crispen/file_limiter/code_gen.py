@@ -51,6 +51,20 @@ _FUTURE_IMPORT_LINE_RE = re.compile(r"^from __future__ import .*\n?", re.MULTILI
 # Matches the leading dots of a relative import (``from .foo`` or ``from ..``).
 _REL_IMPORT_RE = re.compile(r"^from (\.+)", re.MULTILINE)
 
+# Matches four or more consecutive newlines (= 3+ blank lines between entities).
+_EXCESS_BLANK_RE = re.compile(r"\n{4,}")
+
+
+def _normalize_blank_lines(source: str) -> str:
+    """Collapse runs of 3+ blank lines to 2; ensure exactly one trailing newline.
+
+    Removes blank-line artefacts produced by entity removal (original file)
+    and entity-source stripping (new files).  PEP 8 / flake8 E303 allows at
+    most two blank lines between top-level definitions.
+    """
+    source = _EXCESS_BLANK_RE.sub("\n\n\n", source)
+    return source.rstrip("\n") + "\n"
+
 
 def _import_derived_names(source: str) -> Set[str]:
     """Return names introduced solely by import statements in *source*.
@@ -1792,5 +1806,10 @@ def generate_file_splits(
     # by _remove_entity_lines if the entity owning line 1 was migrated.
     if shebang and not updated.startswith("#!"):
         updated = shebang + updated
+
+    # Normalize blank lines: collapse 3+ consecutive blank lines to 2 and
+    # ensure exactly one trailing newline in every generated file.
+    new_files = {f: _normalize_blank_lines(s) for f, s in new_files.items()}
+    updated = _normalize_blank_lines(updated)
 
     return SplitResult(new_files=new_files, original_source=updated, abort=False)
