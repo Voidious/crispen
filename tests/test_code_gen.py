@@ -28,6 +28,7 @@ from crispen.file_limiter.code_gen import (
     _inject_inline_test_imports_original,
     _is_pytest_fixture,
     _is_test_name,
+    _merge_conftest_sources,
     _merge_from_imports,
     _module_path_from_file,
     _prune_inline_redundant_imports,
@@ -96,6 +97,70 @@ def test_collect_name_loads_store_not_included():
 
 def test_collect_name_loads_syntax_error():
     assert _collect_name_loads("def (invalid") == set()
+
+
+def test_collect_name_loads_excludes_function_params():
+    # 'client' is a parameter of test_foo — excluded from loads inside the body.
+    source = "def test_foo(client):\n    client.call()\n"
+    names = _collect_name_loads(source)
+    assert "client" not in names
+
+
+def test_collect_name_loads_includes_non_param_name():
+    # 'helper' is not a parameter of test_foo — still counted as a load.
+    source = "def test_foo(client):\n    helper(client)\n"
+    names = _collect_name_loads(source)
+    assert "helper" in names
+    assert "client" not in names
+
+
+def test_collect_name_loads_excludes_nested_function_params():
+    # Inner function params are excluded only within that function's own body.
+    source = textwrap.dedent(
+        """\
+        def outer(x):
+            def inner(y):
+                return y + x
+            return inner
+        """
+    )
+    names = _collect_name_loads(source)
+    assert "y" not in names  # param of inner — excluded inside inner body
+    assert "x" not in names  # param of outer — excluded inside outer body
+
+
+def test_collect_name_loads_includes_annotation_names():
+    # Type annotations are in the outer scope — their names are included.
+    source = "def f(x: MyType) -> ReturnType:\n    pass\n"
+    names = _collect_name_loads(source)
+    assert "MyType" in names
+    assert "ReturnType" in names
+    assert "x" not in names  # param name itself, not counted
+
+
+def test_collect_name_loads_includes_decorator_names():
+    # Decorator expressions are in the outer scope.
+    source = "@pytest.fixture\ndef client():\n    pass\n"
+    names = _collect_name_loads(source)
+    assert "pytest" in names
+
+
+def test_collect_name_loads_kw_defaults_none_skipped():
+    # kw_defaults may contain None for keyword-only args without defaults.
+    # None entries must not cause a crash and are simply skipped.
+    source = "def f(*, a, b=DEFAULT):\n    pass\n"
+    names = _collect_name_loads(source)
+    assert "DEFAULT" in names
+    assert "a" not in names
+    assert "b" not in names
+
+
+def test_collect_name_loads_annotated_vararg_kwarg():
+    # *args: T and **kwargs: T annotations are in the outer scope.
+    source = "def f(*args: VarType, **kwargs: KwType):\n    pass\n"
+    names = _collect_name_loads(source)
+    assert "VarType" in names
+    assert "KwType" in names
 
 
 # ---------------------------------------------------------------------------
@@ -3553,3 +3618,102 @@ def test_generate_pytest_conftest_prepends_existing(tmp_path):
     assert "def client():" in conftest_src
     # Existing content should come first.
     assert conftest_src.index("prior") < conftest_src.index("client")
+
+
+# ---------------------------------------------------------------------------
+# _merge_conftest_sources
+# ---------------------------------------------------------------------------
+
+
+def test_merge_conftest_sources_deduplicates_imports():
+    # Imports that already exist are not repeated.
+    existing = "import pytest\n\n\n@pytest.fixture\ndef prior():\n    pass\n"
+    new = "import pytest\n\n\n@pytest.fixture\ndef client():\n    pass\n"
+    result = _merge_conftest_sources(existing, new)
+    assert result.count("import pytest") == 1
+
+
+def test_merge_conftest_sources_deduplicates_functions():
+    # A function already in existing is not appended again.
+    existing = "@pytest.fixture\ndef client():\n    return 1\n"
+    new = "@pytest.fixture\ndef client():\n    return 2\n"
+    result = _merge_conftest_sources(existing, new)
+    assert result.count("def client():") == 1
+    assert "return 1" in result
+    assert "return 2" not in result
+
+
+def test_merge_conftest_sources_appends_new_fixture():
+    # A new fixture not in existing is appended.
+    existing = "@pytest.fixture\ndef prior():\n    pass\n"
+    new = "@pytest.fixture\ndef client():\n    pass\n"
+    result = _merge_conftest_sources(existing, new)
+    assert "def prior():" in result
+    assert "def client():" in result
+    assert result.index("prior") < result.index("client")
+
+
+def test_merge_conftest_sources_no_changes_returns_existing():
+    # When nothing new to add, return existing unchanged.
+    existing = "import pytest\n\n\n@pytest.fixture\ndef client():\n    pass\n"
+    new = "import pytest\n\n\n@pytest.fixture\ndef client():\n    pass\n"
+    result = _merge_conftest_sources(existing, new)
+    assert result == existing
+
+
+def test_merge_conftest_sources_inserts_new_imports_before_functions():
+    # New imports are inserted after existing imports but before functions — no E402.
+    existing = "import pytest\n\n\n@pytest.fixture\ndef prior():\n    pass\n"
+    new = "import asyncio\n\n\n@pytest.fixture\ndef client():\n    pass\n"
+    result = _merge_conftest_sources(existing, new)
+    assert "import asyncio" in result
+    assert "def client():" in result
+    # Imports must come before the first function definition.
+    assert result.index("import asyncio") < result.index("def prior():")
+
+
+def test_merge_conftest_sources_syntax_error_fallback():
+    # Falls back to simple concatenation when existing cannot be parsed.
+    existing = "def (broken"
+    new = "import pytest\n"
+    result = _merge_conftest_sources(existing, new)
+    assert "def (broken" in result
+    assert "import pytest" in result
+
+
+def test_merge_conftest_sources_preserves_comments():
+    # Comments in the existing conftest are preserved.
+    existing = "# shared fixtures\nimport pytest\n\n\ndef prior():\n    pass\n"
+    new = "@pytest.fixture\ndef client():\n    pass\n"
+    result = _merge_conftest_sources(existing, new)
+    assert "# shared fixtures" in result
+    assert "def client():" in result
+
+
+def test_merge_conftest_sources_from_import_dedup():
+    # from-style imports are also deduplicated via the _import_key F: path.
+    existing = "from conftest import setup\n\n\ndef prior():\n    pass\n"
+    new = "from conftest import setup\n\n\ndef client():\n    pass\n"
+    result = _merge_conftest_sources(existing, new)
+    assert result.count("from conftest import setup") == 1
+    assert "def client():" in result
+
+
+def test_merge_conftest_sources_only_new_imports_no_defs():
+    # When only new imports are added but no new functions, ends with newline.
+    existing = "import pytest\n\n\ndef prior():\n    pass\n"
+    new = "import asyncio\n"
+    result = _merge_conftest_sources(existing, new)
+    assert "import asyncio" in result
+    assert result.endswith("\n")
+    # No duplicate function definition appended.
+    assert result.count("def prior():") == 1
+
+
+def test_merge_conftest_sources_non_import_non_def_in_new():
+    # Bare statements (assignments, expressions) in new_content are silently ignored.
+    existing = "def prior():\n    pass\n"
+    new = "X = 42\n"
+    result = _merge_conftest_sources(existing, new)
+    # Nothing to import or define → returns existing unchanged.
+    assert result == existing

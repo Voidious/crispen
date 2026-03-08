@@ -75,15 +75,65 @@ def _import_derived_names(source: str) -> Set[str]:
 
 
 def _collect_name_loads(source: str) -> Set[str]:
-    """Return all Name loads referenced in *source*."""
+    """Return Name loads in *source* that are not shadowed by function parameters.
+
+    For each function or async function, names that appear as parameters of that
+    function are excluded from Name loads within its body.  This prevents generating
+    spurious cross-file imports for names that are satisfied locally (e.g. pytest
+    fixture names that appear as test function parameters).
+
+    Decorators, argument default values, and return/argument annotations are
+    always evaluated in the outer scope and are never excluded.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return set()
     names: Set[str] = set()
-    for node in ast.walk(tree):
+
+    def _walk(node: ast.AST, excluded: frozenset) -> None:
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            names.add(node.id)
+            if node.id not in excluded:
+                names.add(node.id)
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = node.args
+            own_params: frozenset = frozenset(
+                a.arg
+                for a in (
+                    args.args
+                    + args.posonlyargs
+                    + args.kwonlyargs
+                    + ([args.vararg] if args.vararg else [])
+                    + ([args.kwarg] if args.kwarg else [])
+                )
+            )
+            # Decorators are evaluated in the outer scope.
+            for dec in node.decorator_list:
+                _walk(dec, excluded)
+            # Default values are evaluated in the outer scope.
+            for default in args.defaults + args.kw_defaults:
+                if default is not None:
+                    _walk(default, excluded)
+            # Annotations are in the outer scope (PEP 563 / regular annotations).
+            for arg in args.args + args.posonlyargs + args.kwonlyargs:
+                if arg.annotation:
+                    _walk(arg.annotation, excluded)
+            if args.vararg and args.vararg.annotation:
+                _walk(args.vararg.annotation, excluded)
+            if args.kwarg and args.kwarg.annotation:
+                _walk(args.kwarg.annotation, excluded)
+            if node.returns:
+                _walk(node.returns, excluded)
+            # Function body uses the combined excluded set.
+            new_excluded = excluded | own_params
+            for child in node.body:
+                _walk(child, new_excluded)
+            return
+        for child in ast.iter_child_nodes(node):
+            _walk(child, excluded)
+
+    _walk(tree, frozenset())
     return names
 
 
@@ -1249,6 +1299,109 @@ def _inject_inline_test_imports_original(
 
 
 # ---------------------------------------------------------------------------
+# Conftest merging
+# ---------------------------------------------------------------------------
+
+
+def _merge_conftest_sources(existing: str, new_content: str) -> str:
+    """Merge *new_content* into an existing conftest.py without duplicating anything.
+
+    When multiple file splits each contribute fixtures to the same conftest.py,
+    naively appending produces duplicate import statements, duplicate function
+    definitions, and E402 errors (imports after function definitions).
+
+    This function avoids all three:
+    - Duplicate import statements (same module + same names) are skipped.
+    - Function/class definitions whose names already appear in *existing* are skipped.
+    - Non-duplicate imports from *new_content* are inserted after the last existing
+      import (before any existing function definitions), preventing E402.
+    - Non-duplicate definitions are appended at the end.
+
+    Falls back to simple concatenation when either source cannot be parsed.
+    """
+    try:
+        existing_tree = ast.parse(existing)
+        new_tree = ast.parse(new_content)
+    except SyntaxError:
+        return existing.rstrip() + "\n\n\n" + new_content
+
+    existing_lines = existing.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+
+    def _import_key(node: ast.stmt) -> str:
+        if isinstance(node, ast.Import):
+            return "I:" + ",".join(
+                sorted(f"{a.name}:{a.asname or ''}" for a in node.names)
+            )
+        assert isinstance(node, ast.ImportFrom)
+        dots = "." * (node.level or 0)
+        mod = node.module or ""
+        return (
+            "F:"
+            + dots
+            + mod
+            + ":"
+            + ",".join(sorted(f"{a.name}:{a.asname or ''}" for a in node.names))
+        )
+
+    # What is already in existing?
+    existing_import_keys: Set[str] = {
+        _import_key(n)
+        for n in existing_tree.body
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+    }
+    existing_defined_names: Set[str] = {
+        n.name
+        for n in existing_tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+    # Last import line in existing (0-indexed insertion point).
+    last_import_lineno: int = 0
+    for n in existing_tree.body:
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            last_import_lineno = max(last_import_lineno, n.end_lineno)
+
+    # Collect new, non-duplicate imports and definitions from new_content.
+    imports_to_insert: List[str] = []
+    defs_to_append: List[str] = []
+
+    for node in new_tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if _import_key(node) not in existing_import_keys:
+                src = "".join(new_lines[node.lineno - 1 : node.end_lineno]).rstrip()
+                imports_to_insert.append(src)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name not in existing_defined_names:
+                first_line = (
+                    node.decorator_list[0].lineno
+                    if node.decorator_list
+                    else node.lineno
+                )
+                src = "".join(new_lines[first_line - 1 : node.end_lineno]).rstrip()
+                defs_to_append.append(src)
+
+    if not imports_to_insert and not defs_to_append:
+        return existing
+
+    result_lines = list(existing_lines)
+    if imports_to_insert:
+        # Insert new imports directly after the last existing import line.
+        insert_at = last_import_lineno  # 0-indexed position after last import
+        new_import_lines = [imp + "\n" for imp in imports_to_insert]
+        result_lines = (
+            result_lines[:insert_at] + new_import_lines + result_lines[insert_at:]
+        )
+
+    result = "".join(result_lines).rstrip()
+    if defs_to_append:
+        result = result + "\n\n\n" + "\n\n\n".join(defs_to_append) + "\n"
+    else:
+        result = result + "\n"
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -1548,17 +1701,19 @@ def generate_file_splits(
         if all_imports:
             parts.append("\n".join(all_imports))
         parts.extend(entity_srcs)
-        pruned = _prune_unused_imports("\n\n".join(parts) + "\n")
+        pruned = _prune_unused_imports("\n\n\n".join(parts) + "\n")
         new_files[target_file] = _prune_inline_redundant_imports(pruned)
 
-    # If an existing conftest.py is present on disk, prepend it so the
-    # generated file does not overwrite fixtures already defined there.
+    # If an existing conftest.py is present on disk, merge intelligently so
+    # that duplicate imports and fixture definitions are not repeated (which
+    # would cause flake8 F811/E402 errors when multiple splits write to the
+    # same conftest.py file).
     if "conftest.py" in new_files:
         existing_conftest = Path(original_path).parent / "conftest.py"
         if existing_conftest.exists():
             prior = existing_conftest.read_text(encoding="utf-8")
-            new_files["conftest.py"] = (
-                prior.rstrip() + "\n\n\n" + new_files["conftest.py"]
+            new_files["conftest.py"] = _merge_conftest_sources(
+                prior, new_files["conftest.py"]
             )
 
     # Build updated original source.
