@@ -87,11 +87,17 @@ def _strip_orphaned_section_headers(source: str) -> str:
         header_1idx.update(range(start, end + 1))
 
     # A header is orphaned when no substantive line (non-blank and not part of
-    # any header block) follows it before the end of the file.
+    # any header block) falls between it and the *next* header (or EOF).
     orphaned_0idx: Set[int] = set()
-    for start_1, end_1, _ in headers:
+    for h_idx, (start_1, end_1, _) in enumerate(headers):
+        # Scan only up to the start of the next header so that content beneath
+        # a later header does not rescue an earlier, empty one.
+        if h_idx + 1 < len(headers):
+            scan_end_0 = headers[h_idx + 1][0] - 1  # 0-indexed exclusive
+        else:
+            scan_end_0 = len(lines)
         has_content = False
-        for j0 in range(end_1, len(lines)):  # 0-indexed, past the header block
+        for j0 in range(end_1, scan_end_0):  # 0-indexed, past the header block
             stripped = lines[j0].strip()
             if stripped and (j0 + 1) not in header_1idx:
                 has_content = True
@@ -1847,7 +1853,8 @@ def generate_file_splits(
         updated = shebang + updated
 
     # Remove section header comment blocks that became orphaned after entity
-    # removal (nothing substantive remains beneath them in the original file).
+    # removal (nothing substantive remains beneath them).
+    new_files = {f: _strip_orphaned_section_headers(s) for f, s in new_files.items()}
     updated = _strip_orphaned_section_headers(updated)
 
     # Normalize blank lines: collapse 3+ consecutive blank lines to 2 and
