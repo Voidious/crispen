@@ -1733,3 +1733,41 @@ def test_runner_success_with_empty_entity_source(mock_classify, mock_advise, moc
     # Only foo (migrated) counts.
     assert result.verified_functions == 1
     assert result.verified_lines == 2
+
+
+# ---------------------------------------------------------------------------
+# run_file_limiter — __init__.py never gets a subdir split
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_CLASSIFY)
+def test_runner_init_py_skips_subdir_split(mock_classify, tmp_path):
+    """__init__.py with a whole-file diff must not trigger subdir-split detection.
+
+    A subdir split for __init__.py would create an ``__init__/`` subdirectory,
+    which is nonsensical.  Instead it should fall through to the normal in-place
+    split (siblings in the same package directory).
+    """
+    # Classify returns abort so the LLM path is skipped; we only care that
+    # subdir_name is NOT set on the result.
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[],
+        set_3_groups=[],
+        abort=True,
+    )
+    filepath = str(tmp_path / "__init__.py")
+    # Make the source long enough to be a "whole-file diff".
+    source = "".join(f"def func_{i}():\n    pass\n\n" for i in range(10))
+    cfg = CrispenConfig(file_limiter_subdir_split=True)
+    result = run_file_limiter(
+        filepath, source, source, [(1, len(source.splitlines()))], cfg
+    )
+
+    # Abort comes from the classifier — subdir conflict detection was bypassed.
+    assert result.abort is True
+    assert result.subdir_name is None
+    assert "already exists" not in " ".join(result.messages)

@@ -1817,3 +1817,152 @@ def test_engine_match_function_enabled_by_default(tmp_path):
         )
 
     assert constructed_with.get("match_functions") is True
+
+
+def test_file_limiter_empty_original_source_deletes_file(tmp_path):
+    """FileLimiter returns empty original_source → original file is deleted."""
+    f = tmp_path / "big.py"
+    original = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(original, encoding="utf-8")
+    # All content was moved out; original_source is empty (all entities migrated).
+    # new_files content is kept short (≤ max_file_lines) so it doesn't re-enter
+    # the recursive queue (file_limiter_recursive defaults to True).
+    moved_source = "# moved content\n"
+    drained_result = FileLimiterResult(
+        original_source="",
+        new_files={"utils.py": moved_source},
+        messages=[f"{f}: FileLimiter: moved all → utils.py"],
+        abort=False,
+    )
+    with patch(_FL_PATCH, return_value=drained_result):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5),
+            )
+        )
+    assert any("FileLimiter" in m for m in msgs)
+    # Original file must be deleted, not left as a blank file.
+    assert not f.exists()
+    # New file must exist with the moved content.
+    assert (tmp_path / "utils.py").exists()
+
+
+def test_file_limiter_recursive_empty_original_source_deletes_file(tmp_path):
+    """Recursive FileLimiter with empty original_source deletes the recursive file."""
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    # chunk_a content is short so it doesn't re-enter the recursive queue.
+    small = "# chunk_a content\n"
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"chunk.py": oversized},
+        messages=[],
+        abort=False,
+    )
+    # Recursive call drains chunk.py entirely; original_source is empty.
+    second_result = FileLimiterResult(
+        original_source="",
+        new_files={"chunk_a.py": small},
+        messages=[],
+        abort=False,
+    )
+
+    with patch(_FL_PATCH, side_effect=[first_result, second_result]):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5, file_limiter_recursive=True),
+            )
+        )
+
+    # chunk.py was drained and must be deleted.
+    assert not (tmp_path / "chunk.py").exists()
+    # New file from the recursive split must exist.
+    assert (tmp_path / "chunk_a.py").exists()
+
+
+def test_file_limiter_subdir_split_empty_source_file_already_deleted(tmp_path):
+    """Subdir split deletes the original file; empty original_source skips re-unlink."""
+    f = tmp_path / "big.py"
+    original = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(original, encoding="utf-8")
+    # subdir_name causes Phase 3 to delete the original file.  original_source=""
+    # means the per_file loop sees an empty source for a file that no longer
+    # exists — exercising the elif-is-False branch (803→805).
+    # new_files content kept short (≤ max_file_lines) to avoid recursive queue.
+    subdir_result = FileLimiterResult(
+        original_source="",
+        new_files={"big/__init__.py": "# package\n"},
+        messages=[f"{f}: FileLimiter: subdir split → big/"],
+        abort=False,
+        subdir_name="big",
+    )
+    with patch(_FL_PATCH, return_value=subdir_result):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5),
+            )
+        )
+    assert any("FileLimiter" in m for m in msgs)
+    # Original file was deleted by the subdir split; must not exist.
+    assert not f.exists()
+    # Package init was created.
+    assert (tmp_path / "big" / "__init__.py").exists()
+
+
+def test_file_limiter_empty_init_py_preserved(tmp_path):
+    """__init__.py is never deleted even when FileLimiter drains it to empty."""
+    f = tmp_path / "__init__.py"
+    original = "".join(f"def func_{i}():\n    pass\n\n" for i in range(10))
+    f.write_text(original, encoding="utf-8")
+    drained = FileLimiterResult(
+        original_source="",
+        new_files={"utils.py": "# moved\n"},
+        messages=[f"{f}: FileLimiter: moved all → utils.py"],
+        abort=False,
+    )
+    with patch(_FL_PATCH, return_value=drained):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5),
+            )
+        )
+    # __init__.py must still exist (empty is fine; deletion would break the package).
+    assert f.exists()
+    assert f.read_text(encoding="utf-8") == ""
+
+
+def test_file_limiter_recursive_empty_init_py_preserved(tmp_path):
+    """__init__.py created during recursive split is kept even when drained empty."""
+    orig = tmp_path / "big.py"
+    orig.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"pkg/__init__.py": oversized},
+        messages=[],
+        abort=False,
+    )
+    # Recursive pass drains pkg/__init__.py; original_source is empty.
+    second_result = FileLimiterResult(
+        original_source="",
+        new_files={"pkg/utils.py": "# utils\n"},
+        messages=[],
+        abort=False,
+    )
+    with patch(_FL_PATCH, side_effect=[first_result, second_result]):
+        list(
+            run_engine(
+                {str(orig): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=5, file_limiter_recursive=True),
+            )
+        )
+    # pkg/__init__.py must survive as an empty file, not be deleted.
+    assert (tmp_path / "pkg" / "__init__.py").exists()
+    assert (tmp_path / "pkg" / "__init__.py").read_text(encoding="utf-8") == ""

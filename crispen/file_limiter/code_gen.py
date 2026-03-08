@@ -61,9 +61,15 @@ def _normalize_blank_lines(source: str) -> str:
     Removes blank-line artefacts produced by entity removal (original file)
     and entity-source stripping (new files).  PEP 8 / flake8 E303 allows at
     most two blank lines between top-level definitions.
+
+    Returns an empty string when *source* contains only whitespace, signalling
+    that the file should be deleted rather than written with a lone blank line.
     """
     source = _EXCESS_BLANK_RE.sub("\n\n\n", source)
-    return source.rstrip("\n") + "\n"
+    stripped = source.rstrip("\n")
+    if not stripped.strip():
+        return ""
+    return stripped + "\n"
 
 
 def _strip_orphaned_section_headers(source: str) -> str:

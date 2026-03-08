@@ -344,7 +344,7 @@ def run_file_limiter(
     is_test = source_name.startswith("test_")
     subdir_name: Optional[str] = None
     has_main: bool = False
-    if config.file_limiter_subdir_split:
+    if config.file_limiter_subdir_split and source_name != "__init__.py":
         n_lines = len(post_source.splitlines())
         if _is_whole_file_diff(diff_ranges, n_lines):
             stem = Path(source_name).stem

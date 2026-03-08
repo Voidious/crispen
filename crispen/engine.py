@@ -779,8 +779,16 @@ def run_engine(
                 Path(r_path).unlink()
                 _fl_new_file_final.pop(str(r_path), None)
             elif r_result.original_source != r_source:
-                Path(r_path).write_text(r_result.original_source, encoding="utf-8")
-                _fl_new_file_final[str(r_path)] = r_result.original_source
+                if r_result.original_source:
+                    Path(r_path).write_text(r_result.original_source, encoding="utf-8")
+                    _fl_new_file_final[str(r_path)] = r_result.original_source
+                elif Path(r_path).name == "__init__.py":
+                    # Keep __init__.py even when empty — it defines the package.
+                    Path(r_path).write_text("", encoding="utf-8")
+                    _fl_new_file_final[str(r_path)] = ""
+                else:
+                    Path(r_path).unlink()
+                    _fl_new_file_final.pop(str(r_path), None)
 
         for path, content in _fl_new_file_final.items():
             _stats.count_lines_changed("", content)
@@ -794,7 +802,13 @@ def run_engine(
     # ------------------------------------------------------------------ #
     for filepath, state in per_file.items():
         if state["source"] != state["original"]:
-            Path(filepath).write_text(state["source"], encoding="utf-8")
+            if state["source"]:
+                Path(filepath).write_text(state["source"], encoding="utf-8")
+            elif Path(filepath).name == "__init__.py":
+                # Keep __init__.py even when empty — it defines the package.
+                Path(filepath).write_text("", encoding="utf-8")
+            elif Path(filepath).exists():
+                Path(filepath).unlink()
             _stats.files_edited.append(filepath)
             _stats.count_lines_changed(state["original"], state["source"])
         yield from state["msgs"]
