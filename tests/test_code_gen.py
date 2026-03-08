@@ -1148,6 +1148,43 @@ def test_generate_aborts_on_cycle_through_original():
     assert result.new_files == {}
 
 
+def test_generate_aborts_on_cycle_through_original_test_subdir():
+    # In a test-file subdir split non_migrated_home ("test_svc.py") differs
+    # from original_basename ("svc/__init__.py").  The cycle detection must
+    # treat the original test file as its own graph node:
+    #
+    # _CONFIG stays in test_svc.py (TOP_LEVEL, non-migrated).
+    # _helper is migrated to svc/test_helpers.py and references _CONFIG.
+    # test_fn (non-migrated) calls _helper → test_svc.py re-exports _helper.
+    # Cycle: test_svc.py → svc/test_helpers.py (re-export of _helper)
+    #              → test_svc.py (via `from ..test_svc import _CONFIG`).
+    source = textwrap.dedent(
+        """\
+        _CONFIG = "value"
+
+        def _helper():
+            return _CONFIG
+
+        def test_fn():
+            return _helper()
+    """
+    )
+    e_config = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONFIG"])
+    e_helper = _make_entity("_helper", 3, 4)
+    e_test = _make_entity("test_fn", 6, 7)
+    c = _classified(entities=[e_config, e_helper, e_test])
+    plan = _plan([GroupPlacement(group=["_helper"], target_file="svc/test_helpers.py")])
+
+    result = generate_file_splits(
+        c, plan, source, "tests/test_svc.py", subdir_name="svc"
+    )
+
+    # svc/test_helpers.py imports _CONFIG from test_svc.py, and test_svc.py
+    # re-exports _helper from svc/test_helpers.py → circular import → abort.
+    assert result.abort is True
+    assert result.new_files == {}
+
+
 # ---------------------------------------------------------------------------
 # _extract_shared_helpers
 # ---------------------------------------------------------------------------

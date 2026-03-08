@@ -1590,12 +1590,18 @@ def generate_file_splits(
     # Original's outgoing edges: it will re-export a migrated name when the
     # name is public (no _/test_ prefix), referenced by a non-migrated entity,
     # or imported by an external file (external_loads).
+    #
+    # In a test-file subdir split, non_migrated_home ("test_runner.py") differs
+    # from original_basename ("runner/__init__.py").  Re-exports are injected
+    # into the original test file, so it—not the __init__.py—gains outgoing
+    # import edges and must be a separate node in the dependency graph.
     non_migrated_loads: Set[str] = set()
     for ent_name, src in entity_source_map.items():
         if ent_name not in migrated_names:
             non_migrated_loads |= _collect_name_loads(src)
 
-    all_dep_nodes = set(file_entity_names.keys()) | {original_basename}
+    reexport_home = non_migrated_home
+    all_dep_nodes = set(file_entity_names.keys()) | {original_basename, reexport_home}
     file_deps: Dict[str, Set[str]] = {node: set() for node in all_dep_nodes}
     for target_file, ent_names in file_entity_names.items():
         for ent_name in ent_names:
@@ -1617,7 +1623,7 @@ def generate_file_splits(
                         or defined_name in non_migrated_loads
                         or defined_name in external_loads
                     ):
-                        file_deps[original_basename].add(placement.target_file)
+                        file_deps[reexport_home].add(placement.target_file)
                         break
     if any(len(scc) > 1 for scc in find_sccs(file_deps)):
         return SplitResult(
