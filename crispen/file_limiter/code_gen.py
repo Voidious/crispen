@@ -1151,6 +1151,41 @@ def _is_pytest_fixture(entity_src: str) -> bool:
     return False
 
 
+def _file_has_only_fixtures(source: str) -> bool:
+    """Return True if *source* has at least one @pytest.fixture and nothing else.
+
+    "Nothing else" means no test functions (``def test_*``), no test classes
+    (``class Test*``), no other function/class definitions, and no non-import
+    module-level statements other than a module docstring.  Import statements
+    and a leading docstring are allowed because they are needed to support the
+    fixture definitions.
+
+    Returns False on syntax errors (be conservative).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    lines = source.splitlines(keepends=True)
+    has_fixture = False
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue  # module docstring or standalone string literal
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            first_line = (
+                node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            )
+            fn_src = "".join(lines[first_line - 1 : node.end_lineno]).rstrip()
+            if _is_pytest_fixture(fn_src):
+                has_fixture = True
+                continue
+            return False  # non-fixture function (including test_ functions)
+        return False  # class, assignment, or other statement
+    return has_fixture
+
+
 def _split_cross_imports_by_test(
     imports: List[str],
 ) -> Tuple[List[str], List[str]]:
@@ -1862,6 +1897,30 @@ def generate_file_splits(
     # removal (nothing substantive remains beneath them).
     new_files = {f: _strip_orphaned_section_headers(s) for f, s in new_files.items()}
     updated = _strip_orphaned_section_headers(updated)
+
+    # When pytest_conftest is active and the test file's remaining content
+    # contains only fixtures (no test functions, no other definitions), the
+    # file has become dead code — all tests migrated away and the fixture is
+    # stranded.  Route the remaining content to conftest.py (merging to avoid
+    # duplicates if it is already there) and empty the original so the engine
+    # deletes it.
+    if (
+        is_test_file
+        and pytest_conftest
+        and updated
+        and _file_has_only_fixtures(updated)
+    ):
+        existing_conftest = Path(original_path).parent / "conftest.py"
+        if "conftest.py" in new_files:
+            new_files["conftest.py"] = _merge_conftest_sources(
+                new_files["conftest.py"], updated
+            )
+        elif existing_conftest.exists():
+            prior = existing_conftest.read_text(encoding="utf-8")
+            new_files["conftest.py"] = _merge_conftest_sources(prior, updated)
+        else:
+            new_files["conftest.py"] = updated
+        updated = ""
 
     # Normalize blank lines: collapse 3+ consecutive blank lines to 2 and
     # ensure exactly one trailing newline in every generated file.

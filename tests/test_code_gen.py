@@ -26,6 +26,7 @@ from crispen.file_limiter.code_gen import (
     _import_line_numbers,
     _inject_inline_imports,
     _inject_inline_test_imports_original,
+    _file_has_only_fixtures,
     _is_pytest_fixture,
     _is_test_name,
     _merge_conftest_sources,
@@ -3676,6 +3677,323 @@ def test_generate_pytest_conftest_prepends_existing(tmp_path):
     assert "def client():" in conftest_src
     # Existing content should come first.
     assert conftest_src.index("prior") < conftest_src.index("client")
+
+
+# ---------------------------------------------------------------------------
+# _file_has_only_fixtures
+# ---------------------------------------------------------------------------
+
+
+def test_file_has_only_fixtures_syntax_error():
+    assert _file_has_only_fixtures("def (") is False
+
+
+def test_file_has_only_fixtures_empty():
+    assert _file_has_only_fixtures("") is False
+
+
+def test_file_has_only_fixtures_no_fixture():
+    # Regular function only — not a fixture.
+    assert _file_has_only_fixtures("def helper():\n    pass\n") is False
+
+
+def test_file_has_only_fixtures_with_test_function():
+    # Has both a fixture and a test function → not fixture-only.
+    src = textwrap.dedent(
+        """\
+        @pytest.fixture
+        def client():
+            pass
+
+        def test_foo(client):
+            pass
+        """
+    )
+    assert _file_has_only_fixtures(src) is False
+
+
+def test_file_has_only_fixtures_with_test_class():
+    # Has both a fixture and a Test class → not fixture-only.
+    src = textwrap.dedent(
+        """\
+        @pytest.fixture
+        def client():
+            pass
+
+        class TestFoo:
+            pass
+        """
+    )
+    assert _file_has_only_fixtures(src) is False
+
+
+def test_file_has_only_fixtures_with_non_fixture_function():
+    # Has a fixture and a plain helper function → not fixture-only.
+    src = textwrap.dedent(
+        """\
+        @pytest.fixture
+        def client():
+            pass
+
+        def helper():
+            pass
+        """
+    )
+    assert _file_has_only_fixtures(src) is False
+
+
+def test_file_has_only_fixtures_with_class():
+    # Has a fixture and a regular class → not fixture-only.
+    src = textwrap.dedent(
+        """\
+        @pytest.fixture
+        def client():
+            pass
+
+        class Config:
+            pass
+        """
+    )
+    assert _file_has_only_fixtures(src) is False
+
+
+def test_file_has_only_fixtures_single_fixture():
+    # Just a fixture and an import → fixture-only.
+    src = textwrap.dedent(
+        """\
+        import pytest
+
+        @pytest.fixture
+        def client():
+            pass
+        """
+    )
+    assert _file_has_only_fixtures(src) is True
+
+
+def test_file_has_only_fixtures_multiple_fixtures():
+    # Multiple fixtures with no tests → fixture-only.
+    src = textwrap.dedent(
+        """\
+        import pytest
+
+        @pytest.fixture
+        def client():
+            pass
+
+        @pytest.fixture
+        def db():
+            pass
+        """
+    )
+    assert _file_has_only_fixtures(src) is True
+
+
+def test_file_has_only_fixtures_async_fixture():
+    # Async fixture → fixture-only.
+    src = textwrap.dedent(
+        """\
+        import pytest
+
+        @pytest.fixture
+        async def client():
+            pass
+        """
+    )
+    assert _file_has_only_fixtures(src) is True
+
+
+def test_file_has_only_fixtures_with_docstring():
+    # Module docstring + fixture → fixture-only (docstring is allowed).
+    src = textwrap.dedent(
+        """\
+        \"\"\"Module docstring.\"\"\"
+
+        import pytest
+
+        @pytest.fixture
+        def client():
+            pass
+        """
+    )
+    assert _file_has_only_fixtures(src) is True
+
+
+# ---------------------------------------------------------------------------
+# generate_file_splits: fixture-only stranded test file cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_generate_stays_fixture_emptied_when_tests_migrated():
+    # When a fixture "stays" in the original test file but all tests migrate
+    # out, the original becomes fixture-only → route fixture to conftest.py
+    # and empty the original so the engine deletes it.
+    src = textwrap.dedent(
+        """\
+        import pytest
+
+        @pytest.fixture
+        def client():
+            pass
+
+        def test_foo(client):
+            pass
+        """
+    )
+    e_fixture = Entity(EntityKind.FUNCTION, "client", 3, 5, ["client"])
+    e_test = Entity(EntityKind.FUNCTION, "test_foo", 7, 8, ["test_foo"])
+    c = _classified(entities=[e_fixture, e_test])
+    # Only test_foo is migrated; client "stays" in original.
+    plan = _plan(
+        [GroupPlacement(group=["test_foo"], target_file="expression/test_foo.py")]
+    )
+
+    result = generate_file_splits(c, plan, src, "test_big.py", pytest_conftest=True)
+
+    # Original should be empty (engine will delete it).
+    assert result.original_source == ""
+    # Fixture should be routed to conftest.py.
+    assert "conftest.py" in result.new_files
+    assert "def client():" in result.new_files["conftest.py"]
+
+
+def test_generate_stays_fixture_merged_with_existing_conftest(tmp_path):
+    # If conftest.py already exists on disk (e.g. same fixture already there),
+    # the merge deduplicates so the fixture is not repeated.
+    existing = tmp_path / "conftest.py"
+    existing.write_text(
+        "import pytest\n\n\n@pytest.fixture\ndef client():\n    pass\n",
+        encoding="utf-8",
+    )
+
+    src = textwrap.dedent(
+        """\
+        import pytest
+
+        @pytest.fixture
+        def client():
+            pass
+
+        def test_foo(client):
+            pass
+        """
+    )
+    e_fixture = Entity(EntityKind.FUNCTION, "client", 3, 5, ["client"])
+    e_test = Entity(EntityKind.FUNCTION, "test_foo", 7, 8, ["test_foo"])
+    c = _classified(entities=[e_fixture, e_test])
+    plan = _plan(
+        [GroupPlacement(group=["test_foo"], target_file="expression/test_foo.py")]
+    )
+    original_path = str(tmp_path / "test_expression.py")
+
+    result = generate_file_splits(c, plan, src, original_path, pytest_conftest=True)
+
+    assert result.original_source == ""
+    # Fixture should appear exactly once in conftest.py (deduplicated).
+    assert result.new_files["conftest.py"].count("def client():") == 1
+
+
+def test_generate_stays_fixture_not_emptied_when_tests_remain():
+    # If test functions still remain in the original, the fixture-only cleanup
+    # does NOT trigger — the file should keep both fixture and test.
+    src = textwrap.dedent(
+        """\
+        import pytest
+
+        @pytest.fixture
+        def client():
+            pass
+
+        def test_foo(client):
+            pass
+
+        def test_bar(client):
+            pass
+        """
+    )
+    e_fixture = Entity(EntityKind.FUNCTION, "client", 3, 5, ["client"])
+    e_test_foo = Entity(EntityKind.FUNCTION, "test_foo", 7, 8, ["test_foo"])
+    e_test_bar = Entity(EntityKind.FUNCTION, "test_bar", 10, 11, ["test_bar"])
+    c = _classified(entities=[e_fixture, e_test_foo, e_test_bar])
+    # Only test_foo migrates; test_bar stays → original still has a test.
+    plan = _plan(
+        [GroupPlacement(group=["test_foo"], target_file="expression/test_foo.py")]
+    )
+
+    result = generate_file_splits(c, plan, src, "test_big.py", pytest_conftest=True)
+
+    # Original should still contain the remaining test and fixture.
+    assert "def test_bar" in result.original_source
+    assert result.original_source != ""
+
+
+def test_generate_stays_fixture_not_emptied_when_conftest_disabled():
+    # When pytest_conftest=False, stranded fixtures are left in the original.
+    src = textwrap.dedent(
+        """\
+        import pytest
+
+        @pytest.fixture
+        def client():
+            pass
+
+        def test_foo(client):
+            pass
+        """
+    )
+    e_fixture = Entity(EntityKind.FUNCTION, "client", 3, 5, ["client"])
+    e_test = Entity(EntityKind.FUNCTION, "test_foo", 7, 8, ["test_foo"])
+    c = _classified(entities=[e_fixture, e_test])
+    plan = _plan(
+        [GroupPlacement(group=["test_foo"], target_file="expression/test_foo.py")]
+    )
+
+    result = generate_file_splits(c, plan, src, "test_big.py", pytest_conftest=False)
+
+    # Original keeps the fixture (conftest routing disabled).
+    assert "def client():" in result.original_source
+    assert "conftest.py" not in result.new_files
+
+
+def test_generate_stays_fixture_merged_with_already_written_conftest():
+    # If conftest.py was already written by this same split run (e.g. another
+    # entity was already routed there), merge into it rather than reading disk.
+    src = textwrap.dedent(
+        """\
+        import pytest
+
+        @pytest.fixture
+        def client():
+            pass
+
+        @pytest.fixture
+        def db():
+            pass
+
+        def test_foo(client):
+            pass
+        """
+    )
+    e_client = Entity(EntityKind.FUNCTION, "client", 3, 5, ["client"])
+    e_db = Entity(EntityKind.FUNCTION, "db", 7, 9, ["db"])
+    e_test = Entity(EntityKind.FUNCTION, "test_foo", 11, 12, ["test_foo"])
+    c = _classified(entities=[e_client, e_db, e_test])
+    # db migrates (and goes to conftest.py via pytest routing); test_foo migrates;
+    # client stays but is then stranded.
+    plan = _plan(
+        [
+            GroupPlacement(group=["db"], target_file="fixtures.py"),
+            GroupPlacement(group=["test_foo"], target_file="expression/test_foo.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, src, "test_big.py", pytest_conftest=True)
+
+    assert result.original_source == ""
+    conftest_src = result.new_files["conftest.py"]
+    # Both migrated db and stranded client fixtures should be in conftest.
+    assert "def db():" in conftest_src
+    assert "def client():" in conftest_src
 
 
 # ---------------------------------------------------------------------------
