@@ -193,6 +193,8 @@ def _group_summary(group: List[str], entity_map: Dict[str, Entity]) -> str:
             size = ent.end_line - ent.start_line + 1
             desc = f"{name} ({size} lines)"
             extras = []
+            if ent.section_header:
+                extras.append(f'section: "{ent.section_header}"')
             if ent.docstring:
                 flat = ent.docstring.replace("\n", " ")
                 idx = flat.find(". ")

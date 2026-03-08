@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 class EntityKind(Enum):
@@ -32,6 +33,67 @@ class Entity:
     names_defined: List[str] = field(default_factory=list)
     docstring: Optional[str] = None  # first docstring if present
     params: List[str] = field(default_factory=list)  # up to 3 param descriptions
+    section_header: Optional[str] = (
+        None  # label of the nearest preceding section header
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section header detection
+# ---------------------------------------------------------------------------
+
+# Matches a "divider" line: # followed by 3+ copies of the same non-alphanumeric,
+# non-space character (e.g. ---..., ===..., ###..., ***..., ~~~...).
+_SECTION_DIVIDER_RE = re.compile(r"^# ([^a-zA-Z0-9\s])\1{2,}\s*$")
+
+# Matches a single-line section header: # --- label --- or # === LABEL === etc.
+# Group 1 = delimiter char, group 2 = label text.
+_SECTION_SINGLE_RE = re.compile(r"^# ([^a-zA-Z0-9\s])\1{2,} (.+?) \1{2,}\s*$")
+
+
+def _parse_section_headers(lines: List[str]) -> List[Tuple[int, int, str]]:
+    """Return ``(start_line, end_line, label)`` triples for section header blocks.
+
+    Both line numbers are 1-indexed and inclusive.  Two patterns are
+    recognised:
+
+    * **3-line block** — a divider line, a label line, another divider line::
+
+          # ---------------------------------------------------------------------------
+          # Helpers used by parse_entities
+          # ---------------------------------------------------------------------------
+
+    * **Single-line** — ``# --- Label ---`` or ``# === LABEL ===``
+
+    *lines* may contain trailing newlines; they are stripped before matching.
+    """
+    result: List[Tuple[int, int, str]] = []
+    n = len(lines)
+    i = 0
+    while i < n:
+        stripped = lines[i].rstrip("\n").rstrip()
+        # Try 3-line block first (needs at least 3 remaining lines).
+        if i + 2 < n and _SECTION_DIVIDER_RE.match(stripped):
+            middle = lines[i + 1].rstrip("\n").rstrip()
+            bottom = lines[i + 2].rstrip("\n").rstrip()
+            if (
+                middle.startswith("# ")
+                and middle[2:].strip()
+                and not _SECTION_DIVIDER_RE.match(middle)
+                and _SECTION_DIVIDER_RE.match(bottom)
+            ):
+                label = middle[2:].strip()
+                result.append((i + 1, i + 3, label))  # 1-indexed, inclusive
+                i += 3
+                continue
+        # Try single-line header.
+        m = _SECTION_SINGLE_RE.match(stripped)
+        if m:
+            result.append((i + 1, i + 1, m.group(2).strip()))  # 1-indexed
+            i += 1
+            continue
+        i += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -203,4 +265,17 @@ def parse_entities(source: str) -> List[Entity]:
             pending_block.append(stmt)
 
     _flush_block()
+
+    # Assign section_header: the label of the nearest preceding section header
+    # block whose end_line is before the entity's start_line.
+    headers = _parse_section_headers(lines)
+    if headers:
+        h_idx = 0
+        current_label: Optional[str] = None
+        for entity in entities:
+            while h_idx < len(headers) and headers[h_idx][1] < entity.start_line:
+                current_label = headers[h_idx][2]
+                h_idx += 1
+            entity.section_header = current_label
+
     return entities

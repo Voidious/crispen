@@ -1118,6 +1118,29 @@ def test_group_summary_docstring_no_period():
     assert '"No period here"' in summary
 
 
+def test_group_summary_with_section_header():
+    """Entity with section_header → section appears first in extras."""
+    from crispen.file_limiter.entity_parser import Entity, EntityKind
+
+    ent = Entity(
+        EntityKind.FUNCTION,
+        "foo",
+        1,
+        5,
+        ["foo"],
+        section_header="Helpers",
+    )
+    summary = _group_summary(["foo"], {"foo": ent})
+    assert 'section: "Helpers"' in summary
+
+
+def test_group_summary_no_section_header():
+    """Entity without section_header → no 'section:' in summary."""
+    ent = _make_entity("bar", 1, 5)
+    summary = _group_summary(["bar"], {"bar": ent})
+    assert "section:" not in summary
+
+
 # ---------------------------------------------------------------------------
 # _build_group_mermaid
 # ---------------------------------------------------------------------------

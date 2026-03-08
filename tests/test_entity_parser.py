@@ -11,6 +11,7 @@ from crispen.file_limiter.entity_parser import (
     _collect_defined_names,
     _find_attached_comment_start,
     _format_params,
+    _parse_section_headers,
     _target_names,
     parse_entities,
 )
@@ -433,3 +434,162 @@ def test_parse_top_level_block_no_docstring_no_params():
     assert e.kind == EntityKind.TOP_LEVEL
     assert e.docstring is None
     assert e.params == []
+
+
+# ---------------------------------------------------------------------------
+# _parse_section_headers
+# ---------------------------------------------------------------------------
+
+
+def test_parse_section_headers_3line_block():
+    div = "# ---\n"
+    lines = [div, "# My Section\n", div, "def foo(): pass\n"]
+    result = _parse_section_headers(lines)
+    assert result == [(1, 3, "My Section")]
+
+
+def test_parse_section_headers_single_line_dashes():
+    lines = [
+        "# --- Find By Expression Tests ---\n",
+        "def test_foo(): pass\n",
+    ]
+    result = _parse_section_headers(lines)
+    assert result == [(1, 1, "Find By Expression Tests")]
+
+
+def test_parse_section_headers_single_line_equals():
+    lines = [
+        "# === STRINGS TOOL TESTS ===\n",
+        "def test_bar(): pass\n",
+    ]
+    result = _parse_section_headers(lines)
+    assert result == [(1, 1, "STRINGS TOOL TESTS")]
+
+
+def test_parse_section_headers_hash_3line_block():
+    """Hash-style 3-line block (# ### Label ###) is recognised."""
+    div = "# ###\n"
+    lines = [div, "# Hash Section\n", div, "def foo(): pass\n"]
+    result = _parse_section_headers(lines)
+    assert result == [(1, 3, "Hash Section")]
+
+
+def test_parse_section_headers_single_line_asterisks():
+    """Asterisk-delimited single-line header is recognised."""
+    lines = ["# *** My Section ***\n", "def foo(): pass\n"]
+    result = _parse_section_headers(lines)
+    assert result == [(1, 1, "My Section")]
+
+
+def test_parse_section_headers_mixed_delimiters_not_matched():
+    """Mixed delimiter characters (--- and ===) are not matched as single-line."""
+    lines = ["# --- Label ===\n"]
+    assert _parse_section_headers(lines) == []
+
+
+def test_parse_section_headers_multiple():
+    lines = [
+        "# --- First ---\n",
+        "def a(): pass\n",
+        "\n",
+        "# --- Second ---\n",
+        "def b(): pass\n",
+    ]
+    result = _parse_section_headers(lines)
+    assert result == [(1, 1, "First"), (4, 4, "Second")]
+
+
+def test_parse_section_headers_no_headers():
+    lines = ["def foo(): pass\n", "x = 1\n"]
+    assert _parse_section_headers(lines) == []
+
+
+def test_parse_section_headers_3line_skips_double_divider():
+    """Middle line that is itself a divider is not treated as a 3-line block."""
+    lines = [
+        "# ---\n",
+        "# ---\n",
+        "# ---\n",
+    ]
+    result = _parse_section_headers(lines)
+    # Middle line is a divider itself, so no 3-line block; no single-line either
+    assert result == []
+
+
+def test_parse_section_headers_empty_middle_not_3line():
+    """3-line block requires a non-empty label in the middle line."""
+    lines = [
+        "# ---\n",
+        "#\n",
+        "# ---\n",
+    ]
+    result = _parse_section_headers(lines)
+    assert result == []
+
+
+def test_parse_section_headers_no_trailing_delimiter_not_single():
+    """Single-line header must have closing delimiter."""
+    lines = ["# --- Just a plain comment\n"]
+    assert _parse_section_headers(lines) == []
+
+
+# ---------------------------------------------------------------------------
+# section_header field on Entity
+# ---------------------------------------------------------------------------
+
+
+def test_section_header_3line_block():
+    div = "# ---\n"
+    source = div + "# Helpers\n" + div + "\n" "\n" "def foo():\n" "    pass\n"
+    entities = parse_entities(source)
+    assert entities[0].name == "foo"
+    assert entities[0].section_header == "Helpers"
+
+
+def test_section_header_single_line():
+    source = "# --- Tools ---\n\ndef foo():\n    pass\n"
+    entities = parse_entities(source)
+    assert entities[0].section_header == "Tools"
+
+
+def test_section_header_none_when_no_header():
+    source = "def foo():\n    pass\n"
+    entities = parse_entities(source)
+    assert entities[0].section_header is None
+
+
+def test_section_header_changes_between_functions():
+    source = (
+        "# --- First ---\n"
+        "\n"
+        "def foo():\n"
+        "    pass\n"
+        "\n"
+        "# --- Second ---\n"
+        "\n"
+        "def bar():\n"
+        "    pass\n"
+    )
+    entities = parse_entities(source)
+    foo = next(e for e in entities if e.name == "foo")
+    bar = next(e for e in entities if e.name == "bar")
+    assert foo.section_header == "First"
+    assert bar.section_header == "Second"
+
+
+def test_section_header_first_entity_before_any_header():
+    """Entity before first section header has no section_header."""
+    source = (
+        "def foo():\n"
+        "    pass\n"
+        "\n"
+        "# --- Helpers ---\n"
+        "\n"
+        "def bar():\n"
+        "    pass\n"
+    )
+    entities = parse_entities(source)
+    foo = next(e for e in entities if e.name == "foo")
+    bar = next(e for e in entities if e.name == "bar")
+    assert foo.section_header is None
+    assert bar.section_header == "Helpers"

@@ -37,6 +37,7 @@ from crispen.file_limiter.code_gen import (
     _remove_entity_lines,
     _split_cross_imports_by_test,
     _strip_module_docstring,
+    _strip_orphaned_section_headers,
     _strip_top_level_import_lines,
     _target_module_name,
     _topo_depth,
@@ -3774,3 +3775,91 @@ def test_merge_conftest_sources_non_import_non_def_in_new():
     result = _merge_conftest_sources(existing, new)
     # Nothing to import or define → returns existing unchanged.
     assert result == existing
+
+
+# ---------------------------------------------------------------------------
+# _strip_orphaned_section_headers
+# ---------------------------------------------------------------------------
+
+
+def test_strip_orphaned_3line_header_at_eof():
+    """3-line block with no code after it is removed."""
+    div = "# ---\n"
+    source = "def foo():\n    pass\n\n\n" + div + "# Old Section\n" + div
+    result = _strip_orphaned_section_headers(source)
+    assert "# Old Section" not in result
+    assert "def foo():" in result
+
+
+def test_strip_orphaned_single_line_header_at_eof():
+    """Single-line header with no code after it is removed."""
+    source = "def foo():\n    pass\n\n# --- Removed ---\n"
+    result = _strip_orphaned_section_headers(source)
+    assert "# --- Removed ---" not in result
+    assert "def foo():" in result
+
+
+def test_strip_not_orphaned_3line_header():
+    """3-line block followed by substantive code is kept."""
+    div = "# ---\n"
+    source = div + "# Helpers\n" + div + "\n\ndef helper():\n    pass\n"
+    result = _strip_orphaned_section_headers(source)
+    assert "# Helpers" in result
+    assert "def helper():" in result
+
+
+def test_strip_not_orphaned_single_line_header():
+    """Single-line header followed by substantive code is kept."""
+    source = "# --- Tools ---\n\ndef tool():\n    pass\n"
+    result = _strip_orphaned_section_headers(source)
+    assert "# --- Tools ---" in result
+
+
+def test_strip_orphaned_header_followed_only_by_another_header():
+    """Header followed only by another header (and then nothing) — both orphaned."""
+    source = "def foo():\n" "    pass\n" "\n" "# --- First ---\n" "# --- Second ---\n"
+    result = _strip_orphaned_section_headers(source)
+    assert "# --- First ---" not in result
+    assert "# --- Second ---" not in result
+    assert "def foo():" in result
+
+
+def test_strip_partial_orphan():
+    """Only the header with no code after it is removed; the other stays."""
+    source = (
+        "# --- Active ---\n" "\n" "def foo():\n" "    pass\n" "\n" "# --- Empty ---\n"
+    )
+    result = _strip_orphaned_section_headers(source)
+    assert "# --- Active ---" in result
+    assert "# --- Empty ---" not in result
+
+
+def test_strip_no_headers_returns_unchanged():
+    """Source with no section headers is returned unchanged."""
+    source = "def foo():\n    pass\n"
+    assert _strip_orphaned_section_headers(source) == source
+
+
+def test_strip_all_headers_have_content():
+    """When every header has content below it, source is returned unchanged."""
+    source = (
+        "# --- A ---\n"
+        "\n"
+        "def a():\n"
+        "    pass\n"
+        "\n"
+        "# --- B ---\n"
+        "\n"
+        "def b():\n"
+        "    pass\n"
+    )
+    result = _strip_orphaned_section_headers(source)
+    assert "# --- A ---" in result
+    assert "# --- B ---" in result
+
+
+def test_strip_equals_single_line_header_orphaned():
+    """=== style orphaned header is also removed."""
+    source = "def foo():\n    pass\n\n# === OLD SECTION ===\n"
+    result = _strip_orphaned_section_headers(source)
+    assert "# === OLD SECTION ===" not in result

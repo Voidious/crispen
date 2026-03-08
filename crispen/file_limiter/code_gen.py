@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from .advisor import FileLimiterPlan, GroupPlacement
 from .classifier import ClassifiedEntities
 from .dep_graph import find_sccs
-from .entity_parser import Entity, EntityKind
+from .entity_parser import Entity, EntityKind, _parse_section_headers
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +64,45 @@ def _normalize_blank_lines(source: str) -> str:
     """
     source = _EXCESS_BLANK_RE.sub("\n\n\n", source)
     return source.rstrip("\n") + "\n"
+
+
+def _strip_orphaned_section_headers(source: str) -> str:
+    """Remove section header comment blocks with no substantive code after them.
+
+    When entities are removed from the original file, section headers that
+    labelled a group of functions may be left with nothing beneath them.
+    This function detects both 3-line (``# ---...--- / # Label / # ---...---``)
+    and single-line (``# --- Label ---``, ``# === LABEL ===``) patterns and
+    removes any whose remaining content (non-blank, non-header lines) has
+    been entirely stripped away.
+    """
+    lines = source.splitlines(keepends=True)
+    headers = _parse_section_headers(lines)
+    if not headers:
+        return source
+
+    # 1-indexed set of lines that belong to any header block.
+    header_1idx: Set[int] = set()
+    for start, end, _ in headers:
+        header_1idx.update(range(start, end + 1))
+
+    # A header is orphaned when no substantive line (non-blank and not part of
+    # any header block) follows it before the end of the file.
+    orphaned_0idx: Set[int] = set()
+    for start_1, end_1, _ in headers:
+        has_content = False
+        for j0 in range(end_1, len(lines)):  # 0-indexed, past the header block
+            stripped = lines[j0].strip()
+            if stripped and (j0 + 1) not in header_1idx:
+                has_content = True
+                break
+        if not has_content:
+            for i1 in range(start_1, end_1 + 1):
+                orphaned_0idx.add(i1 - 1)  # convert to 0-indexed
+
+    if not orphaned_0idx:
+        return source
+    return "".join(line for i, line in enumerate(lines) if i not in orphaned_0idx)
 
 
 def _import_derived_names(source: str) -> Set[str]:
@@ -1806,6 +1845,10 @@ def generate_file_splits(
     # by _remove_entity_lines if the entity owning line 1 was migrated.
     if shebang and not updated.startswith("#!"):
         updated = shebang + updated
+
+    # Remove section header comment blocks that became orphaned after entity
+    # removal (nothing substantive remains beneath them in the original file).
+    updated = _strip_orphaned_section_headers(updated)
 
     # Normalize blank lines: collapse 3+ consecutive blank lines to 2 and
     # ensure exactly one trailing newline in every generated file.
