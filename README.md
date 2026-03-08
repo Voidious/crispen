@@ -35,6 +35,9 @@ git diff --cached | crispen
 
 # Refactor changes since a specific commit
 git diff HEAD~1 | crispen
+
+# Refactor a specific file as if it were entirely new (triggers whole-file subdir split)
+git diff /dev/null crispen/file_limiter/advisor.py | crispen
 ```
 
 Crispen prints a summary of every change it applies, then writes the modified files back in place.
@@ -54,6 +57,11 @@ model = "claude-sonnet-4-6"
 # Optional base URL override for OpenAI-compatible providers.
 # Useful for LM Studio on a non-default port, or other self-hosted endpoints.
 # base_url = "http://localhost:1234/v1"
+
+# Optional tool_choice override for OpenAI-compatible providers (default: unset).
+# Use "required" for local models (e.g. LM Studio with qwen3) that do not
+# support the default named-function form.
+# tool_choice = "required"
 
 # HTTP timeout in seconds for each LLM API call (default: 60.0).
 # Raise this when using slow local models.
@@ -102,7 +110,10 @@ file_limiter_retries = 2
 
 # Run only specific refactors (default: run all).
 # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
-# "tuple_dataclass", "file_limiter"
+# "tuple_dataclass", "file_limiter", "match_function"
+# ("match_function" controls the sub-pass inside duplicate_extractor that
+# replaces inline code with calls to existing functions; only takes effect
+# when duplicate_extractor is also enabled.)
 # enabled_refactors = ["function_splitter", "file_limiter"]
 
 # Always skip specific refactors (ignored when enabled_refactors is set).
@@ -392,7 +403,11 @@ The algorithm:
 5. Ask the LLM to assign each movable SCC group to a target filename. Groups with related purposes may share a file.
 6. Generate the new files, add `from .module import name` re-exports to the original, and verify every entity's source is preserved before writing.
 
-**Whole-file mode (subdir split):** When the diff covers every line of the file — e.g. a brand-new file — crispen places the new sibling files in a subdirectory named after the module (e.g. `service/*.py` for `service.py`). For non-test files, a `service/__init__.py` is generated that re-exports the public API so callers need no updates. For test files, the original `test_service.py` keeps re-export stubs so pytest can still find the tests.
+**Whole-file mode (subdir split):** When the diff covers every line of the file — e.g. a brand-new file — crispen places the new sibling files in a subdirectory named after the module (e.g. `service/*.py` for `service.py`). For non-test files, a `service/__init__.py` is generated that re-exports the public API so callers need no updates. For test files, the original `test_service.py` keeps re-export stubs so pytest can still find the tests. Test classes that contain `test_` methods are not re-exported (re-importing them would cause pytest to discover and run every test twice).
+
+**Script entry points:** When a non-test file contains `if __name__ == '__main__':`, the original file is kept on disk as the runnable entry point (with re-export stubs) rather than being replaced by `subdir/__init__.py`. The subdirectory is named with a `_lib`, `_helpers`, `_impl`, `_internals`, or `_support` suffix to avoid shadowing the original module name.
+
+**Directories with dashes:** Crispen skips files located under directories whose names contain dashes (e.g. `my-project/service.py`), because dashes are illegal in Python package names and would produce a `SyntaxError` in generated imports. Rename the directory to use underscores first.
 
 **Before** (`service.py`, 1200 lines):
 ```python
