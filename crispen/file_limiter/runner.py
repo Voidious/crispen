@@ -250,6 +250,11 @@ def _detect_naming_conflicts(
                 f"target '{top}/' directory conflicts with existing file '{top}.py'"
             )
 
+    # Plan target matches a forbidden/existing file exactly.
+    for p in placements:
+        if len(Path(p.target_file).parts) == 1 and p.target_file in existing_files:
+            conflicts.append(f"target '{p.target_file}' is a reserved or existing file")
+
     return conflicts
 
 
@@ -396,6 +401,11 @@ def run_file_limiter(
             # Brand-new directory: no pre-existing files or dirs to conflict with.
             existing_files = frozenset()
             existing_dirs = frozenset()
+
+    # conftest.py is reserved for pytest fixtures; treat it as an existing/
+    # forbidden file so the LLM cannot assign non-fixture entities there.
+    if config.file_limiter_pytest_conftest:
+        existing_files = existing_files | frozenset({"conftest.py"})
 
     # Deterministic failure — retrying the LLM would not help.
     if classified.abort:

@@ -721,6 +721,10 @@ def _find_conflicting_placement_indices(
     for top, idxs in dir_top_to_idxs.items():
         if f"{top}.py" in existing_files:  # subdir vs disk file
             conflicting.update(idxs)
+    # Flat target matches a forbidden/existing file directly.
+    for i, p in enumerate(placements):
+        if len(Path(p.target_file).parts) == 1 and p.target_file in existing_files:
+            conflicting.add(i)
     return sorted(conflicting)
 
 

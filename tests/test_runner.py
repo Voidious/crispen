@@ -1100,6 +1100,16 @@ def test_detect_conflicts_subdir_only_no_conflict():
     assert _detect_naming_conflicts(placements, frozenset(), frozenset()) == []
 
 
+def test_detect_conflicts_flat_target_in_existing_files():
+    # Flat target whose filename is in existing_files (e.g. conftest.py) → conflict.
+    placements = [GroupPlacement(group=["fix"], target_file="conftest.py")]
+    conflicts = _detect_naming_conflicts(
+        placements, frozenset({"conftest.py"}), frozenset()
+    )
+    assert len(conflicts) == 1
+    assert "conftest.py" in conflicts[0]
+
+
 # ---------------------------------------------------------------------------
 # run_file_limiter — naming conflict retry paths
 # ---------------------------------------------------------------------------

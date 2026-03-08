@@ -750,6 +750,18 @@ def test_find_conflicting_idx_subdir_vs_existing_file():
     assert idxs == [0]
 
 
+def test_find_conflicting_idx_flat_target_in_existing_files():
+    """Flat target in existing_files (e.g. conftest.py) → index returned."""
+    placements = [
+        GroupPlacement(group=["fix"], target_file="conftest.py"),
+        GroupPlacement(group=["bar"], target_file="helpers.py"),
+    ]
+    idxs = _find_conflicting_placement_indices(
+        placements, frozenset({"conftest.py"}), frozenset()
+    )
+    assert idxs == [0]
+
+
 def test_find_conflicting_idx_no_conflict():
     """Clean plan with no conflicts → empty list."""
     placements = [
