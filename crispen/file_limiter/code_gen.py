@@ -39,6 +39,9 @@ class SplitResult:
     entity_name_rewrites: Dict[str, Dict[str, str]] = field(
         default_factory=dict
     )  # {entity_name: {old_name: new_qualified_name}} per migrated entity
+    actual_placements: List[GroupPlacement] = field(
+        default_factory=list
+    )  # final placements after conftest routing (for accurate output messages)
 
 
 # ---------------------------------------------------------------------------
@@ -1808,7 +1811,20 @@ def generate_file_splits(
     # For subdir splits, route fixtures into the subdirectory's own conftest.py
     # so that multiple test files in the same parent directory each get an
     # isolated conftest scope and cannot overwrite each other's fixtures.
+    # Exception to the exception: if the fixture is still referenced in entities
+    # that remain in the original file (i.e. tests that were not migrated), route
+    # it to the parent conftest.py instead so those tests can find it.  Tests in
+    # the subdirectory also inherit from the parent conftest, so this is safe.
+    # Further exception: if the fixture is referenced in remaining source AND the
+    # parent conftest already has a fixture with the same name (the module was
+    # overriding it), merging into parent conftest would silently keep the old
+    # version — the original test would get the wrong fixture and the migrated
+    # subdir tests would also inherit the wrong version.  In that case, copy
+    # (don't move) the fixture to the subdir conftest so migrated tests get the
+    # override; the entity is also kept in the original file so the original
+    # test can discover it directly from its own module.
     conftest_target = f"{subdir_name}/conftest.py" if subdir_name else "conftest.py"
+    parent_conftest_target = "conftest.py"
     existing_conftest_path = (
         Path(original_path).parent / subdir_name / "conftest.py"
         if subdir_name
@@ -1819,6 +1835,13 @@ def generate_file_splits(
     # conftest.py already defines a symbol with that name.  Fixtures injected
     # by pytest name-lookup need no re-export import in the original file.
     conftest_conflict_names: Set[str] = set()
+    # Names of fixtures that are copied to the subdir conftest but also kept in
+    # the original file (not removed).  This handles the case where the fixture
+    # overrides a parent conftest fixture and is also referenced in remaining
+    # entities: the subdir copy ensures migrated tests see the override; the
+    # original file copy ensures the original test's module-level fixture takes
+    # precedence over the stale parent conftest version.
+    copy_not_migrate: Set[str] = set()
     if pytest_conftest:
         existing_conftest_names: Set[str] = set()
         if existing_conftest_path.exists():
@@ -1833,7 +1856,38 @@ def generate_file_splits(
             except (SyntaxError, OSError):
                 pass
 
+        # For subdir splits: build source of entities that will remain in the
+        # original file so we can detect fixtures still needed by those entities.
+        # Also load parent conftest names to detect fixtures that override a
+        # parent-level fixture (used below to avoid silently keeping the old
+        # parent version when merging would drop the new override).
+        _migrating_names: Set[str] = {
+            name for p in valid_placements for name in p.group
+        }
+        _remaining_src = "\n".join(
+            entity_source_map[e.name]
+            for e in classified.entities
+            if e.name not in _migrating_names and e.name in entity_source_map
+        )
+        _parent_conftest_names: Set[str] = set()
+        if subdir_name:
+            _parent_conftest_path = Path(original_path).parent / "conftest.py"
+            if _parent_conftest_path.exists():
+                try:
+                    _pc_tree = ast.parse(
+                        _parent_conftest_path.read_text(encoding="utf-8")
+                    )
+                    for _pc_node in _pc_tree.body:
+                        if isinstance(
+                            _pc_node,
+                            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                        ):
+                            _parent_conftest_names.add(_pc_node.name)
+                except (SyntaxError, OSError):
+                    pass
+
         conftest_group: List[str] = []
+        conftest_group_parent: List[str] = []
         new_valid: List[GroupPlacement] = []
         for p in valid_placements:
             non_fixture: List[str] = []
@@ -1848,6 +1902,25 @@ def generate_file_splits(
                         # by name-lookup, not by import.
                         non_fixture.append(name)
                         conftest_conflict_names.add(name)
+                    elif subdir_name and re.search(
+                        r"\b" + re.escape(name) + r"\b", _remaining_src
+                    ):
+                        # Fixture still used by non-migrated tests.
+                        if name in _parent_conftest_names:
+                            # Parent conftest already has this name: the module
+                            # was overriding it.  Merging into parent conftest
+                            # would silently keep the old version.  Instead,
+                            # copy (don't move) to subdir conftest — migrated
+                            # tests get the override via the subdir conftest;
+                            # the entity stays in the original file so the
+                            # original test discovers the override from its own
+                            # module rather than the stale parent conftest entry.
+                            conftest_group.append(name)
+                            copy_not_migrate.add(name)
+                        else:
+                            # No conflict: route to the parent conftest.py so
+                            # both original and subdir tests can find it.
+                            conftest_group_parent.append(name)
                     else:
                         conftest_group.append(name)
                 else:
@@ -1859,6 +1932,12 @@ def generate_file_splits(
         if conftest_group:
             new_valid.append(
                 GroupPlacement(group=conftest_group, target_file=conftest_target)
+            )
+        if conftest_group_parent:
+            new_valid.append(
+                GroupPlacement(
+                    group=conftest_group_parent, target_file=parent_conftest_target
+                )
             )
         valid_placements = new_valid
 
@@ -2065,8 +2144,13 @@ def generate_file_splits(
             )
 
     # Build updated original source.
+    # copy_not_migrate fixtures are written to the subdir conftest (so they
+    # appear in migrated_names / file_entity_names) but must NOT be removed
+    # from the original file — the original test discovers them via the test
+    # module itself, which takes precedence over the parent conftest's stale
+    # base version.
     updated = _remove_entity_lines(
-        post_source, migrated_names, entity_map, entity_source_map
+        post_source, migrated_names - copy_not_migrate, entity_map, entity_source_map
     )
     updated = _prune_unused_imports(updated)
     # For non-test subdir splits, re-exports from the __init__.py use relative
@@ -2104,9 +2188,10 @@ def generate_file_splits(
     # conftest already has that name): pytest discovers them by name-lookup, so
     # re-exporting them from the original file would be dead code and prevent
     # the original from being cleaned up / deleted.
+    _conftest_files = {conftest_target, parent_conftest_target}
     re_export_placements = []
     for p in valid_placements + synthetic_placements:
-        if p.target_file == conftest_target:
+        if p.target_file in _conftest_files:
             continue
         if conftest_conflict_names:
             filtered_group = [n for n in p.group if n not in conftest_conflict_names]
@@ -2180,4 +2265,5 @@ def generate_file_splits(
         original_source=updated,
         abort=False,
         entity_name_rewrites=entity_name_rewrites,
+        actual_placements=valid_placements + synthetic_placements,
     )

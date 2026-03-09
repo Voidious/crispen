@@ -659,9 +659,13 @@ def run_file_limiter(
             llm_calls=total_llm_calls,
         )
 
+    # Use actual_placements (after conftest routing) for accurate target files.
+    _report_placements = (
+        split.actual_placements if split.actual_placements else plan.placements
+    )
     msgs = [
         f"{filepath}: FileLimiter: moved {', '.join(p.group)} \u2192 {p.target_file}"
-        for p in plan.placements
+        for p in _report_placements
     ]
     return FileLimiterResult(
         original_source=split.original_source,

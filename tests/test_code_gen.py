@@ -4015,6 +4015,144 @@ def test_generate_pytest_conftest_subdir_routes_to_subdir_conftest():
     assert "import client" not in result.original_source
 
 
+def test_generate_pytest_conftest_subdir_fixture_referenced_in_remaining_goes_to_parent():  # noqa: E501
+    # When a fixture is migrated from a subdir split but its name still appears
+    # in entities that remain in the original file, route it to the parent
+    # conftest.py (not the subdir conftest) so those tests can find it.
+    src = textwrap.dedent(
+        """\
+        @pytest.fixture
+        def client():
+            pass
+
+        def test_big(client):
+            pass
+        """
+    )
+    e_client = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    e_test = Entity(EntityKind.FUNCTION, "test_big", 5, 6, ["test_big"])
+    # Only the fixture is migrated; the test stays in the original.
+    c = _classified(entities=[e_client, e_test])
+    plan = _plan([GroupPlacement(group=["client"], target_file="expr/fixtures.py")])
+
+    result = generate_file_splits(
+        c, plan, src, "test_big.py", subdir_name="expr", pytest_conftest=True
+    )
+
+    # Fixture goes to parent conftest.py, not the subdir one.
+    assert "conftest.py" in result.new_files
+    assert "def client():" in result.new_files["conftest.py"]
+    assert "expr/conftest.py" not in result.new_files
+    # No import of client back into the original.
+    assert "import client" not in result.original_source
+
+
+def test_generate_pytest_conftest_subdir_fixture_overrides_parent_conftest(tmp_path):
+    # When the fixture is referenced in remaining source AND the parent conftest
+    # already has a fixture with the same name (the module was overriding it),
+    # the fixture is *copied* (not moved) to the subdir conftest so migrated
+    # tests get the override; the entity also stays in the original file so
+    # the original test discovers it from its own module.
+    parent_conftest = tmp_path / "conftest.py"
+    parent_conftest.write_text(
+        "@pytest.fixture\ndef client():\n    return 'base'\n", encoding="utf-8"
+    )
+    src = textwrap.dedent(
+        """\
+        @pytest.fixture
+        def client():
+            return 'override'
+
+        def test_big(client):
+            pass
+        """
+    )
+    e_client = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    e_test = Entity(EntityKind.FUNCTION, "test_big", 5, 6, ["test_big"])
+    c = _classified(entities=[e_client, e_test])
+    plan = _plan([GroupPlacement(group=["client"], target_file="expr/fixtures.py")])
+    original_path = str(tmp_path / "test_big.py")
+
+    result = generate_file_splits(
+        c, plan, src, original_path, subdir_name="expr", pytest_conftest=True
+    )
+
+    # Fixture goes to subdir conftest for migrated tests.
+    assert "expr/conftest.py" in result.new_files
+    assert "def client():" in result.new_files["expr/conftest.py"]
+    assert "return 'override'" in result.new_files["expr/conftest.py"]
+    # Parent conftest is NOT modified (would drop the override via merge).
+    assert "conftest.py" not in result.new_files
+    # Fixture stays in original file so the original test finds the override.
+    assert "def client():" in result.original_source
+    assert "return 'override'" in result.original_source
+    # No re-export import injected.
+    assert "import client" not in result.original_source
+
+
+def test_generate_pytest_conftest_subdir_parent_conftest_imports_only(tmp_path):
+    # When parent conftest exists but contains only imports (no function defs),
+    # no conflict is detected and the fixture routes to parent conftest normally.
+    parent_conftest = tmp_path / "conftest.py"
+    parent_conftest.write_text("import pytest\n", encoding="utf-8")
+    src = textwrap.dedent(
+        """\
+        @pytest.fixture
+        def client():
+            pass
+
+        def test_big(client):
+            pass
+        """
+    )
+    e_client = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    e_test = Entity(EntityKind.FUNCTION, "test_big", 5, 6, ["test_big"])
+    c = _classified(entities=[e_client, e_test])
+    plan = _plan([GroupPlacement(group=["client"], target_file="expr/fixtures.py")])
+    original_path = str(tmp_path / "test_big.py")
+
+    result = generate_file_splits(
+        c, plan, src, original_path, subdir_name="expr", pytest_conftest=True
+    )
+
+    # No conflict in parent conftest → fixture routes to parent conftest.
+    assert "conftest.py" in result.new_files
+    assert "def client():" in result.new_files["conftest.py"]
+    assert "expr/conftest.py" not in result.new_files
+
+
+def test_generate_pytest_conftest_subdir_parent_conftest_syntax_error(tmp_path):
+    # When parent conftest has a syntax error, the OSError/SyntaxError handler
+    # silently ignores it (no names loaded), so no conflict is detected and the
+    # fixture routes to parent conftest normally.
+    parent_conftest = tmp_path / "conftest.py"
+    parent_conftest.write_text("def (broken syntax", encoding="utf-8")
+    src = textwrap.dedent(
+        """\
+        @pytest.fixture
+        def client():
+            pass
+
+        def test_big(client):
+            pass
+        """
+    )
+    e_client = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    e_test = Entity(EntityKind.FUNCTION, "test_big", 5, 6, ["test_big"])
+    c = _classified(entities=[e_client, e_test])
+    plan = _plan([GroupPlacement(group=["client"], target_file="expr/fixtures.py")])
+    original_path = str(tmp_path / "test_big.py")
+
+    result = generate_file_splits(
+        c, plan, src, original_path, subdir_name="expr", pytest_conftest=True
+    )
+
+    # Unreadable parent conftest → no conflict detected → parent conftest.
+    assert "conftest.py" in result.new_files
+    assert "def client():" in result.new_files["conftest.py"]
+    assert "expr/conftest.py" not in result.new_files
+
+
 def test_generate_pytest_conftest_fixture_goes_to_conftest():
     # With pytest_conftest=True, fixture entity lands in conftest.py, not the
     # LLM-assigned file, and no re-export import appears in the original.
