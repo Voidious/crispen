@@ -97,6 +97,155 @@ def _blocked_private_scopes(source: str, ranges: List[Tuple[int, int]]) -> Set[s
 
 
 # ---------------------------------------------------------------------------
+# FileLimiter: inline-import redirect helpers
+# ---------------------------------------------------------------------------
+
+_PROJECT_MARKERS = frozenset({"pyproject.toml", "setup.py", "setup.cfg", ".git"})
+
+
+def _module_path_for_file(file_path: str) -> Optional[str]:
+    """Return the dotted Python module path of *file_path*.
+
+    Walks up from the file's directory to find the project root (the first
+    ancestor containing pyproject.toml, setup.py, setup.cfg, or .git), then
+    computes the dotted path relative to that root.
+
+    Returns ``None`` when the project root cannot be determined or when the
+    resolved path is not under the project root.
+    """
+    abs_path = Path(file_path).resolve()
+    current = abs_path.parent
+    while True:
+        if any((current / m).exists() for m in _PROJECT_MARKERS):
+            rel = abs_path.relative_to(current)
+            return ".".join(rel.with_suffix("").parts)
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _redirect_inline_module_imports(
+    source: str,
+    old_mod: str,
+    name_to_new_mod: Dict[str, str],
+) -> str:
+    """Replace ``from old_mod import names`` statements with new module paths.
+
+    Scans all ``from <old_mod> import …`` statements at every level
+    (module-level and inside function/class bodies).  Each imported name is
+    redirected to the module given by *name_to_new_mod*; names absent from the
+    map are kept pointing at *old_mod*.
+
+    Returns *source* unchanged when there are no matching imports or when
+    *source* cannot be parsed as Python.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    lines = source.splitlines(keepends=True)
+    replacements: Dict[Tuple[int, int], str] = {}
+
+    def _scan(stmts: list) -> None:
+        for node in stmts:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and node.module == old_mod
+            ):
+                names = [alias.name for alias in node.names]
+                new_mod_to_names: Dict[str, List[str]] = {}
+                kept: List[str] = []
+                for n in names:
+                    dest = name_to_new_mod.get(n)
+                    if dest:
+                        new_mod_to_names.setdefault(dest, []).append(n)
+                    else:
+                        kept.append(n)
+                if not new_mod_to_names:
+                    continue  # No names moved; leave unchanged.
+                raw_line = lines[node.lineno - 1]
+                indent = raw_line[: len(raw_line) - len(raw_line.lstrip())]
+                parts: List[str] = []
+                if kept:
+                    parts.append(f"{indent}from {old_mod} import {', '.join(kept)}")
+                for dest_mod, dest_names in sorted(new_mod_to_names.items()):
+                    joined = ", ".join(sorted(dest_names))
+                    parts.append(f"{indent}from {dest_mod} import {joined}")
+                replacements[(node.lineno, node.end_lineno)] = "\n".join(parts)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                _scan(node.body)
+
+    _scan(tree.body)
+    if not replacements:
+        return source
+
+    result = list(lines)
+    for (start, end), text in sorted(replacements.items(), reverse=True):
+        last_line = result[end - 1]
+        trailing = "\n" if last_line.endswith("\n") else ""
+        result[start - 1 : end] = [text + trailing]
+    return "".join(result)
+
+
+def _patch_inline_imports_after_test_deletion(
+    deleted_path: str,
+    deleted_dir: Path,
+    new_files: Dict[str, str],
+    per_file: Dict,
+    fl_new_file_final: Dict[str, Optional[str]],
+) -> None:
+    """Redirect inline imports pointing to a deleted test module.
+
+    When a test file is deleted after a recursive subdir split (because all
+    entities migrated away, leaving an empty ``original_source``), any parent
+    file that received injected inline imports during the *first* split still
+    references the now-gone module.  This function rewrites those stale imports
+    to point directly at the new sub-file locations.
+
+    Updates both ``per_file`` states (written to disk later by the write loop)
+    and ``fl_new_file_final`` entries (already on disk; re-written immediately).
+    """
+    old_mod = _module_path_for_file(deleted_path)
+    if old_mod is None:
+        return
+
+    # Build name → new_module by parsing top-level definitions in new_files.
+    name_to_new_mod: Dict[str, str] = {}
+    for rel_path, content in new_files.items():
+        new_abs = (deleted_dir / rel_path).resolve()
+        new_mod = _module_path_for_file(str(new_abs))
+        if new_mod is None:
+            continue
+        try:
+            sub_tree = ast.parse(content)
+        except SyntaxError:
+            continue
+        for node in sub_tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                name_to_new_mod[node.name] = new_mod
+
+    if not name_to_new_mod:
+        return
+
+    for state in per_file.values():
+        updated = _redirect_inline_module_imports(
+            state["source"], old_mod, name_to_new_mod
+        )
+        if updated != state["source"]:
+            state["source"] = updated
+
+    for path, content in list(fl_new_file_final.items()):
+        if not content:
+            continue
+        updated = _redirect_inline_module_imports(content, old_mod, name_to_new_mod)
+        if updated != content:
+            fl_new_file_final[path] = updated
+            Path(path).write_text(updated, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Repo-root helpers
 # ---------------------------------------------------------------------------
 
@@ -787,6 +936,16 @@ def run_engine(
                     Path(r_path).write_text("", encoding="utf-8")
                     _fl_new_file_final[str(r_path)] = ""
                 else:
+                    # Before deleting a test file, redirect any inline imports
+                    # in parent or sibling files that point to the old module.
+                    if Path(r_path).name.startswith("test_"):
+                        _patch_inline_imports_after_test_deletion(
+                            r_path,
+                            r_dir,
+                            r_result.new_files,
+                            per_file,
+                            _fl_new_file_final,
+                        )
                     Path(r_path).unlink()
                     _fl_new_file_final.pop(str(r_path), None)
 
