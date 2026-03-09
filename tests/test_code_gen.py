@@ -33,6 +33,7 @@ from crispen.file_limiter.code_gen import (
     _is_test_name,
     _merge_conftest_sources,
     _merge_from_imports,
+    _sort_imports_pep8,
     _module_path_from_file,
     _prune_inline_redundant_imports,
     _prune_unused_imports,
@@ -1210,6 +1211,49 @@ def test_merge_from_imports_preserves_plain_imports():
 
 def test_merge_from_imports_empty():
     assert _merge_from_imports([]) == []
+
+
+# ---------------------------------------------------------------------------
+# _sort_imports_pep8
+# ---------------------------------------------------------------------------
+
+
+def test_sort_imports_pep8_basic_ordering():
+    # Third-party plain import after relative from-import → should be reordered.
+    imports = [
+        "from typing import Any",
+        "from .conversion import foo",
+        "import lupa",
+    ]
+    result = _sort_imports_pep8(imports)
+    assert result == [
+        "from typing import Any",
+        "import lupa",
+        "from .conversion import foo",
+    ]
+
+
+def test_sort_imports_pep8_future_first():
+    imports = ["import os", "from __future__ import annotations", "from .x import y"]
+    result = _sort_imports_pep8(imports)
+    assert result[0] == "from __future__ import annotations"
+
+
+def test_sort_imports_pep8_preserves_within_group_order():
+    imports = ["from .b import y", "from .a import x"]
+    result = _sort_imports_pep8(imports)
+    # Both are local; original order preserved
+    assert result == ["from .b import y", "from .a import x"]
+
+
+def test_sort_imports_pep8_empty():
+    assert _sort_imports_pep8([]) == []
+
+
+def test_sort_imports_pep8_all_stdlib():
+    imports = ["import os", "import sys", "from pathlib import Path"]
+    result = _sort_imports_pep8(imports)
+    assert result == imports  # already ordered, stable sort keeps original order
 
 
 # ---------------------------------------------------------------------------

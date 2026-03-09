@@ -471,6 +471,28 @@ def _merge_from_imports(imports: List[str]) -> List[str]:
     return result + plain
 
 
+def _sort_imports_pep8(imports: List[str]) -> List[str]:
+    """Re-order *imports* following PEP 8: future → stdlib → third-party → local.
+
+    Within each group the original relative order is preserved (stable sort).
+    """
+    import sys
+
+    stdlib = sys.stdlib_module_names  # frozenset; available since Python 3.10
+
+    def _group(imp: str) -> int:
+        if imp.startswith("from __future__"):
+            return 0  # __future__
+        if re.match(r"^from\s+\.", imp):
+            return 3  # relative / local
+        m = re.match(r"^(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", imp)
+        if m and m.group(1) in stdlib:
+            return 1  # stdlib
+        return 2  # third-party
+
+    return sorted(imports, key=_group)
+
+
 def _target_module_name(target_file: str) -> str:
     """Convert a relative target filename to a dotted module name.
 
@@ -2023,7 +2045,7 @@ def generate_file_splits(
             entity_srcs.append(_src)
         entity_srcs = [s for s in entity_srcs if s]
         parts: List[str] = []
-        all_imports = _merge_from_imports(needed + top_cross)
+        all_imports = _sort_imports_pep8(_merge_from_imports(needed + top_cross))
         if all_imports:
             parts.append("\n".join(all_imports))
         parts.extend(entity_srcs)
