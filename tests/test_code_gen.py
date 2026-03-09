@@ -14,6 +14,7 @@ from crispen.file_limiter.code_gen import (
     _class_has_test_methods,
     _collect_external_imported_names,
     _collect_name_loads,
+    _test_names_in_decorators,
     _extract_import_info,
     _extract_module_docstring,
     _extract_shared_helpers,
@@ -166,6 +167,32 @@ def test_collect_name_loads_annotated_vararg_kwarg():
     names = _collect_name_loads(source)
     assert "VarType" in names
     assert "KwType" in names
+
+
+# ---------------------------------------------------------------------------
+# _test_names_in_decorators
+# ---------------------------------------------------------------------------
+
+
+def test_test_names_in_decorators_finds_name_in_decorator():
+    src = (
+        "@pytest.mark.parametrize('x', TestFixture.PARAMS)\ndef test_fn(x):\n    pass\n"
+    )
+    assert _test_names_in_decorators(src, {"TestFixture"}) == {"TestFixture"}
+
+
+def test_test_names_in_decorators_name_only_in_body_not_found():
+    src = "def test_fn():\n    TestFixture.setup()\n"
+    assert _test_names_in_decorators(src, {"TestFixture"}) == set()
+
+
+def test_test_names_in_decorators_syntax_error_returns_empty():
+    assert _test_names_in_decorators("def (invalid", {"TestFixture"}) == set()
+
+
+def test_test_names_in_decorators_class_decorator():
+    src = "@TestFixture.mark\nclass TestSomething:\n    pass\n"
+    assert _test_names_in_decorators(src, {"TestFixture"}) == {"TestFixture"}
 
 
 # ---------------------------------------------------------------------------
@@ -864,10 +891,11 @@ def test_find_cross_file_imports_basic():
     # fn_a references _MODEL which is defined in block_1.py
     entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
     name_to_target_file = {"_MODEL": "block_1.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "llm_extract.py"
     )
-    assert imports == ["from .block_1 import _MODEL"]
+    assert from_imports == ["from .block_1 import _MODEL"]
+    assert module_imports == []
     assert rewrites == {}
 
 
@@ -875,29 +903,32 @@ def test_find_cross_file_imports_same_file_excluded():
     # _MODEL goes to the same file as fn_a → no cross-file import needed
     entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
     name_to_target_file = {"_MODEL": "llm_extract.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "llm_extract.py"
     )
-    assert imports == []
+    assert from_imports == []
+    assert module_imports == []
     assert rewrites == {}
 
 
 def test_find_cross_file_imports_no_match():
     # Referenced name not in name_to_target_file → no cross-file import
     entity_source_map = {"fn_a": "def fn_a():\n    return os.getcwd()\n"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, {}, "utils.py"
     )
-    assert imports == []
+    assert from_imports == []
+    assert module_imports == []
     assert rewrites == {}
 
 
 def test_find_cross_file_imports_entity_not_in_map():
     # Entity name not in entity_source_map → treated as empty source, no imports
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["ghost"], {}, {"x": "other.py"}, "utils.py"
     )
-    assert imports == []
+    assert from_imports == []
+    assert module_imports == []
     assert rewrites == {}
 
 
@@ -941,16 +972,19 @@ def test_find_cross_file_imports_cross_directory():
     # Cross-directory import needs ".." to go up from tests/ to root.
     entity_source_map = {"fn_a": "def fn_a():\n    return _helper()\n"}
     name_to_target_file = {"_helper": "helpers/entities.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "tests/test.py"
     )
-    assert imports == ["from ..helpers.entities import _helper"]
+    assert from_imports == ["from ..helpers.entities import _helper"]
+    assert module_imports == []
     assert rewrites == {}
 
 
 def test_find_cross_file_imports_top_level_var_uses_module_import():
     # SAFE_MODE is a TOP_LEVEL variable in conversion.py; runtime.py references it.
-    # Should produce a module-level import and a rewrite dict, not a direct name import.
+    # Should produce a module-level import (from . import conversion) in
+    # module_imports, not a direct name import, so that later mutations to the
+    # variable propagate correctly.
     entity_source_map = {
         "create_lua_runtime": (
             "def create_lua_runtime(safe_mode=None):\n"
@@ -959,24 +993,24 @@ def test_find_cross_file_imports_top_level_var_uses_module_import():
         )
     }
     name_to_target_file = {"SAFE_MODE": "conversion.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["create_lua_runtime"],
         entity_source_map,
         name_to_target_file,
         "runtime.py",
         top_level_var_names={"SAFE_MODE"},
     )
-    assert imports == ["from . import conversion"]
+    assert from_imports == []
+    assert module_imports == ["from . import conversion"]
     assert rewrites == {"SAFE_MODE": "conversion.SAFE_MODE"}
 
 
 def test_find_cross_file_imports_top_level_var_abs_pkg():
     # Same as above but with abs_pkg set (test-file context).
-    # Uses "import pkg.module as local" syntax to avoid misidentifying test-named
-    # modules as test symbols (which would trigger inline injection).
+    # Uses "import pkg.module as local" syntax to avoid test-name misclassification.
     entity_source_map = {"fn_a": "def fn_a():\n    return SAFE_MODE\n"}
     name_to_target_file = {"SAFE_MODE": "conversion.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"],
         entity_source_map,
         name_to_target_file,
@@ -984,7 +1018,8 @@ def test_find_cross_file_imports_top_level_var_abs_pkg():
         abs_pkg="mylib",
         top_level_var_names={"SAFE_MODE"},
     )
-    assert imports == ["import mylib.conversion as conversion"]
+    assert from_imports == []
+    assert module_imports == ["import mylib.conversion as conversion"]
     assert rewrites == {"SAFE_MODE": "conversion.SAFE_MODE"}
 
 
@@ -992,7 +1027,7 @@ def test_find_cross_file_imports_top_level_var_abs_pkg_empty():
     # abs_pkg="" (root-level test) — no package prefix, plain "import conversion".
     entity_source_map = {"fn_a": "def fn_a():\n    return SAFE_MODE\n"}
     name_to_target_file = {"SAFE_MODE": "conversion.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"],
         entity_source_map,
         name_to_target_file,
@@ -1000,7 +1035,8 @@ def test_find_cross_file_imports_top_level_var_abs_pkg_empty():
         abs_pkg="",
         top_level_var_names={"SAFE_MODE"},
     )
-    assert imports == ["import conversion"]
+    assert from_imports == []
+    assert module_imports == ["import conversion"]
     assert rewrites == {"SAFE_MODE": "conversion.SAFE_MODE"}
 
 
@@ -1008,14 +1044,15 @@ def test_find_cross_file_imports_top_level_var_cross_directory():
     # TOP_LEVEL var in sub/constants.py, referenced from runtime.py at root.
     entity_source_map = {"fn_a": "def fn_a():\n    return TIMEOUT\n"}
     name_to_target_file = {"TIMEOUT": "sub/constants.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"],
         entity_source_map,
         name_to_target_file,
         "runtime.py",
         top_level_var_names={"TIMEOUT"},
     )
-    assert imports == ["from .sub import constants"]
+    assert from_imports == []
+    assert module_imports == ["from .sub import constants"]
     assert rewrites == {"TIMEOUT": "constants.TIMEOUT"}
 
 
@@ -1025,15 +1062,15 @@ def test_find_cross_file_imports_mixed_top_level_and_function():
         "fn_a": ("def fn_a():\n" "    if SAFE_MODE:\n" "        return _helper()\n")
     }
     name_to_target_file = {"SAFE_MODE": "conversion.py", "_helper": "helpers.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"],
         entity_source_map,
         name_to_target_file,
         "runtime.py",
         top_level_var_names={"SAFE_MODE"},
     )
-    assert "from . import conversion" in imports
-    assert "from .helpers import _helper" in imports
+    assert from_imports == ["from .helpers import _helper"]
+    assert module_imports == ["from . import conversion"]
     assert rewrites == {"SAFE_MODE": "conversion.SAFE_MODE"}
 
 
@@ -1263,9 +1300,9 @@ def test_sort_imports_pep8_all_stdlib():
 
 def test_generate_cross_file_import():
     # fn_a goes to fn_module.py; _block_1 (defining _CONST) goes to constants.py.
-    # _CONST is a TOP_LEVEL variable → fn_module.py must use a module-level import
-    # ("from . import constants") and reference it as "constants._CONST" so that
-    # later mutations to the variable propagate correctly.
+    # _CONST is a TOP_LEVEL variable → fn_module.py uses a module-level import
+    # ("from . import constants") so that later mutations to the variable propagate.
+    # The import must be at module level (not inlined) so decorators can use it.
     source = "_CONST = 42\n\ndef fn_a():\n    return _CONST\n"
     e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
     e_fn = _make_entity("fn_a", 3, 4)
@@ -1282,6 +1319,8 @@ def test_generate_cross_file_import():
     fn_src = result.new_files["fn_module.py"]
     assert "from . import constants" in fn_src
     assert "constants._CONST" in fn_src
+    # The module import must be at module level (first non-empty line), not indented
+    assert any(ln.startswith("from . import constants") for ln in fn_src.splitlines())
     # constants.py should NOT have a cross-import (it defines _CONST, not uses it)
     const_src = result.new_files["constants.py"]
     assert "from .fn_module" not in const_src
@@ -1291,7 +1330,7 @@ def test_generate_cross_file_import_no_duplicate_names():
     # Two entities (fn_a and fn_b) migrate to the same new file.
     # fn_a uses X and Z from helpers; fn_b uses Y and Z from helpers.
     # X, Y, Z are TOP_LEVEL variables → the new file gets ONE "from . import constants"
-    # and references them as constants.X / constants.Y / constants.Z.
+    # at module level (not inlined) and references them as constants.X / Y / Z.
     source = textwrap.dedent(
         """\
         X = 1
@@ -1322,13 +1361,48 @@ def test_generate_cross_file_import_no_duplicate_names():
     # Both fn_a and fn_b are present
     assert "def fn_a" in funcs_src
     assert "def fn_b" in funcs_src
-    # Module-level import for the TOP_LEVEL variables, with no duplicates
+    # Module-level import at module level, with no duplicates
     import_lines = [ln for ln in funcs_src.splitlines() if "import constants" in ln]
     assert len(import_lines) == 1, f"Expected 1 import line, got: {import_lines}"
+    assert import_lines[0].startswith("from . import constants")
     # Variables are referenced through the module object
     assert "constants.X" in funcs_src
     assert "constants.Y" in funcs_src
     assert "constants.Z" in funcs_src
+
+
+def test_generate_aborts_when_test_class_used_in_decorator():
+    # TestFixture (a Test* class) provides PARAMS used in a parametrize decorator
+    # on test_fn.  If they are split into different files, TestFixture would need
+    # to be imported inline (to avoid pytest duplicate collection), but that
+    # import would not be in scope when the decorator is evaluated.
+    source = textwrap.dedent(
+        """\
+        import pytest
+
+        class TestFixture:
+            PARAMS = [1, 2, 3]
+
+        @pytest.mark.parametrize("x", TestFixture.PARAMS)
+        def test_fn(x):
+            assert x
+        """
+    )
+    e_fixture = Entity(EntityKind.CLASS, "TestFixture", 3, 4, ["TestFixture"])
+    e_fn = _make_entity("test_fn", 6, 8)
+    c = _classified(entities=[e_fixture, e_fn])
+    plan = _plan(
+        [
+            GroupPlacement(group=["TestFixture"], target_file="test_fixture.py"),
+            GroupPlacement(group=["test_fn"], target_file="test_fns.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "tests/test_original.py")
+
+    assert result.abort
+    assert "TestFixture" in result.abort_reason
+    assert "decorator" in result.abort_reason
 
 
 def test_generate_non_migrated_helper_extracted_to_new_file():
@@ -2781,10 +2855,11 @@ def test_find_cross_file_imports_abs_pkg_package_prefix():
     # abs_pkg="tests" → "from tests.block_1 import _MODEL"
     entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
     name_to_target_file = {"_MODEL": "block_1.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "test_fn.py", abs_pkg="tests"
     )
-    assert imports == ["from tests.block_1 import _MODEL"]
+    assert from_imports == ["from tests.block_1 import _MODEL"]
+    assert module_imports == []
     assert rewrites == {}
 
 
@@ -2792,10 +2867,11 @@ def test_find_cross_file_imports_abs_pkg_root_level():
     # abs_pkg="" → "from block_1 import _MODEL" (no package prefix)
     entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
     name_to_target_file = {"_MODEL": "block_1.py"}
-    imports, rewrites = _find_cross_file_imports(
+    from_imports, module_imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "test_fn.py", abs_pkg=""
     )
-    assert imports == ["from block_1 import _MODEL"]
+    assert from_imports == ["from block_1 import _MODEL"]
+    assert module_imports == []
     assert rewrites == {}
 
 
@@ -2887,7 +2963,7 @@ def test_generate_test_file_cross_imports_use_absolute_imports(tmp_path):
     result = generate_file_splits(c, plan, source, str(test_file))
 
     fn_src = result.new_files["test_fns.py"]
-    # _CONST is a TOP_LEVEL variable → live module import, not direct name import.
+    # _CONST is a TOP_LEVEL variable → module-level import using absolute path.
     # Uses "import" syntax to avoid misidentifying test_constants as a test symbol.
     assert "import tests.test_constants as test_constants" in fn_src
     assert "test_constants._CONST" in fn_src
@@ -3014,12 +3090,12 @@ def test_generate_file_splits_test_subdir_nonmigrated_imports_from_original():
 
     assert not result.abort
     test_src = result.new_files["svc/test_fns.py"]
-    # Module-level import (inline because test_svc is a test-named module);
-    # references the variable live via test_svc._CONFIG.
+    # Module-level import must be at module level (not injected inline), because
+    # decorators like @pytest.mark.parametrize are evaluated before function bodies.
     assert "from .. import test_svc" in test_src
     assert "test_svc._CONFIG" in test_src
-    # Should NOT capture a stale value copy
-    assert "from ..test_svc import _CONFIG" not in test_src
+    # Must NOT be indented (i.e., must be at module level, not inside a function)
+    assert any(ln.startswith("from .. import test_svc") for ln in test_src.splitlines())
 
 
 def test_generate_file_splits_has_main_uses_filename_as_original_basename():

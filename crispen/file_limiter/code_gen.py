@@ -208,6 +208,33 @@ def _collect_name_loads(source: str) -> Set[str]:
     return names
 
 
+def _test_names_in_decorators(source: str, names: Set[str]) -> Set[str]:
+    """Return the subset of *names* that appear as Name loads inside a decorator.
+
+    Decorators are evaluated before function bodies run, so a symbol that
+    only reaches a file via an inline import (injected into the function body)
+    will not be in scope when the decorator is evaluated.  This helper detects
+    that situation so callers can abort the split rather than generate broken
+    code.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    found: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for dec in node.decorator_list:
+                for child in ast.walk(dec):
+                    if (
+                        isinstance(child, ast.Name)
+                        and isinstance(child.ctx, ast.Load)
+                        and child.id in names
+                    ):
+                        found.add(child.id)
+    return found
+
+
 def _extract_import_info(source: str) -> List[ImportInfo]:
     """Return :class:`ImportInfo` for each top-level import in *source*."""
     try:
@@ -380,20 +407,27 @@ def _find_cross_file_imports(
     current_target: str,
     abs_pkg: Optional[str] = None,
     top_level_var_names: Optional[Set[str]] = None,
-) -> Tuple[List[str], Dict[str, str]]:
-    """Return ``(imports, name_rewrites)`` for other-file dependencies.
+) -> Tuple[List[str], List[str], Dict[str, str]]:
+    """Return ``(from_imports, module_imports, name_rewrites)`` for other-file
+    dependencies.
 
     When an entity being moved to *current_target* references a name that is
     defined by another entity being moved to a different target file, the new
     file needs an explicit import for that name.
 
-    For names defined by ``TOP_LEVEL`` entities (module-level variables such as
-    ``SAFE_MODE = True``), a module-level import is used instead of a direct
-    name import.  This preserves the dynamic lookup semantics of the original
-    single-file module: mutations to the variable in its home module are
-    immediately visible to the importing file.  The returned *name_rewrites*
-    dict maps each such bare name (e.g. ``"SAFE_MODE"``) to its qualified form
-    (e.g. ``"conversion.SAFE_MODE"``); callers must rewrite the entity source
+    *from_imports* are ``from .module import Name`` statements for
+    function/class references.  These may be subject to test-name inline
+    injection by the caller (to avoid pytest collecting imported test functions
+    as duplicate tests).
+
+    *module_imports* are ``from . import module`` (or ``import pkg.module as
+    module``) statements for names defined by ``TOP_LEVEL`` entities
+    (module-level variables such as ``SAFE_MODE = True``).  These must always
+    be placed at module level — never injected inline — because they are
+    required by decorator expressions that are evaluated before any function
+    body runs.  The returned *name_rewrites* dict maps each such bare name
+    (e.g. ``"SAFE_MODE"``) to its qualified form (e.g.
+    ``"conversion.SAFE_MODE"``); callers must rewrite the entity source
     accordingly.
 
     When *abs_pkg* is ``None`` the import prefix is relative (e.g.
@@ -415,7 +449,8 @@ def _find_cross_file_imports(
             else:
                 from_files.setdefault(source_file, []).append(ref_name)
 
-    result = []
+    from_result: List[str] = []
+    mod_result: List[str] = []
     rewrites: Dict[str, str] = {}
     for source_file, names in sorted(from_files.items()):
         if abs_pkg is not None:
@@ -423,13 +458,13 @@ def _find_cross_file_imports(
             prefix = f"{abs_pkg}.{mod}" if abs_pkg else mod
         else:
             prefix = _relative_import_prefix(current_target, source_file)
-        result.append(f"from {prefix} import {', '.join(sorted(names))}")
+        from_result.append(f"from {prefix} import {', '.join(sorted(names))}")
     for source_file, names in sorted(mod_files.items()):
         stmt, local_name = _module_import_stmt(current_target, source_file, abs_pkg)
-        result.append(stmt)
+        mod_result.append(stmt)
         for name in names:
             rewrites[name] = f"{local_name}.{name}"
-    return result, rewrites
+    return from_result, mod_result, rewrites
 
 
 _FROM_IMPORT_RE = re.compile(r"^(from\s+\S+)\s+import\s+(.*)")
@@ -1970,9 +2005,9 @@ def generate_file_splits(
                     name_to_target_file.setdefault(defined_name, non_migrated_home)
 
     # Collect names defined by TOP_LEVEL entities (module-level variables, not
-    # functions or classes).  Cross-file references to these names require a
-    # live module-level import so that later mutations to the variable in its
-    # home module propagate to all importing files.
+    # functions or classes).  Cross-file references to these names use a
+    # module-level import so that later mutations to the variable in its home
+    # module propagate to all importing files.
     top_level_var_names: Set[str] = {
         defined_name
         for entity in classified.entities
@@ -2097,7 +2132,7 @@ def generate_file_splits(
             _src = _src.rstrip()
             # Compute cross-file imports for this entity and split off any
             # test-named symbols (Test* / test_*) to be injected inline.
-            entity_cross, entity_rewrites = _find_cross_file_imports(
+            entity_from, entity_mod, entity_rewrites = _find_cross_file_imports(
                 [_ent_name],
                 entity_source_map,
                 name_to_target_file,
@@ -2108,12 +2143,42 @@ def generate_file_splits(
             if entity_rewrites:
                 _src = _rewrite_module_var_names(_src, entity_rewrites)
                 entity_name_rewrites[_ent_name] = entity_rewrites
-            ent_top_cross, ent_test_imports = _split_cross_imports_by_test(entity_cross)
+            # Module imports for TOP_LEVEL vars must always be at module level
+            # (never inlined) — decorators are evaluated before function bodies run.
+            for imp in entity_mod:
+                if imp not in seen_top_cross:
+                    seen_top_cross.add(imp)
+                    top_cross.append(imp)
+            ent_top_cross, ent_test_imports = _split_cross_imports_by_test(entity_from)
             for imp in ent_top_cross:
                 if imp not in seen_top_cross:
                     seen_top_cross.add(imp)
                     top_cross.append(imp)
             if ent_test_imports and _entity and _entity.kind != EntityKind.TOP_LEVEL:
+                # Extract the test-named symbols that would be inlined.
+                # All items from _split_cross_imports_by_test are "from X import Y"
+                # form, so partitioning on " import " is safe.
+                inlined_names: Set[str] = set()
+                for _imp in ent_test_imports:
+                    _, _, _names_part = _imp.partition(" import ")
+                    for _n in _names_part.split(","):
+                        inlined_names.add(_n.strip())
+                # Decorators are evaluated before function bodies, so a symbol
+                # that only arrives via an inline import will not be in scope.
+                dec_conflicts = _test_names_in_decorators(_src, inlined_names)
+                if dec_conflicts:
+                    _names_str = ", ".join(f"'{n}'" for n in sorted(dec_conflicts))
+                    return SplitResult(
+                        new_files={},
+                        original_source=post_source,
+                        abort=True,
+                        abort_reason=(
+                            f"cannot split '{_ent_name}': {_names_str} appear(s) "
+                            f"in a decorator but would need to be imported inline "
+                            f"to avoid pytest collecting them as duplicate tests — "
+                            f"keep the dependent test classes in the same file"
+                        ),
+                    )
                 _src = _inject_inline_imports(_src, ent_test_imports)
             else:
                 # TOP_LEVEL entity: no body scope, fall back to module level.
