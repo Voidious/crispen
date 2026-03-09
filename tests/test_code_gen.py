@@ -3615,6 +3615,26 @@ def test_generate_pytest_conftest_disabled_no_conftest():
     assert "client" in result.new_files["fixtures.py"]
 
 
+def test_generate_pytest_conftest_subdir_routes_to_subdir_conftest():
+    # With pytest_conftest=True AND subdir_name set, fixtures go to
+    # <subdir>/conftest.py (not the parent conftest.py).  This prevents
+    # multiple test files in the same directory from conflicting when they
+    # each have a fixture of the same name.
+    src = "@pytest.fixture\ndef client():\n    pass\n"
+    entity = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["client"], target_file="expr/fixtures.py")])
+
+    result = generate_file_splits(
+        c, plan, src, "test_big.py", subdir_name="expr", pytest_conftest=True
+    )
+
+    assert "expr/conftest.py" in result.new_files
+    assert "def client():" in result.new_files["expr/conftest.py"]
+    assert "conftest.py" not in result.new_files  # parent conftest untouched
+    assert "import client" not in result.original_source
+
+
 def test_generate_pytest_conftest_fixture_goes_to_conftest():
     # With pytest_conftest=True, fixture entity lands in conftest.py, not the
     # LLM-assigned file, and no re-export import appears in the original.
@@ -3693,6 +3713,81 @@ def test_generate_pytest_conftest_prepends_existing(tmp_path):
     assert "def client():" in conftest_src
     # Existing content should come first.
     assert conftest_src.index("prior") < conftest_src.index("client")
+
+
+def test_generate_pytest_conftest_name_conflict_keeps_in_target(tmp_path):
+    # When conftest.py already defines a function with the same name as the
+    # fixture being routed, the fixture stays in its LLM-assigned target file
+    # instead of being dropped by _merge_conftest_sources.  This preserves the
+    # entity in the split output so that _verify_preservation passes.
+    existing = tmp_path / "conftest.py"
+    existing.write_text(
+        "@pytest.fixture\nasync def client():\n    return 'old'\n", encoding="utf-8"
+    )
+
+    src = "@pytest.fixture\nasync def client():\n    return 'new'\n"
+    entity = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["client"], target_file="fixtures.py")])
+    original_path = str(tmp_path / "test_big.py")
+
+    result = generate_file_splits(c, plan, src, original_path, pytest_conftest=True)
+
+    # Fixture must appear in the output — in the LLM-assigned file, not conftest.
+    assert "fixtures.py" in result.new_files
+    assert "def client():" in result.new_files["fixtures.py"]
+    # conftest.py should not be created/modified (no new fixtures were routed there).
+    assert "conftest.py" not in result.new_files
+
+
+def test_generate_pytest_conftest_name_conflict_mixed_group(tmp_path):
+    # When a placement group contains both a conftest-conflict fixture AND a
+    # regular function, the fixture is excluded from re-exports but the regular
+    # function is still re-exported.  This covers the branch that rebuilds the
+    # GroupPlacement with only the non-conflict names.
+    existing = tmp_path / "conftest.py"
+    existing.write_text(
+        "@pytest.fixture\ndef client():\n    return 'old'\n", encoding="utf-8"
+    )
+
+    src = (
+        "@pytest.fixture\ndef client():\n    return 'new'\n\n"
+        "def helper():\n    pass\n"
+    )
+    e_client = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    e_helper = Entity(EntityKind.FUNCTION, "helper", 5, 6, ["helper"])
+    c = _classified(entities=[e_client, e_helper])
+    plan = _plan([GroupPlacement(group=["client", "helper"], target_file="helpers.py")])
+    original_path = str(tmp_path / "test_big.py")
+
+    result = generate_file_splits(c, plan, src, original_path, pytest_conftest=True)
+
+    # Both entities migrate to helpers.py.
+    assert "helpers.py" in result.new_files
+    assert "def client():" in result.new_files["helpers.py"]
+    assert "def helper():" in result.new_files["helpers.py"]
+    # helper is re-exported (public non-fixture); client is not (conftest conflict).
+    assert "helper" in result.original_source
+    assert "client" not in result.original_source
+
+
+def test_generate_pytest_conftest_unreadable_conftest_falls_through(tmp_path):
+    # When conftest.py exists but has a syntax error, the OSError/SyntaxError
+    # handler silently ignores it and routes the fixture to conftest normally.
+    existing = tmp_path / "conftest.py"
+    existing.write_text("def (broken syntax", encoding="utf-8")
+
+    src = "@pytest.fixture\ndef client():\n    pass\n"
+    entity = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["client"], target_file="fixtures.py")])
+    original_path = str(tmp_path / "test_big.py")
+
+    result = generate_file_splits(c, plan, src, original_path, pytest_conftest=True)
+
+    # With unreadable conftest, routing proceeds normally → fixture goes to conftest.
+    assert "conftest.py" in result.new_files
+    assert "def client():" in result.new_files["conftest.py"]
 
 
 # ---------------------------------------------------------------------------

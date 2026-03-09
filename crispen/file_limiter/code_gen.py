@@ -1627,8 +1627,42 @@ def generate_file_splits(
     # conftest.py instead of the LLM-assigned target file.  pytest discovers
     # fixtures from conftest.py automatically, so no re-export import is added
     # to the original file — eliminating the F401/F811 flake8 false positives.
+    #
+    # Exception: if conftest.py already defines a function with the same name
+    # (e.g. a default fixture that this test file overrides), routing the entity
+    # there would cause _merge_conftest_sources to silently drop the new version
+    # (keeping the old one), so the entity would disappear from the split output
+    # entirely and verification would fail.  In that case the fixture stays in
+    # its LLM-assigned target file; re-exports are still suppressed to avoid
+    # F401/F811 (the fixture is injected by pytest name-lookup, not by import).
+    # For subdir splits, route fixtures into the subdirectory's own conftest.py
+    # so that multiple test files in the same parent directory each get an
+    # isolated conftest scope and cannot overwrite each other's fixtures.
+    conftest_target = f"{subdir_name}/conftest.py" if subdir_name else "conftest.py"
+    existing_conftest_path = (
+        Path(original_path).parent / subdir_name / "conftest.py"
+        if subdir_name
+        else Path(original_path).parent / "conftest.py"
+    )
     fixture_entity_names: Set[str] = set()
+    # Names of fixtures kept in their LLM-assigned file because the target
+    # conftest.py already defines a symbol with that name.  Fixtures injected
+    # by pytest name-lookup need no re-export import in the original file.
+    conftest_conflict_names: Set[str] = set()
     if pytest_conftest:
+        existing_conftest_names: Set[str] = set()
+        if existing_conftest_path.exists():
+            try:
+                _ec_tree = ast.parse(existing_conftest_path.read_text(encoding="utf-8"))
+                for _ec_node in _ec_tree.body:
+                    if isinstance(
+                        _ec_node,
+                        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                    ):
+                        existing_conftest_names.add(_ec_node.name)
+            except (SyntaxError, OSError):
+                pass
+
         conftest_group: List[str] = []
         new_valid: List[GroupPlacement] = []
         for p in valid_placements:
@@ -1637,7 +1671,15 @@ def generate_file_splits(
                 src = entity_source_map.get(name, "")
                 if src and _is_pytest_fixture(src):
                     fixture_entity_names.add(name)
-                    conftest_group.append(name)
+                    if name in existing_conftest_names:
+                        # conftest already has this name: keep in the
+                        # LLM-assigned file to avoid losing the entity.
+                        # No re-export needed — pytest discovers fixtures
+                        # by name-lookup, not by import.
+                        non_fixture.append(name)
+                        conftest_conflict_names.add(name)
+                    else:
+                        conftest_group.append(name)
                 else:
                     non_fixture.append(name)
             if non_fixture:
@@ -1646,7 +1688,7 @@ def generate_file_splits(
                 )
         if conftest_group:
             new_valid.append(
-                GroupPlacement(group=conftest_group, target_file="conftest.py")
+                GroupPlacement(group=conftest_group, target_file=conftest_target)
             )
         valid_placements = new_valid
 
@@ -1871,11 +1913,20 @@ def generate_file_splits(
     )
     # Exclude conftest.py from re-exports: fixtures there are auto-discovered
     # by pytest and must not be imported back into the original test file.
-    re_export_placements = [
-        p
-        for p in valid_placements + synthetic_placements
-        if p.target_file != "conftest.py"
-    ]
+    # Also exclude conftest-conflict fixtures (kept in LLM-assigned file because
+    # conftest already has that name): pytest discovers them by name-lookup, so
+    # re-exporting them from the original file would be dead code and prevent
+    # the original from being cleaned up / deleted.
+    re_export_placements = []
+    for p in valid_placements + synthetic_placements:
+        if p.target_file == conftest_target:
+            continue
+        if conftest_conflict_names:
+            filtered_group = [n for n in p.group if n not in conftest_conflict_names]
+            if not filtered_group:
+                continue
+            p = GroupPlacement(group=filtered_group, target_file=p.target_file)
+        re_export_placements.append(p)
     updated = _add_re_exports(
         updated,
         re_export_placements,
@@ -1920,16 +1971,15 @@ def generate_file_splits(
         and updated
         and _file_has_only_fixtures(updated)
     ):
-        existing_conftest = Path(original_path).parent / "conftest.py"
-        if "conftest.py" in new_files:
-            new_files["conftest.py"] = _merge_conftest_sources(
-                new_files["conftest.py"], updated
+        if conftest_target in new_files:
+            new_files[conftest_target] = _merge_conftest_sources(
+                new_files[conftest_target], updated
             )
-        elif existing_conftest.exists():
-            prior = existing_conftest.read_text(encoding="utf-8")
-            new_files["conftest.py"] = _merge_conftest_sources(prior, updated)
+        elif existing_conftest_path.exists():
+            prior = existing_conftest_path.read_text(encoding="utf-8")
+            new_files[conftest_target] = _merge_conftest_sources(prior, updated)
         else:
-            new_files["conftest.py"] = updated
+            new_files[conftest_target] = updated
         updated = ""
 
     # Normalize blank lines: collapse 3+ consecutive blank lines to 2 and
