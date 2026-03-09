@@ -2256,6 +2256,85 @@ def test_add_re_exports_mixed_splits_into_two_lines():
     assert "_used" in plain_lines[0]
 
 
+def test_add_re_exports_is_test_file_adds_comment_before_first_noqa():
+    # is_test_file=True → single explanatory comment inserted before the first
+    # F401 import; non-test files and test files with no noqa imports get no comment.
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"foo": entity}, {}, is_test_file=True
+    )
+    lines = result.splitlines()
+    comment_idx = next(
+        (
+            i
+            for i, l in enumerate(lines)
+            if "Re-exported for backwards compatibility" in l
+        ),
+        None,
+    )
+    noqa_idx = next(
+        (i for i, l in enumerate(lines) if "# noqa: F401" in l),
+        None,
+    )
+    assert comment_idx is not None
+    assert noqa_idx is not None
+    assert comment_idx == noqa_idx - 1
+
+
+def test_add_re_exports_is_test_file_false_no_comment():
+    # is_test_file=False (default) → no explanatory comment added.
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
+    assert "Re-exported for backwards compatibility" not in result
+
+
+def test_add_re_exports_is_test_file_no_noqa_imports_no_comment():
+    # is_test_file=True but all re-exports are already referenced in source
+    # (no noqa imports) → comment is not added.
+    source = "import os\n\nfoo()\n"
+    entity = _make_entity("foo", 3, 3)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"foo": entity}, {}, is_test_file=True
+    )
+    assert "Re-exported for backwards compatibility" not in result
+
+
+def test_add_re_exports_is_test_file_comment_added_once_for_multiple_noqa():
+    # Multiple noqa imports → comment appears exactly once, before the first one.
+    source = "import os\n"
+    entity = _make_entity("_block", 1, 2, ["foo", "bar"])
+    placement = GroupPlacement(group=["_block"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"_block": entity}, {}, is_test_file=True
+    )
+    comment_count = result.count("Re-exported for backwards compatibility")
+    assert comment_count == 1
+
+
+def test_add_re_exports_is_test_file_comment_before_noqa_when_mixed():
+    # is_test_file=True with a mix of used (no noqa) and pure re-export (noqa)
+    # imports: the comment must appear before the noqa line, not before the used line.
+    source = "import os\n\n_used()\n"
+    entity = _make_entity("_block", 3, 4, ["_used", "pub"])
+    placement = GroupPlacement(group=["_block"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"_block": entity}, {}, is_test_file=True
+    )
+    lines = result.splitlines()
+    comment_idx = next(
+        i for i, l in enumerate(lines) if "Re-exported for backwards" in l
+    )
+    noqa_idx = next(i for i, l in enumerate(lines) if "# noqa: F401" in l)
+    used_idx = next(i for i, l in enumerate(lines) if "import _used" in l)
+    assert used_idx < comment_idx
+    assert comment_idx == noqa_idx - 1
+
+
 # ---------------------------------------------------------------------------
 # _prune_inline_redundant_imports
 # ---------------------------------------------------------------------------

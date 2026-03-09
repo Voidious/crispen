@@ -596,6 +596,7 @@ def _add_re_exports(
     external_loads: Set[str] = frozenset(),
     abs_pkg: Optional[str] = None,
     relative_from: Optional[str] = None,
+    is_test_file: bool = False,
 ) -> str:
     """Add ``from .module import name`` imports for migrated entities.
 
@@ -690,6 +691,14 @@ def _add_re_exports(
             export_stmts.append(
                 f"from {prefix} import {name}  # fmt: skip # noqa: F401, E501\n"
             )
+
+    # In test files, add a single explanatory comment before the first F401 import.
+    if is_test_file and noqa_names:
+        first_noqa = next(i for i, s in enumerate(export_stmts) if "# noqa: F401" in s)
+        export_stmts.insert(
+            first_noqa,
+            "# Re-exported for backwards compatibility with external callers.\n",
+        )
 
     lines = source.splitlines(keepends=True)
     last_import_line = 0
@@ -1935,6 +1944,7 @@ def generate_file_splits(
         external_loads=external_loads,
         abs_pkg=abs_pkg,
         relative_from=relative_from,
+        is_test_file=is_test_file,
     )
 
     # For non-migrated entities that reference test-named symbols now living
