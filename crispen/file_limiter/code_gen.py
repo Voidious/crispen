@@ -701,7 +701,17 @@ def _add_re_exports(
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             last_import_line = max(last_import_line, node.end_lineno)
 
-    return "".join(lines[:last_import_line] + export_stmts + lines[last_import_line:])
+    insert_after = last_import_line
+    if insert_after == 0 and tree.body:
+        first = tree.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            insert_after = first.end_lineno
+
+    return "".join(lines[:insert_after] + export_stmts + lines[insert_after:])
 
 
 def _topo_depth(graph: Dict[str, Set[str]]) -> Dict[str, int]:

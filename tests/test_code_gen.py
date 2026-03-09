@@ -460,12 +460,28 @@ def test_add_re_exports_public_inserted_after_imports():
 
 
 def test_add_re_exports_no_import_in_source():
-    # No imports in source → re-export inserted at beginning.
+    # No imports and no docstring → re-export inserted at beginning.
     source = "\ndef foo():\n    pass\n"
     entity = _make_entity("foo", 2, 3)
     placement = GroupPlacement(group=["foo"], target_file="utils.py")
     result = _add_re_exports(source, [placement], {"foo": entity}, {})
     assert "from .utils import foo" in result
+
+
+def test_add_re_exports_no_import_with_module_docstring():
+    # No imports but module docstring present → re-export inserted after docstring,
+    # not before it, so the docstring remains the first statement.
+    source = '"""Module docstring."""\n\n\ndef foo():\n    pass\n'
+    entity = _make_entity("foo", 4, 5)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(source, [placement], {"foo": entity}, {})
+    lines = result.splitlines()
+    docstring_idx = next(
+        i for i, l in enumerate(lines) if '"""Module docstring."""' in l
+    )
+    reexport_idx = next(i for i, l in enumerate(lines) if "from .utils import foo" in l)
+    assert docstring_idx == 0
+    assert reexport_idx > docstring_idx
 
 
 def test_add_re_exports_from_import_line():
