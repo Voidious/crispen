@@ -288,6 +288,37 @@ def test_verify_async_def_entity_passes():
     assert vr.verified_lines == 2
 
 
+def test_verify_entity_with_name_rewrites_passes():
+    # The original entity references SAFE_MODE; after splitting it becomes
+    # conversion.SAFE_MODE in the new file.  Verification must apply the
+    # name_rewrites before the substring check so it passes rather than
+    # reporting a false failure.
+    post_source = (
+        "def create_runtime(safe_mode=None):\n"
+        "    if safe_mode is None:\n"
+        "        safe_mode = SAFE_MODE\n"
+    )
+    entity = _make_entity("create_runtime", 1, 3)
+    new_file_src = (
+        "def create_runtime(safe_mode=None):\n"
+        "    if safe_mode is None:\n"
+        "        safe_mode = conversion.SAFE_MODE\n"
+    )
+    split = SplitResult(
+        new_files={"runtime.py": new_file_src},
+        original_source="# re-exports\n",
+        abort=False,
+        entity_name_rewrites={"create_runtime": {"SAFE_MODE": "conversion.SAFE_MODE"}},
+    )
+    placements = [GroupPlacement(group=["create_runtime"], target_file="runtime.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    # The function passes verification. Only the 1 rewritten line is excluded;
+    # the other 2 unchanged lines are credited.
+    assert vr.verified_functions == 1
+    assert vr.verified_lines == 2
+
+
 # ---------------------------------------------------------------------------
 # _strip_imports_by_line
 # ---------------------------------------------------------------------------

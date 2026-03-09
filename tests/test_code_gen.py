@@ -18,6 +18,8 @@ from crispen.file_limiter.code_gen import (
     _extract_module_docstring,
     _extract_shared_helpers,
     _find_cross_file_imports,
+    _module_import_stmt,
+    _rewrite_module_var_names,
     _find_main_block_entity,
     _find_main_direct_callees,
     _find_needed_imports,
@@ -861,33 +863,41 @@ def test_find_cross_file_imports_basic():
     # fn_a references _MODEL which is defined in block_1.py
     entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
     name_to_target_file = {"_MODEL": "block_1.py"}
-    result = _find_cross_file_imports(
+    imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "llm_extract.py"
     )
-    assert result == ["from .block_1 import _MODEL"]
+    assert imports == ["from .block_1 import _MODEL"]
+    assert rewrites == {}
 
 
 def test_find_cross_file_imports_same_file_excluded():
     # _MODEL goes to the same file as fn_a → no cross-file import needed
     entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
     name_to_target_file = {"_MODEL": "llm_extract.py"}
-    result = _find_cross_file_imports(
+    imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "llm_extract.py"
     )
-    assert result == []
+    assert imports == []
+    assert rewrites == {}
 
 
 def test_find_cross_file_imports_no_match():
     # Referenced name not in name_to_target_file → no cross-file import
     entity_source_map = {"fn_a": "def fn_a():\n    return os.getcwd()\n"}
-    result = _find_cross_file_imports(["fn_a"], entity_source_map, {}, "utils.py")
-    assert result == []
+    imports, rewrites = _find_cross_file_imports(
+        ["fn_a"], entity_source_map, {}, "utils.py"
+    )
+    assert imports == []
+    assert rewrites == {}
 
 
 def test_find_cross_file_imports_entity_not_in_map():
     # Entity name not in entity_source_map → treated as empty source, no imports
-    result = _find_cross_file_imports(["ghost"], {}, {"x": "other.py"}, "utils.py")
-    assert result == []
+    imports, rewrites = _find_cross_file_imports(
+        ["ghost"], {}, {"x": "other.py"}, "utils.py"
+    )
+    assert imports == []
+    assert rewrites == {}
 
 
 # ---------------------------------------------------------------------------
@@ -930,10 +940,244 @@ def test_find_cross_file_imports_cross_directory():
     # Cross-directory import needs ".." to go up from tests/ to root.
     entity_source_map = {"fn_a": "def fn_a():\n    return _helper()\n"}
     name_to_target_file = {"_helper": "helpers/entities.py"}
-    result = _find_cross_file_imports(
+    imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "tests/test.py"
     )
-    assert result == ["from ..helpers.entities import _helper"]
+    assert imports == ["from ..helpers.entities import _helper"]
+    assert rewrites == {}
+
+
+def test_find_cross_file_imports_top_level_var_uses_module_import():
+    # SAFE_MODE is a TOP_LEVEL variable in conversion.py; runtime.py references it.
+    # Should produce a module-level import and a rewrite dict, not a direct name import.
+    entity_source_map = {
+        "create_lua_runtime": (
+            "def create_lua_runtime(safe_mode=None):\n"
+            "    if safe_mode is None:\n"
+            "        safe_mode = SAFE_MODE\n"
+        )
+    }
+    name_to_target_file = {"SAFE_MODE": "conversion.py"}
+    imports, rewrites = _find_cross_file_imports(
+        ["create_lua_runtime"],
+        entity_source_map,
+        name_to_target_file,
+        "runtime.py",
+        top_level_var_names={"SAFE_MODE"},
+    )
+    assert imports == ["from . import conversion"]
+    assert rewrites == {"SAFE_MODE": "conversion.SAFE_MODE"}
+
+
+def test_find_cross_file_imports_top_level_var_abs_pkg():
+    # Same as above but with abs_pkg set (test-file context).
+    # Uses "import pkg.module as local" syntax to avoid misidentifying test-named
+    # modules as test symbols (which would trigger inline injection).
+    entity_source_map = {"fn_a": "def fn_a():\n    return SAFE_MODE\n"}
+    name_to_target_file = {"SAFE_MODE": "conversion.py"}
+    imports, rewrites = _find_cross_file_imports(
+        ["fn_a"],
+        entity_source_map,
+        name_to_target_file,
+        "test_fn.py",
+        abs_pkg="mylib",
+        top_level_var_names={"SAFE_MODE"},
+    )
+    assert imports == ["import mylib.conversion as conversion"]
+    assert rewrites == {"SAFE_MODE": "conversion.SAFE_MODE"}
+
+
+def test_find_cross_file_imports_top_level_var_abs_pkg_empty():
+    # abs_pkg="" (root-level test) — no package prefix, plain "import conversion".
+    entity_source_map = {"fn_a": "def fn_a():\n    return SAFE_MODE\n"}
+    name_to_target_file = {"SAFE_MODE": "conversion.py"}
+    imports, rewrites = _find_cross_file_imports(
+        ["fn_a"],
+        entity_source_map,
+        name_to_target_file,
+        "test_fn.py",
+        abs_pkg="",
+        top_level_var_names={"SAFE_MODE"},
+    )
+    assert imports == ["import conversion"]
+    assert rewrites == {"SAFE_MODE": "conversion.SAFE_MODE"}
+
+
+def test_find_cross_file_imports_top_level_var_cross_directory():
+    # TOP_LEVEL var in sub/constants.py, referenced from runtime.py at root.
+    entity_source_map = {"fn_a": "def fn_a():\n    return TIMEOUT\n"}
+    name_to_target_file = {"TIMEOUT": "sub/constants.py"}
+    imports, rewrites = _find_cross_file_imports(
+        ["fn_a"],
+        entity_source_map,
+        name_to_target_file,
+        "runtime.py",
+        top_level_var_names={"TIMEOUT"},
+    )
+    assert imports == ["from .sub import constants"]
+    assert rewrites == {"TIMEOUT": "constants.TIMEOUT"}
+
+
+def test_find_cross_file_imports_mixed_top_level_and_function():
+    # SAFE_MODE is a TOP_LEVEL var; _helper is a function — mixed case.
+    entity_source_map = {
+        "fn_a": ("def fn_a():\n" "    if SAFE_MODE:\n" "        return _helper()\n")
+    }
+    name_to_target_file = {"SAFE_MODE": "conversion.py", "_helper": "helpers.py"}
+    imports, rewrites = _find_cross_file_imports(
+        ["fn_a"],
+        entity_source_map,
+        name_to_target_file,
+        "runtime.py",
+        top_level_var_names={"SAFE_MODE"},
+    )
+    assert "from . import conversion" in imports
+    assert "from .helpers import _helper" in imports
+    assert rewrites == {"SAFE_MODE": "conversion.SAFE_MODE"}
+
+
+# ---------------------------------------------------------------------------
+# _module_import_stmt
+# ---------------------------------------------------------------------------
+
+
+def test_module_import_stmt_sibling_relative():
+    stmt, local = _module_import_stmt("runtime.py", "conversion.py", abs_pkg=None)
+    assert stmt == "from . import conversion"
+    assert local == "conversion"
+
+
+def test_module_import_stmt_cross_directory_relative():
+    stmt, local = _module_import_stmt("runtime.py", "sub/constants.py", abs_pkg=None)
+    assert stmt == "from .sub import constants"
+    assert local == "constants"
+
+
+def test_module_import_stmt_parent_directory_relative():
+    # svc/test_fns.py importing from test_svc.py (parent dir)
+    stmt, local = _module_import_stmt("svc/test_fns.py", "test_svc.py", abs_pkg=None)
+    assert stmt == "from .. import test_svc"
+    assert local == "test_svc"
+
+
+def test_module_import_stmt_abs_pkg_with_prefix():
+    # Uses "import pkg.module as local" to avoid test-name collision.
+    stmt, local = _module_import_stmt("test_fn.py", "conversion.py", abs_pkg="mylib")
+    assert stmt == "import mylib.conversion as conversion"
+    assert local == "conversion"
+
+
+def test_module_import_stmt_abs_pkg_empty():
+    # No package prefix → plain "import conversion".
+    stmt, local = _module_import_stmt("test_fn.py", "conversion.py", abs_pkg="")
+    assert stmt == "import conversion"
+    assert local == "conversion"
+
+
+def test_module_import_stmt_abs_pkg_nested_module():
+    # source_file has a nested path within the package
+    stmt, local = _module_import_stmt("test_fn.py", "sub/constants.py", abs_pkg="mylib")
+    assert stmt == "import mylib.sub.constants as constants"
+    assert local == "constants"
+
+
+# ---------------------------------------------------------------------------
+# _rewrite_module_var_names
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_module_var_names_basic():
+    src = "def fn():\n    if SAFE_MODE:\n        pass\n"
+    result = _rewrite_module_var_names(src, {"SAFE_MODE": "conversion.SAFE_MODE"})
+    assert "conversion.SAFE_MODE" in result
+    # bare SAFE_MODE no longer appears as a standalone Name
+    import ast
+
+    tree = ast.parse(result)
+    bare = [
+        n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "SAFE_MODE"
+    ]
+    assert bare == []
+
+
+def test_rewrite_module_var_names_skips_attribute_access():
+    # obj.SAFE_MODE must NOT become obj.conversion.SAFE_MODE — the regex approach
+    # would corrupt this; the AST approach correctly skips it because 'SAFE_MODE'
+    # is the attr string of an Attribute node, not an ast.Name load.
+    src = "def fn():\n    return obj.SAFE_MODE\n"
+    result = _rewrite_module_var_names(src, {"SAFE_MODE": "conversion.SAFE_MODE"})
+    assert result == src
+
+
+def test_rewrite_module_var_names_skips_strings():
+    src = 'x = "SAFE_MODE"\n'
+    result = _rewrite_module_var_names(src, {"SAFE_MODE": "conversion.SAFE_MODE"})
+    assert result == src
+
+
+def test_rewrite_module_var_names_skips_comments():
+    src = "# use SAFE_MODE here\nx = 1\n"
+    result = _rewrite_module_var_names(src, {"SAFE_MODE": "conversion.SAFE_MODE"})
+    assert result == src
+
+
+def test_rewrite_module_var_names_no_partial_name_match():
+    # SAFE_MODE_EXTRA is a different identifier and must not be rewritten
+    src = "x = SAFE_MODE_EXTRA\ny = SAFE_MODE\n"
+    result = _rewrite_module_var_names(src, {"SAFE_MODE": "conversion.SAFE_MODE"})
+    assert "SAFE_MODE_EXTRA" in result
+    assert "y = conversion.SAFE_MODE" in result
+
+
+def test_rewrite_module_var_names_empty_rewrites():
+    src = "def fn():\n    return SAFE_MODE\n"
+    result = _rewrite_module_var_names(src, {})
+    assert result == src
+
+
+def test_rewrite_module_var_names_initial_syntax_error_returns_original():
+    # Unparseable source at the start → return unchanged (first ast.parse fails)
+    src = "def fn(\n"
+    result = _rewrite_module_var_names(src, {"SAFE_MODE": "conversion.SAFE_MODE"})
+    assert result == src
+
+
+def test_rewrite_module_var_names_no_name_nodes_returns_original():
+    # Source has no Name nodes for the given key → return unchanged
+    src = "x = 1\n"
+    result = _rewrite_module_var_names(src, {"SAFE_MODE": "conversion.SAFE_MODE"})
+    assert result == src
+
+
+def test_rewrite_module_var_names_verify_bare_name_survives_returns_original():
+    # If a rewrite introduces a new bare Name that itself appears in rewrites,
+    # verification catches it and returns the original source.
+    # rewrites={"A": "mod.A", "mod": "pkg.mod"}: rewriting "A" → "mod.A" leaves
+    # "mod" as a bare Name load, which is in rewrites → verification fails.
+    src = "x = A\n"
+    result = _rewrite_module_var_names(src, {"A": "mod.A", "mod": "pkg.mod"})
+    assert result == src
+
+
+def test_rewrite_module_var_names_verify_syntax_error_returns_original(monkeypatch):
+    # If re-parsing the rewritten result raises SyntaxError (defensive guard),
+    # the original source is returned unchanged.
+    import crispen.file_limiter.code_gen as _code_gen
+    import ast as _ast
+
+    call_count = [0]
+    real_parse = _ast.parse
+
+    def patched_parse(src, *args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] >= 2:  # fail on the verification parse
+            raise SyntaxError("synthetic verify failure")
+        return real_parse(src, *args, **kwargs)
+
+    monkeypatch.setattr(_code_gen.ast, "parse", patched_parse)
+    src = "x = SAFE_MODE\n"
+    result = _rewrite_module_var_names(src, {"SAFE_MODE": "conversion.SAFE_MODE"})
+    assert result == src
 
 
 # ---------------------------------------------------------------------------
@@ -975,7 +1219,9 @@ def test_merge_from_imports_empty():
 
 def test_generate_cross_file_import():
     # fn_a goes to fn_module.py; _block_1 (defining _CONST) goes to constants.py.
-    # fn_a references _CONST → fn_module.py must have `from .constants import _CONST`.
+    # _CONST is a TOP_LEVEL variable → fn_module.py must use a module-level import
+    # ("from . import constants") and reference it as "constants._CONST" so that
+    # later mutations to the variable propagate correctly.
     source = "_CONST = 42\n\ndef fn_a():\n    return _CONST\n"
     e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
     e_fn = _make_entity("fn_a", 3, 4)
@@ -990,7 +1236,8 @@ def test_generate_cross_file_import():
     result = generate_file_splits(c, plan, source, "big.py")
 
     fn_src = result.new_files["fn_module.py"]
-    assert "from .constants import _CONST" in fn_src
+    assert "from . import constants" in fn_src
+    assert "constants._CONST" in fn_src
     # constants.py should NOT have a cross-import (it defines _CONST, not uses it)
     const_src = result.new_files["constants.py"]
     assert "from .fn_module" not in const_src
@@ -999,8 +1246,8 @@ def test_generate_cross_file_import():
 def test_generate_cross_file_import_no_duplicate_names():
     # Two entities (fn_a and fn_b) migrate to the same new file.
     # fn_a uses X and Z from helpers; fn_b uses Y and Z from helpers.
-    # The new file must get exactly one merged import with X, Y, Z —
-    # not two overlapping imports that both include Z (F811 redefinition).
+    # X, Y, Z are TOP_LEVEL variables → the new file gets ONE "from . import constants"
+    # and references them as constants.X / constants.Y / constants.Z.
     source = textwrap.dedent(
         """\
         X = 1
@@ -1031,14 +1278,13 @@ def test_generate_cross_file_import_no_duplicate_names():
     # Both fn_a and fn_b are present
     assert "def fn_a" in funcs_src
     assert "def fn_b" in funcs_src
-    # Only ONE import from constants, with X, Y, Z each appearing exactly once
-    import_lines = [
-        ln for ln in funcs_src.splitlines() if "from .constants import" in ln
-    ]
+    # Module-level import for the TOP_LEVEL variables, with no duplicates
+    import_lines = [ln for ln in funcs_src.splitlines() if "import constants" in ln]
     assert len(import_lines) == 1, f"Expected 1 import line, got: {import_lines}"
-    assert import_lines[0].count("X") == 1
-    assert import_lines[0].count("Y") == 1
-    assert import_lines[0].count("Z") == 1
+    # Variables are referenced through the module object
+    assert "constants.X" in funcs_src
+    assert "constants.Y" in funcs_src
+    assert "constants.Z" in funcs_src
 
 
 def test_generate_non_migrated_helper_extracted_to_new_file():
@@ -2491,20 +2737,22 @@ def test_find_cross_file_imports_abs_pkg_package_prefix():
     # abs_pkg="tests" → "from tests.block_1 import _MODEL"
     entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
     name_to_target_file = {"_MODEL": "block_1.py"}
-    result = _find_cross_file_imports(
+    imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "test_fn.py", abs_pkg="tests"
     )
-    assert result == ["from tests.block_1 import _MODEL"]
+    assert imports == ["from tests.block_1 import _MODEL"]
+    assert rewrites == {}
 
 
 def test_find_cross_file_imports_abs_pkg_root_level():
     # abs_pkg="" → "from block_1 import _MODEL" (no package prefix)
     entity_source_map = {"fn_a": "def fn_a():\n    return _MODEL\n"}
     name_to_target_file = {"_MODEL": "block_1.py"}
-    result = _find_cross_file_imports(
+    imports, rewrites = _find_cross_file_imports(
         ["fn_a"], entity_source_map, name_to_target_file, "test_fn.py", abs_pkg=""
     )
-    assert result == ["from block_1 import _MODEL"]
+    assert imports == ["from block_1 import _MODEL"]
+    assert rewrites == {}
 
 
 # ---------------------------------------------------------------------------
@@ -2595,8 +2843,11 @@ def test_generate_test_file_cross_imports_use_absolute_imports(tmp_path):
     result = generate_file_splits(c, plan, source, str(test_file))
 
     fn_src = result.new_files["test_fns.py"]
-    assert "from tests.test_constants import _CONST" in fn_src
-    assert "from .test_constants import _CONST" not in fn_src
+    # _CONST is a TOP_LEVEL variable → live module import, not direct name import.
+    # Uses "import" syntax to avoid misidentifying test_constants as a test symbol.
+    assert "import tests.test_constants as test_constants" in fn_src
+    assert "test_constants._CONST" in fn_src
+    assert "from tests.test_constants import _CONST" not in fn_src
 
 
 # ---------------------------------------------------------------------------
@@ -2700,9 +2951,11 @@ def test_generate_file_splits_subdir_name_cross_file_uses_relative():
 
 
 def test_generate_file_splits_test_subdir_nonmigrated_imports_from_original():
-    # Non-migrated names (e.g. module-level constants) stay in the original
-    # test file, not in __init__.py.  A new subfile that references them should
-    # get "from ..test_svc import _CONFIG", not "from . import _CONFIG".
+    # Non-migrated TOP_LEVEL variables (e.g. module-level constants) stay in
+    # the original test file.  A new subfile that references them should use a
+    # live module-level import (not a stale value copy).
+    # Because test_svc is a test-named module, the import is injected inline
+    # inside the function body.
     source = "_CONFIG = 'val'\n\ndef test_fn():\n    return _CONFIG\n"
     # Use TOP_LEVEL kind so _extract_shared_helpers does not pull _CONFIG into
     # the new file (it only extracts FUNCTION/CLASS entities).
@@ -2717,8 +2970,12 @@ def test_generate_file_splits_test_subdir_nonmigrated_imports_from_original():
 
     assert not result.abort
     test_src = result.new_files["svc/test_fns.py"]
-    assert "from ..test_svc import _CONFIG" in test_src
-    assert "from . import _CONFIG" not in test_src
+    # Module-level import (inline because test_svc is a test-named module);
+    # references the variable live via test_svc._CONFIG.
+    assert "from .. import test_svc" in test_src
+    assert "test_svc._CONFIG" in test_src
+    # Should NOT capture a stale value copy
+    assert "from ..test_svc import _CONFIG" not in test_src
 
 
 def test_generate_file_splits_has_main_uses_filename_as_original_basename():

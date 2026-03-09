@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -36,6 +36,9 @@ class SplitResult:
     original_source: str  # updated original file source
     abort: bool  # True if generation failed / nothing to split
     abort_reason: str = ""  # human-readable explanation when abort=True
+    entity_name_rewrites: Dict[str, Dict[str, str]] = field(
+        default_factory=dict
+    )  # {entity_name: {old_name: new_qualified_name}} per migrated entity
 
 
 # ---------------------------------------------------------------------------
@@ -320,18 +323,75 @@ def _relative_import_prefix(from_file: str, to_file: str) -> str:
     return "." * (levels_up + 1) + module
 
 
+def _module_import_stmt(
+    current_target: str,
+    source_file: str,
+    abs_pkg: Optional[str],
+) -> Tuple[str, str]:
+    """Return ``(import_statement, local_name)`` for a module-level import.
+
+    Produces ``from . import conversion`` instead of
+    ``from .conversion import SAFE_MODE`` so callers can reference
+    ``conversion.SAFE_MODE`` for a live lookup rather than a value snapshot.
+    This preserves the original single-file behaviour where module globals are
+    looked up dynamically rather than captured at import time.
+    """
+    local_name = _target_module_name(source_file).split(".")[-1]
+    if abs_pkg is not None:
+        mod = _target_module_name(source_file)
+        # Use "import full.module.path as local_name" for absolute contexts.
+        # This avoids "from pkg import test_module" patterns that are
+        # misidentified as test-name imports by _split_cross_imports_by_test.
+        full_mod = f"{abs_pkg}.{mod}" if abs_pkg else mod
+        stmt = (
+            f"import {full_mod} as {local_name}"
+            if full_mod != local_name
+            else f"import {local_name}"
+        )
+    else:
+        prefix = _relative_import_prefix(current_target, source_file)
+        # prefix looks like ".conversion", "..test_svc", or "..helpers.io".
+        # Decompose into leading dots + module path, then extract the last
+        # segment as local_name and the rest as the parent package prefix.
+        #   ".conversion"  → dots="..",   path="conversion" → "from . import conversion"
+        #   "..test_svc"   → dots="..",   path="test_svc"   → "from .. import test_svc"
+        #   "..helpers.io" → dots="..",   path="helpers.io" → "from ..helpers import io"
+        dot_end = 0
+        while dot_end < len(prefix) and prefix[dot_end] == ".":
+            dot_end += 1
+        dots = prefix[:dot_end]
+        path = prefix[dot_end:]
+        last_dot = path.rfind(".")
+        if last_dot == -1:
+            parent = dots or "."
+        else:
+            parent = dots + path[:last_dot]
+        stmt = f"from {parent} import {local_name}"
+    return stmt, local_name
+
+
 def _find_cross_file_imports(
     entity_names: List[str],
     entity_source_map: Dict[str, str],
     name_to_target_file: Dict[str, str],
     current_target: str,
     abs_pkg: Optional[str] = None,
-) -> List[str]:
-    """Return ``from … import name`` statements for other-file dependencies.
+    top_level_var_names: Optional[Set[str]] = None,
+) -> Tuple[List[str], Dict[str, str]]:
+    """Return ``(imports, name_rewrites)`` for other-file dependencies.
 
     When an entity being moved to *current_target* references a name that is
     defined by another entity being moved to a different target file, the new
     file needs an explicit import for that name.
+
+    For names defined by ``TOP_LEVEL`` entities (module-level variables such as
+    ``SAFE_MODE = True``), a module-level import is used instead of a direct
+    name import.  This preserves the dynamic lookup semantics of the original
+    single-file module: mutations to the variable in its home module are
+    immediately visible to the importing file.  The returned *name_rewrites*
+    dict maps each such bare name (e.g. ``"SAFE_MODE"``) to its qualified form
+    (e.g. ``"conversion.SAFE_MODE"``); callers must rewrite the entity source
+    accordingly.
 
     When *abs_pkg* is ``None`` the import prefix is relative (e.g.
     ``from .constants import _CONST``).  When *abs_pkg* is set the import is
@@ -342,13 +402,18 @@ def _find_cross_file_imports(
     for name in entity_names:
         src = entity_source_map.get(name, "")
         referenced |= _collect_name_loads(src)
-    from_files: Dict[str, List[str]] = {}  # source_file → names
+    from_files: Dict[str, List[str]] = {}  # source_file → regular names
+    mod_files: Dict[str, List[str]] = {}  # source_file → top-level var names
     for ref_name in sorted(referenced):
         source_file = name_to_target_file.get(ref_name)
         if source_file and source_file != current_target:
-            from_files.setdefault(source_file, []).append(ref_name)
+            if top_level_var_names and ref_name in top_level_var_names:
+                mod_files.setdefault(source_file, []).append(ref_name)
+            else:
+                from_files.setdefault(source_file, []).append(ref_name)
 
     result = []
+    rewrites: Dict[str, str] = {}
     for source_file, names in sorted(from_files.items()):
         if abs_pkg is not None:
             mod = _target_module_name(source_file)
@@ -356,7 +421,12 @@ def _find_cross_file_imports(
         else:
             prefix = _relative_import_prefix(current_target, source_file)
         result.append(f"from {prefix} import {', '.join(sorted(names))}")
-    return result
+    for source_file, names in sorted(mod_files.items()):
+        stmt, local_name = _module_import_stmt(current_target, source_file, abs_pkg)
+        result.append(stmt)
+        for name in names:
+            rewrites[name] = f"{local_name}.{name}"
+    return result, rewrites
 
 
 _FROM_IMPORT_RE = re.compile(r"^(from\s+\S+)\s+import\s+(.*)")
@@ -1520,6 +1590,75 @@ def _merge_conftest_sources(existing: str, new_content: str) -> str:
     return result
 
 
+def _rewrite_module_var_names(src: str, rewrites: Dict[str, str]) -> str:
+    """Replace bare ``Name`` loads with ``module.name`` attribute accesses.
+
+    Uses the AST to locate exact positions of ``Name`` load nodes whose
+    ``id`` is in *rewrites*, replacing each with its qualified form (e.g.
+    ``"SAFE_MODE"`` → ``"conversion.SAFE_MODE"``).
+
+    Because ``ast.Name`` nodes **never** represent the attribute part of an
+    ``Attribute`` node (which stores ``attr`` as a plain string), this
+    approach is immune to the corruption that a regex would cause on
+    ``obj.SAFE_MODE`` and naturally skips string literals and comments.
+
+    After rewriting, the result is re-parsed and every original ``Name``
+    load for each rewritten identifier is verified to be absent.  If
+    verification fails the original source is returned unchanged so that
+    callers can fall back to direct-import semantics rather than corrupt
+    the output.
+    """
+    if not rewrites:
+        return src
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+
+    lines = src.splitlines(keepends=True)
+
+    # Collect (lineno, col_offset, end_col_offset, new_text).
+    # ast uses 1-indexed lineno and 0-indexed col_offset / end_col_offset.
+    edits: List[Tuple[int, int, int, str]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in rewrites
+        ):
+            edits.append(
+                (node.lineno, node.col_offset, node.end_col_offset, rewrites[node.id])
+            )
+
+    if not edits:
+        return src
+
+    # Apply edits from last to first within each line to keep earlier offsets valid.
+    edits.sort(key=lambda e: (e[0], e[1]), reverse=True)
+    for lineno, col_start, col_end, new_text in edits:
+        line = lines[lineno - 1]
+        lines[lineno - 1] = line[:col_start] + new_text + line[col_end:]
+
+    result = "".join(lines)
+
+    # Verification: re-parse and confirm no bare Name loads remain for any
+    # rewritten identifier.  If the result is unparseable or a bare name
+    # survives, return the original source to avoid corrupting the output.
+    try:
+        new_tree = ast.parse(result)
+    except SyntaxError:
+        return src
+    for node in ast.walk(new_tree):
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in rewrites
+        ):
+            return src
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1729,6 +1868,18 @@ def generate_file_splits(
                 if defined_name not in import_defined_names:
                     name_to_target_file.setdefault(defined_name, non_migrated_home)
 
+    # Collect names defined by TOP_LEVEL entities (module-level variables, not
+    # functions or classes).  Cross-file references to these names require a
+    # live module-level import so that later mutations to the variable in its
+    # home module propagate to all importing files.
+    top_level_var_names: Set[str] = {
+        defined_name
+        for entity in classified.entities
+        if entity.kind == EntityKind.TOP_LEVEL
+        for defined_name in entity.names_defined
+        if defined_name not in import_defined_names
+    }
+
     # Extract non-migrated FUNCTION/CLASS entities referenced by migrated ones
     # into the new files that use them, breaking O→F→O import cycles.
     synthetic_placements = _extract_shared_helpers(
@@ -1811,6 +1962,7 @@ def generate_file_splits(
 
     # Generate new file contents.
     new_files: Dict[str, str] = {}
+    entity_name_rewrites: Dict[str, Dict[str, str]] = {}  # per-entity rewrites
     for target_file, ent_names in file_entity_names.items():
         needed = _find_needed_imports(
             ent_names, entity_source_map, import_infos, all_entity_names
@@ -1844,13 +1996,17 @@ def generate_file_splits(
             _src = _src.rstrip()
             # Compute cross-file imports for this entity and split off any
             # test-named symbols (Test* / test_*) to be injected inline.
-            entity_cross = _find_cross_file_imports(
+            entity_cross, entity_rewrites = _find_cross_file_imports(
                 [_ent_name],
                 entity_source_map,
                 name_to_target_file,
                 target_file,
                 abs_pkg=abs_pkg_for_new_files,
+                top_level_var_names=top_level_var_names,
             )
+            if entity_rewrites:
+                _src = _rewrite_module_var_names(_src, entity_rewrites)
+                entity_name_rewrites[_ent_name] = entity_rewrites
             ent_top_cross, ent_test_imports = _split_cross_imports_by_test(entity_cross)
             for imp in ent_top_cross:
                 if imp not in seen_top_cross:
@@ -1997,4 +2153,9 @@ def generate_file_splits(
     new_files = {f: _normalize_blank_lines(s) for f, s in new_files.items()}
     updated = _normalize_blank_lines(updated)
 
-    return SplitResult(new_files=new_files, original_source=updated, abort=False)
+    return SplitResult(
+        new_files=new_files,
+        original_source=updated,
+        abort=False,
+        entity_name_rewrites=entity_name_rewrites,
+    )

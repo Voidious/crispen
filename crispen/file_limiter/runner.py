@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 from ..config import CrispenConfig
 from .advisor import GroupPlacement, advise_file_limiter, resolve_naming_conflicts
 from .classifier import classify_entities
-from .code_gen import SplitResult, generate_file_splits
+from .code_gen import SplitResult, _rewrite_module_var_names, generate_file_splits
 from .entity_parser import Entity, EntityKind
 
 
@@ -161,6 +161,16 @@ def _verify_preservation(
         entity_src = "".join(lines[entity.start_line - 1 : entity.end_line]).rstrip()
         if not entity_src:
             continue
+        # Apply the rewrites specific to this entity (e.g. SAFE_MODE →
+        # conversion.SAFE_MODE) so the comparison uses the same qualified names
+        # that appear in the split output.  Using per-entity rewrites rather than
+        # a global accumulation ensures that an entity which keeps SAFE_MODE as a
+        # local name is not incorrectly rewritten because another entity caused
+        # that name to be in the global set.
+        entity_rewrites = split.entity_name_rewrites.get(entity.name, {})
+        entity_no_imports_orig = _strip_imports_by_line(entity_src)
+        if entity_rewrites:
+            entity_src = _rewrite_module_var_names(entity_src, entity_rewrites)
         entity_no_imports = _strip_imports_by_line(entity_src)
         if entity_no_imports not in combined_no_imports:
             preview_lines = entity_src.splitlines()[:3]
@@ -177,7 +187,13 @@ def _verify_preservation(
         else:
             if entity.name not in name_to_file:
                 continue  # stayed in original; not a FileLimiter edit
-            n_lines = len(entity_no_imports.splitlines())
+            # Count only lines whose content is identical in the original and
+            # rewritten source.  Lines that had a name rewritten (e.g.
+            # SAFE_MODE → conversion.SAFE_MODE) are intentionally changed and
+            # are not credited as exact-match verified lines.
+            orig_lines = entity_no_imports_orig.splitlines()
+            new_lines = entity_no_imports.splitlines()
+            n_lines = sum(1 for o, n in zip(orig_lines, new_lines) if o == n)
             if entity.kind == EntityKind.FUNCTION:
                 result.verified_functions += 1
                 result.verified_function_names.add(entity.name)
