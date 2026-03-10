@@ -1064,26 +1064,36 @@ def advise_file_limiter(
     counter: List[int] = [0]
 
     # Call 1: advise Set 3 groups (only if set_3 is non-empty).
+    # In a test-file subdir split every group must migrate — there is no public
+    # API contract that forces anything to stay, and leaving test functions
+    # behind in the original causes fixture-visibility problems.  Skip the LLM
+    # call and treat all set-3 groups as migrating.
+    is_test_subdir = subdir_name is not None and Path(original_path).name.startswith(
+        "test_"
+    )
     set3_migrate: List[List[str]] = []
     if classified.set_3_groups:
-        result = _advise_set3(
-            classified,
-            original_path,
-            client,
-            config,
-            prev_failure=prev_set3_failure,
-            verbose=verbose,
-            _counter=counter,
-        )
-        if result is None:
-            return FileLimiterPlan(
-                set3_migrate=[],
-                placements=[],
-                abort=True,
-                abort_reason="LLM failed to plan set-3 groups",
-                llm_calls=counter[0],
+        if is_test_subdir:
+            set3_migrate = classified.set_3_groups
+        else:
+            result = _advise_set3(
+                classified,
+                original_path,
+                client,
+                config,
+                prev_failure=prev_set3_failure,
+                verbose=verbose,
+                _counter=counter,
             )
-        set3_migrate = result
+            if result is None:
+                return FileLimiterPlan(
+                    set3_migrate=[],
+                    placements=[],
+                    abort=True,
+                    abort_reason="LLM failed to plan set-3 groups",
+                    llm_calls=counter[0],
+                )
+            set3_migrate = result
 
     # Calls 2+: propose files, assign groups, refine (merge tiny).
     groups_to_place = classified.set_2_groups + set3_migrate

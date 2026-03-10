@@ -209,6 +209,31 @@ def test_plan_set3_migrate(mock_key, mock_client, mock_call):
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
+def test_plan_set3_test_subdir_skips_advise_call(mock_key, mock_client, mock_call):
+    """Test-file subdir split: set-3 groups migrate without an LLM advice call."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    # Only propose + assign calls; no set3-advice call.
+    mock_call.side_effect = [
+        _propose_ok("test_helpers.py"),
+        {"placements": [{"group_id": 0, "target_file": "test_helpers.py"}]},
+    ]
+    c = _classified(
+        entities=[_make_entity("test_bar", 1, 10)],
+        set_3_groups=[["test_bar"]],
+    )
+    plan = advise_file_limiter(c, "tests/test_big.py", _CONFIG, subdir_name="big")
+
+    assert plan.abort is False
+    assert plan.set3_migrate == [["test_bar"]]
+    assert len(plan.placements) == 1
+    assert plan.placements[0].target_file == "test_helpers.py"
+    assert mock_call.call_count == 2  # no set3-advice call
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
 def test_plan_set2_and_set3_migrate(mock_key, mock_client, mock_call):
     """set_2 + migrating set_3 → both groups in placement call."""
     mock_key.return_value = "key"
