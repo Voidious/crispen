@@ -14,12 +14,15 @@ from crispen.file_limiter.code_gen import (
     _class_has_test_methods,
     _collect_external_imported_names,
     _collect_name_loads,
+    _collect_name_stores,
+    _inject_module_level_imports,
     _test_names_in_decorators,
     _extract_import_info,
     _extract_module_docstring,
     _extract_shared_helpers,
     _find_cross_file_imports,
     _module_import_stmt,
+    _rewrite_module_level_stores,
     _rewrite_module_var_names,
     _find_main_block_entity,
     _find_main_direct_callees,
@@ -167,6 +170,120 @@ def test_collect_name_loads_annotated_vararg_kwarg():
     names = _collect_name_loads(source)
     assert "VarType" in names
     assert "KwType" in names
+
+
+# ---------------------------------------------------------------------------
+# _collect_name_stores
+# ---------------------------------------------------------------------------
+
+
+def test_collect_name_stores_simple_assign():
+    assert _collect_name_stores("X = 1\n") == {"X"}
+
+
+def test_collect_name_stores_multiple_assigns():
+    src = "X = 1\nY = 2\n"
+    assert _collect_name_stores(src) == {"X", "Y"}
+
+
+def test_collect_name_stores_augassign():
+    assert _collect_name_stores("X += 1\n") == {"X"}
+
+
+def test_collect_name_stores_annotated_assign_with_value():
+    assert _collect_name_stores("X: int = 42\n") == {"X"}
+
+
+def test_collect_name_stores_annotated_assign_without_value():
+    # Declaration only (no assignment) — not a store.
+    assert _collect_name_stores("X: int\n") == set()
+
+
+def test_collect_name_stores_function_body_not_included():
+    # Assignments inside function bodies are not module-level stores.
+    src = "def f():\n    X = 1\n"
+    assert _collect_name_stores(src) == set()
+
+
+def test_collect_name_stores_load_not_included():
+    assert _collect_name_stores("y = X\n") == {"y"}
+    assert "X" not in _collect_name_stores("y = X\n")
+
+
+def test_collect_name_stores_syntax_error():
+    assert _collect_name_stores("def (broken:\n") == set()
+
+
+def test_collect_name_stores_empty():
+    assert _collect_name_stores("") == set()
+
+
+def test_collect_name_stores_non_name_assign_target():
+    # Tuple-unpacking targets are not plain Name nodes — must not crash.
+    src = "a, b = 1, 2\n"
+    result = _collect_name_stores(src)
+    assert "a" not in result  # tuple target, not a plain Name store
+    assert "b" not in result
+
+
+def test_collect_name_stores_non_name_augassign_target():
+    # Attribute augmented assignment — target is Attribute, not Name.
+    src = "obj.x += 1\n"
+    result = _collect_name_stores(src)
+    assert result == set()
+
+
+# ---------------------------------------------------------------------------
+# _inject_module_level_imports
+# ---------------------------------------------------------------------------
+
+
+def test_inject_module_level_imports_docstring_only():
+    # Source with only a docstring and no imports — insert after the docstring.
+    src = '"""Module doc."""\n\nx = 1\n'
+    result = _inject_module_level_imports(src, ["from . import converters"])
+    assert '"""Module doc."""' in result
+    assert "from . import converters" in result
+    doc_pos = result.index('"""Module doc."""')
+    imp_pos = result.index("from . import converters")
+    assert doc_pos < imp_pos
+
+
+def test_inject_module_level_imports_empty_list():
+    src = "x = 1\n"
+    assert _inject_module_level_imports(src, []) == src
+
+
+def test_inject_module_level_imports_after_imports():
+    src = "import os\n\nx = 1\n"
+    result = _inject_module_level_imports(src, ["from . import converters"])
+    assert result == "import os\nfrom . import converters\n\nx = 1\n"
+
+
+def test_inject_module_level_imports_no_existing_imports():
+    src = "x = 1\n"
+    result = _inject_module_level_imports(src, ["from . import converters"])
+    # Prepended before non-import content
+    assert "from . import converters" in result
+    assert result.index("from . import converters") < result.index("x = 1")
+
+
+def test_inject_module_level_imports_sorted():
+    src = "import os\n\nx = 1\n"
+    result = _inject_module_level_imports(
+        src, ["from . import z_mod", "from . import a_mod"]
+    )
+    lines = result.splitlines()
+    import_lines = [ln for ln in lines if "import" in ln]
+    assert import_lines.index("from . import a_mod") < import_lines.index(
+        "from . import z_mod"
+    )
+
+
+def test_inject_module_level_imports_syntax_error_prepends():
+    src = "def (broken:\n"
+    result = _inject_module_level_imports(src, ["import os"])
+    assert result.startswith("import os\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1120,6 +1237,66 @@ def test_module_import_stmt_abs_pkg_nested_module():
 
 
 # ---------------------------------------------------------------------------
+# _rewrite_module_level_stores
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_module_level_stores_simple():
+    src = "_CONST = int('99')\n"
+    result = _rewrite_module_level_stores(src, {"_CONST": "constants._CONST"})
+    assert result == "constants._CONST = int('99')\n"
+
+
+def test_rewrite_module_level_stores_augassign():
+    src = "X += 1\n"
+    result = _rewrite_module_level_stores(src, {"X": "mod.X"})
+    assert result == "mod.X += 1\n"
+
+
+def test_rewrite_module_level_stores_annassign_with_value():
+    src = "X: int = 42\n"
+    result = _rewrite_module_level_stores(src, {"X": "mod.X"})
+    assert result == "mod.X: int = 42\n"
+
+
+def test_rewrite_module_level_stores_annassign_without_value_skipped():
+    # Declaration only — no value, so nothing to rewrite.
+    src = "X: int\n"
+    result = _rewrite_module_level_stores(src, {"X": "mod.X"})
+    assert result == src
+
+
+def test_rewrite_module_level_stores_function_body_not_rewritten():
+    # Assignments inside function bodies must not be touched.
+    src = "def f():\n    X = 1\n"
+    result = _rewrite_module_level_stores(src, {"X": "mod.X"})
+    assert result == src
+
+
+def test_rewrite_module_level_stores_empty_rewrites():
+    src = "X = 1\n"
+    assert _rewrite_module_level_stores(src, {}) == src
+
+
+def test_rewrite_module_level_stores_syntax_error():
+    src = "def (broken:\n"
+    assert _rewrite_module_level_stores(src, {"X": "mod.X"}) == src
+
+
+def test_rewrite_module_level_stores_name_not_in_rewrites():
+    src = "Y = 1\n"
+    result = _rewrite_module_level_stores(src, {"X": "mod.X"})
+    assert result == src
+
+
+def test_rewrite_module_level_stores_augassign_non_name_target():
+    # Attribute augmented assignment — target is Attribute, not Name; must be skipped.
+    src = "obj.x += 1\n"
+    result = _rewrite_module_level_stores(src, {"x": "mod.x"})
+    assert result == src
+
+
+# ---------------------------------------------------------------------------
 # _rewrite_module_var_names
 # ---------------------------------------------------------------------------
 
@@ -1300,9 +1477,8 @@ def test_sort_imports_pep8_all_stdlib():
 
 def test_generate_cross_file_import():
     # fn_a goes to fn_module.py; _block_1 (defining _CONST) goes to constants.py.
-    # _CONST is a TOP_LEVEL variable → fn_module.py uses a module-level import
-    # ("from . import constants") so that later mutations to the variable propagate.
-    # The import must be at module level (not inlined) so decorators can use it.
+    # _CONST is a TOP_LEVEL variable that is never reassigned → fn_module.py uses
+    # a plain "from .constants import _CONST" (idiomatic Python; no module alias).
     source = "_CONST = 42\n\ndef fn_a():\n    return _CONST\n"
     e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
     e_fn = _make_entity("fn_a", 3, 4)
@@ -1317,10 +1493,9 @@ def test_generate_cross_file_import():
     result = generate_file_splits(c, plan, source, "big.py")
 
     fn_src = result.new_files["fn_module.py"]
-    assert "from . import constants" in fn_src
-    assert "constants._CONST" in fn_src
-    # The module import must be at module level (first non-empty line), not indented
-    assert any(ln.startswith("from . import constants") for ln in fn_src.splitlines())
+    assert "from .constants import _CONST" in fn_src
+    assert "from . import constants" not in fn_src
+    assert "constants._CONST" not in fn_src
     # constants.py should NOT have a cross-import (it defines _CONST, not uses it)
     const_src = result.new_files["constants.py"]
     assert "from .fn_module" not in const_src
@@ -1329,8 +1504,8 @@ def test_generate_cross_file_import():
 def test_generate_cross_file_import_no_duplicate_names():
     # Two entities (fn_a and fn_b) migrate to the same new file.
     # fn_a uses X and Z from helpers; fn_b uses Y and Z from helpers.
-    # X, Y, Z are TOP_LEVEL variables → the new file gets ONE "from . import constants"
-    # at module level (not inlined) and references them as constants.X / Y / Z.
+    # X, Y, Z are TOP_LEVEL variables that are never reassigned → the new file
+    # gets ONE "from .constants import X, Y, Z" (no module alias needed).
     source = textwrap.dedent(
         """\
         X = 1
@@ -1361,14 +1536,144 @@ def test_generate_cross_file_import_no_duplicate_names():
     # Both fn_a and fn_b are present
     assert "def fn_a" in funcs_src
     assert "def fn_b" in funcs_src
-    # Module-level import at module level, with no duplicates
+    # Plain from-import (no module alias) since none of X/Y/Z are reassigned
+    assert "from .constants import" in funcs_src
+    assert "from . import constants" not in funcs_src
+    # Variables are referenced by their bare names, not as module attributes
+    assert "constants.X" not in funcs_src
+    assert "constants.Y" not in funcs_src
+    assert "constants.Z" not in funcs_src
+
+
+def test_generate_cross_file_import_reassigned_uses_module_alias():
+    # _CONST is defined by _block_1 (→ constants.py) AND reassigned by _block_2
+    # (non-migrated, stays in big.py).  Because _CONST is stored by a different
+    # entity, fn_module.py must use the module-alias form so that any mutation of
+    # _CONST propagates through the module reference rather than a stale copy.
+    source = textwrap.dedent(
+        """\
+        _CONST = 42
+        _CONST = int("99")
+
+        def fn_a():
+            return _CONST
+        """
+    )
+    e_block1 = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
+    e_block2 = Entity(EntityKind.TOP_LEVEL, "_block_2", 2, 2, ["_CONST"])
+    e_fn = _make_entity("fn_a", 4, 5)
+    c = _classified(entities=[e_block1, e_block2, e_fn])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1"], target_file="constants.py"),
+            GroupPlacement(group=["fn_a"], target_file="fn_module.py"),
+            # _block_2 stays (non-migrated) — its store makes _CONST "reassigned"
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    fn_src = result.new_files["fn_module.py"]
+    # _CONST is reassigned → module-alias import so mutations propagate.
+    assert "from . import constants" in fn_src
+    assert "constants._CONST" in fn_src
+    assert "from .constants import _CONST" not in fn_src
+
+
+def test_generate_cross_file_reassigned_original_file_uses_module_alias():
+    # _CONST is defined by _block_1 (migrated) and reassigned by _block_2
+    # (non-migrated).
+    # The original file must rewrite both the load in fn_a AND the module-level
+    # store in _block_2 to constants._CONST so that the reassignment updates the
+    # value in constants.py rather than creating an orphaned local binding.
+    source = textwrap.dedent(
+        """\
+        _CONST = 42
+        _CONST = int("99")
+
+        def fn_a():
+            return _CONST
+        """
+    )
+    e_block1 = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
+    e_block2 = Entity(EntityKind.TOP_LEVEL, "_block_2", 2, 2, ["_CONST"])
+    e_fn = _make_entity("fn_a", 4, 5)
+    c = _classified(entities=[e_block1, e_block2, e_fn])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1"], target_file="constants.py"),
+            # _block_2 and fn_a stay (non-migrated)
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    assert not result.abort
+    orig = result.original_source
+    # Module-level import added for the module alias.
+    assert "from . import constants" in orig
+    # Both the store (_block_2) and the load (fn_a) are rewritten.
+    assert 'constants._CONST = int("99")' in orig
+    assert "return constants._CONST" in orig
+    # Must NOT bind _CONST as a bare name via from-import (would shadow the rewrite)
+    assert "from .constants import _CONST" not in orig
+
+
+def test_generate_reassigned_all_entities_migrated_no_original_processing():
+    # When ALL entities are migrated, non_migrated_entity_names is empty and the
+    # original-file module-alias processing block must be skipped without error.
+    source = "_CONST = 42\n_CONST = 99\n\ndef fn_a():\n    return _CONST\n"
+    e_block1 = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
+    e_block2 = Entity(EntityKind.TOP_LEVEL, "_block_2", 2, 2, ["_CONST"])
+    e_fn = _make_entity("fn_a", 4, 5)
+    c = _classified(entities=[e_block1, e_block2, e_fn])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1"], target_file="constants.py"),
+            GroupPlacement(group=["_block_2", "fn_a"], target_file="funcs.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+    # Does not abort or crash; original source may be minimal.
+    assert not result.abort
+
+
+def test_generate_reassigned_two_entities_same_file_single_module_import():
+    # Two entities in the same new file both reference a reassigned constant.
+    # The same "from . import constants" import must appear only once
+    # (seen_top_cross deduplication).
+    source = textwrap.dedent(
+        """\
+        _CONST = 42
+        _CONST = 99
+
+        def fn_a():
+            return _CONST
+
+        def fn_b():
+            return _CONST
+        """
+    )
+    e_block1 = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
+    e_block2 = Entity(EntityKind.TOP_LEVEL, "_block_2", 2, 2, ["_CONST"])
+    e_fn_a = _make_entity("fn_a", 4, 5)
+    e_fn_b = _make_entity("fn_b", 7, 8)
+    c = _classified(entities=[e_block1, e_block2, e_fn_a, e_fn_b])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1"], target_file="constants.py"),
+            GroupPlacement(group=["fn_a", "fn_b"], target_file="funcs.py"),
+            # _block_2 stays non-migrated → makes _CONST "reassigned"
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "big.py")
+
+    funcs_src = result.new_files["funcs.py"]
+    # The module import must appear exactly once despite two entities needing it.
     import_lines = [ln for ln in funcs_src.splitlines() if "import constants" in ln]
-    assert len(import_lines) == 1, f"Expected 1 import line, got: {import_lines}"
-    assert import_lines[0].startswith("from . import constants")
-    # Variables are referenced through the module object
-    assert "constants.X" in funcs_src
-    assert "constants.Y" in funcs_src
-    assert "constants.Z" in funcs_src
+    assert len(import_lines) == 1
 
 
 def test_generate_aborts_when_test_class_used_in_decorator():
@@ -3161,11 +3466,11 @@ def test_generate_test_file_cross_imports_use_absolute_imports(tmp_path):
     result = generate_file_splits(c, plan, source, str(test_file))
 
     fn_src = result.new_files["test_fns.py"]
-    # _CONST is a TOP_LEVEL variable → module-level import using absolute path.
-    # Uses "import" syntax to avoid misidentifying test_constants as a test symbol.
-    assert "import tests.test_constants as test_constants" in fn_src
-    assert "test_constants._CONST" in fn_src
-    assert "from tests.test_constants import _CONST" not in fn_src
+    # _CONST is a TOP_LEVEL variable that is never reassigned → plain absolute
+    # from-import (idiomatic Python; module alias only needed if reassigned).
+    assert "from tests.test_constants import _CONST" in fn_src
+    assert "import tests.test_constants as test_constants" not in fn_src
+    assert "test_constants._CONST" not in fn_src
 
 
 # ---------------------------------------------------------------------------
@@ -3270,10 +3575,9 @@ def test_generate_file_splits_subdir_name_cross_file_uses_relative():
 
 def test_generate_file_splits_test_subdir_nonmigrated_imports_from_original():
     # Non-migrated TOP_LEVEL variables (e.g. module-level constants) stay in
-    # the original test file.  A new subfile that references them should use a
-    # live module-level import (not a stale value copy).
-    # Because test_svc is a test-named module, the import is injected inline
-    # inside the function body.
+    # the original test file.  A new subfile that references a constant that is
+    # never reassigned should use a plain ``from`` import (idiomatic Python);
+    # module-alias access is only needed when the constant is mutated at runtime.
     source = "_CONFIG = 'val'\n\ndef test_fn():\n    return _CONFIG\n"
     # Use TOP_LEVEL kind so _extract_shared_helpers does not pull _CONFIG into
     # the new file (it only extracts FUNCTION/CLASS entities).
@@ -3288,12 +3592,10 @@ def test_generate_file_splits_test_subdir_nonmigrated_imports_from_original():
 
     assert not result.abort
     test_src = result.new_files["svc/test_fns.py"]
-    # Module-level import must be at module level (not injected inline), because
-    # decorators like @pytest.mark.parametrize are evaluated before function bodies.
-    assert "from .. import test_svc" in test_src
-    assert "test_svc._CONFIG" in test_src
-    # Must NOT be indented (i.e., must be at module level, not inside a function)
-    assert any(ln.startswith("from .. import test_svc") for ln in test_src.splitlines())
+    # _CONFIG is never reassigned → plain from-import (no module alias).
+    assert "from ..test_svc import _CONFIG" in test_src
+    assert "from .. import test_svc" not in test_src
+    assert "test_svc._CONFIG" not in test_src
 
 
 def test_generate_file_splits_has_main_uses_filename_as_original_basename():

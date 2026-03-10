@@ -208,6 +208,65 @@ def _collect_name_loads(source: str) -> Set[str]:
     return names
 
 
+def _collect_name_stores(source: str) -> Set[str]:
+    """Return names assigned at module level in *source*.
+
+    Detects ``x = ...``, ``x += ...``, and annotated assignments with a value
+    (``x: int = ...``) at the top level of the module.  Used to identify
+    TOP_LEVEL constants that are mutated outside their defining entity so that
+    cross-file references must use ``module.NAME`` rather than a plain
+    ``from .module import NAME``.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    stores: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    stores.add(target.id)
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name):
+                stores.add(node.target.id)
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is not None and isinstance(node.target, ast.Name):
+                stores.add(node.target.id)
+    return stores
+
+
+def _inject_module_level_imports(source: str, imports: List[str]) -> str:
+    """Insert *imports* after the last existing import line in *source*.
+
+    Uses the same insertion logic as :func:`_add_re_exports` so that module
+    imports for reassigned TOP_LEVEL variables land in the same position as
+    other imports added to the original file.
+    """
+    if not imports:
+        return source
+    lines = source.splitlines(keepends=True)
+    last_import_line = 0
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return "\n".join(sorted(imports)) + "\n\n" + source
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            last_import_line = max(last_import_line, node.end_lineno)
+    insert_after = last_import_line
+    if insert_after == 0 and tree.body:
+        first = tree.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            insert_after = first.end_lineno
+    import_lines = [imp + "\n" for imp in sorted(imports)]
+    return "".join(lines[:insert_after] + import_lines + lines[insert_after:])
+
+
 def _test_names_in_decorators(source: str, names: Set[str]) -> Set[str]:
     """Return the subset of *names* that appear as Name loads inside a decorator.
 
@@ -1735,6 +1794,72 @@ def _rewrite_module_var_names(src: str, rewrites: Dict[str, str]) -> str:
     return result
 
 
+def _rewrite_module_level_stores(src: str, rewrites: Dict[str, str]) -> str:
+    """Rewrite module-level Name store targets to ``module.name`` attribute stores.
+
+    Only statements at the top level of the module are affected
+    (``ast.Module.body``).  Assignments inside function or class bodies are
+    left unchanged so that local variable bindings are not corrupted.
+
+    Used for the non-migrated home file: when a non-migrated entity reassigns
+    a TOP_LEVEL constant that was moved to a sub-file, the assignment must be
+    rewritten as ``module.CONST = expr`` so that the mutation updates the
+    canonical value in the sub-file rather than creating an orphaned local
+    binding.
+    """
+    if not rewrites:
+        return src
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+    lines = src.splitlines(keepends=True)
+    edits: List[Tuple[int, int, int, str]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in rewrites:
+                    edits.append(
+                        (
+                            target.lineno,
+                            target.col_offset,
+                            target.end_col_offset,
+                            rewrites[target.id],
+                        )
+                    )
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name) and node.target.id in rewrites:
+                edits.append(
+                    (
+                        node.target.lineno,
+                        node.target.col_offset,
+                        node.target.end_col_offset,
+                        rewrites[node.target.id],
+                    )
+                )
+        elif isinstance(node, ast.AnnAssign):
+            if (
+                node.value is not None
+                and isinstance(node.target, ast.Name)
+                and node.target.id in rewrites
+            ):
+                edits.append(
+                    (
+                        node.target.lineno,
+                        node.target.col_offset,
+                        node.target.end_col_offset,
+                        rewrites[node.target.id],
+                    )
+                )
+    if not edits:
+        return src
+    edits.sort(key=lambda e: (e[0], e[1]), reverse=True)
+    for lineno, col_start, col_end, new_text in edits:
+        line = lines[lineno - 1]
+        lines[lineno - 1] = line[:col_start] + new_text + line[col_end:]
+    return "".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -2021,16 +2146,23 @@ def generate_file_splits(
                 if defined_name not in import_defined_names:
                     name_to_target_file.setdefault(defined_name, non_migrated_home)
 
-    # Collect names defined by TOP_LEVEL entities (module-level variables, not
-    # functions or classes).  Cross-file references to these names use a
-    # module-level import so that later mutations to the variable in its home
-    # module propagate to all importing files.
-    top_level_var_names: Set[str] = {
-        defined_name
+    # For TOP_LEVEL names that are reassigned (stored) by a *different* entity,
+    # cross-file references must use ``module.NAME`` so that the mutation is
+    # visible to all importers.  Names that are only ever defined once and never
+    # mutated elsewhere use a plain ``from .module import NAME`` — the idiomatic
+    # Python form — since the value is stable after import.
+    _top_level_def_entity: Dict[str, str] = {
+        defined_name: entity.name
         for entity in classified.entities
         if entity.kind == EntityKind.TOP_LEVEL
         for defined_name in entity.names_defined
         if defined_name not in import_defined_names
+    }
+    top_level_var_names: Set[str] = {
+        name
+        for name, def_ent in _top_level_def_entity.items()
+        for ent_name, src in entity_source_map.items()
+        if ent_name != def_ent and name in _collect_name_stores(src)
     }
 
     # Extract non-migrated FUNCTION/CLASS entities referenced by migrated ones
@@ -2269,6 +2401,30 @@ def generate_file_splits(
         if (subdir_name and not is_test_file and not has_main)
         else None
     )
+    # Apply module-qualified rewrites to the original file for any non-migrated
+    # entity that reassigns a TOP_LEVEL name that was moved to a sub-file.
+    # This is symmetric with the same treatment for new sub-files: when a name
+    # is in top_level_var_names (i.e. reassigned somewhere), all files that
+    # reference it — including the non-migrated home — use ``module.NAME``.
+    if top_level_var_names:
+        non_migrated_entity_names = [
+            e.name for e in classified.entities if e.name not in migrated_names
+        ]
+        if non_migrated_entity_names:
+            _orig_from, orig_mod_imports, orig_rewrites = _find_cross_file_imports(
+                non_migrated_entity_names,
+                entity_source_map,
+                name_to_target_file,
+                non_migrated_home,
+                abs_pkg=abs_pkg,
+                top_level_var_names=top_level_var_names,
+            )
+            if orig_rewrites:
+                updated = _rewrite_module_var_names(updated, orig_rewrites)
+                updated = _rewrite_module_level_stores(updated, orig_rewrites)
+            if orig_mod_imports:
+                updated = _inject_module_level_imports(updated, orig_mod_imports)
+
     # Exclude conftest.py from re-exports: fixtures there are auto-discovered
     # by pytest and must not be imported back into the original test file.
     # Also exclude conftest-conflict fixtures (kept in LLM-assigned file because
