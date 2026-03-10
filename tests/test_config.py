@@ -148,6 +148,19 @@ def test_file_limiter_pytest_conftest_default():
     assert cfg.file_limiter_pytest_conftest is True
 
 
+def test_file_limiter_reexports_default():
+    cfg = CrispenConfig()
+    assert cfg.file_limiter_reexports == "imported"
+
+
+def test_load_config_file_limiter_reexports(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.crispen]\nfile_limiter_reexports = "always"\n'
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.file_limiter_reexports == "always"
+
+
 def test_refactor_filter_defaults():
     cfg = CrispenConfig()
     assert cfg.enabled_refactors == []

@@ -94,6 +94,28 @@ class CrispenConfig:
     # using pytest or if your project manages fixtures in a non-standard way.
     file_limiter_pytest_conftest: bool = True
 
+    # Controls when the original file keeps re-export stubs for public names
+    # that were moved to new files.  Re-exports preserve the original module's
+    # public API so existing callers need no changes.
+    #
+    # "always"      — Always add re-exports for every public name (most
+    #                 conservative).  Best for library packages that publish a
+    #                 public API not necessarily tested or imported from within
+    #                 this codebase.
+    # "application" — Add re-exports in non-test files (same as "always"), but
+    #                 not in test files.  Pragmatic: application code keeps its
+    #                 API intact; test modules are less likely to have external
+    #                 callers.
+    # "imported"    — Only add a re-export when the name is actually imported
+    #                 from the original module somewhere else in the project
+    #                 (the same rule already used for private names).  Best for
+    #                 most application codebases.  May remove needed re-exports
+    #                 for library packages whose public API is not exercised
+    #                 within this codebase.  Note: only ``from module import
+    #                 name`` style imports are detected; qualified access via
+    #                 ``module.name`` is not scanned.
+    file_limiter_reexports: str = "imported"
+
     # Refactor allow-list: if non-empty, only the named refactors are run.
     # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
     # "tuple_dataclass", "file_limiter", "match_function".

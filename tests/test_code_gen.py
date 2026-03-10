@@ -2504,6 +2504,141 @@ def test_add_re_exports_test_function_in_external_loads_not_re_exported():
 
 
 # ---------------------------------------------------------------------------
+# _add_re_exports — reexport_mode parameter
+# ---------------------------------------------------------------------------
+
+
+def test_add_re_exports_mode_always_public_always_reexported():
+    # "always" mode: public names are unconditionally re-exported (current behaviour).
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"foo": entity}, {}, reexport_mode="always"
+    )
+    assert "from .utils import foo" in result
+
+
+def test_add_re_exports_mode_application_non_test_public_reexported():
+    # "application" mode + non-test file: public names are re-exported.
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"foo": entity},
+        {},
+        reexport_mode="application",
+        is_test_file=False,
+    )
+    assert "from .utils import foo" in result
+
+
+def test_add_re_exports_mode_application_test_file_public_not_reexported():
+    # "application" mode + test file: public names are NOT unconditionally re-exported.
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"foo": entity},
+        {},
+        reexport_mode="application",
+        is_test_file=True,
+    )
+    assert result == source
+
+
+def test_add_re_exports_mode_application_test_file_in_external_loads_reexported():
+    # "application" mode + test file: public name IS re-exported when in external_loads.
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"foo": entity},
+        {},
+        external_loads={"foo"},
+        reexport_mode="application",
+        is_test_file=True,
+    )
+    assert "from .utils import foo" in result
+
+
+def test_add_re_exports_mode_application_test_file_public_in_still_loaded_reexported():
+    # "application" mode + test file: public name IS re-exported when still referenced.
+    source = "import os\n\nfoo()\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"foo": entity},
+        {},
+        reexport_mode="application",
+        is_test_file=True,
+    )
+    assert "from .utils import foo" in result
+
+
+def test_add_re_exports_mode_imported_public_not_in_external_loads_not_reexported():
+    # "imported" mode: public name is NOT re-exported if absent from external_loads.
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"foo": entity}, {}, reexport_mode="imported"
+    )
+    assert result == source
+
+
+def test_add_re_exports_mode_imported_public_in_external_loads_reexported():
+    # "imported" mode: public name IS re-exported when in external_loads.
+    source = "import os\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"foo": entity},
+        {},
+        external_loads={"foo"},
+        reexport_mode="imported",
+    )
+    assert "from .utils import foo" in result
+
+
+def test_add_re_exports_mode_imported_public_in_still_loaded_reexported():
+    # "imported" mode: public name IS re-exported when still referenced in source.
+    source = "import os\n\nfoo()\n"
+    entity = _make_entity("foo", 1, 2)
+    placement = GroupPlacement(group=["foo"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"foo": entity}, {}, reexport_mode="imported"
+    )
+    assert "from .utils import foo" in result
+
+
+def test_add_re_exports_mode_imported_private_in_external_loads_reexported():
+    # "imported" mode: private names still follow the same rule (external_loads).
+    source = "import os\n"
+    entity = _make_entity("_helper", 1, 2)
+    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"_helper": entity},
+        {},
+        external_loads={"_helper"},
+        reexport_mode="imported",
+    )
+    assert "from .utils import _helper" in result
+
+
+# ---------------------------------------------------------------------------
 # generate_file_splits — private entity re-exported for external caller
 # ---------------------------------------------------------------------------
 
@@ -2527,6 +2662,69 @@ def test_generate_private_entity_reexported_when_external_caller(tmp_path):
     result = generate_file_splits(c, plan, source, str(mod))
 
     assert "from .private import _helper" in result.original_source
+
+
+def test_generate_file_splits_reexport_imported_public_not_reexported_without_caller(
+    tmp_path,
+):
+    # "imported" mode: public entity not imported elsewhere → no re-export stub.
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    mod = pkg / "big.py"
+    mod.write_text("def foo():\n    pass\n")
+    # No external callers import foo.
+
+    source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["foo"], target_file="helpers.py")])
+
+    result = generate_file_splits(c, plan, source, str(mod), reexport_mode="imported")
+
+    assert "from .helpers import foo" not in result.original_source
+
+
+def test_generate_file_splits_reexport_mode_imported_public_reexported_with_caller(
+    tmp_path,
+):
+    # "imported" mode: public entity imported elsewhere → re-export stub is added.
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    mod = pkg / "big.py"
+    mod.write_text("def foo():\n    pass\n")
+    caller = tmp_path / "other.py"
+    caller.write_text("from mypkg.big import foo\n")
+
+    source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["foo"], target_file="helpers.py")])
+
+    result = generate_file_splits(c, plan, source, str(mod), reexport_mode="imported")
+
+    assert "from .helpers import foo" in result.original_source
+
+
+def test_generate_file_splits_reexport_mode_always_public_reexported_without_caller(
+    tmp_path,
+):
+    # "always" mode: public entity re-exported even when no external callers exist.
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    mod = pkg / "big.py"
+    mod.write_text("def foo():\n    pass\n")
+
+    source = "def foo():\n    pass\n"
+    entity = _make_entity("foo", 1, 2)
+    c = _classified(entities=[entity])
+    plan = _plan([GroupPlacement(group=["foo"], target_file="helpers.py")])
+
+    result = generate_file_splits(c, plan, source, str(mod), reexport_mode="always")
+
+    assert "from .helpers import foo" in result.original_source
 
 
 # ---------------------------------------------------------------------------

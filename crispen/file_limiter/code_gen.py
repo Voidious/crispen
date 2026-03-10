@@ -727,14 +727,23 @@ def _add_re_exports(
     abs_pkg: Optional[str] = None,
     relative_from: Optional[str] = None,
     is_test_file: bool = False,
+    reexport_mode: str = "always",
 ) -> str:
     """Add ``from .module import name`` imports for migrated entities.
 
-    Public names are always re-exported so external callers can still import
-    them from the original module.  Private names (starting with ``_``) are
-    re-imported when the remaining *source* still references them, or when
-    they appear in *external_loads* (names imported from the original module
-    by other files in the project).
+    *reexport_mode* controls when public (non-underscore) names get a
+    re-export stub:
+
+    * ``"always"``      — always re-export every public name (default; most
+      conservative, preserves the full public API regardless of usage).
+    * ``"application"`` — re-export public names in non-test files only.
+    * ``"imported"``    — re-export a public name only when it appears in
+      *external_loads* (imported from the original module by another file in
+      the project) or is still referenced in the remaining *source*.
+
+    Private names (starting with ``_``) are always re-exported when the
+    remaining *source* still references them, or when they appear in
+    *external_loads*, regardless of *reexport_mode*.
 
     When *relative_from* is set (e.g. ``"service/__init__.py"``), import
     prefixes are computed via :func:`_relative_import_prefix` so that
@@ -787,14 +796,21 @@ def _add_re_exports(
                 # discovering the same test twice.
                 if _is_test_name(defined_name):
                     continue
-                if (
-                    (
-                        not defined_name.startswith("_")
-                        and not defined_name.startswith("test_")
-                        and not is_test_class
+                # Unconditional public re-export: only when reexport_mode
+                # permits it for this file type.
+                reexport_unconditionally = (
+                    not defined_name.startswith("_")
+                    and not defined_name.startswith("test_")
+                    and not is_test_class
+                    and (
+                        reexport_mode == "always"
+                        or (reexport_mode == "application" and not is_test_file)
                     )
+                )
+                if (
+                    reexport_unconditionally
                     or defined_name in still_loaded
-                    or (defined_name.startswith("_") and defined_name in external_loads)
+                    or defined_name in external_loads
                 ):
                     to_import.append(defined_name)
                     if defined_name not in still_loaded:
@@ -1732,6 +1748,7 @@ def generate_file_splits(
     subdir_name: Optional[str] = None,
     pytest_conftest: bool = False,
     has_main: bool = False,
+    reexport_mode: str = "always",
 ) -> SplitResult:
     """Generate new file contents and the updated original source.
 
@@ -2066,11 +2083,16 @@ def generate_file_splits(
             entity = entity_map.get(ent_name)
             if entity:
                 for defined_name in entity.names_defined:
-                    if (
-                        (
-                            not defined_name.startswith("_")
-                            and not defined_name.startswith("test_")
+                    reexport_unconditionally = (
+                        not defined_name.startswith("_")
+                        and not defined_name.startswith("test_")
+                        and (
+                            reexport_mode == "always"
+                            or (reexport_mode == "application" and not is_test_file)
                         )
+                    )
+                    if (
+                        reexport_unconditionally
                         or defined_name in non_migrated_loads
                         or defined_name in external_loads
                     ):
@@ -2273,6 +2295,7 @@ def generate_file_splits(
         abs_pkg=abs_pkg,
         relative_from=relative_from,
         is_test_file=is_test_file,
+        reexport_mode=reexport_mode,
     )
 
     # For non-migrated entities that reference test-named symbols now living

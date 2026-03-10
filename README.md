@@ -85,6 +85,23 @@ file_limiter_subdir_split = true
 # Set to false if not using pytest or using custom fixture decorators. Default: true.
 file_limiter_pytest_conftest = true
 
+# FileLimiter: when to keep re-export stubs in the original file for public
+# names that were moved to new files. Re-exports preserve the module's public
+# API so existing callers need no changes. Default: "imported".
+#
+# "always"      — Always add re-exports for every public name. Best for
+#                 library packages whose public API may not be imported within
+#                 this codebase.
+# "application" — Add re-exports in non-test files (same as "always"), but
+#                 omit them in test files. Pragmatic middle ground.
+# "imported"    — Only add a re-export when the name is actually imported from
+#                 the original module somewhere else in the project (the same
+#                 rule already used for private names). Best for most
+#                 application codebases. Note: only detects
+#                 "from module import name" style imports, not qualified access
+#                 via "module.name".
+file_limiter_reexports = "imported"
+
 # Tuple Return to Dataclass: min tuple element count to trigger replacement (default: 4)
 min_tuple_size = 4
 
@@ -466,6 +483,7 @@ Configuration:
 - `file_limiter_retries` — additional LLM retry attempts on failure (default: 2).
 - `file_limiter_recursive` — recursively split newly-created files that are still over the limit (default: `true`).
 - `file_limiter_pytest_conftest` — route fixtures split out of test files to `conftest.py` so pytest auto-discovers them without imports (avoids F401/F811 warnings). Set to `false` if not using pytest or using custom fixture decorators (default: `true`).
+- `file_limiter_reexports` — controls when re-export stubs are added to the original file for public names moved to new files: `"always"` (every public name), `"application"` (all non-test files, no test files), or `"imported"` (only when the name is imported from this module elsewhere in the project — the same rule used for private names). Default: `"imported"`.
 
 ## Architecture
 

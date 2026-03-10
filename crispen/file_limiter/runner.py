@@ -592,6 +592,7 @@ def run_file_limiter(
             subdir_name=subdir_name,
             pytest_conftest=config.file_limiter_pytest_conftest,
             has_main=has_main,
+            reexport_mode=config.file_limiter_reexports,
         )
 
         if split.abort:
