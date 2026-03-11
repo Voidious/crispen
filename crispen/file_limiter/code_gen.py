@@ -731,7 +731,7 @@ def _collect_external_imported_names(original_path: str) -> Set[str]:
             continue
         try:
             source = py_file.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(source)
+            tree = ast.parse(source, filename=str(py_file))
         except Exception:
             continue
         # Compute this file's dotted module path for relative-import resolution.
