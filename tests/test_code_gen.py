@@ -44,6 +44,7 @@ from crispen.file_limiter.code_gen import (
     _relative_import_prefix,
     _remove_entity_lines,
     _split_cross_imports_by_test,
+    _source_is_only_docstring,
     _strip_module_docstring,
     _strip_orphaned_section_headers,
     _strip_top_level_import_lines,
@@ -3789,6 +3790,27 @@ def test_strip_module_docstring_syntax_error():
 
 
 # ---------------------------------------------------------------------------
+# _source_is_only_docstring
+# ---------------------------------------------------------------------------
+
+
+def test_source_is_only_docstring_true():
+    assert _source_is_only_docstring('"""Just a docstring."""\n') is True
+
+
+def test_source_is_only_docstring_with_other_content():
+    assert _source_is_only_docstring('"""Doc."""\n\nimport os\n') is False
+
+
+def test_source_is_only_docstring_no_docstring():
+    assert _source_is_only_docstring("import os\n") is False
+
+
+def test_source_is_only_docstring_syntax_error():
+    assert _source_is_only_docstring("def (\n") is False
+
+
+# ---------------------------------------------------------------------------
 # generate_file_splits — TOP_LEVEL entity import deduplication
 # ---------------------------------------------------------------------------
 
@@ -3921,6 +3943,50 @@ def test_generate_subdir_module_docstring_goes_to_test_init():
     # Docstring must NOT appear in the child test file or the stub file.
     assert '"""Tests for the runner module."""' not in child_src
     assert '"""Tests for the runner module."""' not in updated_src
+
+
+def test_generate_subdir_test_docstring_only_remaining_clears_original():
+    # Regression: when a test-file subdir split migrates all entities and the
+    # only thing left in the original is the module docstring (a TOP_LEVEL
+    # entity that is not migrated by _remove_entity_lines), the docstring must
+    # be routed to __init__.py and the original file must be cleared for
+    # deletion by the engine.
+    source = textwrap.dedent(
+        """\
+        \"\"\"Tests for the widget module.
+        Covers edge cases.
+        \"\"\"
+
+        def test_alpha():
+            pass
+
+        def test_beta():
+            pass
+        """
+    )
+    # The module docstring is a TOP_LEVEL entity spanning lines 1-3.
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, [])
+    e_alpha = _make_entity("test_alpha", 5, 6)
+    e_beta = _make_entity("test_beta", 8, 9)
+    c = _classified(entities=[e_block, e_alpha, e_beta])
+    # Only the test functions are migrated; the TOP_LEVEL entity stays.
+    plan = _plan(
+        [
+            GroupPlacement(group=["test_alpha"], target_file="widget/test_alpha.py"),
+            GroupPlacement(group=["test_beta"], target_file="widget/test_beta.py"),
+        ]
+    )
+
+    result = generate_file_splits(
+        c, plan, source, "tests/test_widget.py", subdir_name="widget"
+    )
+
+    assert not result.abort
+    # Docstring must end up in __init__.py.
+    init_src = result.new_files["widget/__init__.py"]
+    assert '"""Tests for the widget module.' in init_src
+    # Original source must be empty so the engine deletes it.
+    assert result.original_source == ""
 
 
 def test_generate_subdir_docstring_not_stripped_from_non_subdir_split():

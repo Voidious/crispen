@@ -1338,6 +1338,20 @@ def _strip_module_docstring(src: str) -> str:
     return "".join(line for i, line in enumerate(lines, 1) if i not in remove)
 
 
+def _source_is_only_docstring(source: str) -> bool:
+    """Return True if *source* contains only a module-level docstring."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    return (
+        len(tree.body) == 1
+        and isinstance(tree.body[0], ast.Expr)
+        and isinstance(tree.body[0].value, ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+    )
+
+
 # ---------------------------------------------------------------------------
 # __main__ handling
 # ---------------------------------------------------------------------------
@@ -2396,6 +2410,15 @@ def generate_file_splits(
                 new_files[f"{subdir_name}/__init__.py"] = _module_doc + "\n"
             else:
                 updated = _module_doc + "\n\n" + updated
+        elif is_test_file and _source_is_only_docstring(updated):
+            # All entities migrated; the only thing remaining in the original
+            # is the module docstring (a TOP_LEVEL entity that was never
+            # removed by _remove_entity_lines).  Route it to __init__.py and
+            # clear the original so the engine deletes it.
+            new_files[f"{subdir_name}/__init__.py"] = (
+                _extract_module_docstring(updated) + "\n"
+            )
+            updated = _strip_module_docstring(updated)
     relative_from: Optional[str] = (
         f"{subdir_name}/__init__.py"
         if (subdir_name and not is_test_file and not has_main)
