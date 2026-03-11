@@ -513,14 +513,30 @@ def run_file_limiter(
                 llm_calls=total_llm_calls,
             )
 
-        # Apply test_ prefix so pytest can discover moved test files.
+        # Apply test_ prefix and strip _tests suffix so pytest can discover moved
+        # test files.  conftest.py and __init__.py are left untouched (defence-
+        # in-depth: the LLM is already told not to assign to them, but if it
+        # does we must not compound the error by renaming them).
         if source_name.startswith("test_"):
             for p in plan.placements:
                 target = Path(p.target_file)
-                if not target.name.startswith("test_") and any(
-                    name.startswith("test_") for name in p.group
+                new_name = target.name
+                if new_name in ("conftest.py", "__init__.py"):
+                    continue
+                # Strip _tests suffix produced by the LLM (e.g. strings_tests.py
+                # → strings.py) before adding the test_ prefix.
+                if new_name.endswith("_tests.py"):
+                    new_name = new_name[: -len("_tests.py")] + ".py"
+                # Add test_ prefix only for groups that contain test functions
+                # (test_*) or test classes (Test*).  Helper-only groups are left
+                # unprefixed so pytest does not try to collect them.
+                if not new_name.startswith("test_") and any(
+                    name.startswith("test_") or name.startswith("Test")
+                    for name in p.group
                 ):
-                    p.target_file = str(target.parent / ("test_" + target.name))
+                    new_name = "test_" + new_name
+                if new_name != target.name:
+                    p.target_file = str(target.parent / new_name)
 
         # In subdir-split mode, prefix all target files with the subdirectory.
         # This happens after the test_ prefix so names like "test_utils.py"
