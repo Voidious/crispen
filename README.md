@@ -125,6 +125,11 @@ llm_verify_retries = 2
 # FileLimiter: additional retry attempts after an LLM-related failure (default: 2)
 file_limiter_retries = 2
 
+# FileLimiter: recursively split newly-created files that are still over the
+# limit (default: true). The recursion terminates when each new file is either
+# under the limit, aborted (cannot be split), or produces no further oversized files.
+file_limiter_recursive = true
+
 # Run only specific refactors (default: run all).
 # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
 # "tuple_dataclass", "file_limiter", "match_function"
