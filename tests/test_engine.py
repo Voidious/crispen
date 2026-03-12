@@ -66,6 +66,12 @@ def test_no_changes_no_messages(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _write_code_py(tmp_path, source):
+    f = tmp_path / "code.py"
+    f.write_text(source, encoding="utf-8")
+    return f
+
+
 def test_applies_refactor_and_writes(tmp_path):
     source = textwrap.dedent(
         """\
@@ -75,8 +81,7 @@ def test_applies_refactor_and_writes(tmp_path):
             b()
         """
     )
-    f = tmp_path / "code.py"
-    f.write_text(source, encoding="utf-8")
+    f = _write_code_py(tmp_path, source)
     msgs = _run({str(f): [(1, 4)]})
     assert any("IfNotElse" in m for m in msgs)
     assert "if x:" in f.read_text(encoding="utf-8")
@@ -333,7 +338,7 @@ def _make_pkg(root, name):
     return pkg
 
 
-def test_cross_file_transforms_public_func_and_caller(tmp_path):
+def _create_mypkg_with_service_and_api(tmp_path):
     pkg = _make_pkg(tmp_path, "mypkg")
 
     service = pkg / "service.py"
@@ -348,6 +353,11 @@ def test_cross_file_transforms_public_func_and_caller(tmp_path):
         "    a, b, c = get_user()\n",
         encoding="utf-8",
     )
+    return pkg, service, api
+
+
+def test_cross_file_transforms_public_func_and_caller(tmp_path):
+    pkg, service, api = _create_mypkg_with_service_and_api(tmp_path)
 
     changed = {str(service): [(1, 2)], str(api): [(1, 4)]}
     msgs = list(
@@ -375,6 +385,19 @@ def test_cross_file_transforms_public_func_and_caller(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _run_engine_and_assert_outside_callers(changed, tmp_path):
+    msgs = list(
+        run_engine(
+            changed,
+            _repo_root=str(tmp_path),
+            config=CrispenConfig(min_tuple_size=3),
+        )
+    )
+
+    assert any("callers exist outside the diff" in m for m in msgs)
+    return msgs
+
+
 def test_cross_file_skips_when_outside_caller_exists(tmp_path):
     pkg = _make_pkg(tmp_path, "mypkg")
 
@@ -391,15 +414,7 @@ def test_cross_file_skips_when_outside_caller_exists(tmp_path):
     )
 
     changed = {str(service): [(1, 2)]}
-    msgs = list(
-        run_engine(
-            changed,
-            _repo_root=str(tmp_path),
-            config=CrispenConfig(min_tuple_size=3),
-        )
-    )
-
-    assert any("callers exist outside the diff" in m for m in msgs)
+    msgs = _run_engine_and_assert_outside_callers(changed, tmp_path)
     assert "return (name, age, score)" in service.read_text(encoding="utf-8")
 
 
@@ -679,13 +694,7 @@ def test_cross_file_init_alias_detected_as_outside_caller(tmp_path):
     )
 
     changed = {str(service): [(1, 2)]}
-    msgs = list(
-        run_engine(
-            changed, _repo_root=str(tmp_path), config=CrispenConfig(min_tuple_size=3)
-        )
-    )
-
-    assert any("callers exist outside the diff" in m for m in msgs)
+    msgs = _run_engine_and_assert_outside_callers(changed, tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -764,8 +773,7 @@ def _make_phase1_pkg(root):
     return pkg
 
 
-def test_phase1_private_caller_updated(tmp_path):
-    """Private function callers in the same file are updated after Phase 1."""
+def _write_phase1_source(tmp_path):
     source = textwrap.dedent(
         """\
         def _make_result():
@@ -777,6 +785,12 @@ def test_phase1_private_caller_updated(tmp_path):
     )
     f = tmp_path / "code.py"
     f.write_text(source, encoding="utf-8")
+    return f
+
+
+def test_phase1_private_caller_updated(tmp_path):
+    """Private function callers in the same file are updated after Phase 1."""
+    f = _write_phase1_source(tmp_path)
     msgs = _run({str(f): [(1, 100)]})
     result = f.read_text(encoding="utf-8")
     assert "_ = _make_result()" in result
@@ -795,17 +809,7 @@ def test_phase1_private_no_callers_no_caller_updater_msg(tmp_path):
 
 def test_phase1_private_caller_updater_exception_ignored(tmp_path):
     """If CallerUpdater raises during Phase 1, the engine continues gracefully."""
-    source = textwrap.dedent(
-        """\
-        def _make_result():
-            return (1, 2, 3)
-
-        def use_it():
-            a, b, c = _make_result()
-        """
-    )
-    f = tmp_path / "code.py"
-    f.write_text(source, encoding="utf-8")
+    f = _write_phase1_source(tmp_path)
     with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
         msgs = _run({str(f): [(1, 100)]})
     # TupleDataclass still ran successfully
@@ -974,20 +978,7 @@ def test_update_diff_file_callers_false_allows_public_with_all_callers_in_diff(
     tmp_path,
 ):
     """Public function with all callers inside diff (no diff-file outside callers)."""
-    pkg = _make_pkg(tmp_path, "mypkg")
-
-    service = pkg / "service.py"
-    service.write_text(
-        "def get_user():\n    return (name, age, score)\n", encoding="utf-8"
-    )
-
-    api = pkg / "api.py"
-    api.write_text(
-        "from mypkg.service import get_user\n"
-        "def main():\n"
-        "    a, b, c = get_user()\n",
-        encoding="utf-8",
-    )
+    pkg, service, api = _create_mypkg_with_service_and_api(tmp_path)
 
     changed = {str(service): [(1, 2)], str(api): [(1, 3)]}
     config = CrispenConfig(min_tuple_size=3, update_diff_file_callers=False)
@@ -1288,6 +1279,16 @@ def test_file_limiter_subdir_split_non_test_deletes_original(tmp_path):
     assert s.lines_deleted == 10
 
 
+def _run_engine_with_file_limiter_patch(f, success_result, max_file_lines=5):
+    with patch(_FL_PATCH, return_value=success_result):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(max_file_lines=max_file_lines),
+            )
+        )
+
+
 def test_file_limiter_subdir_split_test_keeps_original(tmp_path):
     """Test subdir split → original test file kept (not deleted)."""
     f = tmp_path / "test_service.py"
@@ -1300,13 +1301,7 @@ def test_file_limiter_subdir_split_test_keeps_original(tmp_path):
         abort=False,
         subdir_name="service",
     )
-    with patch(_FL_PATCH, return_value=success_result):
-        list(
-            run_engine(
-                {str(f): [(1, 1)]},
-                config=CrispenConfig(max_file_lines=5),
-            )
-        )
+    _run_engine_with_file_limiter_patch(f, success_result)
     # Original test file must still exist (with re-export content written back).
     assert f.exists()
     assert f.read_text(encoding="utf-8") == re_export_src
@@ -1328,13 +1323,7 @@ def test_file_limiter_subdir_split_has_main_keeps_original(tmp_path):
         subdir_name="service_lib",
         has_main=True,
     )
-    with patch(_FL_PATCH, return_value=success_result):
-        list(
-            run_engine(
-                {str(f): [(1, 1)]},
-                config=CrispenConfig(max_file_lines=5),
-            )
-        )
+    _run_engine_with_file_limiter_patch(f, success_result)
     # Original service.py must still exist (not deleted).
     assert f.exists()
     # It should be updated with the re-export stubs + __main__.
@@ -1698,8 +1687,7 @@ def test_engine_disabled_refactors_skips_if_not_else(tmp_path):
             b()
         """
     )
-    f = tmp_path / "code.py"
-    f.write_text(source, encoding="utf-8")
+    f = _write_code_py(tmp_path, source)
     msgs = list(
         run_engine(
             {str(f): [(1, 4)]},
@@ -1720,8 +1708,7 @@ def test_engine_enabled_refactors_runs_only_listed(tmp_path):
             b()
         """
     )
-    f = tmp_path / "code.py"
-    f.write_text(source, encoding="utf-8")
+    f = _write_code_py(tmp_path, source)
 
     called = []
 

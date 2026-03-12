@@ -1,6 +1,8 @@
 """Tests for file_limiter.code_gen — 100% branch coverage."""
 
 from __future__ import annotations
+from typing import Any
+from dataclasses import dataclass
 
 import textwrap
 
@@ -55,9 +57,31 @@ from crispen.file_limiter.code_gen import (
 from crispen.file_limiter.entity_parser import Entity, EntityKind
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@dataclass
+class MakeReassignedConstFixtureResult:
+    source: Any
+    e_block1: Any
+    e_block2: Any
+    e_fn: Any
+    c: Any
+
+
+@dataclass
+class MakeMainBlockFixtureResult:
+    source: Any
+    e_run: Any
+    e_other: Any
+    e_main: Any
+    c: Any
+
+
+@dataclass
+class MakeFixtureTestSetupResult:
+    src: Any
+    e_fixture: Any
+    e_test: Any
+    c: Any
+    plan: Any
 
 
 def _make_entity(name: str, start: int, end: int, defines=None) -> Entity:
@@ -1546,11 +1570,7 @@ def test_generate_cross_file_import_no_duplicate_names():
     assert "constants.Z" not in funcs_src
 
 
-def test_generate_cross_file_import_reassigned_uses_module_alias():
-    # _CONST is defined by _block_1 (→ constants.py) AND reassigned by _block_2
-    # (non-migrated, stays in big.py).  Because _CONST is stored by a different
-    # entity, fn_module.py must use the module-alias form so that any mutation of
-    # _CONST propagates through the module reference rather than a stale copy.
+def _make_reassigned_const_fixture():
     source = textwrap.dedent(
         """\
         _CONST = 42
@@ -1564,6 +1584,22 @@ def test_generate_cross_file_import_reassigned_uses_module_alias():
     e_block2 = Entity(EntityKind.TOP_LEVEL, "_block_2", 2, 2, ["_CONST"])
     e_fn = _make_entity("fn_a", 4, 5)
     c = _classified(entities=[e_block1, e_block2, e_fn])
+    return MakeReassignedConstFixtureResult(
+        source=source, e_block1=e_block1, e_block2=e_block2, e_fn=e_fn, c=c
+    )
+
+
+def test_generate_cross_file_import_reassigned_uses_module_alias():
+    # _CONST is defined by _block_1 (→ constants.py) AND reassigned by _block_2
+    # (non-migrated, stays in big.py).  Because _CONST is stored by a different
+    # entity, fn_module.py must use the module-alias form so that any mutation of
+    # _CONST propagates through the module reference rather than a stale copy.
+    _ = _make_reassigned_const_fixture()
+    source = _.source
+    e_block1 = _.e_block1
+    e_block2 = _.e_block2
+    e_fn = _.e_fn
+    c = _.c
     plan = _plan(
         [
             GroupPlacement(group=["_block_1"], target_file="constants.py"),
@@ -1587,19 +1623,12 @@ def test_generate_cross_file_reassigned_original_file_uses_module_alias():
     # The original file must rewrite both the load in fn_a AND the module-level
     # store in _block_2 to constants._CONST so that the reassignment updates the
     # value in constants.py rather than creating an orphaned local binding.
-    source = textwrap.dedent(
-        """\
-        _CONST = 42
-        _CONST = int("99")
-
-        def fn_a():
-            return _CONST
-        """
-    )
-    e_block1 = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 1, ["_CONST"])
-    e_block2 = Entity(EntityKind.TOP_LEVEL, "_block_2", 2, 2, ["_CONST"])
-    e_fn = _make_entity("fn_a", 4, 5)
-    c = _classified(entities=[e_block1, e_block2, e_fn])
+    _ = _make_reassigned_const_fixture()
+    source = _.source
+    e_block1 = _.e_block1
+    e_block2 = _.e_block2
+    e_fn = _.e_fn
+    c = _.c
     plan = _plan(
         [
             GroupPlacement(group=["_block_1"], target_file="constants.py"),
@@ -2109,6 +2138,32 @@ def test_extract_shared_helpers_transitive_pull_in():
     assert len(synthetic) == 2
 
 
+def _setup_extract_shared_helpers(
+    entity_source_map,
+    entity_map,
+    classified,
+    migrated_names,
+):
+    file_entity_names = {"f1.py": ["fn_1"], "f2.py": ["fn_2"]}
+    name_to_target_file = {
+        "helper_a": "original.py",
+        "helper_b": "original.py",
+        "fn_1": "f1.py",
+        "fn_2": "f2.py",
+    }
+
+    synthetic = _extract_shared_helpers(
+        file_entity_names,
+        entity_source_map,
+        entity_map,
+        classified,
+        name_to_target_file,
+        migrated_names,
+        "original.py",
+    )
+    return file_entity_names, name_to_target_file, synthetic
+
+
 def test_extract_shared_helpers_scc_prevents_new_to_new_cycle():
     # helper_a is wanted by f1.py; helper_b is wanted by f2.py.
     # They mutually reference each other → one SCC → must go to the same file
@@ -2139,22 +2194,11 @@ def test_extract_shared_helpers_scc_prevents_new_to_new_cycle():
         "fn_1": "def fn_1():\n    helper_a()",
         "fn_2": "def fn_2():\n    helper_b()",
     }
-    file_entity_names = {"f1.py": ["fn_1"], "f2.py": ["fn_2"]}
-    name_to_target_file = {
-        "helper_a": "original.py",
-        "helper_b": "original.py",
-        "fn_1": "f1.py",
-        "fn_2": "f2.py",
-    }
-
-    synthetic = _extract_shared_helpers(
-        file_entity_names,
+    file_entity_names, name_to_target_file, synthetic = _setup_extract_shared_helpers(
         entity_source_map,
         entity_map,
         classified,
-        name_to_target_file,
         migrated_names,
-        "original.py",
     )
 
     # Both helpers must land in the same file (f1.py is first in plan order).
@@ -2188,22 +2232,11 @@ def test_extract_shared_helpers_transitive_dep_already_wanted():
         "fn_1": "def fn_1():\n    helper_a()",
         "fn_2": "def fn_2():\n    helper_b()",
     }
-    file_entity_names = {"f1.py": ["fn_1"], "f2.py": ["fn_2"]}
-    name_to_target_file = {
-        "helper_a": "original.py",
-        "helper_b": "original.py",
-        "fn_1": "f1.py",
-        "fn_2": "f2.py",
-    }
-
-    synthetic = _extract_shared_helpers(
-        file_entity_names,
+    file_entity_names, name_to_target_file, synthetic = _setup_extract_shared_helpers(
         entity_source_map,
         entity_map,
         classified,
-        name_to_target_file,
         migrated_names,
-        "original.py",
     )
 
     # Both helpers are extracted (as separate SCCs since no mutual cycle in graph).
@@ -4381,7 +4414,7 @@ def test_generate_shebang_preserved_when_not_migrated():
 # ---------------------------------------------------------------------------
 
 
-def test_generate_main_block_stays_in_original():
+def _make_main_block_fixture():
     source = textwrap.dedent(
         """\
         def run():
@@ -4398,6 +4431,18 @@ def test_generate_main_block_stays_in_original():
     e_other = Entity(EntityKind.FUNCTION, "other", 4, 5, ["other"])
     e_main = Entity(EntityKind.TOP_LEVEL, "_block_7", 7, 8, [])
     c = _classified(entities=[e_run, e_other, e_main])
+    return MakeMainBlockFixtureResult(
+        source=source, e_run=e_run, e_other=e_other, e_main=e_main, c=c
+    )
+
+
+def test_generate_main_block_stays_in_original():
+    _ = _make_main_block_fixture()
+    source = _.source
+    e_run = _.e_run
+    e_other = _.e_other
+    e_main = _.e_main
+    c = _.c
     # Plan tries to migrate run + __main__ block and other.
     plan = _plan(
         [
@@ -4414,22 +4459,12 @@ def test_generate_main_block_stays_in_original():
 
 
 def test_generate_main_callee_stays_in_original():
-    source = textwrap.dedent(
-        """\
-        def run():
-            pass
-
-        def other():
-            pass
-
-        if __name__ == "__main__":
-            run()
-        """
-    )
-    e_run = Entity(EntityKind.FUNCTION, "run", 1, 2, ["run"])
-    e_other = Entity(EntityKind.FUNCTION, "other", 4, 5, ["other"])
-    e_main = Entity(EntityKind.TOP_LEVEL, "_block_7", 7, 8, [])
-    c = _classified(entities=[e_run, e_other, e_main])
+    _ = _make_main_block_fixture()
+    source = _.source
+    e_run = _.e_run
+    e_other = _.e_other
+    e_main = _.e_main
+    c = _.c
     # Plan tries to migrate run (the direct callee of __main__).
     plan = _plan(
         [
@@ -4732,6 +4767,20 @@ def test_generate_pytest_conftest_subdir_fixture_overrides_parent_conftest(tmp_p
     assert "import client" not in result.original_source
 
 
+def _setup_conftest_parent_test(tmp_path, src):
+    e_client = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
+    e_test = Entity(EntityKind.FUNCTION, "test_big", 5, 6, ["test_big"])
+    c = _classified(entities=[e_client, e_test])
+    plan = _plan([GroupPlacement(group=["client"], target_file="expr/fixtures.py")])
+    original_path = str(tmp_path / "test_big.py")
+
+    result = generate_file_splits(
+        c, plan, src, original_path, subdir_name="expr", pytest_conftest=True
+    )
+
+    return result
+
+
 def test_generate_pytest_conftest_subdir_parent_conftest_imports_only(tmp_path):
     # When parent conftest exists but contains only imports (no function defs),
     # no conflict is detected and the fixture routes to parent conftest normally.
@@ -4747,15 +4796,7 @@ def test_generate_pytest_conftest_subdir_parent_conftest_imports_only(tmp_path):
             pass
         """
     )
-    e_client = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
-    e_test = Entity(EntityKind.FUNCTION, "test_big", 5, 6, ["test_big"])
-    c = _classified(entities=[e_client, e_test])
-    plan = _plan([GroupPlacement(group=["client"], target_file="expr/fixtures.py")])
-    original_path = str(tmp_path / "test_big.py")
-
-    result = generate_file_splits(
-        c, plan, src, original_path, subdir_name="expr", pytest_conftest=True
-    )
+    result = _setup_conftest_parent_test(tmp_path, src)
 
     # No conflict in parent conftest → fixture routes to parent conftest.
     assert "conftest.py" in result.new_files
@@ -4779,15 +4820,7 @@ def test_generate_pytest_conftest_subdir_parent_conftest_syntax_error(tmp_path):
             pass
         """
     )
-    e_client = Entity(EntityKind.FUNCTION, "client", 1, 3, ["client"])
-    e_test = Entity(EntityKind.FUNCTION, "test_big", 5, 6, ["test_big"])
-    c = _classified(entities=[e_client, e_test])
-    plan = _plan([GroupPlacement(group=["client"], target_file="expr/fixtures.py")])
-    original_path = str(tmp_path / "test_big.py")
-
-    result = generate_file_splits(
-        c, plan, src, original_path, subdir_name="expr", pytest_conftest=True
-    )
+    result = _setup_conftest_parent_test(tmp_path, src)
 
     # Unreadable parent conftest → no conflict detected → parent conftest.
     assert "conftest.py" in result.new_files
@@ -5095,10 +5128,7 @@ def test_file_has_only_fixtures_with_docstring():
 # ---------------------------------------------------------------------------
 
 
-def test_generate_stays_fixture_emptied_when_tests_migrated():
-    # When a fixture "stays" in the original test file but all tests migrate
-    # out, the original becomes fixture-only → route fixture to conftest.py
-    # and empty the original so the engine deletes it.
+def _make_fixture_test_setup():
     src = textwrap.dedent(
         """\
         import pytest
@@ -5114,10 +5144,24 @@ def test_generate_stays_fixture_emptied_when_tests_migrated():
     e_fixture = Entity(EntityKind.FUNCTION, "client", 3, 5, ["client"])
     e_test = Entity(EntityKind.FUNCTION, "test_foo", 7, 8, ["test_foo"])
     c = _classified(entities=[e_fixture, e_test])
-    # Only test_foo is migrated; client "stays" in original.
     plan = _plan(
         [GroupPlacement(group=["test_foo"], target_file="expression/test_foo.py")]
     )
+    return MakeFixtureTestSetupResult(
+        src=src, e_fixture=e_fixture, e_test=e_test, c=c, plan=plan
+    )
+
+
+def test_generate_stays_fixture_emptied_when_tests_migrated():
+    # When a fixture "stays" in the original test file but all tests migrate
+    # out, the original becomes fixture-only → route fixture to conftest.py
+    # and empty the original so the engine deletes it.
+    _ = _make_fixture_test_setup()
+    src = _.src
+    e_fixture = _.e_fixture
+    e_test = _.e_test
+    c = _.c
+    plan = _.plan
 
     result = generate_file_splits(c, plan, src, "test_big.py", pytest_conftest=True)
 
@@ -5137,24 +5181,12 @@ def test_generate_stays_fixture_merged_with_existing_conftest(tmp_path):
         encoding="utf-8",
     )
 
-    src = textwrap.dedent(
-        """\
-        import pytest
-
-        @pytest.fixture
-        def client():
-            pass
-
-        def test_foo(client):
-            pass
-        """
-    )
-    e_fixture = Entity(EntityKind.FUNCTION, "client", 3, 5, ["client"])
-    e_test = Entity(EntityKind.FUNCTION, "test_foo", 7, 8, ["test_foo"])
-    c = _classified(entities=[e_fixture, e_test])
-    plan = _plan(
-        [GroupPlacement(group=["test_foo"], target_file="expression/test_foo.py")]
-    )
+    _ = _make_fixture_test_setup()
+    src = _.src
+    e_fixture = _.e_fixture
+    e_test = _.e_test
+    c = _.c
+    plan = _.plan
     original_path = str(tmp_path / "test_expression.py")
 
     result = generate_file_splits(c, plan, src, original_path, pytest_conftest=True)
@@ -5200,24 +5232,12 @@ def test_generate_stays_fixture_not_emptied_when_tests_remain():
 
 def test_generate_stays_fixture_not_emptied_when_conftest_disabled():
     # When pytest_conftest=False, stranded fixtures are left in the original.
-    src = textwrap.dedent(
-        """\
-        import pytest
-
-        @pytest.fixture
-        def client():
-            pass
-
-        def test_foo(client):
-            pass
-        """
-    )
-    e_fixture = Entity(EntityKind.FUNCTION, "client", 3, 5, ["client"])
-    e_test = Entity(EntityKind.FUNCTION, "test_foo", 7, 8, ["test_foo"])
-    c = _classified(entities=[e_fixture, e_test])
-    plan = _plan(
-        [GroupPlacement(group=["test_foo"], target_file="expression/test_foo.py")]
-    )
+    _ = _make_fixture_test_setup()
+    src = _.src
+    e_fixture = _.e_fixture
+    e_test = _.e_test
+    c = _.c
+    plan = _.plan
 
     result = generate_file_splits(c, plan, src, "test_big.py", pytest_conftest=False)
 

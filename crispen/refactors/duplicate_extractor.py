@@ -558,6 +558,16 @@ _CALL_GEN_TOOL: dict = {
 }
 
 
+def _parse_llm_tool_response(result: Optional[Dict]) -> Tuple[bool, str, str]:
+    if result is not None:
+        return (
+            result["is_valid_duplicate"],
+            result.get("reason", ""),
+            result.get("extraction_notes", ""),
+        )
+    return False, "no tool response", ""  # pragma: no cover
+
+
 def _llm_veto(
     client,
     group: List[_SeqInfo],
@@ -592,13 +602,7 @@ def _llm_veto(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is not None:
-        return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
-        )
-    return False, "no tool response", ""  # pragma: no cover
+    return _parse_llm_tool_response(result)
 
 
 def _llm_extract(
@@ -767,13 +771,7 @@ def _llm_veto_func_match(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is not None:
-        return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
-        )
-    return False, "no tool response", ""  # pragma: no cover
+    return _parse_llm_tool_response(result)
 
 
 def _generate_no_arg_call(seq: _SeqInfo, func: _FunctionInfo) -> str:
@@ -1131,6 +1129,13 @@ def _pyflakes_new_undefined_names(original: str, candidate: str) -> set:
     return after.names - before.names
 
 
+def _try_parse_ast(source: str) -> ast.AST | None:
+    try:
+        return ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None
+
+
 def _missing_free_vars(
     block_src: str, call_srcs: List[str], helper_src: str, source: str
 ) -> set:
@@ -1157,9 +1162,8 @@ def _missing_free_vars(
     failure does not block the extraction — the later ``compile()`` guard will
     catch real syntax problems.
     """
-    try:
-        block_tree = ast.parse(textwrap.dedent(block_src))
-    except SyntaxError:
+    block_tree = _try_parse_ast(block_src)
+    if block_tree is None:
         return set()
 
     reads: set = set()
@@ -1279,6 +1283,17 @@ def _replacement_steals_post_block_line(
     return False
 
 
+def _collect_import_names(node: ast.AST, target_set: set) -> None:
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name.split(".")[0]
+            target_set.add(name)
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            target_set.add(name)
+
+
 def _helper_imports_local_name(helper_source: str, original_source: str) -> bool:
     """Return True if helper_source imports a name that is only a local in original.
 
@@ -1293,14 +1308,7 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
 
     helper_imports: set = set()
     for node in ast.walk(helper_tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                helper_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                helper_imports.add(name)
+        _collect_import_names(node, helper_imports)
 
     if not helper_imports:
         return False
@@ -1313,14 +1321,7 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
     # Names already imported at the top level of the original file.
     orig_top_imports: set = set()
     for node in orig_tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name.split(".")[0]
-                orig_top_imports.add(name)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                name = alias.asname if alias.asname else alias.name
-                orig_top_imports.add(name)
+        _collect_import_names(node, orig_top_imports)
 
     new_helper_imports = helper_imports - orig_top_imports
     if not new_helper_imports:
@@ -1346,9 +1347,8 @@ def _names_assigned_in(block_source: str) -> set:
     Covers bare ``x = ...`` (ast.Assign) and augmented ``x += ...``
     (ast.AugAssign) statements only; other assignment forms are ignored.
     """
-    try:
-        tree = ast.parse(textwrap.dedent(block_source))
-    except SyntaxError:
+    tree = _try_parse_ast(block_source)
+    if tree is None:
         return set()
     names: set = set()
     for node in tree.body:
@@ -1577,6 +1577,23 @@ def _find_insertion_point(source: str, scope: str) -> int:
 
 
 class DuplicateExtractor(Refactor):
+
+    @staticmethod
+    def _log_and_maybe_continue(
+        verbose: bool, stats, is_valid: bool, reason: str
+    ) -> bool:
+        if verbose:
+            status = "ACCEPTED" if is_valid else "VETOED"
+            print(
+                f"crispen: DuplicateExtractor:   → {status}: {reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not is_valid:
+            stats.llm_rejected += 1
+            return True
+        return False
+
     """Detect and extract duplicate code blocks into helper functions via LLM."""
 
     def __init__(
@@ -1714,15 +1731,9 @@ class DuplicateExtractor(Refactor):
                         flush=True,
                     )
                     continue
-                if self.verbose:
-                    status = "ACCEPTED" if is_valid else "VETOED"
-                    print(
-                        f"crispen: DuplicateExtractor:   → {status}: {reason}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                if not is_valid:
-                    self.stats.llm_rejected += 1
+                if self._log_and_maybe_continue(
+                    self.verbose, self.stats, is_valid, reason
+                ):
                     continue
                 if func.scope == "<module>" and not func.params:
                     replacement = _generate_no_arg_call(seq, func)
@@ -1820,15 +1831,7 @@ class DuplicateExtractor(Refactor):
                     flush=True,
                 )
                 continue
-            if self.verbose:
-                status = "ACCEPTED" if is_valid else "VETOED"
-                print(
-                    f"crispen: DuplicateExtractor:   → {status}: {reason}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            if not is_valid:
-                self.stats.llm_rejected += 1
+            if self._log_and_maybe_continue(self.verbose, self.stats, is_valid, reason):
                 continue
 
             # Extraction retry loop: attempt extraction up to

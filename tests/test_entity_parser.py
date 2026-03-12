@@ -233,12 +233,17 @@ def test_parse_syntax_error():
     assert parse_entities("def (invalid") == []
 
 
-def test_parse_single_function():
-    source = "def foo():\n    pass\n"
+def _get_single_function_entity(source: str):
     entities = parse_entities(source)
     assert len(entities) == 1
     e = entities[0]
     assert e.kind == EntityKind.FUNCTION
+    return e
+
+
+def test_parse_single_function():
+    source = "def foo():\n    pass\n"
+    e = _get_single_function_entity(source)
     assert e.name == "foo"
     assert e.start_line == 1
     assert e.end_line == 2
@@ -247,10 +252,7 @@ def test_parse_single_function():
 
 def test_parse_async_function():
     source = "async def bar():\n    pass\n"
-    entities = parse_entities(source)
-    assert len(entities) == 1
-    e = entities[0]
-    assert e.kind == EntityKind.FUNCTION
+    e = _get_single_function_entity(source)
     assert e.name == "bar"
 
 
@@ -264,11 +266,16 @@ def test_parse_single_class():
     assert e.names_defined == ["Foo"]
 
 
-def test_parse_top_level_assignment():
-    entities = parse_entities("X = 1\n")
+def _assert_single_top_level_entity(entities):
     assert len(entities) == 1
     e = entities[0]
     assert e.kind == EntityKind.TOP_LEVEL
+    return e
+
+
+def test_parse_top_level_assignment():
+    entities = parse_entities("X = 1\n")
+    e = _assert_single_top_level_entity(entities)
     assert e.name == "_block_1"
     assert e.names_defined == ["X"]
     assert e.start_line == 1
@@ -277,9 +284,7 @@ def test_parse_top_level_assignment():
 
 def test_parse_imports_form_top_level_entity():
     entities = parse_entities("import os\nfrom sys import argv\n")
-    assert len(entities) == 1
-    e = entities[0]
-    assert e.kind == EntityKind.TOP_LEVEL
+    e = _assert_single_top_level_entity(entities)
     assert "os" in e.names_defined
     assert "argv" in e.names_defined
 
@@ -402,6 +407,13 @@ def test_parse_function_no_docstring():
     assert e.params == ["a", "b", "c"]
 
 
+def _get_first_class_entity(source: str):
+    entities = parse_entities(source)
+    e = entities[0]
+    assert e.kind == EntityKind.CLASS
+    return e
+
+
 def test_parse_class_with_docstring_and_init():
     source = textwrap.dedent(
         """\
@@ -411,18 +423,14 @@ def test_parse_class_with_docstring_and_init():
                 pass
         """
     )
-    entities = parse_entities(source)
-    e = entities[0]
-    assert e.kind == EntityKind.CLASS
+    e = _get_first_class_entity(source)
     assert e.docstring == "Bar class docstring."
     assert e.params == ["x: int", "y: str"]
 
 
 def test_parse_class_no_init():
     source = "class Baz:\n    pass\n"
-    entities = parse_entities(source)
-    e = entities[0]
-    assert e.kind == EntityKind.CLASS
+    e = _get_first_class_entity(source)
     assert e.docstring is None
     assert e.params == []
 
@@ -558,6 +566,11 @@ def test_section_header_none_when_no_header():
     assert entities[0].section_header is None
 
 
+def _get_entities_by_names(source: str, *names: str):
+    entities = parse_entities(source)
+    return tuple(next(e for e in entities if e.name == name) for name in names)
+
+
 def test_section_header_changes_between_functions():
     source = (
         "# --- First ---\n"
@@ -570,9 +583,7 @@ def test_section_header_changes_between_functions():
         "def bar():\n"
         "    pass\n"
     )
-    entities = parse_entities(source)
-    foo = next(e for e in entities if e.name == "foo")
-    bar = next(e for e in entities if e.name == "bar")
+    foo, bar = _get_entities_by_names(source, "foo", "bar")
     assert foo.section_header == "First"
     assert bar.section_header == "Second"
 
@@ -588,8 +599,6 @@ def test_section_header_first_entity_before_any_header():
         "def bar():\n"
         "    pass\n"
     )
-    entities = parse_entities(source)
-    foo = next(e for e in entities if e.name == "foo")
-    bar = next(e for e in entities if e.name == "bar")
+    foo, bar = _get_entities_by_names(source, "foo", "bar")
     assert foo.section_header is None
     assert bar.section_header == "Helpers"

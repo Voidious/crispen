@@ -509,6 +509,40 @@ def _categorize_into_stats(stats: RunStats, msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _record_changes(
+    change_source, filepath: str, file_msgs: list, stats: RunStats
+) -> None:
+    for msg in change_source.get_changes():
+        file_msgs.append(f"{filepath}: {msg}")
+        _categorize_into_stats(stats, msg)
+
+
+def _check_and_get_dir(result, file_path: str):
+    if result.abort or not result.new_files:
+        return None
+    return Path(file_path).parent
+
+
+def _write_new_file_with_init(
+    base_dir: Path,
+    rel_path: Path,
+    new_source: str,
+    _stats: RunStats,
+    _fl_new_file_final: Dict[str, str],
+) -> Path:
+    new_path = base_dir / rel_path
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    if new_path.parent != base_dir:
+        init_py = new_path.parent / "__init__.py"
+        if not init_py.exists():
+            init_py.write_text("", encoding="utf-8")
+    new_path.write_text(new_source, encoding="utf-8")
+    _stats.files_edited.append(str(new_path))
+    _stats.file_limiter_edits += 1
+    _fl_new_file_final[str(new_path)] = new_source
+    return new_path
+
+
 def run_engine(
     changed: Dict[str, List[Tuple[int, int]]],
     verbose: bool = True,
@@ -608,9 +642,7 @@ def run_engine(
                 )
                 continue
 
-            for msg in transformer.get_changes():
-                file_msgs.append(f"{filepath}: {msg}")
-                _categorize_into_stats(_stats, msg)
+            _record_changes(transformer, filepath, file_msgs, _stats)
             _stats.merge(transformer.stats)
             current_source = new_source
 
@@ -657,9 +689,7 @@ def run_engine(
                         except SyntaxError:  # pragma: no cover
                             pass
                         else:
-                            for msg in cu.get_changes():
-                                file_msgs.append(f"{filepath}: {msg}")
-                                _categorize_into_stats(_stats, msg)
+                            _record_changes(cu, filepath, file_msgs, _stats)
                             current_source = cu_new_source
 
         per_file[filepath] = {
@@ -832,21 +862,14 @@ def run_engine(
             if fl_result.messages:
                 state["msgs"].extend(fl_result.messages)
 
-            if fl_result.abort or not fl_result.new_files:
+            original_dir = _check_and_get_dir(fl_result, filepath)
+            if original_dir is None:
                 continue
 
-            original_dir = Path(filepath).parent
             for rel_path, new_source in fl_result.new_files.items():
-                new_path = original_dir / rel_path
-                new_path.parent.mkdir(parents=True, exist_ok=True)
-                if new_path.parent != original_dir:
-                    init_py = new_path.parent / "__init__.py"
-                    if not init_py.exists():
-                        init_py.write_text("", encoding="utf-8")
-                new_path.write_text(new_source, encoding="utf-8")
-                _stats.files_edited.append(str(new_path))
-                _stats.file_limiter_edits += 1
-                _fl_new_file_final[str(new_path)] = new_source
+                new_path = _write_new_file_with_init(
+                    original_dir, rel_path, new_source, _stats, _fl_new_file_final
+                )
                 if (
                     config.file_limiter_recursive
                     and len(new_source.splitlines()) > config.max_file_lines
@@ -898,21 +921,14 @@ def run_engine(
 
             _recursive_msgs.extend(r_result.messages)
 
-            if r_result.abort or not r_result.new_files:
+            r_dir = _check_and_get_dir(r_result, r_path)
+            if r_dir is None:
                 continue
 
-            r_dir = Path(r_path).parent
             for rel_path, new_source in r_result.new_files.items():
-                new_path = r_dir / rel_path
-                new_path.parent.mkdir(parents=True, exist_ok=True)
-                if new_path.parent != r_dir:
-                    init_py = new_path.parent / "__init__.py"
-                    if not init_py.exists():
-                        init_py.write_text("", encoding="utf-8")
-                new_path.write_text(new_source, encoding="utf-8")
-                _stats.files_edited.append(str(new_path))
-                _stats.file_limiter_edits += 1
-                _fl_new_file_final[str(new_path)] = new_source
+                new_path = _write_new_file_with_init(
+                    r_dir, rel_path, new_source, _stats, _fl_new_file_final
+                )
                 if len(new_source.splitlines()) > config.max_file_lines:
                     _fl_recursive.append((str(new_path), new_source))
 

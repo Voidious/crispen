@@ -873,10 +873,7 @@ def test_runner_split_aborts_on_cycle(mock_classify, mock_advise, mock_gen):
     assert any("cannot be split" in m for m in result.messages)
 
 
-@patch(_PATCH_GEN)
-@patch(_PATCH_ADVISE)
-@patch(_PATCH_CLASSIFY)
-def test_runner_split_aborts_with_reason(mock_classify, mock_advise, mock_gen):
+def _setup_split_abort_scenario(mock_classify, mock_advise, mock_gen):
     source = "def foo():\n    pass\n"
     entity = _make_entity("foo", 1, 2)
     mock_classify.return_value = _make_classified(entities=[entity])
@@ -887,6 +884,14 @@ def test_runner_split_aborts_with_reason(mock_classify, mock_advise, mock_gen):
         abort=True,
         abort_reason="proposed split would create circular file imports",
     )
+    return source
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_split_aborts_with_reason(mock_classify, mock_advise, mock_gen):
+    source = _setup_split_abort_scenario(mock_classify, mock_advise, mock_gen)
 
     result = run_file_limiter("big.py", "", source, [], _CONFIG_NO_RETRY)
 
@@ -904,16 +909,7 @@ def test_runner_split_aborts_with_reason(mock_classify, mock_advise, mock_gen):
 @patch(_PATCH_CLASSIFY)
 def test_runner_split_abort_retries_and_fails(mock_classify, mock_advise, mock_gen):
     # retries=1: both attempts produce split.abort → 2 SKIP messages, abort=True.
-    source = "def foo():\n    pass\n"
-    entity = _make_entity("foo", 1, 2)
-    mock_classify.return_value = _make_classified(entities=[entity])
-    mock_advise.return_value = _plan_with(["foo"], "utils.py")
-    mock_gen.return_value = SplitResult(
-        new_files={},
-        original_source=source,
-        abort=True,
-        abort_reason="proposed split would create circular file imports",
-    )
+    source = _setup_split_abort_scenario(mock_classify, mock_advise, mock_gen)
     cfg = CrispenConfig(file_limiter_retries=1)
 
     result = run_file_limiter("big.py", "", source, [], cfg)
@@ -962,6 +958,20 @@ def test_runner_split_abort_retries_and_succeeds(mock_classify, mock_advise, moc
 # ---------------------------------------------------------------------------
 
 
+def _run_and_assert_test_prefix(mock_gen, source, config):
+    mock_gen.return_value = SplitResult(
+        new_files={"test_helpers.py": "def test_foo():\n    pass"},
+        original_source="# original\n",
+        abort=False,
+    )
+
+    result = run_file_limiter("tests/test_big.py", "", source, [], config)
+
+    assert result.abort is False
+    assert any("test_helpers.py" in m for m in result.messages)
+    return result
+
+
 @patch(_PATCH_GEN)
 @patch(_PATCH_ADVISE)
 @patch(_PATCH_CLASSIFY)
@@ -972,18 +982,9 @@ def test_runner_adds_test_prefix_to_new_files(mock_classify, mock_advise, mock_g
     entity = _make_entity("test_foo", 1, 2)
     mock_classify.return_value = _make_classified(entities=[entity])
     mock_advise.return_value = _plan_with(["test_foo"], "helpers.py")
-    mock_gen.return_value = SplitResult(
-        new_files={"test_helpers.py": "def test_foo():\n    pass"},
-        original_source="# original\n",
-        abort=False,
-    )
-
-    result = run_file_limiter("tests/test_big.py", "", source, [], _CONFIG)
-
-    assert result.abort is False
     # The placement target passed to generate_file_splits must have been
     # normalised — verify via the success message.
-    assert any("test_helpers.py" in m for m in result.messages)
+    result = _run_and_assert_test_prefix(mock_gen, source, _CONFIG)
     assert not any(
         "helpers.py" in m and "test_helpers.py" not in m for m in result.messages
     )
@@ -998,16 +999,7 @@ def test_runner_test_prefix_already_present(mock_classify, mock_advise, mock_gen
     entity = _make_entity("test_foo", 1, 2)
     mock_classify.return_value = _make_classified(entities=[entity])
     mock_advise.return_value = _plan_with(["test_foo"], "test_helpers.py")
-    mock_gen.return_value = SplitResult(
-        new_files={"test_helpers.py": "def test_foo():\n    pass"},
-        original_source="# original\n",
-        abort=False,
-    )
-
-    result = run_file_limiter("tests/test_big.py", "", source, [], _CONFIG)
-
-    assert result.abort is False
-    assert any("test_helpers.py" in m for m in result.messages)
+    _run_and_assert_test_prefix(mock_gen, source, _CONFIG)
 
 
 @patch(_PATCH_GEN)
@@ -1518,14 +1510,7 @@ def test_runner_subdir_split_non_test_success(mock_classify, mock_advise, mock_g
     assert any("service/utils.py" in m for m in result.messages)
 
 
-@patch(_PATCH_GEN)
-@patch(_PATCH_ADVISE)
-@patch(_PATCH_CLASSIFY)
-def test_runner_subdir_split_test_file_keeps_original(
-    mock_classify, mock_advise, mock_gen
-):
-    # Whole-file diff on a test file → placements get subdir prefix but
-    # original_source (re-export stubs in test_service.py) is written back.
+def _setup_two_group_classify_advise(mock_classify, mock_advise):
     source = "def test_foo():\n    pass\ndef test_bar():\n    pass\n"
     entity1 = _make_entity("test_foo", 1, 2)
     entity2 = _make_entity("test_bar", 3, 4)
@@ -1546,6 +1531,20 @@ def test_runner_subdir_split_test_file_keeps_original(
             GroupPlacement(group=["test_bar"], target_file="extras.py"),
         ],
         abort=False,
+    )
+    return source, entity1, entity2
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_runner_subdir_split_test_file_keeps_original(
+    mock_classify, mock_advise, mock_gen
+):
+    # Whole-file diff on a test file → placements get subdir prefix but
+    # original_source (re-export stubs in test_service.py) is written back.
+    source, entity1, entity2 = _setup_two_group_classify_advise(
+        mock_classify, mock_advise
     )
     mock_gen.return_value = SplitResult(
         new_files={
@@ -1574,26 +1573,8 @@ def test_runner_subdir_split_strips_test_prefix_from_stem(
     mock_classify, mock_advise, mock_gen
 ):
     # test_big.py → subdir "big/" (strip "test_" prefix from stem).
-    source = "def test_foo():\n    pass\ndef test_bar():\n    pass\n"
-    entity1 = _make_entity("test_foo", 1, 2)
-    entity2 = _make_entity("test_bar", 3, 4)
-    # Two groups required so the n_groups > 1 subdir guard doesn't fire.
-    mock_classify.return_value = ClassifiedEntities(
-        entities=[entity1, entity2],
-        entity_class={},
-        graph={},
-        set_1=[],
-        set_2_groups=[["test_foo"], ["test_bar"]],
-        set_3_groups=[],
-        abort=False,
-    )
-    mock_advise.return_value = FileLimiterPlan(
-        set3_migrate=[],
-        placements=[
-            GroupPlacement(group=["test_foo"], target_file="helpers.py"),
-            GroupPlacement(group=["test_bar"], target_file="extras.py"),
-        ],
-        abort=False,
+    source, entity1, entity2 = _setup_two_group_classify_advise(
+        mock_classify, mock_advise
     )
     mock_gen.return_value = SplitResult(
         new_files={

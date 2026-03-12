@@ -78,14 +78,18 @@ def _make_veto_response(is_valid: bool, reason: str = "test") -> MagicMock:
     return resp
 
 
-def _make_extract_response(data: dict) -> MagicMock:
-    block = MagicMock()
-    block.type = "tool_use"
-    block.name = "extract_helper"
+def _build_mock_response(block: MagicMock, data: dict) -> MagicMock:
     block.input = data
     resp = MagicMock()
     resp.content = [block]
     return resp
+
+
+def _make_extract_response(data: dict) -> MagicMock:
+    block = MagicMock()
+    block.type = "tool_use"
+    block.name = "extract_helper"
+    return _build_mock_response(block, data)
 
 
 def _make_verify_response(is_correct: bool, issues: list) -> MagicMock:
@@ -194,6 +198,13 @@ def test_tuple_dataclass_small_tuple():
 # ===========================================================================
 
 
+def _setup_mock_anthropic(mock_anthropic):
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    return mock_client
+
+
 def test_duplicate_extraction_cross_function(monkeypatch):
     """Same 3-statement setup block duplicated across two functions → extracted."""
     src, diff, _ = _load("duplicate_extraction", "01_cross_function")
@@ -208,9 +219,7 @@ def test_duplicate_extraction_cross_function(monkeypatch):
     )
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
+        mock_client = _setup_mock_anthropic(mock_anthropic)
         mock_client.messages.create.side_effect = [
             _make_veto_response(True, "identical setup block"),
             _make_extract_response(
@@ -249,9 +258,7 @@ def test_duplicate_extraction_within_function(monkeypatch):
     )
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
+        mock_client = _setup_mock_anthropic(mock_anthropic)
         mock_client.messages.create.side_effect = [
             _make_veto_response(True, "identical connection setup"),
             _make_extract_response(
@@ -282,9 +289,7 @@ def test_duplicate_extraction_below_threshold(monkeypatch):
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     with patch("crispen.llm_client.anthropic") as mock_anthropic:
-        mock_client = MagicMock()
-        mock_anthropic.Anthropic.return_value = mock_client
-        mock_anthropic.APIError = Exception
+        mock_client = _setup_mock_anthropic(mock_anthropic)
         de = DuplicateExtractor(ranges, source=src)
 
     assert de._new_source is None
@@ -360,10 +365,7 @@ def test_function_splitter_method(mock_anthropic):
     assert "@staticmethod" in result
 
 
-@patch("crispen.llm_client.anthropic")
-def test_function_splitter_skip_async(mock_anthropic):
-    """Async functions are never split — no LLM call is made."""
-    src, diff, expected = _load("function_splitter", "03_skip_async")
+def _assert_splitter_skips(src: str, diff: str, mock_anthropic) -> None:
     ranges = _ranges(diff)
 
     with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
@@ -371,19 +373,20 @@ def test_function_splitter_skip_async(mock_anthropic):
 
     assert splitter.get_rewritten_source() is None
     mock_anthropic.Anthropic.return_value.messages.create.assert_not_called()
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_skip_async(mock_anthropic):
+    """Async functions are never split — no LLM call is made."""
+    src, diff, expected = _load("function_splitter", "03_skip_async")
+    _assert_splitter_skips(src, diff, mock_anthropic)
 
 
 @patch("crispen.llm_client.anthropic")
 def test_function_splitter_skip_generator(mock_anthropic):
     """Generator functions (containing yield) are never split — no LLM call is made."""
     src, diff, expected = _load("function_splitter", "04_skip_generator")
-    ranges = _ranges(diff)
-
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-        splitter = FunctionSplitter(ranges, source=src, verbose=False, max_lines=8)
-
-    assert splitter.get_rewritten_source() is None
-    mock_anthropic.Anthropic.return_value.messages.create.assert_not_called()
+    _assert_splitter_skips(src, diff, mock_anthropic)
 
 
 @patch("crispen.llm_client.anthropic")
@@ -442,24 +445,26 @@ def _make_fl_response(tool_name: str, data: dict) -> MagicMock:
     block = MagicMock()
     block.type = "tool_use"
     block.name = tool_name
-    block.input = data
-    resp = MagicMock()
-    resp.content = [block]
-    return resp
+    return _build_mock_response(block, data)
+
+
+def _setup_test_file(
+    tmp_path: Path, diff: str, src: str
+) -> tuple[list[tuple[int, int]], Path]:
+    ranges = _ranges(diff)
+
+    input_file = tmp_path / "input.py"
+    input_file.write_text(src)
+    return ranges, input_file
 
 
 @patch("crispen.llm_client.anthropic")
 def test_file_limiter_set2_split(mock_anthropic, tmp_path):
     """New public helpers added by the diff are moved to a sibling utils.py file."""
     original_src, src, diff = _load_fl("01_set2_split")
-    ranges = _ranges(diff)
+    ranges, input_file = _setup_test_file(tmp_path, diff, src)
 
-    input_file = tmp_path / "input.py"
-    input_file.write_text(src)
-
-    mock_client = MagicMock()
-    mock_anthropic.Anthropic.return_value = mock_client
-    mock_anthropic.APIError = Exception
+    mock_client = _setup_mock_anthropic(mock_anthropic)
     # Two LLM calls: propose output files, then assign_file_placements.
     mock_client.messages.create.side_effect = [
         _make_fl_response(
@@ -498,10 +503,7 @@ def test_file_limiter_set2_split(mock_anthropic, tmp_path):
 def test_file_limiter_skip_single_scc(tmp_path):
     """A file where all entities form one dependency cycle cannot be split."""
     _, src, diff = _load_fl("02_skip_single_scc")
-    ranges = _ranges(diff)
-
-    input_file = tmp_path / "input.py"
-    input_file.write_text(src)
+    ranges, input_file = _setup_test_file(tmp_path, diff, src)
 
     result = run_file_limiter(
         str(input_file),

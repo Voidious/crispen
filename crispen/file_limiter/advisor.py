@@ -333,6 +333,15 @@ def _advise_set3(
     ]
 
 
+def _build_groups_text(groups, entities):
+    entity_map = {e.name: e for e in entities}
+    group_lines = []
+    for idx, group in enumerate(groups):
+        summary = _group_summary(group, entity_map)
+        group_lines.append(f"  [{idx}]: {summary}")
+    return "\n".join(group_lines)
+
+
 def _propose_files_step(
     groups_to_place: List[List[str]],
     classified: ClassifiedEntities,
@@ -353,12 +362,7 @@ def _propose_files_step(
     2 * total_lines / max_file_lines) so output files average half the line
     limit, keeping well-sized files even when entity sizes are uneven.
     """
-    entity_map = {e.name: e for e in classified.entities}
-    group_lines = []
-    for idx, group in enumerate(groups_to_place):
-        summary = _group_summary(group, entity_map)
-        group_lines.append(f"  [{idx}]: {summary}")
-    groups_text = "\n".join(group_lines)
+    groups_text = _build_groups_text(groups_to_place, classified.entities)
 
     mermaid_text = _build_group_mermaid(groups_to_place, classified)
     exclude_section = ""
@@ -477,12 +481,7 @@ def _assign_placements_chunk(
     Groups within *chunk* are numbered 0…N-1 for this call.
     Returns ``None`` on failure (LLM error, missing group, or invalid target).
     """
-    entity_map = {e.name: e for e in classified.entities}
-    group_lines = []
-    for idx, group in enumerate(chunk):
-        summary = _group_summary(group, entity_map)
-        group_lines.append(f"  [{idx}]: {summary}")
-    groups_text = "\n".join(group_lines)
+    groups_text = _build_groups_text(chunk, classified.entities)
 
     n_groups = len(chunk)
     original_basename = Path(original_path).name
@@ -847,6 +846,13 @@ def _rename_conflicting_chunk(
     return placements
 
 
+def _extend_or_return(chunk_result, accumulator):
+    if chunk_result is None:
+        return None
+    accumulator.extend(chunk_result)
+    return accumulator
+
+
 def _assign_placements(
     groups_to_place: List[List[str]],
     classified: ClassifiedEntities,
@@ -926,9 +932,8 @@ def _assign_placements(
             )
             if chunk_placements is not None:
                 break
-        if chunk_placements is None:
+        if _extend_or_return(chunk_placements, all_placements) is None:
             return None
-        all_placements.extend(chunk_placements)
 
     # Step 3: Refine — merge tiny output files (best-effort).
     all_placements = _refine_merge_tiny(
@@ -1019,9 +1024,8 @@ def resolve_naming_conflicts(
                 "Please try again with a valid, non-conflicting target filename "
                 "for every group."
             )
-        if chunk_result is None:
+        if _extend_or_return(chunk_result, all_renamed) is None:
             return None
-        all_renamed.extend(chunk_result)
 
     # Merge back: replace conflicting slots, leave non-conflicting unchanged.
     result = list(placements)
