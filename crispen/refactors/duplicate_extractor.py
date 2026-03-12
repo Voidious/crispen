@@ -847,14 +847,20 @@ def _llm_verify_extraction(
         f"Replacement for block {i + 1}:\n```python\n{r.rstrip()}\n```"
         for i, r in enumerate(call_replacements)
     )
-    snippet = full_source[:2000] if len(full_source) > 2000 else full_source
+    src_lines = full_source.splitlines(keepends=True)
+    min_start = min(s.start_line for s in group)
+    max_end = max(s.end_line for s in group)
+    window_start = max(0, min_start - 30)
+    window_end = min(len(src_lines), max_end + 100)
+    snippet = "".join(src_lines[window_start:window_end])
     prompt = (
         "Verify that the following helper function extraction is semantically "
         "correct by tracing through the code carefully.\n\n"
         f"Original duplicate blocks:\n{blocks_text}\n\n"
         f"Extracted helper:\n```python\n{helper_source.rstrip()}\n```\n\n"
         f"Call site replacements:\n{replacements_text}\n\n"
-        f"File context (truncated):\n```python\n{snippet}\n```\n\n"
+        f"Source context around duplicate blocks "
+        f"(lines {window_start + 1}–{window_end}):\n```python\n{snippet}\n```\n\n"
         "Check each of the following:\n"
         "1. Every variable read (but not locally assigned) in the original block "
         "is passed as a parameter to the helper\n"
