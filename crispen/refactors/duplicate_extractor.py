@@ -919,6 +919,171 @@ def _normalize_replacement_indentation(seq: _SeqInfo, replacement: str) -> str:
     return textwrap.indent(dedented, expected_indent)
 
 
+def _collect_ast_store_names(node: ast.AST, names: List[str]) -> None:
+    """Recursively collect Name ids from an assignment target (Store context)."""
+    if isinstance(node, ast.Name):
+        names.append(node.id)
+    elif isinstance(node, (ast.Tuple, ast.List)):
+        for elt in node.elts:
+            _collect_ast_store_names(elt, names)
+
+
+def _replace_unused_in_target(
+    target: ast.AST, following_src: str
+) -> Tuple[ast.AST, bool, bool]:
+    """Replace unused Name nodes in *target* with ``_``.
+
+    Returns ``(new_target, all_replaced, any_replaced)`` where:
+    - *all_replaced*: every name in the target was replaced (all unused).
+    - *any_replaced*: at least one name was replaced.
+
+    Non-Name, non-Tuple/List targets (Attribute, Subscript, …) are treated as
+    *used* so we never accidentally strip an assignment we cannot analyse.
+    """
+    if isinstance(target, ast.Name):
+        if re.search(r"\b" + re.escape(target.id) + r"\b", following_src):
+            return target, False, False  # used → keep
+        return ast.Name(id="_", ctx=ast.Store()), True, True  # unused → _
+    if isinstance(target, (ast.Tuple, ast.List)):
+        new_elts: List[ast.AST] = []
+        all_replaced = True
+        any_replaced = False
+        for elt in target.elts:
+            new_elt, elt_all, elt_any = _replace_unused_in_target(elt, following_src)
+            new_elts.append(new_elt)
+            if not elt_all:
+                all_replaced = False
+            if elt_any:
+                any_replaced = True
+        new_target = type(target)(elts=new_elts, ctx=ast.Store())
+        return new_target, all_replaced, any_replaced
+    # Attribute, Subscript, Starred, etc. — treat as used.
+    return target, False, False
+
+
+def _scope_end_line(source_lines: List[str], scope: str, after_line: int) -> int:
+    """Return the exclusive slice index into *source_lines* for the end of *scope*.
+
+    ``after_line`` is the 1-based line number of the last line of the replaced
+    block.  The returned index is suitable for ``source_lines[after_line:idx]``
+    to get only the lines inside the enclosing scope that follow the block.
+
+    For ``"<module>"`` scope the whole rest of the file is in scope, so
+    ``len(source_lines)`` is returned.  For named function/class scopes the
+    innermost definition whose name matches *scope* and that contains
+    *after_line* is located via the AST; its end line is returned as the
+    exclusive slice bound (1-based end_lineno used directly as a 0-based
+    exclusive index is correct because line N is at index N-1, so slicing up
+    to index N includes line N).  Falls back to ``len(source_lines)`` on any
+    parse error or if no matching scope is found.
+    """
+    if scope == "<module>":
+        return len(source_lines)
+
+    source = "".join(source_lines)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return len(source_lines)
+
+    # ast.walk is BFS, so outer scopes are visited before inner ones.  Always
+    # overwriting best_end means the last match wins — which is the innermost
+    # (smallest) scope that still contains after_line.
+    best_end: int = len(source_lines)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if node.name != scope:
+            continue
+        if not (node.lineno <= after_line <= node.end_lineno):
+            continue
+        best_end = node.end_lineno
+
+    return best_end
+
+
+def _strip_unused_call_assignments(replacement: str, following_lines: List[str]) -> str:
+    """Clean up unused assignment targets in a call-site replacement.
+
+    For each ``Assign`` node whose right-hand side is a ``Call``:
+
+    * **Single target** — unused ``Name`` elements in the target are replaced
+      with ``_``.  If every element is unused the whole assignment is dropped
+      and only the call expression is emitted.  Example::
+
+          result = _helper(x)          →  _helper(x)
+          a, b   = _helper(x)  (b used)  →  a, _ = _helper(x)
+
+    * **Chained assignment** (``a = b = call()``) — stripped to just the call
+      only when every name across every target is unused; otherwise left alone.
+
+    Augmented (``+=``) and annotated assignments are never touched.  Assignment
+    targets that are not plain names or tuples/lists (e.g. ``self.x``) are
+    treated as *used* so we never accidentally remove live assignments.
+
+    This prevents flake8 F841 "local variable assigned but never used" errors
+    introduced by the extraction.
+    """
+    following_src = "".join(following_lines)
+    try:
+        dedented = textwrap.dedent(replacement)
+        tree = ast.parse(dedented)
+    except SyntaxError:
+        return replacement
+
+    # Build a list of (start_ln, end_ln, new_src) edits.  new_src is the
+    # replacement text for that statement (without leading indentation).
+    edits: List[Tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not isinstance(node.value, ast.Call):
+            continue
+
+        call_src = ast.unparse(node.value)
+
+        if len(node.targets) == 1:
+            new_target, all_replaced, any_replaced = _replace_unused_in_target(
+                node.targets[0], following_src
+            )
+            if all_replaced:
+                edits.append((node.lineno, node.end_lineno, call_src))
+            elif any_replaced:
+                edits.append(
+                    (
+                        node.lineno,
+                        node.end_lineno,
+                        ast.unparse(new_target) + " = " + call_src,
+                    )
+                )
+        else:
+            # Chained assignment: strip only when every name is unused.
+            all_names: List[str] = []
+            for t in node.targets:
+                _collect_ast_store_names(t, all_names)
+            if not all_names:
+                continue
+            if not any(
+                re.search(r"\b" + re.escape(n) + r"\b", following_src)
+                for n in all_names
+            ):
+                edits.append((node.lineno, node.end_lineno, call_src))
+
+    if not edits:
+        return replacement
+
+    # Determine the leading indentation from the first non-empty line.
+    first_content = next((ln for ln in replacement.splitlines() if ln.strip()), "")
+    indent = first_content[: len(first_content) - len(first_content.lstrip())]
+
+    # Apply edits in reverse line order so earlier indices stay valid.
+    dedented_lines = dedented.splitlines(keepends=True)
+    for start_ln, end_ln, new_src in sorted(edits, key=lambda x: x[0], reverse=True):
+        dedented_lines[start_ln - 1 : end_ln] = [new_src + "\n"]
+
+    return textwrap.indent("".join(dedented_lines), indent)
+
+
 _MUTABLE_CONSTRUCTORS = frozenset({"set", "list", "dict", "frozenset", "bytearray"})
 
 
@@ -1946,6 +2111,23 @@ class DuplicateExtractor(Refactor):
                     # valid Python.
                     call_replacements = [
                         _normalize_replacement_indentation(seq, r)
+                        for seq, r in zip(group, call_replacements)
+                    ]
+
+                    # Strip unused variable assignments from call-site
+                    # replacements.  The LLM may assign return values that are
+                    # never used after the block (e.g. when the helper returns a
+                    # value only needed at some call sites), which would produce
+                    # flake8 F841 warnings.
+                    call_replacements = [
+                        _strip_unused_call_assignments(
+                            r,
+                            source_lines[
+                                seq.end_line : _scope_end_line(
+                                    source_lines, seq.scope, seq.end_line
+                                )
+                            ],
+                        )
                         for seq, r in zip(group, call_replacements)
                     ]
 

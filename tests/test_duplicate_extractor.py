@@ -14,6 +14,9 @@ from crispen.refactors.duplicate_extractor import (
     _has_funcdef,
     _collect_attribute_names,
     _collect_called_attr_names,
+    _collect_ast_store_names,
+    _replace_unused_in_target,
+    _scope_end_line,
     _extract_defined_names,
     _FunctionCollector,
     _FunctionInfo,
@@ -47,6 +50,7 @@ from crispen.refactors.duplicate_extractor import (
     _replacement_steals_post_block_line,
     _helper_imports_local_name,
     _strip_helper_docstring,
+    _strip_unused_call_assignments,
     _verify_extraction,
     DuplicateExtractor,
 )
@@ -3759,6 +3763,287 @@ def test_strip_helper_docstring_docstring_only_body():
     source = 'def _helper():\n    """Only doc."""\n'
     result = _strip_helper_docstring(source)
     assert '"""Only doc."""' in result
+
+
+# ---------------------------------------------------------------------------
+# _collect_ast_store_names
+# ---------------------------------------------------------------------------
+
+
+def test_collect_ast_store_names_simple_name():
+    import ast
+
+    node = ast.parse("x = 1").body[0].targets[0]
+    names: list = []
+    _collect_ast_store_names(node, names)
+    assert names == ["x"]
+
+
+def test_collect_ast_store_names_tuple():
+    import ast
+
+    node = ast.parse("a, b = 1, 2").body[0].targets[0]
+    names: list = []
+    _collect_ast_store_names(node, names)
+    assert set(names) == {"a", "b"}
+
+
+def test_collect_ast_store_names_nested_tuple():
+    import ast
+
+    node = ast.parse("(a, (b, c)) = x").body[0].targets[0]
+    names: list = []
+    _collect_ast_store_names(node, names)
+    assert set(names) == {"a", "b", "c"}
+
+
+def test_collect_ast_store_names_non_name_non_tuple_noop():
+    # ast.Attribute target (e.g. self.x) → nothing collected.
+    import ast
+
+    node = ast.parse("self.x = 1").body[0].targets[0]
+    names: list = []
+    _collect_ast_store_names(node, names)
+    assert names == []
+
+
+# ---------------------------------------------------------------------------
+# _scope_end_line
+# ---------------------------------------------------------------------------
+
+
+def _make_source_lines(src: str):
+    return src.splitlines(keepends=True)
+
+
+def test_scope_end_line_module_returns_full_length():
+    lines = _make_source_lines("x = 1\ny = 2\n")
+    assert _scope_end_line(lines, "<module>", 1) == len(lines)
+
+
+def test_scope_end_line_function_scope():
+    src = "def foo():\n    x = 1\n    y = 2\n\ndef bar():\n    z = 3\n"
+    lines = _make_source_lines(src)
+    # Block ends at line 2 (inside foo). foo ends at line 3.
+    assert _scope_end_line(lines, "foo", 2) == 3
+
+
+def test_scope_end_line_does_not_bleed_into_next_function():
+    src = "def foo():\n    x = 1\n\ndef bar():\n    x = 2\n"
+    lines = _make_source_lines(src)
+    # Searching for `x` after line 2 should stop at end of foo (line 2), not
+    # reach bar where `x` also appears.
+    end = _scope_end_line(lines, "foo", 2)
+    assert end == 2  # foo ends at line 2; bar's x is excluded
+
+
+def test_scope_end_line_picks_innermost_matching_scope():
+    # Two functions named "inner" — one nested inside outer, one at module level.
+    src = (
+        "def outer():\n"
+        "    def inner():\n"
+        "        a = 1\n"
+        "    inner()\n"
+        "\n"
+        "def inner():\n"
+        "    b = 2\n"
+    )
+    lines = _make_source_lines(src)
+    # Block at line 3 is inside the nested inner (lines 2-3). That is the
+    # smallest matching span, so end_lineno == 3 is returned.
+    assert _scope_end_line(lines, "inner", 3) == 3
+
+
+def test_scope_end_line_class_scope():
+    src = "class Foo:\n    x = 1\n    y = 2\n\nclass Bar:\n    x = 3\n"
+    lines = _make_source_lines(src)
+    assert _scope_end_line(lines, "Foo", 2) == 3
+
+
+def test_scope_end_line_no_match_returns_full_length():
+    src = "def foo():\n    x = 1\n"
+    lines = _make_source_lines(src)
+    # Scope name doesn't match any definition.
+    assert _scope_end_line(lines, "bar", 1) == len(lines)
+
+
+def test_scope_end_line_syntax_error_returns_full_length():
+    lines = _make_source_lines("def (\n    x = 1\n")
+    assert _scope_end_line(lines, "foo", 1) == len(lines)
+
+
+# ---------------------------------------------------------------------------
+# _replace_unused_in_target
+# ---------------------------------------------------------------------------
+
+
+def test_replace_unused_in_target_name_used():
+    import ast
+
+    target = ast.parse("result = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "print(result)\n")
+    assert all_r is False and any_r is False
+    assert ast.unparse(new_t) == "result"
+
+
+def test_replace_unused_in_target_name_unused():
+    import ast
+
+    target = ast.parse("result = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "return None\n")
+    assert all_r is True and any_r is True
+    assert ast.unparse(new_t) == "_"
+
+
+def test_replace_unused_in_target_tuple_all_unused():
+    import ast
+
+    target = ast.parse("a, b = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "return None\n")
+    assert all_r is True and any_r is True
+    assert ast.unparse(new_t) == "(_, _)"
+
+
+def test_replace_unused_in_target_tuple_some_unused():
+    import ast
+
+    target = ast.parse("a, b = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "print(a)\n")
+    assert all_r is False and any_r is True
+    assert ast.unparse(new_t) == "(a, _)"
+
+
+def test_replace_unused_in_target_tuple_all_used():
+    import ast
+
+    target = ast.parse("a, b = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "print(a, b)\n")
+    assert all_r is False and any_r is False
+
+
+def test_replace_unused_in_target_attribute_treated_as_used():
+    import ast
+
+    target = ast.parse("self.x = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "return None\n")
+    assert all_r is False and any_r is False
+
+
+# ---------------------------------------------------------------------------
+# _strip_unused_call_assignments
+# ---------------------------------------------------------------------------
+
+
+def test_strip_unused_call_assignments_removes_unused_single():
+    # `result` never appears after the block → assignment stripped.
+    replacement = "    result = _helper(x, y)\n"
+    following = ["    do_something()\n", "    return z\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    _helper(x, y)\n"
+
+
+def test_strip_unused_call_assignments_keeps_used_single():
+    # `result` is referenced after the block → assignment kept.
+    replacement = "    result = _helper(x, y)\n"
+    following = ["    print(result)\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_removes_unused_tuple():
+    # Both names unused after the block → assignment stripped entirely.
+    replacement = "    a, b = _helper(x)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_partial_tuple_replaces_with_underscore():
+    # One name used, one unused → replace unused with _.
+    replacement = "    a, b = _helper(x)\n"
+    following = ["    print(a)\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    (a, _) = _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_attribute_target_unchanged():
+    # Target is an attribute (self.x = call()) → treated as used → left unchanged.
+    replacement = "    self.result = _helper(x)\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_non_call_rhs_unchanged():
+    # RHS is not a Call → leave unchanged.
+    replacement = "    result = x + y\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_chained_all_unused_stripped():
+    # Chained assignment where every name is unused → stripped to just the call.
+    replacement = "    a = b = _helper(x)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_chained_some_used_unchanged():
+    # Chained assignment where one name is used → left unchanged.
+    replacement = "    a = b = _helper(x)\n"
+    following = ["    print(a)\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_chained_no_names_unchanged():
+    # Chained assignment whose targets yield no names (e.g. attributes) → unchanged.
+    replacement = "    self.a = self.b = _helper(x)\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_no_assignment_unchanged():
+    # Replacement is already just a call → returned as-is.
+    replacement = "    _helper(x, y)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_syntax_error_unchanged():
+    # Unparseable replacement → returned unchanged.
+    replacement = "    def (\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_multiline_replacement():
+    # Multi-statement replacement: only the unused assignment is stripped.
+    replacement = "    result = _helper(x)\n    do_other()\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    _helper(x)\n    do_other()\n"
+
+
+def test_strip_unused_call_assignments_preserves_indentation():
+    # Indentation of stripped replacement matches original block indent.
+    replacement = "        result = _helper(x)\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "        _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_leading_blank_line():
+    # Replacement with a blank leading line: indent is read from first content line.
+    replacement = "\n    result = _helper(x)\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "\n    _helper(x)\n"
 
 
 # ---------------------------------------------------------------------------
