@@ -973,6 +973,21 @@ def _collect_called_attr_names(source: str) -> set:
     }
 
 
+def _has_funcdef(func_name: str, source: str) -> bool:
+    """Return True if func_name is defined anywhere in source."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == func_name
+        ):
+            return True
+    return False
+
+
 def _has_call_to(func_name: str, source: str) -> bool:
     """Return True if func_name is called anywhere in source.
 
@@ -1426,9 +1441,14 @@ def _build_helper_insertion(
 ) -> Tuple[int, int, str]:
     """Build an edit tuple that inserts helper_source with correct surrounding blanks.
 
-    Absorbs existing blank lines around the insertion point so the result has
-    exactly 2 blank lines before and after module-level helpers, or 1 blank
-    line for staticmethod insertions inside a class body.
+    Always returns a pure insertion (start == end) so that two groups inserting
+    before the same scope are never in conflict: pure insertions are not subject
+    to the overlap-skip logic in _apply_edits.
+
+    The insertion point is placed after all blank lines that already exist
+    around insert_pos (right before the def/decorator line).  Leading blank
+    lines are prepended only to make up the difference so the result always
+    has exactly ``blank_lines`` blank lines before the helper.
     """
     blank_lines = 1 if placement.startswith("staticmethod:") else 2
 
@@ -1446,12 +1466,13 @@ def _build_helper_insertion(
         after_blanks += 1
         i += 1
 
-    # Replace surrounding blank lines so we don't double-count them.
-    start = insert_pos - before_blanks
-    end = insert_pos + after_blanks
+    # Insert right before the def/decorator (after all surrounding blanks).
+    insert_at = insert_pos + after_blanks
+    # Prepend only as many blank lines as are still missing.
+    leading = max(0, blank_lines - (before_blanks + after_blanks))
     clean = helper_source.strip("\n") + "\n"
-    text = "\n" * blank_lines + clean + "\n" * blank_lines
-    return (start, end, text)
+    text = "\n" * leading + clean + "\n" * blank_lines
+    return (insert_at, insert_at, text)
 
 
 def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
@@ -2252,6 +2273,37 @@ class DuplicateExtractor(Refactor):
                         )
                 extraction_groups = [
                     (n, g, m) for n, g, m in extraction_groups if n not in uncalled
+                ]
+                all_edits = list(edits)
+                for _, g_edits, _ in extraction_groups:
+                    all_edits.extend(g_edits)
+                combined = _apply_edits(source, all_edits)
+
+            # Drop any extraction group whose helper function is not defined in
+            # the combined output.  This happens when two groups insert helpers
+            # before the same scope: _build_helper_insertion absorbs surrounding
+            # blank lines into a replacement edit, so the second group's helper
+            # insertion is silently skipped by the overlap detector — leaving a
+            # call to the helper but no definition.
+            undefined_helpers = {
+                name
+                for name, _, _ in extraction_groups
+                if not _has_funcdef(name, combined)
+            }
+            if undefined_helpers:
+                for name in sorted(undefined_helpers):
+                    if self.verbose:
+                        print(
+                            f"crispen: DuplicateExtractor: extraction DROPPED — "
+                            f"'{name}' not defined in combined output "
+                            f"(helper insertion blocked by overlapping edit)",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                extraction_groups = [
+                    (n, g, m)
+                    for n, g, m in extraction_groups
+                    if n not in undefined_helpers
                 ]
                 all_edits = list(edits)
                 for _, g_edits, _ in extraction_groups:

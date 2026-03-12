@@ -11,6 +11,7 @@ from crispen.errors import CrispenAPIError
 from crispen.refactors.duplicate_extractor import (
     _ApiTimeout,
     _build_helper_insertion,
+    _has_funcdef,
     _collect_attribute_names,
     _collect_called_attr_names,
     _extract_defined_names,
@@ -613,6 +614,27 @@ def test_has_call_to_syntax_error():
 
 
 # ---------------------------------------------------------------------------
+# _has_funcdef
+# ---------------------------------------------------------------------------
+
+
+def test_has_funcdef_present():
+    assert _has_funcdef("_helper", "def _helper(x):\n    pass\n") is True
+
+
+def test_has_funcdef_async():
+    assert _has_funcdef("_helper", "async def _helper(x):\n    pass\n") is True
+
+
+def test_has_funcdef_missing():
+    assert _has_funcdef("_helper", "def other(x):\n    pass\n") is False
+
+
+def test_has_funcdef_syntax_error():
+    assert _has_funcdef("_helper", "def f(x:") is False
+
+
+# ---------------------------------------------------------------------------
 # _normalize_replacement_indentation
 # ---------------------------------------------------------------------------
 
@@ -1183,16 +1205,17 @@ def test_find_insertion_point_skips_over_multiline_decorator():
 # ---------------------------------------------------------------------------
 
 
-def test_build_helper_insertion_absorbs_blank_before_function():
-    # Blank line between import and def is absorbed; 2 blank lines ensured.
+def test_build_helper_insertion_blank_before_insert_pos():
+    # Blank line at index 1 is before insert_pos=2 (before_blanks=1, after_blanks=0).
+    # insert_at=2 (pure insertion), leading=max(0,2-1)=1 so text starts with "\n".
     source = "import os\n\ndef foo():\n    pass\n"
     lines = source.splitlines(keepends=True)
     helper = "def _helper():\n    pass\n"
     start, end, text = _build_helper_insertion(lines, 2, helper, "module_level")
-    # Blank line at index 1 is before insert_pos=2, so before_blanks=1 → start=1.
-    assert start == 1
-    assert end == 2  # no blanks after insert_pos (def foo starts there)
-    assert text.startswith("\n\n")
+    assert start == 2
+    assert end == 2  # pure insertion
+    assert text.startswith("\n")
+    assert not text.startswith("\n\n")  # only 1 leading blank needed
     assert text.endswith("\n\n")
     assert "def _helper():" in text
 
@@ -1222,16 +1245,17 @@ def test_build_helper_insertion_staticmethod_uses_one_blank():
     assert text.endswith("\n\n")  # clean + 1 trailing blank = \n + \n
 
 
-def test_build_helper_insertion_absorbs_blank_at_insert_pos():
-    # When insert_pos itself is a blank line, after_blanks counts it.
+def test_build_helper_insertion_blank_at_insert_pos():
+    # insert_pos=1 is the blank line itself (after_blanks=1, before_blanks=0).
+    # insert_at=1+1=2 (pure insertion after the blank), leading=max(0,2-1)=1.
     source = "import os\n\ndef foo():\n    pass\n"
     lines = source.splitlines(keepends=True)
     helper = "def _helper():\n    pass\n"
-    # insert_pos=1 lands on the blank line: after_blanks=1, end=2.
     start, end, text = _build_helper_insertion(lines, 1, helper, "module_level")
-    assert start == 1
-    assert end == 2
-    assert text.startswith("\n\n")
+    assert start == 2
+    assert end == 2  # pure insertion
+    assert text.startswith("\n")
+    assert not text.startswith("\n\n")  # only 1 leading blank needed
     assert text.endswith("\n\n")
 
 
@@ -1244,6 +1268,20 @@ def test_build_helper_insertion_strips_extra_newlines_from_helper():
     assert text.startswith("\n\n")
     assert text.endswith("\n\n")
     assert "\n\n\n\ndef _helper" not in text  # no extra leading blanks inside text
+
+
+def test_build_helper_insertion_two_at_same_scope():
+    # Two helpers inserted before the same def via _apply_edits: both must appear.
+    source = "import os\n\n\ndef foo():\n    pass\n"
+    lines = source.splitlines(keepends=True)
+    edits = [
+        _build_helper_insertion(lines, 3, "def _h1():\n    pass\n", "module_level"),
+        _build_helper_insertion(lines, 3, "def _h2():\n    pass\n", "module_level"),
+    ]
+    result = _apply_edits(source, edits)
+    assert "def _h1():" in result
+    assert "def _h2():" in result
+    assert "def foo():" in result
 
 
 def test_successful_extraction_has_two_blank_lines(monkeypatch):
@@ -2344,6 +2382,112 @@ def test_uncalled_in_combined_drops_group_verbose(monkeypatch, capsys):
 def test_uncalled_in_combined_drops_group_verbose_false(monkeypatch):
     de = _make_uncalled_in_combined_extractor(monkeypatch, verbose=False)
     assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# DuplicateExtractor — helper defined in per-group candidate but missing from
+# combined output (insertion blocked by overlapping blank-line replacement)
+# ---------------------------------------------------------------------------
+
+
+def _make_undefined_in_combined_extractor(monkeypatch, verbose=True):
+    """Simulate: per-group checks all pass but helper definition is absent from
+    the combined output (insertion edit blocked by overlap detector).
+
+    Achieved by patching _has_funcdef: returns True for the per-group pyflakes
+    check (not called there directly, but we patch the combined check) and
+    False for the final combined check.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with (
+        patch("crispen.llm_client.anthropic") as mock_anthropic,
+        patch(
+            "crispen.refactors.duplicate_extractor._has_funcdef",
+            side_effect=[False],
+        ),
+    ):
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": "def _helper(data):\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+
+
+def test_undefined_helper_in_combined_drops_group_verbose(monkeypatch, capsys):
+    de = _make_undefined_in_combined_extractor(monkeypatch, verbose=True)
+    assert de._new_source is None
+    assert "not defined in combined output" in capsys.readouterr().err
+
+
+def test_undefined_helper_in_combined_drops_group_verbose_false(monkeypatch):
+    de = _make_undefined_in_combined_extractor(monkeypatch, verbose=False)
+    assert de._new_source is None
+
+
+def test_undefined_helper_in_combined_two_groups_one_dropped(monkeypatch):
+    """Two groups: first group's helper missing from combined, second kept.
+
+    _has_funcdef returns [False, True]: first group dropped, second kept.
+    This exercises the all_edits.extend(g_edits) loop after the drop (line 2304).
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with (
+        patch("crispen.llm_client.anthropic") as mock_anthropic,
+        patch(
+            "crispen.refactors.duplicate_extractor._has_funcdef",
+            side_effect=[False, True],
+        ),
+    ):
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper1",
+                    "placement": "module_level",
+                    "helper_source": "def _helper1():\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper1()\n",
+                        "    _helper1()\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper2",
+                    "placement": "module_level",
+                    "helper_source": "def _helper2():\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper2()\n",
+                        "    _helper2()\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _TWO_PAIR_RANGES, source=_TWO_PAIR_SOURCE, verbose=False
+        )
+    # First group dropped (undefined), second group kept → new source written
+    assert de._new_source is not None
 
 
 # ---------------------------------------------------------------------------
