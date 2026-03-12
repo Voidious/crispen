@@ -21,6 +21,7 @@ LLM calls are mocked so the suite runs offline without API keys.
 | `match_existing_function/` | Replace block with call to existing function | Yes |
 | `function_splitter/` | Split oversized functions | Yes |
 | `tuple_dataclass/` | Convert large tuple returns to `@dataclass` | No |
+| `file_limiter/` | Split files exceeding the line-count limit | Yes |
 
 ## Running the examples
 

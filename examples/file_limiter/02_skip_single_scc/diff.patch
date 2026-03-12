@@ -1,0 +1,15 @@
+--- a/input.py
++++ b/input.py
+@@ -0,0 +1,12 @@
++def format_result(result):
++    return summarize(validate(result))
++
++
++def validate(result):
++    if summarize(result) is None:
++        raise ValueError("invalid")
++    return result
++
++
++def summarize(result):
++    return format_result(result) if result else None

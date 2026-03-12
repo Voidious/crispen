@@ -14,6 +14,7 @@ from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvi
 
 from .config import CrispenConfig, load_config
 from .errors import CrispenAPIError
+from .file_limiter.runner import run_file_limiter
 from .refactors.caller_updater import CallerUpdater
 from .refactors.duplicate_extractor import DuplicateExtractor
 from .refactors.function_splitter import FunctionSplitter
@@ -22,6 +23,25 @@ from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
 
 # Single-file refactors applied in order before TupleDataclass.
 _REFACTORS = [IfNotElse, DuplicateExtractor, FunctionSplitter]
+
+# Canonical snake_case name for each refactor class (used by _should_run).
+_REFACTOR_KEY: Dict[type, str] = {
+    IfNotElse: "if_not_else",
+    DuplicateExtractor: "duplicate_extractor",
+    FunctionSplitter: "function_splitter",
+}
+
+
+def _should_run(name: str, config: CrispenConfig) -> bool:
+    """Return True if the named refactor should run given the config.
+
+    When ``config.enabled_refactors`` is non-empty only names in that list run.
+    Otherwise names in ``config.disabled_refactors`` are skipped.
+    """
+    if config.enabled_refactors:
+        return name in config.enabled_refactors
+    return name not in config.disabled_refactors
+
 
 # Directory names excluded from the outside-caller scan (e.g. virtual environments).
 _EXCLUDED_DIR_NAMES = frozenset(
@@ -74,6 +94,155 @@ def _blocked_private_scopes(source: str, ranges: List[Tuple[int, int]]) -> Set[s
             if not any(start <= line <= end for start, end in ranges):
                 blocked.add(node.func.id)
     return blocked
+
+
+# ---------------------------------------------------------------------------
+# FileLimiter: inline-import redirect helpers
+# ---------------------------------------------------------------------------
+
+_PROJECT_MARKERS = frozenset({"pyproject.toml", "setup.py", "setup.cfg", ".git"})
+
+
+def _module_path_for_file(file_path: str) -> Optional[str]:
+    """Return the dotted Python module path of *file_path*.
+
+    Walks up from the file's directory to find the project root (the first
+    ancestor containing pyproject.toml, setup.py, setup.cfg, or .git), then
+    computes the dotted path relative to that root.
+
+    Returns ``None`` when the project root cannot be determined or when the
+    resolved path is not under the project root.
+    """
+    abs_path = Path(file_path).resolve()
+    current = abs_path.parent
+    while True:
+        if any((current / m).exists() for m in _PROJECT_MARKERS):
+            rel = abs_path.relative_to(current)
+            return ".".join(rel.with_suffix("").parts)
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _redirect_inline_module_imports(
+    source: str,
+    old_mod: str,
+    name_to_new_mod: Dict[str, str],
+) -> str:
+    """Replace ``from old_mod import names`` statements with new module paths.
+
+    Scans all ``from <old_mod> import …`` statements at every level
+    (module-level and inside function/class bodies).  Each imported name is
+    redirected to the module given by *name_to_new_mod*; names absent from the
+    map are kept pointing at *old_mod*.
+
+    Returns *source* unchanged when there are no matching imports or when
+    *source* cannot be parsed as Python.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    lines = source.splitlines(keepends=True)
+    replacements: Dict[Tuple[int, int], str] = {}
+
+    def _scan(stmts: list) -> None:
+        for node in stmts:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and node.module == old_mod
+            ):
+                names = [alias.name for alias in node.names]
+                new_mod_to_names: Dict[str, List[str]] = {}
+                kept: List[str] = []
+                for n in names:
+                    dest = name_to_new_mod.get(n)
+                    if dest:
+                        new_mod_to_names.setdefault(dest, []).append(n)
+                    else:
+                        kept.append(n)
+                if not new_mod_to_names:
+                    continue  # No names moved; leave unchanged.
+                raw_line = lines[node.lineno - 1]
+                indent = raw_line[: len(raw_line) - len(raw_line.lstrip())]
+                parts: List[str] = []
+                if kept:
+                    parts.append(f"{indent}from {old_mod} import {', '.join(kept)}")
+                for dest_mod, dest_names in sorted(new_mod_to_names.items()):
+                    joined = ", ".join(sorted(dest_names))
+                    parts.append(f"{indent}from {dest_mod} import {joined}")
+                replacements[(node.lineno, node.end_lineno)] = "\n".join(parts)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                _scan(node.body)
+
+    _scan(tree.body)
+    if not replacements:
+        return source
+
+    result = list(lines)
+    for (start, end), text in sorted(replacements.items(), reverse=True):
+        last_line = result[end - 1]
+        trailing = "\n" if last_line.endswith("\n") else ""
+        result[start - 1 : end] = [text + trailing]
+    return "".join(result)
+
+
+def _patch_inline_imports_after_test_deletion(
+    deleted_path: str,
+    deleted_dir: Path,
+    new_files: Dict[str, str],
+    per_file: Dict,
+    fl_new_file_final: Dict[str, Optional[str]],
+) -> None:
+    """Redirect inline imports pointing to a deleted test module.
+
+    When a test file is deleted after a recursive subdir split (because all
+    entities migrated away, leaving an empty ``original_source``), any parent
+    file that received injected inline imports during the *first* split still
+    references the now-gone module.  This function rewrites those stale imports
+    to point directly at the new sub-file locations.
+
+    Updates both ``per_file`` states (written to disk later by the write loop)
+    and ``fl_new_file_final`` entries (already on disk; re-written immediately).
+    """
+    old_mod = _module_path_for_file(deleted_path)
+    if old_mod is None:
+        return
+
+    # Build name → new_module by parsing top-level definitions in new_files.
+    name_to_new_mod: Dict[str, str] = {}
+    for rel_path, content in new_files.items():
+        new_abs = (deleted_dir / rel_path).resolve()
+        new_mod = _module_path_for_file(str(new_abs))
+        if new_mod is None:
+            continue
+        try:
+            sub_tree = ast.parse(content)
+        except SyntaxError:
+            continue
+        for node in sub_tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                name_to_new_mod[node.name] = new_mod
+
+    if not name_to_new_mod:
+        return
+
+    for state in per_file.values():
+        updated = _redirect_inline_module_imports(
+            state["source"], old_mod, name_to_new_mod
+        )
+        if updated != state["source"]:
+            state["source"] = updated
+
+    for path, content in list(fl_new_file_final.items()):
+        if not content:
+            continue
+        updated = _redirect_inline_module_imports(content, old_mod, name_to_new_mod)
+        if updated != content:
+            fl_new_file_final[path] = updated
+            Path(path).write_text(updated, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +538,9 @@ def run_engine(
         had_parse_error = False
 
         for RefactorClass in _REFACTORS:
+            key = _REFACTOR_KEY.get(RefactorClass)
+            if key is not None and not _should_run(key, config):
+                continue
             try:
                 current_tree = cst.parse_module(current_source)
             except cst.ParserSyntaxError as exc:
@@ -395,6 +567,7 @@ def run_engine(
                         base_url=config.base_url,
                         tool_choice=config.tool_choice,
                         api_timeout=config.api_timeout,
+                        match_functions=_should_run("match_function", config),
                     )
                 elif RefactorClass is FunctionSplitter:
                     transformer = FunctionSplitter(
@@ -443,7 +616,7 @@ def run_engine(
 
         # Apply TupleDataclass — private functions only in this pass.
         candidates: Dict[str, TransformInfo] = {}
-        if not had_parse_error:
+        if not had_parse_error and _should_run("tuple_dataclass", config):
             blocked: Set[str] = set()
             if not config.update_diff_file_callers:
                 blocked = _blocked_private_scopes(current_source, ranges)
@@ -620,11 +793,181 @@ def run_engine(
                     state["source"] = new_source
 
     # ------------------------------------------------------------------ #
+    # Phase 3 — FileLimiter: split files exceeding max_file_lines        #
+    # ------------------------------------------------------------------ #
+    if config.max_file_lines > 0 and _should_run("file_limiter", config):
+        # Pending queue for recursive FileLimiter processing: (filepath, source)
+        # pairs for newly-created files that are still over the limit.
+        _fl_recursive: List[Tuple[str, str]] = []
+        # Track the final content of each new file created by FileLimiter so
+        # lines_added/deleted counts reflect the net result, not interim states.
+        _fl_new_file_final: Dict[str, Optional[str]] = {}
+        # Deduplicate verified functions/classes across recursive passes so
+        # entities migrated more than once are not counted multiple times.
+        _fl_verified_func_names: Set[str] = set()
+        _fl_verified_class_names: Set[str] = set()
+        _fl_verified_entity_lines: Dict[str, int] = {}
+
+        for filepath, state in per_file.items():
+            if len(state["source"].splitlines()) <= config.max_file_lines:
+                continue
+
+            try:
+                fl_result = run_file_limiter(
+                    filepath=filepath,
+                    original_source=state["original"],
+                    post_source=state["source"],
+                    diff_ranges=state["ranges"],
+                    config=config,
+                    verbose=verbose,
+                )
+            except CrispenAPIError:
+                raise
+
+            _stats.file_limiter_llm_calls += fl_result.llm_calls
+            _fl_verified_func_names |= fl_result.verified_function_names
+            _fl_verified_class_names |= fl_result.verified_class_names
+            _fl_verified_entity_lines.update(fl_result.verified_entity_line_counts)
+
+            if fl_result.messages:
+                state["msgs"].extend(fl_result.messages)
+
+            if fl_result.abort or not fl_result.new_files:
+                continue
+
+            original_dir = Path(filepath).parent
+            for rel_path, new_source in fl_result.new_files.items():
+                new_path = original_dir / rel_path
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                if new_path.parent != original_dir:
+                    init_py = new_path.parent / "__init__.py"
+                    if not init_py.exists():
+                        init_py.write_text("", encoding="utf-8")
+                new_path.write_text(new_source, encoding="utf-8")
+                _stats.files_edited.append(str(new_path))
+                _stats.file_limiter_edits += 1
+                _fl_new_file_final[str(new_path)] = new_source
+                if (
+                    config.file_limiter_recursive
+                    and len(new_source.splitlines()) > config.max_file_lines
+                ):
+                    _fl_recursive.append((str(new_path), new_source))
+
+            state["source"] = fl_result.original_source
+
+            # For non-test whole-file subdir splits (without __main__), delete
+            # the original file now that service/__init__.py takes its place as
+            # the public entry point.  state["source"] was reset to
+            # state["original"] above, so the final write loop will see no diff
+            # and skip the (deleted) file.  Count the original lines as deleted
+            # so stats stay accurate.
+            # When has_main is True the original file is kept on disk as the
+            # runnable script entry point; the engine's write loop will update
+            # it with the re-export stubs from fl_result.original_source.
+            if (
+                fl_result.subdir_name is not None
+                and not Path(filepath).name.startswith("test_")
+                and not fl_result.has_main
+            ):
+                Path(filepath).unlink()
+                _stats.count_lines_changed(state["original"], "")
+
+        # Recursive pass: process any newly-created files that are still over
+        # the limit.  Each iteration may enqueue further files; the loop ends
+        # when no oversized new files remain.
+        _recursive_msgs: List[str] = []
+        while _fl_recursive:
+            r_path, r_source = _fl_recursive.pop(0)
+            n_lines = len(r_source.splitlines())
+            try:
+                r_result = run_file_limiter(
+                    filepath=r_path,
+                    original_source="",
+                    post_source=r_source,
+                    diff_ranges=[(1, n_lines)],
+                    config=config,
+                    verbose=verbose,
+                )
+            except CrispenAPIError:
+                raise
+
+            _stats.file_limiter_llm_calls += r_result.llm_calls
+            _fl_verified_func_names |= r_result.verified_function_names
+            _fl_verified_class_names |= r_result.verified_class_names
+            _fl_verified_entity_lines.update(r_result.verified_entity_line_counts)
+
+            _recursive_msgs.extend(r_result.messages)
+
+            if r_result.abort or not r_result.new_files:
+                continue
+
+            r_dir = Path(r_path).parent
+            for rel_path, new_source in r_result.new_files.items():
+                new_path = r_dir / rel_path
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                if new_path.parent != r_dir:
+                    init_py = new_path.parent / "__init__.py"
+                    if not init_py.exists():
+                        init_py.write_text("", encoding="utf-8")
+                new_path.write_text(new_source, encoding="utf-8")
+                _stats.files_edited.append(str(new_path))
+                _stats.file_limiter_edits += 1
+                _fl_new_file_final[str(new_path)] = new_source
+                if len(new_source.splitlines()) > config.max_file_lines:
+                    _fl_recursive.append((str(new_path), new_source))
+
+            # Subdir split of a recursively-processed file: delete the file
+            # that was replaced by a package __init__.py.  Handle before the
+            # rewrite check so we don't write-then-delete (and double-count lines).
+            # Skip deletion when has_main is True (original kept as entry point).
+            if (
+                r_result.subdir_name is not None
+                and not Path(r_path).name.startswith("test_")
+                and not r_result.has_main
+            ):
+                Path(r_path).unlink()
+                _fl_new_file_final.pop(str(r_path), None)
+            elif r_result.original_source != r_source:
+                if r_result.original_source:
+                    Path(r_path).write_text(r_result.original_source, encoding="utf-8")
+                    _fl_new_file_final[str(r_path)] = r_result.original_source
+                elif Path(r_path).name == "__init__.py":
+                    # Keep __init__.py even when empty — it defines the package.
+                    Path(r_path).write_text("", encoding="utf-8")
+                    _fl_new_file_final[str(r_path)] = ""
+                else:
+                    # Before deleting a test file, redirect any inline imports
+                    # in parent or sibling files that point to the old module.
+                    if Path(r_path).name.startswith("test_"):
+                        _patch_inline_imports_after_test_deletion(
+                            r_path,
+                            r_dir,
+                            r_result.new_files,
+                            per_file,
+                            _fl_new_file_final,
+                        )
+                    Path(r_path).unlink()
+                    _fl_new_file_final.pop(str(r_path), None)
+
+        for path, content in _fl_new_file_final.items():
+            _stats.count_lines_changed("", content)
+        _stats.file_limiter_functions_verified = len(_fl_verified_func_names)
+        _stats.file_limiter_classes_verified = len(_fl_verified_class_names)
+        _stats.file_limiter_lines_verified = sum(_fl_verified_entity_lines.values())
+        yield from _recursive_msgs
+
+    # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #
     # ------------------------------------------------------------------ #
     for filepath, state in per_file.items():
         if state["source"] != state["original"]:
-            Path(filepath).write_text(state["source"], encoding="utf-8")
+            if state["source"]:
+                Path(filepath).write_text(state["source"], encoding="utf-8")
+            elif Path(filepath).name == "__init__.py":
+                # Keep __init__.py even when empty — it defines the package.
+                Path(filepath).write_text("", encoding="utf-8")
+            elif Path(filepath).exists():
+                Path(filepath).unlink()
             _stats.files_edited.append(filepath)
             _stats.count_lines_changed(state["original"], state["source"])
         yield from state["msgs"]

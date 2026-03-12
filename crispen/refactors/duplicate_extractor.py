@@ -865,6 +865,12 @@ def _llm_verify_extraction(
         "replacement also propagates that return value\n"
         "5. The call site replacements match the original indentation and cover "
         "exactly the lines of the original block\n"
+        "6. If the helper is called more than once with different arguments, verify "
+        "each call site against the exact local variables that appeared in the "
+        "original code at that location — not merely variables of the same type. "
+        "Same-type variables (e.g. two dicts, two strings) that are both in scope "
+        "are a swap risk: confirm neither was substituted for the other across call "
+        "sites.\n"
         "If correct, set is_correct=True and issues=[]. "
         "Otherwise set is_correct=False and list each specific issue."
     )
@@ -1240,11 +1246,12 @@ def _replacement_steals_post_block_line(
     """
     for seq, replacement in zip(group, call_replacements):
         next_idx = seq.end_line  # 0-based index of the first line after the block
+        # Scan forward past blank lines to find the first real post-block line.
+        while next_idx < len(source_lines) and not source_lines[next_idx].strip():
+            next_idx += 1
         if next_idx >= len(source_lines):
             continue
         post_block = source_lines[next_idx].strip()
-        if not post_block:
-            continue
         repl_lines = [ln.strip() for ln in replacement.splitlines() if ln.strip()]
         if repl_lines and repl_lines[-1] == post_block:
             return True
@@ -1560,6 +1567,7 @@ class DuplicateExtractor(Refactor):
         base_url: Optional[str] = None,
         tool_choice: Optional[str] = None,
         api_timeout: float = 60.0,
+        match_functions: bool = True,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self._min_weight = min_weight
@@ -1573,6 +1581,7 @@ class DuplicateExtractor(Refactor):
         self._tool_choice = tool_choice
         self._api_timeout = api_timeout
         self._hard_timeout = api_timeout + 30
+        self._match_functions = match_functions
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -1612,11 +1621,15 @@ class DuplicateExtractor(Refactor):
         groups = _find_duplicate_groups(collector.sequences, self.changed_ranges)
 
         # 9. Check whether any sequence can be replaced with an existing function.
-        has_func_matches = func_body_fps and any(
-            _overlaps_diff(seq, self.changed_ranges)
-            and seq.fingerprint in func_body_fps
-            and func_body_fps[seq.fingerprint].name != seq.scope
-            for seq in collector.sequences
+        has_func_matches = (
+            self._match_functions
+            and func_body_fps
+            and any(
+                _overlaps_diff(seq, self.changed_ranges)
+                and seq.fingerprint in func_body_fps
+                and func_body_fps[seq.fingerprint].name != seq.scope
+                for seq in collector.sequences
+            )
         )
 
         # 10. Early exit — nothing to do.
@@ -1637,7 +1650,7 @@ class DuplicateExtractor(Refactor):
         matched_line_ranges: set = set()
 
         # 14. Function body match pass.
-        if func_body_fps:
+        if self._match_functions and func_body_fps:
             for seq in collector.sequences:
                 if not _overlaps_diff(seq, self.changed_ranges):
                     continue

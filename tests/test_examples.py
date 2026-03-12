@@ -13,7 +13,9 @@ from unittest.mock import MagicMock, patch
 import libcst as cst
 from libcst.metadata import MetadataWrapper
 
+from crispen.config import CrispenConfig
 from crispen.diff_parser import parse_diff
+from crispen.file_limiter.runner import run_file_limiter
 from crispen.refactors.duplicate_extractor import DuplicateExtractor
 from crispen.refactors.function_splitter import FunctionSplitter
 from crispen.refactors.if_not_else import IfNotElse
@@ -416,3 +418,99 @@ def test_function_splitter_instance_method_helper(mock_anthropic):
     assert "@staticmethod" not in result
     assert "return self._build_summary(" in result
     assert len(splitter.changes_made) >= 1
+
+
+# ===========================================================================
+# file_limiter examples
+# ===========================================================================
+
+
+def _load_fl(name: str) -> tuple[str, str, str]:
+    """Return (original_src, input_src, diff_text) for a file_limiter example."""
+    base = EXAMPLES / "file_limiter" / name
+    original_path = base / "original.py"
+    original_src = original_path.read_text() if original_path.exists() else ""
+    return (
+        original_src,
+        (base / "input.py").read_text(),
+        (base / "diff.patch").read_text(),
+    )
+
+
+def _make_fl_response(tool_name: str, data: dict) -> MagicMock:
+    """Build a mock Anthropic tool-use response for a FileLimiter LLM call."""
+    block = MagicMock()
+    block.type = "tool_use"
+    block.name = tool_name
+    block.input = data
+    resp = MagicMock()
+    resp.content = [block]
+    return resp
+
+
+@patch("crispen.llm_client.anthropic")
+def test_file_limiter_set2_split(mock_anthropic, tmp_path):
+    """New public helpers added by the diff are moved to a sibling utils.py file."""
+    original_src, src, diff = _load_fl("01_set2_split")
+    ranges = _ranges(diff)
+
+    input_file = tmp_path / "input.py"
+    input_file.write_text(src)
+
+    mock_client = MagicMock()
+    mock_anthropic.Anthropic.return_value = mock_client
+    mock_anthropic.APIError = Exception
+    # Two LLM calls: propose output files, then assign_file_placements.
+    mock_client.messages.create.side_effect = [
+        _make_fl_response(
+            "propose_output_files",
+            {"files": [{"filename": "utils.py", "description": "utility helpers"}]},
+        ),
+        _make_fl_response(
+            "assign_file_placements",
+            {
+                "placements": [
+                    {"group_id": 0, "target_file": "utils.py"},
+                    {"group_id": 1, "target_file": "utils.py"},
+                ]
+            },
+        ),
+    ]
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        result = run_file_limiter(
+            str(input_file),
+            original_source=original_src,
+            post_source=src,
+            diff_ranges=ranges,
+            config=CrispenConfig(),
+        )
+
+    assert not result.abort
+    assert "utils.py" in result.new_files
+    new_src = result.new_files["utils.py"]
+    assert "normalize_name" in new_src
+    assert "validate_record" in new_src
+    compile(new_src, "<utils.py>", "exec")
+    compile(result.original_source, "<input.py>", "exec")
+
+
+def test_file_limiter_skip_single_scc(tmp_path):
+    """A file where all entities form one dependency cycle cannot be split."""
+    _, src, diff = _load_fl("02_skip_single_scc")
+    ranges = _ranges(diff)
+
+    input_file = tmp_path / "input.py"
+    input_file.write_text(src)
+
+    result = run_file_limiter(
+        str(input_file),
+        original_source="",
+        post_source=src,
+        diff_ranges=ranges,
+        config=CrispenConfig(file_limiter_subdir_split=False),
+    )
+
+    assert result.abort
+    assert not result.new_files
+    assert any("cannot be split" in m for m in result.messages)

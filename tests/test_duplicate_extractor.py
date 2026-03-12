@@ -3451,6 +3451,41 @@ def test_func_match_then_dup_extract(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# match_functions=False
+# ---------------------------------------------------------------------------
+
+
+def test_match_functions_false_skips_func_match_pass(monkeypatch):
+    """match_functions=False: func-match veto never called even when match exists."""
+    from crispen.refactors.duplicate_extractor import _llm_veto_func_match
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    veto_func_match_called: list = []
+
+    def _mock_run_with_timeout(fn, timeout, *args, **kwargs):
+        if fn is _llm_veto_func_match:
+            veto_func_match_called.append(True)
+        # Reject any extraction-pass LLM call so no new source is produced.
+        return (False, "rejected", "")
+
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            side_effect=_mock_run_with_timeout,
+        ),
+    ):
+        de = DuplicateExtractor(
+            _FUNC_MATCH_RANGES,
+            source=_FUNC_MATCH_SOURCE,
+            verbose=False,
+            match_functions=False,
+        )
+    assert veto_func_match_called == []
+    assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
 # DuplicateExtractor — name collision guard
 # ---------------------------------------------------------------------------
 
@@ -3778,10 +3813,29 @@ def test_replacement_steals_post_block_at_eof():
 
 
 def test_replacement_steals_post_block_blank_after():
-    # Post-block line is blank — skip (blank lines are not "code").
+    # Post-block line is blank but there is a non-blank line further down.
+    # The check must scan past the blank to find the real post-block code.
     source_lines = ["x = 1\n", "\n", "y = 2\n"]
-    seq = _make_steal_seq(1)  # next_idx=1 → "\n" → stripped is empty
-    assert not _replacement_steals_post_block_line([seq], ["y = 2\n"], source_lines)
+    seq = _make_steal_seq(1)  # next_idx=1 → "\n" → scan → next_idx=2 → "y = 2"
+    assert _replacement_steals_post_block_line([seq], ["y = 2\n"], source_lines)
+
+
+def test_replacement_steals_post_block_blank_after_no_match():
+    # Blank after block, but replacement doesn't steal the non-blank post-block line.
+    source_lines = ["x = 1\n", "\n", "y = 2\n"]
+    seq = _make_steal_seq(1)
+    assert not _replacement_steals_post_block_line(
+        [seq], ["z = helper()\n"], source_lines
+    )
+
+
+def test_replacement_steals_post_block_all_blank_after():
+    # Only blank lines follow the block — no real post-block line to steal.
+    source_lines = ["x = 1\n", "\n", "\n"]
+    seq = _make_steal_seq(1)
+    assert not _replacement_steals_post_block_line(
+        [seq], ["z = helper()\n"], source_lines
+    )
 
 
 def test_replacement_steals_post_block_no_match():
