@@ -28,6 +28,7 @@ from crispen.refactors.duplicate_extractor import (
     _filter_maximal_groups,
     _find_duplicate_groups,
     _find_insertion_point,
+    _skip_class_docstring,
     _generate_no_arg_call,
     _has_call_to,
     _has_def,
@@ -1202,6 +1203,77 @@ def test_find_insertion_point_skips_over_multiline_decorator():
     )
     # Should return 2 (before the @patch line), not 5 (the def line).
     assert _find_insertion_point(source, "target") == 2
+
+
+# ---------------------------------------------------------------------------
+# _skip_class_docstring
+# ---------------------------------------------------------------------------
+
+
+def test_skip_class_docstring_no_docstring():
+    source = "class Foo:\n    def method(self):\n        pass\n"
+    lines = source.splitlines()
+    # after_class_line=1 (line "    def method..."), no docstring → unchanged
+    assert _skip_class_docstring(lines, 1) == 1
+
+
+def test_skip_class_docstring_triple_double_quote_single_line():
+    source = 'class Foo:\n    """A docstring."""\n    def method(self):\n        pass\n'
+    lines = source.splitlines()
+    # after_class_line=1 is the docstring line; should return 2
+    assert _skip_class_docstring(lines, 1) == 2
+
+
+def test_skip_class_docstring_triple_single_quote_single_line():
+    source = "class Foo:\n    '''A docstring.'''\n    def method(self):\n        pass\n"
+    lines = source.splitlines()
+    assert _skip_class_docstring(lines, 1) == 2
+
+
+def test_skip_class_docstring_triple_quote_multiline():
+    source = (
+        "class Foo:\n"
+        '    """First line.\n'
+        "    Second line.\n"
+        '    """\n'
+        "    def method(self):\n"
+        "        pass\n"
+    )
+    lines = source.splitlines()
+    # Closing """ is on line 3 (0-based); should return 4
+    assert _skip_class_docstring(lines, 1) == 4
+
+
+def test_skip_class_docstring_with_leading_blank_line():
+    source = 'class Foo:\n\n    """Docstring."""\n    def method(self):\n        pass\n'
+    lines = source.splitlines()
+    # Line 1 is blank, line 2 is the docstring; should return 3
+    assert _skip_class_docstring(lines, 1) == 3
+
+
+def test_skip_class_docstring_empty_class():
+    source = "class Foo:\n    pass\n"
+    lines = source.splitlines()
+    assert _skip_class_docstring(lines, 1) == 1
+
+
+def test_skip_class_docstring_only_blank_lines():
+    # after_class_line points past end of file after skipping blanks
+    lines = ["class Foo:", "    "]
+    assert _skip_class_docstring(lines, 1) == 1
+
+
+def test_skip_class_docstring_malformed_multiline_no_close():
+    # Triple-quoted docstring that never closes (malformed) — returns end-of-lines
+    lines = ["class Foo:", '    """This never closes', "    still going"]
+    result = _skip_class_docstring(lines, 1)
+    assert result == 3  # past end of lines, best-effort
+
+
+def test_skip_class_docstring_single_quote():
+    # Single-quoted one-liner docstring
+    lines = ["class Foo:", '    "A brief note."', "    def method(self): pass"]
+    assert _skip_class_docstring(lines, 1) == 2
 
 
 # ---------------------------------------------------------------------------

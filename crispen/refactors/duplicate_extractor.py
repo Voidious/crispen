@@ -1672,6 +1672,45 @@ def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
     return "".join(lines)
 
 
+def _skip_class_docstring(source_lines: List[str], after_class_line: int) -> int:
+    """Return the 0-based line index after the class docstring, if any.
+
+    Given the line immediately after ``class Foo:`` (or its colon line),
+    advance past any leading blank lines and then past a string-literal
+    docstring (single- or triple-quoted).  If no docstring is present,
+    returns ``after_class_line`` unchanged.
+    """
+    i = after_class_line
+    n = len(source_lines)
+    # Skip blank lines inside the class body.
+    while i < n and not source_lines[i].strip():
+        i += 1
+    if i >= n:
+        return after_class_line
+    stripped = source_lines[i].lstrip()
+    # Check for a triple-quoted docstring.
+    for q in ('"""', "'''"):
+        if stripped.startswith(q):
+            # Check whether the closing quote is on the same line (after the
+            # opening).
+            rest = stripped[len(q) :]
+            if q in rest:
+                # Single-line triple-quoted docstring.
+                return i + 1
+            # Multi-line: scan forward for the closing triple-quote.
+            i += 1
+            while i < n:
+                if q in source_lines[i]:
+                    return i + 1
+                i += 1
+            return i  # malformed, best-effort
+    # Single-quoted docstring (rare but valid).
+    for q in ('"', "'"):
+        if stripped.startswith(q) and not stripped.startswith(q * 2):
+            return i + 1
+    return after_class_line
+
+
 def _find_insertion_point(source: str, scope: str) -> int:
     """Return 0-based line index to insert before.
 
@@ -2261,9 +2300,11 @@ class DuplicateExtractor(Refactor):
                         )
                     first_seq = min(group, key=lambda s: s.start_line)
                     if placement.startswith("staticmethod:"):
-                        # Insert inside the class body, one line after "class Foo:".
+                        # Insert inside the class body, after "class Foo:" and
+                        # any class docstring (which must remain first).
                         scope = placement.split(":", 1)[1]
-                        insert_pos = _find_insertion_point(source, scope) + 1
+                        class_line = _find_insertion_point(source, scope)
+                        insert_pos = _skip_class_docstring(source_lines, class_line + 1)
                     else:
                         scope = first_seq.scope
                         insert_pos = _find_insertion_point(source, scope)
