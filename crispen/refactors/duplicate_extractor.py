@@ -259,6 +259,8 @@ class _SequenceCollector(cst.CSTVisitor):
                 start_line = stmt_info[start_i][1]
                 end_line = stmt_info[end_i - 1][2]
                 seq_source = "".join(self._source_lines[start_line - 1 : end_line])
+                if _seq_source_contains_yield(seq_source):
+                    continue
                 self.sequences.append(
                     _SeqInfo(
                         stmts=window,
@@ -1403,6 +1405,39 @@ def _seq_ends_with_return(seq: _SeqInfo) -> bool:
     if isinstance(last.value, ast.Constant) and last.value.value is None:
         return False
     return True
+
+
+def _seq_source_contains_yield(source: str) -> bool:
+    """Return True if *source* contains ``yield`` or ``yield from`` outside
+    any nested function definition.
+
+    Sequences with a yield cannot be safely extracted into a plain helper
+    function: extraction would make the helper a generator, forcing call sites
+    to iterate via ``for``/``async for`` instead of calling it directly.  This
+    is a semantic transformation (e.g. ``async with X as c: yield c`` →
+    ``async for c in helper(): yield c``) that the extractor must not attempt.
+    """
+    wrapped = "def _f():\n" + textwrap.indent(textwrap.dedent(source), "    ")
+    try:
+        tree = ast.parse(wrapped)
+    except SyntaxError:
+        return False
+    if not tree.body or not isinstance(
+        tree.body[0], ast.FunctionDef
+    ):  # pragma: no cover
+        return False
+
+    def _walk(nodes):
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue  # don't cross into nested scope
+            if isinstance(node, (ast.Yield, ast.YieldFrom)):
+                return True
+            if _walk(ast.iter_child_nodes(node)):
+                return True
+        return False
+
+    return _walk(tree.body[0].body)
 
 
 def _replacement_contains_return(replacement: str) -> bool:

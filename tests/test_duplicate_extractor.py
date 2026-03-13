@@ -47,6 +47,7 @@ from crispen.refactors.duplicate_extractor import (
     _run_with_timeout,
     _sequence_weight,
     _seq_ends_with_return,
+    _seq_source_contains_yield,
     _replacement_contains_return,
     _replacement_steals_post_block_line,
     _helper_imports_local_name,
@@ -4702,6 +4703,59 @@ def test_seq_ends_with_return_return_none():
         _seq_ends_with_return(_make_seq_with_source("    x = 1\n    return None\n"))
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# _seq_source_contains_yield
+# ---------------------------------------------------------------------------
+
+
+def test_seq_source_contains_yield_async_with_yield():
+    # The exact pattern that triggered the bug: async with ... as c: yield c
+    src = "    async with Client(mcp) as c:\n        yield c\n"
+    assert _seq_source_contains_yield(src) is True
+
+
+def test_seq_source_contains_yield_plain_yield():
+    assert _seq_source_contains_yield("    yield x\n") is True
+
+
+def test_seq_source_contains_yield_from():
+    assert _seq_source_contains_yield("    yield from something()\n") is True
+
+
+def test_seq_source_contains_yield_no_yield():
+    assert _seq_source_contains_yield("    x = 1\n    y = 2\n") is False
+
+
+def test_seq_source_contains_yield_nested_funcdef_not_counted():
+    # yield inside a nested def must NOT trigger the guard
+    src = "    def inner():\n        yield 1\n"
+    assert _seq_source_contains_yield(src) is False
+
+
+def test_seq_source_contains_yield_syntax_error():
+    assert _seq_source_contains_yield("    (\n") is False
+
+
+def test_collector_skips_yield_sequences():
+    # Sequences whose source contains yield should never be collected.
+    source = textwrap.dedent(
+        """\
+        async def make_client():
+            x = setup()
+            async with Client(x) as c:
+                yield c
+
+        async def make_client2():
+            x = setup()
+            async with Client(x) as c:
+                yield c
+        """
+    )
+    seqs = _collect_sequences(source)
+    for seq in seqs:
+        assert not _seq_source_contains_yield(seq.source)
 
 
 # ---------------------------------------------------------------------------
