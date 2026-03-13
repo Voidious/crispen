@@ -5280,18 +5280,27 @@ def _make_proxy_func(
     )
 
 
-def test_would_create_proxy_wrappers_true_module_level_func():
-    """A seq that covers the entire body of a module-level function → True."""
+def test_would_create_proxy_wrappers_false_single_full_body():
+    """Single-member group where the seq covers the entire function body.
+
+    All members are proxies, so extraction is still worthwhile → False.
+    """
     seq = _make_proxy_seq(3, scope="foo")
     func = _make_proxy_func("foo", body_stmt_count=3, scope="<module>")
-    assert _would_create_proxy_wrappers([seq], [func]) is True
+    assert _would_create_proxy_wrappers([seq], [func]) is False
 
 
-def test_would_create_proxy_wrappers_true_method():
-    """A seq that covers the entire body of a class method → True."""
-    seq = _make_proxy_seq(2, scope="bar", class_scope="MyClass")
-    func = _make_proxy_func("bar", body_stmt_count=2, scope="MyClass")
-    assert _would_create_proxy_wrappers([seq], [func]) is True
+def test_would_create_proxy_wrappers_false_all_full_bodies():
+    """All group members cover entire function bodies → False.
+
+    When every member becomes a proxy the group is all-or-nothing: extracting
+    a shared helper is still worthwhile, so the guard should not block it.
+    """
+    seq1 = _make_proxy_seq(3, scope="process", class_scope="ClassA")
+    seq2 = _make_proxy_seq(3, scope="process", class_scope="ClassB")
+    func1 = _make_proxy_func("process", body_stmt_count=3, scope="ClassA")
+    func2 = _make_proxy_func("process", body_stmt_count=3, scope="ClassB")
+    assert _would_create_proxy_wrappers([seq1, seq2], [func1, func2]) is False
 
 
 def test_would_create_proxy_wrappers_false_partial_body():
@@ -5340,9 +5349,11 @@ def test_would_create_proxy_wrappers_group_with_one_proxy():
 _PROXY_SOURCE = textwrap.dedent(
     """\
     def foo():
+        setup = prepare(data)
         x = compute(data)
         y = transform(x)
         z = finalize(y)
+        return setup, z
 
     def bar():
         x = compute(data)
@@ -5350,7 +5361,9 @@ _PROXY_SOURCE = textwrap.dedent(
         z = finalize(y)
     """
 )
-_PROXY_RANGES = [(1, 4)]  # overlaps foo's body
+# overlaps foo: foo has 5 stmts but duplicate block is only 3 of them (not a proxy);
+# bar has 3 stmts = its entire body (would become a proxy) → mixed → guard fires.
+_PROXY_RANGES = [(1, 11)]
 
 
 def test_proxy_wrapper_guard_skips_group_verbose(monkeypatch, capsys):

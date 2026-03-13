@@ -1607,23 +1607,33 @@ def _extract_defined_names(source: str) -> set:
 def _would_create_proxy_wrappers(
     group: List[_SeqInfo], all_functions: List[_FunctionInfo]
 ) -> bool:
-    """Return True if extracting this group would leave any function as a trivial proxy.
+    """Return True if extracting this group would leave *some but not all* members
+    as trivial proxy wrappers.
 
     A function becomes a trivial proxy wrapper when its entire body is the
     extracted block — after extraction it would contain only a single call to
     the new helper, with no meaningful logic of its own.
+
+    When *every* member of the group would become a proxy, extraction is still
+    worthwhile: all functions delegate to the same helper, which eliminates the
+    duplication.  The problematic case is a mixed group where some members lose
+    all their logic while others keep meaningful bodies.
     """
+    proxy_count = 0
+    non_module_count = 0
     for seq in group:
         if seq.scope == "<module>":
             continue
+        non_module_count += 1
         func_outer_scope = (
             seq.class_scope if seq.class_scope is not None else "<module>"
         )
         for func in all_functions:
             if func.name == seq.scope and func.scope == func_outer_scope:
                 if len(seq.stmts) == func.body_stmt_count:
-                    return True
-    return False
+                    proxy_count += 1
+                break
+    return 0 < proxy_count < non_module_count
 
 
 # ---------------------------------------------------------------------------
