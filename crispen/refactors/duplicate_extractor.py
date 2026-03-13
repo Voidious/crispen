@@ -1044,10 +1044,13 @@ def _strip_unused_call_assignments(replacement: str, following_lines: List[str])
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
-        if not isinstance(node.value, ast.Call):
+        value_node = node.value
+        if isinstance(value_node, ast.Await) and isinstance(value_node.value, ast.Call):
+            pass  # treat `result = await helper(...)` like `result = helper(...)`
+        elif not isinstance(value_node, ast.Call):
             continue
 
-        call_src = ast.unparse(node.value)
+        call_src = ast.unparse(value_node)
 
         if len(node.targets) == 1:
             new_target, all_replaced, any_replaced = _replace_unused_in_target(

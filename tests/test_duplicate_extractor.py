@@ -4470,6 +4470,38 @@ def test_strip_unused_call_assignments_leading_blank_line():
     assert out == "\n    _helper(x)\n"
 
 
+def test_strip_unused_call_assignments_await_unused_stripped():
+    # `result = await _helper(x)` and `result` never used → strip assignment.
+    replacement = "    result = await _helper(x)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    await _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_await_used_kept():
+    # `result = await _helper(x)` and `result` is used → keep assignment.
+    replacement = "    result = await _helper(x)\n"
+    following = ["    print(result)\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_await_tuple_unused_stripped():
+    # `a, b = await _helper(x)` and neither name is used → strip assignment.
+    replacement = "    a, b = await _helper(x)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    await _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_await_non_call_unchanged():
+    # `result = await some_awaitable` (not a call) → left unchanged.
+    replacement = "    result = await some_awaitable\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
 # ---------------------------------------------------------------------------
 # Re-strip with candidate following lines (end-to-end)
 # ---------------------------------------------------------------------------
