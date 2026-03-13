@@ -1301,6 +1301,74 @@ def _pyflakes_new_undefined_names(original: str, candidate: str) -> set:
     return after.names - before.names
 
 
+def _strip_new_f841_assignments(original: str, candidate: str) -> str:
+    """Strip call-assignment statements newly flagged as F841 in *candidate*.
+
+    When multiple call-site replacements are applied together, a variable that
+    appeared "used" to the per-call-site checker (because it was referenced
+    inside another call-site's original block) may become truly unused once all
+    blocks are replaced.  This pass finds pyflakes ``UnusedVariable`` warnings
+    that are new in *candidate* (not already present in *original*) and strips
+    the corresponding ``x = call(...)`` statements.
+
+    Only simple-name single-target assignments are handled, which matches
+    pyflakes' own F841 scope: it does not report unused variables introduced by
+    tuple unpacking.
+    """
+    import pyflakes.api
+    import pyflakes.messages
+
+    class _Collector:
+        def __init__(self):
+            self.unused_names: set = set()
+
+        def unexpectedError(self, filename, msg):  # pragma: no cover
+            pass
+
+        def syntaxError(self, filename, msg, lineno, offset, text):  # pragma: no cover
+            pass
+
+        def flake(self, msg):
+            if isinstance(msg, pyflakes.messages.UnusedVariable):
+                self.unused_names.add(msg.message_args[0])
+
+    before = _Collector()
+    pyflakes.api.check(original, "<original>", reporter=before)
+    after = _Collector()
+    pyflakes.api.check(candidate, "<rewritten>", reporter=after)
+    new_unused = after.unused_names - before.unused_names
+    if not new_unused:
+        return candidate
+
+    # ast.parse cannot fail here: pyflakes already parsed candidate
+    # successfully above (it uses the same Python parser).
+    tree = ast.parse(candidate)
+    candidate_lines = candidate.splitlines(keepends=True)
+    edits: List[Tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not isinstance(node.value, ast.Call):
+            continue
+        if len(node.targets) != 1:
+            continue
+        if not isinstance(node.targets[0], ast.Name):
+            continue
+        if node.targets[0].id not in new_unused:
+            continue
+        edits.append((node.lineno, node.end_lineno, ast.unparse(node.value)))
+
+    if not edits:
+        return candidate
+
+    for start_ln, end_ln, new_src in sorted(edits, key=lambda x: x[0], reverse=True):
+        orig_line = candidate_lines[start_ln - 1]
+        indent = orig_line[: len(orig_line) - len(orig_line.lstrip())]
+        candidate_lines[start_ln - 1 : end_ln] = [indent + new_src + "\n"]
+
+    return "".join(candidate_lines)
+
+
 def _missing_free_vars(
     block_src: str, call_srcs: List[str], helper_src: str, source: str
 ) -> set:
@@ -2642,6 +2710,13 @@ class DuplicateExtractor(Refactor):
                 all_pending.append(msg)
 
             if all_edits:
+                # Post-assembly pass: strip any call-site assignments that
+                # became unused only after all replacements were combined.
+                # The per-call-site checker may have kept an assignment like
+                # ``result_data = helper(x)`` because ``result_data`` appeared
+                # inside another call-site's original block; once that block is
+                # also replaced, the variable can become truly unused.
+                combined = _strip_new_f841_assignments(source, combined)
                 self._new_source = combined
                 self.changes_made.extend(all_pending)
 

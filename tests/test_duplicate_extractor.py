@@ -51,6 +51,7 @@ from crispen.refactors.duplicate_extractor import (
     _replacement_steals_post_block_line,
     _helper_imports_local_name,
     _strip_helper_docstring,
+    _strip_new_f841_assignments,
     _strip_unused_call_assignments,
     _verify_extraction,
     _would_create_proxy_wrappers,
@@ -4467,6 +4468,120 @@ def test_strip_unused_call_assignments_leading_blank_line():
     following = []
     out = _strip_unused_call_assignments(replacement, following)
     assert out == "\n    _helper(x)\n"
+
+
+# ---------------------------------------------------------------------------
+# _strip_new_f841_assignments
+# ---------------------------------------------------------------------------
+
+
+def test_strip_new_f841_no_new_unused_returns_unchanged():
+    # When no new unused variables are introduced, the candidate is returned
+    # unchanged.
+    original = "def f():\n    x = g()\n    print(x)\n"
+    candidate = "def f():\n    x = g()\n    print(x)\n"
+    assert _strip_new_f841_assignments(original, candidate) == candidate
+
+
+def test_strip_new_f841_strips_newly_unused_assignment():
+    # ``result_data`` is used in the original (appears in a second assignment
+    # block) but becomes unused in the candidate once that block is replaced.
+    original = textwrap.dedent(
+        """\
+        def test_error_handling():
+            result = call()
+            result_data = json.loads(result)
+            assert result_data["error"]
+            result2 = call()
+            result_data = json.loads(result2)
+            assert result_data["error"]
+    """
+    )
+    candidate = textwrap.dedent(
+        """\
+        def assert_error_result(result):
+            result_data = json.loads(result)
+            assert result_data["error"]
+
+        def test_error_handling():
+            result = call()
+            result_data = assert_error_result(result)
+            result2 = call()
+            assert_error_result(result2)
+    """
+    )
+    out = _strip_new_f841_assignments(original, candidate)
+    assert "result_data = assert_error_result(result)" not in out
+    assert "assert_error_result(result)" in out
+
+
+def test_strip_new_f841_does_not_strip_preexisting_unused():
+    # When the same variable was already unused in the original, we don't
+    # strip it from the candidate (it's not a new F841).
+    original = textwrap.dedent(
+        """\
+        def f():
+            x = g()
+    """
+    )
+    candidate = textwrap.dedent(
+        """\
+        def f():
+            x = g()
+    """
+    )
+    out = _strip_new_f841_assignments(original, candidate)
+    assert out == candidate
+
+
+def test_strip_new_f841_non_call_rhs_not_stripped():
+    # A newly-unused variable assigned via a non-Call RHS is not touched
+    # (we only strip `x = call()` assignments, not `x = 5`).
+    original = textwrap.dedent(
+        """\
+        def f():
+            x = compute()
+            print(x)
+    """
+    )
+    candidate = textwrap.dedent(
+        """\
+        def f():
+            x = 42
+    """
+    )
+    # x is newly F841 in candidate, but the assignment is not a Call → no edit
+    out = _strip_new_f841_assignments(original, candidate)
+    assert out == candidate
+
+
+def test_strip_new_f841_skips_chained_and_nonname_targets():
+    # With a newly-unused variable, the loop skips:
+    #   - chained assignments (a = b = call(), len(targets) > 1)
+    #   - non-Name single targets (self.x = call())
+    # and strips only the plain single-name assignment.
+    original = textwrap.dedent(
+        """\
+        class C:
+            def f(self):
+                result = make()
+                use(result)
+    """
+    )
+    candidate = textwrap.dedent(
+        """\
+        class C:
+            def f(self):
+                result = make()
+                a = b = make()
+                self.x = make()
+                use(a)
+    """
+    )
+    out = _strip_new_f841_assignments(original, candidate)
+    assert "result = make()" not in out
+    assert "a = b = make()" in out
+    assert "self.x = make()" in out
 
 
 # ---------------------------------------------------------------------------
