@@ -877,6 +877,9 @@ def _llm_verify_extraction(
         "Same-type variables (e.g. two dicts, two strings) that are both in scope "
         "are a swap risk: confirm neither was substituted for the other across call "
         "sites.\n"
+        "7. No line from the helper body is duplicated verbatim in the call site "
+        "replacement. If setup lines were extracted into the helper, they must not "
+        "also appear before or after the call — otherwise the extraction is wrong.\n"
         "If correct, set is_correct=True and issues=[]. "
         "Otherwise set is_correct=False and list each specific issue."
     )
