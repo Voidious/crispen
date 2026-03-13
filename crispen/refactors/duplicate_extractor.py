@@ -686,8 +686,10 @@ def _llm_extract(
     class_scopes = {s.class_scope for s in group}
     all_same_class = len(class_scopes) == 1 and None not in class_scopes
     if all_same_class:
+        same_class_name = next(iter(class_scopes))
         staticmethod_instruction = (
-            "If all call sites are inside the same class, use a @staticmethod. "
+            f"All call sites are inside class '{same_class_name}'. "
+            f"You MUST use placement 'staticmethod:{same_class_name}'. "
         )
     else:
         staticmethod_instruction = (
@@ -2122,8 +2124,7 @@ class DuplicateExtractor(Refactor):
                 _failures: List[str] = []
 
                 # Check 1: name collision
-                # Pre-check: staticmethod placement is invalid when sequences span
-                # multiple class scopes — flag it so the retry loop can correct it.
+                # Pre-check: placement consistency with call-site class scopes.
                 if placement.startswith("staticmethod:"):
                     group_class_scopes = {s.class_scope for s in group}
                     if len(group_class_scopes) != 1 or None in group_class_scopes:
@@ -2135,6 +2136,55 @@ class DuplicateExtractor(Refactor):
                             print(
                                 "crispen: DuplicateExtractor: extraction FAILED — "
                                 "staticmethod placement invalid for cross-class group",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
+                    elif placement.split(":", 1)[1] != next(iter(group_class_scopes)):
+                        named_class = placement.split(":", 1)[1]
+                        actual_class = next(iter(group_class_scopes))
+                        _failures.append(
+                            f"staticmethod names class '{named_class}' but all call "
+                            f"sites are in '{actual_class}'; use "
+                            f"'staticmethod:{actual_class}' instead"
+                        )
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor: extraction FAILED — "
+                                f"staticmethod names wrong class '{named_class}' "
+                                f"(actual: '{actual_class}')",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
+                if placement == "module_level":
+                    # Reject if any call site invokes the helper as an instance
+                    # method (self.<func_name>(...)) — that is inconsistent with
+                    # module-level placement and will fail at runtime.
+                    _self_call_pat = re.compile(rf"\bself\.{re.escape(func_name)}\s*\(")
+                    if any(_self_call_pat.search(r) for r in call_replacements):
+                        group_class_scopes = {s.class_scope for s in group}
+                        if (
+                            len(group_class_scopes) == 1
+                            and None not in group_class_scopes
+                        ):
+                            only_class = next(iter(group_class_scopes))
+                            placement_hint = f"use 'staticmethod:{only_class}' instead"
+                        else:
+                            placement_hint = (
+                                f"change call sites to call "
+                                f"'{func_name}(...)' directly"
+                            )
+                        _failures.append(
+                            f"module_level placement is inconsistent with call "
+                            f"sites that invoke the helper as "
+                            f"'self.{func_name}(...)'; {placement_hint}"
+                        )
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor: extraction FAILED"
+                                f" — module_level placement conflicts with "
+                                f"self.{func_name}() call sites",
                                 file=sys.stderr,
                                 flush=True,
                             )

@@ -2969,6 +2969,311 @@ def test_cross_class_staticmethod_placement_rejected_non_verbose(monkeypatch):
     assert de._new_source is not None
 
 
+def test_same_class_module_level_placement_rejected(monkeypatch):
+    """module_level placement with self.<name>() call sites is rejected and retried."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class MyClass:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper_module = "def _helper(data):\n    pass\n"
+    helper_static = "    @staticmethod\n    def _helper(data):\n        pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            # First attempt: module_level placement but call sites use self._helper()
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper_module,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            # Second attempt: correct staticmethod placement
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:MyClass",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(11, 13)], source=source)
+
+    assert de._new_source is not None
+    # veto + two extraction attempts + verify
+    assert mock_client.messages.create.call_count == 4
+
+
+def test_same_class_module_level_placement_rejected_non_verbose(monkeypatch):
+    """Same inconsistency rejection works when verbose=False."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class MyClass:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper_static = "    @staticmethod\n    def _helper(data):\n        pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": "def _helper(data):\n    pass\n",
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:MyClass",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(11, 13)], source=source, verbose=False)
+
+    assert de._new_source is not None
+
+
+def test_cross_class_module_level_self_call_rejected(monkeypatch):
+    """module_level with self.<name>() call sites in a cross-class group is rejected."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class ClassA:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+        class ClassB:
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper = "def _helper(data):\n    pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            # First attempt: module_level but call sites use self._helper()
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            # Second attempt: correct call sites
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "        _helper(data)\n",
+                        "        _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(3, 5)], source=source)
+
+    assert de._new_source is not None
+    assert mock_client.messages.create.call_count == 4
+
+
+def test_staticmethod_wrong_class_rejected(monkeypatch):
+    """LLM naming the wrong class in staticmethod:X is rejected and retried."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class ClassA:
+            def setup(self):
+                pass
+
+        class ClassB:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper_static = "    @staticmethod\n    def _helper(data):\n        pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            # First attempt: LLM names the wrong class
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:ClassA",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            # Second attempt: correct class name
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:ClassB",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(14, 16)], source=source)
+
+    assert de._new_source is not None
+    assert mock_client.messages.create.call_count == 4
+
+
+def test_staticmethod_wrong_class_rejected_non_verbose(monkeypatch):
+    """Wrong-class staticmethod rejection works when verbose=False."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class ClassA:
+            def setup(self):
+                pass
+
+        class ClassB:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper_static = "    @staticmethod\n    def _helper(data):\n        pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:ClassA",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:ClassB",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(14, 16)], source=source, verbose=False)
+
+    assert de._new_source is not None
+
+
 def test_sequence_collector_class_scope():
     """_SequenceCollector sets class_scope for sequences inside class methods."""
     import libcst as cst
