@@ -51,7 +51,6 @@ from crispen.refactors.duplicate_extractor import (
     _replacement_steals_post_block_line,
     _helper_imports_local_name,
     _strip_helper_docstring,
-    _strip_new_f841_assignments,
     _strip_unused_call_assignments,
     _verify_extraction,
     _would_create_proxy_wrappers,
@@ -4471,117 +4470,81 @@ def test_strip_unused_call_assignments_leading_blank_line():
 
 
 # ---------------------------------------------------------------------------
-# _strip_new_f841_assignments
+# Re-strip with candidate following lines (end-to-end)
 # ---------------------------------------------------------------------------
 
 
-def test_strip_new_f841_no_new_unused_returns_unchanged():
-    # When no new unused variables are introduced, the candidate is returned
-    # unchanged.
-    original = "def f():\n    x = g()\n    print(x)\n"
-    candidate = "def f():\n    x = g()\n    print(x)\n"
-    assert _strip_new_f841_assignments(original, candidate) == candidate
-
-
-def test_strip_new_f841_strips_newly_unused_assignment():
-    # ``result_data`` is used in the original (appears in a second assignment
-    # block) but becomes unused in the candidate once that block is replaced.
-    original = textwrap.dedent(
+def test_restrip_drops_assignment_unused_only_after_all_call_sites_replaced(
+    monkeypatch,
+):
+    # Regression: when two call sites reference the same variable name, the
+    # per-call-site strip (which uses original following lines) sees the name
+    # in the other call site's original block and keeps the assignment.  After
+    # all replacements are assembled the variable is truly unused, so the
+    # re-strip pass must drop it.
+    #
+    # Source:  test_f has two identical 2-line blocks.
+    # LLM returns:
+    #   - call site 1 replacement: ``data = assert_error(result)``
+    #   - call site 2 replacement: ``assert_error(result2)``   (no assignment)
+    # After initial per-call-site strip, call site 1 keeps the assignment
+    # because "data" appears in the original following source (inside call
+    # site 2's original block).  The re-strip must then drop it.
+    # Using function parameters avoids the SequenceCollector merging the
+    # assignment lines into the duplicate block.
+    # Use 3-statement blocks (weight=3 ≥ min_weight) so the SequenceCollector
+    # finds the duplicate group.  Mirroring the real lever-mcp pattern:
+    # json.loads + two asserts.  Both result and result2 are function
+    # parameters so the SequenceCollector cannot absorb the assignment lines
+    # into the duplicate block.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
         """\
-        def test_error_handling():
-            result = call()
-            result_data = json.loads(result)
-            assert result_data["error"]
-            result2 = call()
-            result_data = json.loads(result2)
-            assert result_data["error"]
-    """
+        def test_f(result, result2):
+            rd = json.loads(result)
+            assert rd["value"] is None
+            assert "error" in rd
+            rd = json.loads(result2)
+            assert rd["value"] is None
+            assert "error" in rd
+        """
     )
-    candidate = textwrap.dedent(
+    helper = textwrap.dedent(
         """\
         def assert_error_result(result):
-            result_data = json.loads(result)
-            assert result_data["error"]
-
-        def test_error_handling():
-            result = call()
-            result_data = assert_error_result(result)
-            result2 = call()
-            assert_error_result(result2)
-    """
+            rd = json.loads(result)
+            assert rd["value"] is None
+            assert "error" in rd
+        """
     )
-    out = _strip_new_f841_assignments(original, candidate)
-    assert "result_data = assert_error_result(result)" not in out
-    assert "assert_error_result(result)" in out
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "identical blocks"),
+            _make_extract_response(
+                {
+                    "function_name": "assert_error_result",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        # LLM assigns the return value at call site 1 …
+                        "    rd = assert_error_result(result)\n",
+                        # … but not at call site 2 (helper returns None).
+                        "    assert_error_result(result2)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor([(2, 4), (5, 7)], source=source)
 
-
-def test_strip_new_f841_does_not_strip_preexisting_unused():
-    # When the same variable was already unused in the original, we don't
-    # strip it from the candidate (it's not a new F841).
-    original = textwrap.dedent(
-        """\
-        def f():
-            x = g()
-    """
-    )
-    candidate = textwrap.dedent(
-        """\
-        def f():
-            x = g()
-    """
-    )
-    out = _strip_new_f841_assignments(original, candidate)
-    assert out == candidate
-
-
-def test_strip_new_f841_non_call_rhs_not_stripped():
-    # A newly-unused variable assigned via a non-Call RHS is not touched
-    # (we only strip `x = call()` assignments, not `x = 5`).
-    original = textwrap.dedent(
-        """\
-        def f():
-            x = compute()
-            print(x)
-    """
-    )
-    candidate = textwrap.dedent(
-        """\
-        def f():
-            x = 42
-    """
-    )
-    # x is newly F841 in candidate, but the assignment is not a Call → no edit
-    out = _strip_new_f841_assignments(original, candidate)
-    assert out == candidate
-
-
-def test_strip_new_f841_skips_chained_and_nonname_targets():
-    # With a newly-unused variable, the loop skips:
-    #   - chained assignments (a = b = call(), len(targets) > 1)
-    #   - non-Name single targets (self.x = call())
-    # and strips only the plain single-name assignment.
-    original = textwrap.dedent(
-        """\
-        class C:
-            def f(self):
-                result = make()
-                use(result)
-    """
-    )
-    candidate = textwrap.dedent(
-        """\
-        class C:
-            def f(self):
-                result = make()
-                a = b = make()
-                self.x = make()
-                use(a)
-    """
-    )
-    out = _strip_new_f841_assignments(original, candidate)
-    assert "result = make()" not in out
-    assert "a = b = make()" in out
-    assert "self.x = make()" in out
+    assert de._new_source is not None
+    # The re-strip must have dropped the unused assignment at call site 1.
+    assert "rd = assert_error_result(result)" not in de._new_source
+    assert "assert_error_result(result)" in de._new_source
+    assert "assert_error_result(result2)" in de._new_source
 
 
 # ---------------------------------------------------------------------------
