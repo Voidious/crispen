@@ -1599,6 +1599,28 @@ def _extract_defined_names(source: str) -> set:
     }
 
 
+def _would_create_proxy_wrappers(
+    group: List[_SeqInfo], all_functions: List[_FunctionInfo]
+) -> bool:
+    """Return True if extracting this group would leave any function as a trivial proxy.
+
+    A function becomes a trivial proxy wrapper when its entire body is the
+    extracted block — after extraction it would contain only a single call to
+    the new helper, with no meaningful logic of its own.
+    """
+    for seq in group:
+        if seq.scope == "<module>":
+            continue
+        func_outer_scope = (
+            seq.class_scope if seq.class_scope is not None else "<module>"
+        )
+        for func in all_functions:
+            if func.name == seq.scope and func.scope == func_outer_scope:
+                if len(seq.stmts) == func.body_stmt_count:
+                    return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Text editing
 # ---------------------------------------------------------------------------
@@ -1996,6 +2018,19 @@ class DuplicateExtractor(Refactor):
             # Compute escaping vars algorithmically before any LLM call so the
             # extraction prompt can instruct the LLM to return them.
             escaping_vars = frozenset(_find_escaping_vars(group, source_lines))
+
+            # Skip groups that would leave a function as a trivial proxy wrapper
+            # (i.e. the extracted block is the function's entire body).
+            if _would_create_proxy_wrappers(group, all_functions):
+                if self.verbose:
+                    print(
+                        "crispen: DuplicateExtractor: skipping group — "
+                        "extraction would leave a trivial proxy wrapper",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+
             if self.verbose:
                 ranges_str = ", ".join(
                     f"lines {s.start_line}-{s.end_line}" for s in group

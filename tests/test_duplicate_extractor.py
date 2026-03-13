@@ -53,6 +53,7 @@ from crispen.refactors.duplicate_extractor import (
     _strip_helper_docstring,
     _strip_unused_call_assignments,
     _verify_extraction,
+    _would_create_proxy_wrappers,
     DuplicateExtractor,
 )
 
@@ -1362,16 +1363,24 @@ def test_build_helper_insertion_two_at_same_scope():
 
 def test_successful_extraction_has_two_blank_lines(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    # Each function has 4 statements. The first statement is STRUCTURALLY different
+    # between them (if-block vs assignment), so the normalizer produces different
+    # fingerprints for the full 4-stmt body. Only the trailing 3-stmt block
+    # (compute/transform/finalize) is duplicated, so the proxy-wrapper guard
+    # does not trigger (3 stmts < body_stmt_count 4).
     source = textwrap.dedent(
         """\
         import os
 
         def foo():
+            if debug:
+                validate(data)
             x = compute(data)
             y = transform(x)
             z = finalize(y)
 
         def bar():
+            result = validate(data)
             x = compute(data)
             y = transform(x)
             z = finalize(y)
@@ -1397,7 +1406,7 @@ def test_successful_extraction_has_two_blank_lines(monkeypatch):
             ),
             _make_verify_response(True, []),
         ]
-        de = DuplicateExtractor([(9, 11)], source=source)
+        de = DuplicateExtractor([(12, 14)], source=source)
 
     assert de._new_source is not None
     # Exactly 2 blank lines before and after the inserted helper.
@@ -1421,12 +1430,15 @@ def test_helper_placed_before_class_not_inside(monkeypatch):
 
         class MyClass:
             def method_a(self, x):
+                if self.debug:
+                    pass
                 a = compute(x)
                 b = transform(a)
                 c = finalize(b)
                 return c
 
             def method_b(self, x):
+                result = None
                 a = compute(x)
                 b = transform(a)
                 c = finalize(b)
@@ -1744,17 +1756,20 @@ def test_no_duplicates_no_llm_calls(monkeypatch):
 _DUP_SOURCE = textwrap.dedent(
     """\
     def foo():
+        if debug:
+            pass
         x = compute(data)
         y = transform(x)
         z = finalize(y)
 
     def bar():
+        result = None
         x = compute(data)
         y = transform(x)
         z = finalize(y)
     """
 )
-_DUP_RANGES = [(7, 9)]  # overlaps bar's body
+_DUP_RANGES = [(10, 12)]  # overlaps bar's duplicate block (x/y/z lines)
 
 # Source where foo's duplicate block assigns z, and foo uses z after the block.
 # _has_escaping_vars should detect this and skip the extraction.
@@ -1767,12 +1782,13 @@ _ESC_SOURCE = textwrap.dedent(
         assert z == expected
 
     def bar():
+        result = None
         x = compute(data)
         y = transform(x)
         z = finalize(y)
     """
 )
-_ESC_RANGES = [(8, 10)]  # overlaps bar's body
+_ESC_RANGES = [(9, 11)]  # overlaps bar's duplicate block (x/y/z lines)
 
 
 def test_missing_api_key_raises(monkeypatch):
@@ -2580,27 +2596,33 @@ _TWO_PAIR_SOURCE = textwrap.dedent(
     import os
 
     def foo():
+        if debug:
+            pass
         x = compute(data, config)
         y = transform(x, scale)
         z = finalize(y, mode)
 
     def bar():
+        result = None
         x = compute(data, config)
         y = transform(x, scale)
         z = finalize(y, mode)
 
     def baz():
+        if debug:
+            pass
         a = process(item, key, idx)
         b = convert(a, fmt, enc)
         c = export(b, path, opts)
 
     def qux():
+        result = None
         a = process(item, key, idx)
         b = convert(a, fmt, enc)
         c = export(b, path, opts)
     """
 )
-_TWO_PAIR_RANGES = [(4, 21)]  # overlaps all duplicate sequences
+_TWO_PAIR_RANGES = [(4, 30)]  # overlaps all duplicate sequences
 
 
 def _make_two_group_drop_extractor(monkeypatch, verbose=True):
@@ -2677,11 +2699,14 @@ def test_successful_extraction_module_level(monkeypatch, tmp_path):
         import os
 
         def foo():
+            if debug:
+                pass
             x = compute(data)
             y = transform(x)
             z = finalize(y)
 
         def bar():
+            result = None
             x = compute(data)
             y = transform(x)
             z = finalize(y)
@@ -2708,7 +2733,7 @@ def test_successful_extraction_module_level(monkeypatch, tmp_path):
             _make_verify_response(True, []),
         ]
 
-        de = DuplicateExtractor([(9, 11)], source=source)
+        de = DuplicateExtractor([(12, 14)], source=source)
 
     assert de._new_source is not None
     assert "_helper" in de._new_source
@@ -2728,11 +2753,14 @@ def test_staticmethod_placement(monkeypatch):
         """\
         class MyClass:
             def foo(self):
+                if self.debug:
+                    pass
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
 
             def bar(self):
+                result = None
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
@@ -2759,7 +2787,7 @@ def test_staticmethod_placement(monkeypatch):
             _make_verify_response(True, []),
         ]
 
-        de = DuplicateExtractor([(8, 10)], source=source)
+        de = DuplicateExtractor([(11, 13)], source=source)
 
     assert de._new_source is not None
 
@@ -2771,12 +2799,15 @@ def test_cross_class_duplicates_use_module_level_placement(monkeypatch):
         """\
         class ClassA:
             def foo(self):
+                if self.debug:
+                    pass
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
 
         class ClassB:
             def bar(self):
+                result = None
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
@@ -2821,12 +2852,15 @@ def test_cross_class_staticmethod_placement_rejected(monkeypatch):
         """\
         class ClassA:
             def foo(self):
+                if self.debug:
+                    pass
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
 
         class ClassB:
             def bar(self):
+                result = None
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
@@ -2882,12 +2916,15 @@ def test_cross_class_staticmethod_placement_rejected_non_verbose(monkeypatch):
         """\
         class ClassA:
             def foo(self):
+                if self.debug:
+                    pass
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
 
         class ClassB:
             def bar(self):
+                result = None
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
@@ -3033,11 +3070,14 @@ def test_verbose_false_suppresses_stderr(monkeypatch):
         import os
 
         def foo():
+            if debug:
+                pass
             x = compute(data)
             y = transform(x)
             z = finalize(y)
 
         def bar():
+            result = None
             x = compute(data)
             y = transform(x)
             z = finalize(y)
@@ -3064,7 +3104,7 @@ def test_verbose_false_suppresses_stderr(monkeypatch):
             _make_verify_response(True, []),
         ]
 
-        de = DuplicateExtractor([(9, 11)], source=source, verbose=False)
+        de = DuplicateExtractor([(12, 14)], source=source, verbose=False)
 
     assert de._new_source is not None
     assert "_helper" in de._new_source
@@ -3114,7 +3154,7 @@ def test_cli_exits_on_api_error(tmp_path, monkeypatch):
         f"""\
         --- a/{f}
         +++ b/{f}
-        @@ -7,3 +7,3 @@
+        @@ -10,3 +10,3 @@
         -    x = compute(data)
         +    x = compute(data)
              y = transform(x)
@@ -3458,6 +3498,7 @@ _FUNC_MATCH_THEN_DUP_SOURCE = textwrap.dedent(
         z = finalize(y)
 
     def bar():
+        a = setup(items)
         if condition:
             result = process(items)
         else:
@@ -3465,6 +3506,8 @@ _FUNC_MATCH_THEN_DUP_SOURCE = textwrap.dedent(
         store(result)
 
     def baz():
+        if quick_check:
+            pass
         if condition:
             result = process(items)
         else:
@@ -3475,7 +3518,7 @@ _FUNC_MATCH_THEN_DUP_SOURCE = textwrap.dedent(
         _setup()
     """
 )
-_FUNC_MATCH_THEN_DUP_RANGES = [(2, 23)]  # covers foo, bar, baz bodies
+_FUNC_MATCH_THEN_DUP_RANGES = [(2, 30)]  # covers foo, bar, baz bodies
 
 
 # ---------------------------------------------------------------------------
@@ -3716,17 +3759,20 @@ _COLLISION_SOURCE = textwrap.dedent(
         return x
 
     def foo():
+        if debug:
+            pass
         x = compute(data)
         y = transform(x)
         z = finalize(y)
 
     def bar():
+        result = None
         x = compute(data)
         y = transform(x)
         z = finalize(y)
     """
 )
-_COLLISION_RANGES = [(9, 11)]  # overlaps bar's body
+_COLLISION_RANGES = [(12, 14)]  # overlaps bar's duplicate block
 
 
 def test_extraction_name_collision_skipped(monkeypatch, capsys):
@@ -4426,17 +4472,20 @@ def test_helper_imports_local_name_kwarg():
 _RETURN_BLOCK_SOURCE = textwrap.dedent(
     """\
     def foo():
+        if debug:
+            pass
         x = compute(data)
         y = transform(x)
         return y
 
     def bar():
+        result = None
         x = compute(data)
         y = transform(x)
         return y
     """
 )
-_RETURN_BLOCK_RANGES = [(7, 9)]  # overlaps bar's body
+_RETURN_BLOCK_RANGES = [(10, 12)]  # overlaps bar's duplicate block (x/y/return lines)
 
 
 def _make_return_block_extract_response():
@@ -4508,17 +4557,20 @@ def test_block_ends_with_return_guard_skips_silent(monkeypatch):
 _PARAM_DUP_SOURCE = textwrap.dedent(
     """\
     def test_a(mock_client):
+        if debug:
+            pass
         x = compute(data)
         y = transform(x)
         z = finalize(y)
 
     def test_b(mock_client):
+        result = None
         x = compute(data)
         y = transform(x)
         z = finalize(y)
     """
 )
-_PARAM_DUP_RANGES = [(7, 9)]  # overlaps test_b's body
+_PARAM_DUP_RANGES = [(10, 12)]  # overlaps test_b's duplicate block
 
 
 def _make_import_local_extract_response():
@@ -4890,3 +4942,127 @@ def test_llm_verify_timeout_silent(monkeypatch):
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
 
     assert de._new_source is not None
+
+
+# ---------------------------------------------------------------------------
+# _would_create_proxy_wrappers
+# ---------------------------------------------------------------------------
+
+
+def _make_proxy_seq(stmts_count: int, scope: str, class_scope=None) -> _SeqInfo:
+    """Build a _SeqInfo with a synthetic stmts list of the given length."""
+    return _SeqInfo(
+        stmts=[None] * stmts_count,  # type: ignore[list-item]
+        start_line=1,
+        end_line=stmts_count,
+        scope=scope,
+        source="",
+        fingerprint="",
+        class_scope=class_scope,
+    )
+
+
+def _make_proxy_func(
+    name: str, body_stmt_count: int, scope: str = "<module>"
+) -> _FunctionInfo:
+    return _FunctionInfo(
+        name=name,
+        source=f"def {name}(): pass\n",
+        scope=scope,
+        body_source="    pass\n",
+        body_stmt_count=body_stmt_count,
+        params=[],
+    )
+
+
+def test_would_create_proxy_wrappers_true_module_level_func():
+    """A seq that covers the entire body of a module-level function → True."""
+    seq = _make_proxy_seq(3, scope="foo")
+    func = _make_proxy_func("foo", body_stmt_count=3, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is True
+
+
+def test_would_create_proxy_wrappers_true_method():
+    """A seq that covers the entire body of a class method → True."""
+    seq = _make_proxy_seq(2, scope="bar", class_scope="MyClass")
+    func = _make_proxy_func("bar", body_stmt_count=2, scope="MyClass")
+    assert _would_create_proxy_wrappers([seq], [func]) is True
+
+
+def test_would_create_proxy_wrappers_false_partial_body():
+    """A seq that covers only part of a function body → False."""
+    seq = _make_proxy_seq(2, scope="foo")
+    func = _make_proxy_func("foo", body_stmt_count=4, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is False
+
+
+def test_would_create_proxy_wrappers_false_module_scope():
+    """A seq at module scope (not inside a function) is never a proxy → False."""
+    seq = _make_proxy_seq(3, scope="<module>")
+    func = _make_proxy_func("foo", body_stmt_count=3, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is False
+
+
+def test_would_create_proxy_wrappers_false_no_matching_func():
+    """No function with matching name → False."""
+    seq = _make_proxy_seq(3, scope="foo")
+    func = _make_proxy_func("bar", body_stmt_count=3, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is False
+
+
+def test_would_create_proxy_wrappers_false_scope_mismatch():
+    """Seq in class method but func is module-level with same name → False."""
+    seq = _make_proxy_seq(3, scope="foo", class_scope="MyClass")
+    func = _make_proxy_func("foo", body_stmt_count=3, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is False
+
+
+def test_would_create_proxy_wrappers_group_with_one_proxy():
+    """A group with multiple seqs, one of which covers an entire body → True."""
+    seq_partial = _make_proxy_seq(2, scope="foo")
+    seq_full = _make_proxy_seq(3, scope="bar")
+    func_foo = _make_proxy_func("foo", body_stmt_count=5, scope="<module>")
+    func_bar = _make_proxy_func("bar", body_stmt_count=3, scope="<module>")
+    assert (
+        _would_create_proxy_wrappers([seq_partial, seq_full], [func_foo, func_bar])
+        is True
+    )
+
+
+# DuplicateExtractor: proxy wrapper guard skips groups without LLM calls
+
+
+_PROXY_SOURCE = textwrap.dedent(
+    """\
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+
+    def bar():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_PROXY_RANGES = [(1, 4)]  # overlaps foo's body
+
+
+def test_proxy_wrapper_guard_skips_group_verbose(monkeypatch, capsys):
+    """Groups that would leave a function as a trivial proxy are skipped (verbose)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic.Anthropic"):
+        de = DuplicateExtractor(_PROXY_RANGES, source=_PROXY_SOURCE, verbose=True)
+
+    assert de._new_source is None
+    captured = capsys.readouterr()
+    assert "trivial proxy wrapper" in captured.err
+
+
+def test_proxy_wrapper_guard_skips_group_silent(monkeypatch):
+    """Groups that would leave a trivial proxy are skipped with verbose=False."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic.Anthropic"):
+        de = DuplicateExtractor(_PROXY_RANGES, source=_PROXY_SOURCE, verbose=False)
+
+    assert de._new_source is None
