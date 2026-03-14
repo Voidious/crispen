@@ -685,24 +685,16 @@ def _llm_extract(
     failures_note = ""
     if prev_failures:
         failures_str = "\n".join(f"- {f}" for f in prev_failures)
-        if prev_output is not None:
-            prior_helper = prev_output.get("helper_source", "")
-            prior_repls = prev_output.get("call_site_replacements", [])
-            repls_text = "\n".join(
-                f"  [{i + 1}] {r!r}" for i, r in enumerate(prior_repls)
-            )
-            failures_note = (
-                f"\n\nThe previous extraction attempt produced:\n\n"
-                f"helper_source:\n```python\n{prior_helper}```\n\n"
-                f"call_site_replacements:\n{repls_text}\n\n"
-                f"But failed verification with these issues:\n{failures_str}\n\n"
-                f"Please correct these issues in your new attempt."
-            )
-        else:
-            failures_note = (
-                f"\n\nThe previous extraction attempt failed. Please correct these "
-                f"issues:\n{failures_str}"
-            )
+        prior_helper = prev_output.get("helper_source", "")
+        prior_repls = prev_output.get("call_site_replacements", [])
+        repls_text = "\n".join(f"  [{i + 1}] {r!r}" for i, r in enumerate(prior_repls))
+        failures_note = (
+            f"\n\nThe previous extraction attempt produced:\n\n"
+            f"helper_source:\n```python\n{prior_helper}```\n\n"
+            f"call_site_replacements:\n{repls_text}\n\n"
+            f"But failed these checks:\n{failures_str}\n\n"
+            f"Please correct these issues in your new attempt."
+        )
     class_scopes = {s.class_scope for s in group}
     all_same_class = len(class_scopes) == 1 and None not in class_scopes
     if all_same_class:
@@ -2751,7 +2743,7 @@ class DuplicateExtractor(Refactor):
                     if alg_retries_left > 0:
                         alg_retries_left -= 1
                         prev_failures = _failures
-                        prev_output = None
+                        prev_output = extraction
                         if self.verbose:
                             print(
                                 f"crispen: DuplicateExtractor:   → retrying"
