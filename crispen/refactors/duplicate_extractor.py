@@ -14,6 +14,7 @@ import libcst as cst
 from libcst.metadata import MetadataWrapper, PositionProvider
 
 from .. import llm_client as _llm_client
+from ..import_sort import _sort_imports_pep8
 from .base import Refactor
 
 _MODEL = "claude-sonnet-4-6"
@@ -1548,6 +1549,171 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
     return bool(new_helper_imports & orig_params)
 
 
+def _lift_and_dedup_imports(source: str) -> str:
+    """Lift misplaced module-level imports to the import block and deduplicate.
+
+    When a helper is inserted before a function that is not the first in the
+    file, its leading ``from X import Y`` lines land after the first
+    ``def``/``class``, violating PEP 8.  When a helper re-imports names
+    already present at the top, flake8 reports F811.  This function fixes both:
+
+    1. Collect every simple, unindented ``from X import …`` / ``import X``
+       line from anywhere in the file.
+    2. Merge names for the same module (deduplicate).
+    3. Emit the merged set within the top-of-file import block (before the
+       first ``def``/``class``), removing all later occurrences.
+
+    Only single-line imports without parentheses, backslash continuations, or
+    inline comments are handled.  Indented imports (``if TYPE_CHECKING:``,
+    function-local lazy imports, etc.) and wildcard imports are left untouched.
+    """
+    lines = source.splitlines(keepends=True)
+    n = len(lines)
+
+    # ── pass 1: find the import block boundary ──────────────────────────────
+    # The import block ends at the first unindented def/class line.
+    first_funcdef_idx = n
+    for i, line in enumerate(lines):
+        if line[:1] in (" ", "\t"):
+            continue
+        if re.match(r"^(?:async\s+def|def|class)\s", line.strip()):
+            first_funcdef_idx = i
+            break
+
+    # ── pass 2: collect simple unindented import lines ──────────────────────
+    _FROM_RE = re.compile(r"^from\s+(\S+)\s+import\s+([^(\\#]+)$")
+    _PLAIN_RE = re.compile(r"^import\s+(\S+)$")
+
+    all_imports: List[Tuple[int, str]] = []  # (line_idx, stripped_text)
+    import_indices: set = set()
+    last_block_import_idx = -1
+
+    for i, line in enumerate(lines):
+        if line[:1] in (" ", "\t"):
+            continue
+        stripped = line.strip()
+        mf = _FROM_RE.match(stripped)
+        if mf:
+            names_str = mf.group(2).strip()
+            if not names_str or names_str == "*":
+                continue
+            names = [nm.strip() for nm in names_str.split(",") if nm.strip()]
+            if not names:
+                continue
+            all_imports.append((i, stripped))
+            import_indices.add(i)
+            if i < first_funcdef_idx:
+                last_block_import_idx = i
+            continue
+        mp = _PLAIN_RE.match(stripped)
+        if mp:
+            all_imports.append((i, stripped))
+            import_indices.add(i)
+            if i < first_funcdef_idx:
+                last_block_import_idx = i
+
+    if not all_imports:
+        return source
+
+    # ── pass 3: build merged import map (ordered by first appearance) ───────
+    from_map: Dict[str, List[str]] = {}  # module -> merged name list
+    from_order: List[str] = []
+    plain_order: List[str] = []
+    plain_seen: set = set()
+
+    for _, text in all_imports:
+        mf = _FROM_RE.match(text)
+        if mf:
+            module = mf.group(1)
+            names = [nm.strip() for nm in mf.group(2).split(",") if nm.strip()]
+            if module not in from_map:
+                from_map[module] = list(names)
+                from_order.append(module)
+            else:
+                existing_set = set(from_map[module])
+                for name in names:
+                    if name not in existing_set:
+                        from_map[module].append(name)
+                        existing_set.add(name)
+        else:
+            # Must be a plain import — guaranteed by pass 2 filter.
+            module = _PLAIN_RE.match(text).group(1)  # type: ignore[union-attr]
+            if module not in plain_seen:
+                plain_order.append(module)
+                plain_seen.add(module)
+
+    # ── early exit if nothing to do ─────────────────────────────────────────
+    has_misplaced = any(i >= first_funcdef_idx for i, _ in all_imports)
+    from_counts: Dict[str, int] = {}
+    plain_counts: Dict[str, int] = {}
+    for _, text in all_imports:
+        mf = _FROM_RE.match(text)
+        if mf:
+            mod = mf.group(1)
+            from_counts[mod] = from_counts.get(mod, 0) + 1
+        else:
+            mod = _PLAIN_RE.match(text).group(1)  # type: ignore[union-attr]
+            plain_counts[mod] = plain_counts.get(mod, 0) + 1
+    if not (
+        has_misplaced
+        or any(v > 1 for v in from_counts.values())
+        or any(v > 1 for v in plain_counts.values())
+    ):
+        return source
+
+    # ── pass 4: build the complete sorted import block ──────────────────────
+    # Combine every merged import (existing block + newly lifted) and sort the
+    # whole list so stdlib never ends up after third-party just because it was
+    # a newly lifted import appended at the end.
+    all_final_imports = [
+        f"from {mod} import {', '.join(from_map[mod])}" for mod in from_order
+    ] + [f"import {mod}" for mod in plain_order]
+    sorted_imports = _sort_imports_pep8(all_final_imports)
+
+    first_block_import_idx = min(
+        (i for i, _ in all_imports if i < first_funcdef_idx), default=-1
+    )
+
+    # ── pass 5: rebuild source ───────────────────────────────────────────────
+    # Emit the sorted block at the first block import position (or just before
+    # the first def/class if there are no block imports).  Skip all original
+    # import lines and blank lines within the original block region — the
+    # sorted block replaces them entirely.
+    result: List[str] = []
+    import_block_emitted = False
+
+    for i, line in enumerate(lines):
+        # Edge case: no block imports — insert before the first def/class.
+        if i == first_funcdef_idx and not import_block_emitted:
+            for imp in sorted_imports:
+                result.append(imp + "\n")
+            import_block_emitted = True
+
+        # Emit the sorted block at the position of the first block import.
+        if i == first_block_import_idx:
+            for imp in sorted_imports:
+                result.append(imp + "\n")
+            import_block_emitted = True
+            continue  # the original import line is replaced by the block above
+
+        # Drop all other import lines (block duplicates and misplaced).
+        if i in import_indices:
+            continue
+
+        # Drop blank lines that fell between import lines in the original block
+        # — they were section separators that the sorted block supersedes.
+        if (
+            first_block_import_idx >= 0
+            and first_block_import_idx < i <= last_block_import_idx
+            and not line.strip()
+        ):
+            continue
+
+        result.append(line)
+
+    return "".join(result)
+
+
 def _names_assigned_in(block_source: str) -> set:
     """Return names assigned at the top level of block_source.
 
@@ -2716,7 +2882,7 @@ class DuplicateExtractor(Refactor):
                 all_pending.append(msg)
 
             if all_edits:
-                self._new_source = combined
+                self._new_source = _lift_and_dedup_imports(combined)
                 self.changes_made.extend(all_pending)
 
     def get_rewritten_source(self) -> Optional[str]:

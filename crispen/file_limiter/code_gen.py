@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+from ..import_sort import _sort_imports_pep8
 from .advisor import FileLimiterPlan, GroupPlacement
 from .classifier import ClassifiedEntities
 from .dep_graph import find_sccs
@@ -566,28 +567,6 @@ def _merge_from_imports(imports: List[str]) -> List[str]:
         unique = sorted(dict.fromkeys(from_map[prefix]))
         result.append(f"{prefix} import {', '.join(unique)}")
     return result + plain
-
-
-def _sort_imports_pep8(imports: List[str]) -> List[str]:
-    """Re-order *imports* following PEP 8: future → stdlib → third-party → local.
-
-    Within each group the original relative order is preserved (stable sort).
-    """
-    import sys
-
-    stdlib = sys.stdlib_module_names  # frozenset; available since Python 3.10
-
-    def _group(imp: str) -> int:
-        if imp.startswith("from __future__"):
-            return 0  # __future__
-        if re.match(r"^from\s+\.", imp):
-            return 3  # relative / local
-        m = re.match(r"^(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", imp)
-        if m and m.group(1) in stdlib:
-            return 1  # stdlib
-        return 2  # third-party
-
-    return sorted(imports, key=_group)
 
 
 def _target_module_name(target_file: str) -> str:

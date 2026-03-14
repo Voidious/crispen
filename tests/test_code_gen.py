@@ -6,6 +6,7 @@ import textwrap
 
 from crispen.file_limiter.advisor import FileLimiterPlan, GroupPlacement
 from crispen.file_limiter.classifier import ClassifiedEntities
+from crispen.import_sort import _sort_imports_pep8
 from crispen.file_limiter.code_gen import (
     ImportInfo,
     _abs_package_for_dir,
@@ -37,7 +38,6 @@ from crispen.file_limiter.code_gen import (
     _is_test_name,
     _merge_conftest_sources,
     _merge_from_imports,
-    _sort_imports_pep8,
     _module_path_from_file,
     _prune_inline_redundant_imports,
     _prune_unused_imports,
