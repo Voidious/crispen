@@ -44,7 +44,10 @@ from crispen.refactors.duplicate_extractor import (
     _normalize_source,
     _overlaps_diff,
     _missing_free_vars,
+    _is_pure_literal,
+    _names_in_edit_texts,
     _pyflakes_new_undefined_names,
+    _pyflakes_strip_unused_simple_assigns,
     _run_with_timeout,
     _sequence_weight,
     _seq_ends_with_return,
@@ -793,6 +796,174 @@ def test_pyflakes_new_undefined_names_detects_introduced_name():
     # candidate removes the assignment, leaving x undefined at the call site
     candidate = "def _h():\n    x = 1\n\ndef foo():\n    _h(x)\n    return x\n"
     assert "x" in _pyflakes_new_undefined_names(original, candidate)
+
+
+# ---------------------------------------------------------------------------
+# _is_pure_literal
+# ---------------------------------------------------------------------------
+
+
+def test_is_pure_literal_constant():
+    import ast
+
+    assert _is_pure_literal(ast.parse("0", mode="eval").body)
+    assert _is_pure_literal(ast.parse('"s"', mode="eval").body)
+    assert _is_pure_literal(ast.parse("None", mode="eval").body)
+    assert _is_pure_literal(ast.parse("True", mode="eval").body)
+
+
+def test_is_pure_literal_containers():
+    import ast
+
+    assert _is_pure_literal(ast.parse("[]", mode="eval").body)
+    assert _is_pure_literal(ast.parse("(1, 2)", mode="eval").body)
+    assert _is_pure_literal(ast.parse("{1: 2}", mode="eval").body)
+    assert _is_pure_literal(ast.parse("{1, 2}", mode="eval").body)
+
+
+def test_is_pure_literal_call_is_false():
+    import ast
+
+    assert not _is_pure_literal(ast.parse("func()", mode="eval").body)
+
+
+def test_is_pure_literal_name_is_false():
+    import ast
+
+    assert not _is_pure_literal(ast.parse("x", mode="eval").body)
+
+
+def test_is_pure_literal_nested_call_is_false():
+    import ast
+
+    assert not _is_pure_literal(ast.parse("[func()]", mode="eval").body)
+
+
+# ---------------------------------------------------------------------------
+# _pyflakes_strip_unused_simple_assigns
+# ---------------------------------------------------------------------------
+
+
+def test_pyflakes_strip_unused_simple_assigns_removes_literal_init():
+    # last_import_line = 0 becomes unused after extraction.
+    source = textwrap.dedent(
+        """\
+        def foo(source):
+            last_import_line = 0
+            lines = source.splitlines()
+            return lines
+    """
+    )
+    result = _pyflakes_strip_unused_simple_assigns(source, {"last_import_line"})
+    assert "last_import_line" not in result
+    assert "lines = source.splitlines()" in result
+
+
+def test_pyflakes_strip_unused_simple_assigns_keeps_call_rhs():
+    # x = func() must NOT be stripped — it has side effects.
+    source = textwrap.dedent(
+        """\
+        def foo():
+            x = side_effect()
+            return 1
+    """
+    )
+    result = _pyflakes_strip_unused_simple_assigns(source, {"x"})
+    assert "x = side_effect()" in result
+
+
+def test_pyflakes_strip_unused_simple_assigns_no_change_when_used():
+    source = textwrap.dedent(
+        """\
+        def foo(source):
+            last_import_line = 0
+            for line in source.splitlines():
+                last_import_line += 1
+            return last_import_line
+    """
+    )
+    result = _pyflakes_strip_unused_simple_assigns(source, {"last_import_line"})
+    assert result == source
+
+
+def test_pyflakes_strip_unused_simple_assigns_fallback_on_empty_block():
+    # If stripping would leave a block with no statements (syntax error),
+    # the original source is returned unchanged.
+    source = textwrap.dedent(
+        """\
+        def foo():
+            x = 0
+    """
+    )
+    # After stripping x = 0 the function body is empty — SyntaxError.
+    result = _pyflakes_strip_unused_simple_assigns(source, {"x"})
+    assert result == source
+
+
+def test_pyflakes_strip_unused_simple_assigns_module_level_unchanged():
+    # Module-level assignments are not flagged as UnusedVariable by pyflakes.
+    source = "x = 0\n"
+    result = _pyflakes_strip_unused_simple_assigns(source, {"x"})
+    assert result == source
+
+
+def test_pyflakes_strip_unused_simple_assigns_skips_unrelated_names():
+    # A variable unused after extraction but NOT in allowed_names is preserved.
+    source = textwrap.dedent(
+        """\
+        def foo(source):
+            unrelated = 0
+            lines = source.splitlines()
+            return lines
+    """
+    )
+    # "unrelated" is not in the allowed set → must not be removed.
+    result = _pyflakes_strip_unused_simple_assigns(source, {"last_import_line"})
+    assert "unrelated = 0" in result
+
+
+def test_pyflakes_strip_unused_simple_assigns_empty_allowed():
+    # Empty allowed_names means nothing can be stripped.
+    source = textwrap.dedent(
+        """\
+        def foo(source):
+            x = 0
+            lines = source.splitlines()
+            return lines
+    """
+    )
+    result = _pyflakes_strip_unused_simple_assigns(source, set())
+    assert result == source
+
+
+# ---------------------------------------------------------------------------
+# _names_in_edit_texts
+# ---------------------------------------------------------------------------
+
+
+def test_names_in_edit_texts_collects_from_all_edits():
+    groups = [
+        (
+            "_helper",
+            [
+                (1, 3, "def _helper(last_import_line):\n    return last_import_line\n"),
+                (5, 6, "result = _helper(x)\n"),
+            ],
+            "msg",
+        )
+    ]
+    names = _names_in_edit_texts(groups)
+    assert "last_import_line" in names
+    assert "_helper" in names
+    assert "result" in names
+    assert "x" in names
+
+
+def test_names_in_edit_texts_skips_syntax_errors():
+    groups = [("_h", [(1, 2, "def (\n")], "msg")]
+    # Should not raise — returns whatever names were parseable.
+    names = _names_in_edit_texts(groups)
+    assert isinstance(names, set)
 
 
 # ---------------------------------------------------------------------------

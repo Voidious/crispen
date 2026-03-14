@@ -1320,6 +1320,119 @@ def _pyflakes_new_undefined_names(original: str, candidate: str) -> set:
     return after.names - before.names
 
 
+def _is_pure_literal(node: ast.expr) -> bool:
+    """Return True if *node* is a side-effect-free literal expression.
+
+    Covers ``ast.Constant`` (numbers, strings, bytes, True/False/None) and
+    recursively-pure container literals (list, tuple, set, dict).  Anything
+    involving a function call or attribute access returns False.
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_pure_literal(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            (k is None or _is_pure_literal(k)) and _is_pure_literal(v)
+            for k, v in zip(node.keys, node.values)
+        )
+    return False
+
+
+def _names_in_edit_texts(extraction_groups) -> set:
+    """Return all bare ``Name`` ids found in every edit text of *extraction_groups*.
+
+    ``extraction_groups`` is the list of ``(func_name, group_edits, msg)``
+    tuples accepted at the end of ``DuplicateExtractor._transform``.  Each
+    ``group_edits`` entry is a ``(start, end, text)`` triple; *text* may be
+    the helper function source or a call-site replacement.  Collecting names
+    from all of them gives the set of variables that the extraction actually
+    touched.
+    """
+    names: set = set()
+    for _, g_edits, _ in extraction_groups:
+        for _start, _end, text in g_edits:
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    names.add(node.id)
+    return names
+
+
+def _pyflakes_strip_unused_simple_assigns(source: str, allowed_names: set) -> str:
+    """Remove simple literal initializations that became unused after extraction.
+
+    Only considers assignments whose target name is in *allowed_names* — the
+    set of variable names that the extraction actually touched.  This prevents
+    the cleaner from making unrelated changes to variables that were already
+    unused before the extraction ran.
+
+    Runs pyflakes ``UnusedVariable`` (F841) detection on *source* and strips
+    any ``Assign`` statement whose right-hand side is a pure literal (no
+    function calls, no attribute accesses), so we never discard side effects.
+
+    A ``compile()`` check guards against the rare case where the removed line
+    was the only statement in its block — if the result is invalid Python the
+    original source is returned unchanged.
+    """
+    import pyflakes.api
+    import pyflakes.messages
+
+    class _Collector:
+        def __init__(self):
+            self.linenos: set = set()
+
+        def unexpectedError(self, filename, msg):  # pragma: no cover
+            pass
+
+        def syntaxError(self, filename, msg, lineno, offset, text):  # pragma: no cover
+            pass
+
+        def flake(self, msg):
+            if isinstance(msg, pyflakes.messages.UnusedVariable):
+                self.linenos.add(msg.lineno)
+
+    reporter = _Collector()
+    pyflakes.api.check(source, "<candidate>", reporter=reporter)
+    if not reporter.linenos:
+        return source
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # pragma: no cover
+        return source  # pragma: no cover
+
+    lines_to_remove: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if node.lineno not in reporter.linenos:
+            continue
+        # Restrict to names the extraction actually touched.
+        assigned: List[str] = []
+        _collect_ast_store_names(node.targets[0], assigned)
+        if not assigned or not set(assigned).issubset(allowed_names):
+            continue
+        if _is_pure_literal(node.value):
+            lines_to_remove.update(range(node.lineno, node.end_lineno + 1))
+
+    if not lines_to_remove:
+        return source
+
+    lines = source.splitlines(keepends=True)
+    cleaned = "".join(
+        line for i, line in enumerate(lines, 1) if i not in lines_to_remove
+    )
+    try:
+        compile(cleaned, "<stripped>", "exec")
+    except SyntaxError:
+        return source
+    return cleaned
+
+
 def _missing_free_vars(
     block_src: str, call_srcs: List[str], helper_src: str, source: str
 ) -> set:
@@ -2917,6 +3030,10 @@ class DuplicateExtractor(Refactor):
                 all_pending.append(msg)
 
             if all_edits:
+                _extracted_names = _names_in_edit_texts(extraction_groups)
+                combined = _pyflakes_strip_unused_simple_assigns(
+                    combined, _extracted_names
+                )
                 self._new_source = _lift_and_dedup_imports(combined)
                 self.changes_made.extend(all_pending)
 
