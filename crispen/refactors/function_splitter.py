@@ -911,11 +911,12 @@ class FunctionSplitter(Refactor):
                     task.is_instance_method,
                 )
                 head_lines = source_lines[fi.start_line - 1 : tail_start - 1]
+                sep = "\n\n" if fi.class_name is not None else "\n\n\n"
                 replacement = (
                     "".join(head_lines).rstrip("\n")
                     + "\n"
                     + call_line
-                    + "\n\n\n"
+                    + sep
                     + helper_src
                 )
                 edits.append((fi.start_line, fi.end_line, replacement))
