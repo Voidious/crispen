@@ -2345,6 +2345,18 @@ class DuplicateExtractor(Refactor):
                     helper_source = _strip_helper_docstring(helper_source)
                 call_replacements = extraction["call_site_replacements"]
                 placement = extraction.get("placement", "module_level")
+                # Auto-indent 0-indent helpers for staticmethod: placement.
+                # The LLM sometimes writes a module-level def even when it
+                # selects staticmethod:ClassName.  Inserting 0-indent code
+                # inside the class body ends the class silently and makes all
+                # subsequent methods nested inside the helper — valid syntax
+                # but semantically broken, so compile() does not catch it.
+                if placement.startswith("staticmethod:") and helper_source:
+                    first_code = next(
+                        (ln for ln in helper_source.splitlines() if ln.strip()), ""
+                    )
+                    if first_code and not first_code[0].isspace():
+                        helper_source = textwrap.indent(helper_source, "    ")
                 func_name = extraction["function_name"]
 
                 # Helpers are always file-internal; enforce a leading underscore.
