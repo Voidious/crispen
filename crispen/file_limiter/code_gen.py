@@ -237,6 +237,23 @@ def _collect_name_stores(source: str) -> Set[str]:
     return stores
 
 
+def _find_insertion_point_after_imports_and_docstring(tree: ast.Module) -> int:
+    last_import_line = 0
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            last_import_line = max(last_import_line, node.end_lineno)
+    insert_after = last_import_line
+    if insert_after == 0 and tree.body:
+        first = tree.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            insert_after = first.end_lineno
+    return insert_after
+
+
 def _inject_module_level_imports(source: str, imports: List[str]) -> str:
     """Insert *imports* after the last existing import line in *source*.
 
@@ -252,18 +269,7 @@ def _inject_module_level_imports(source: str, imports: List[str]) -> str:
         tree = ast.parse(source)
     except SyntaxError:
         return "\n".join(sorted(imports)) + "\n\n" + source
-    for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            last_import_line = max(last_import_line, node.end_lineno)
-    insert_after = last_import_line
-    if insert_after == 0 and tree.body:
-        first = tree.body[0]
-        if (
-            isinstance(first, ast.Expr)
-            and isinstance(first.value, ast.Constant)
-            and isinstance(first.value.value, str)
-        ):
-            insert_after = first.end_lineno
+    insert_after = _find_insertion_point_after_imports_and_docstring(tree)
     import_lines = [imp + "\n" for imp in sorted(imports)]
     return "".join(lines[:insert_after] + import_lines + lines[insert_after:])
 
@@ -864,6 +870,10 @@ def _add_re_exports(
     # so flake8 does not flag it as an unused import and Black does not reformat
     # the line (which would break the noqa directive).  Split mixed imports into
     # two lines so that the noqa comment does not suppress warnings for used names.
+    return _insert_re_export_stmts(is_test_file, noqa_names, re_exports, source)
+
+
+def _insert_re_export_stmts(is_test_file, noqa_names, re_exports, source):
     export_stmts: List[str] = []
     for prefix, names in sorted(re_exports.items()):
         sorted_names = sorted(names)
@@ -890,19 +900,7 @@ def _add_re_exports(
         tree = ast.parse(source)
     except SyntaxError:
         return source
-    for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            last_import_line = max(last_import_line, node.end_lineno)
-
-    insert_after = last_import_line
-    if insert_after == 0 and tree.body:
-        first = tree.body[0]
-        if (
-            isinstance(first, ast.Expr)
-            and isinstance(first.value, ast.Constant)
-            and isinstance(first.value.value, str)
-        ):
-            insert_after = first.end_lineno
+    insert_after = _find_insertion_point_after_imports_and_docstring(tree)
 
     return "".join(lines[:insert_after] + export_stmts + lines[insert_after:])
 
@@ -928,6 +926,27 @@ def _topo_depth(graph: Dict[str, Set[str]]) -> Dict[str, int]:
     for node in graph:
         dfs(node)
     return depths
+
+
+def _update_deps_for_scc(
+    deps: Dict[str, Set[str]],
+    target_file: str,
+    scc_wanting: Set[str],
+    scc: Set[str],
+    entity_source_map: Dict[str, str],
+    name_to_target_file: Dict[str, str],
+    file_entity_names: Dict[str, Set[str]],
+    _collect_name_loads,
+) -> None:
+    for wanting_file in scc_wanting:
+        if wanting_file != target_file:
+            deps[wanting_file].add(target_file)
+    for helper_name in scc:
+        src = entity_source_map.get(helper_name, "")
+        for ref_name in _collect_name_loads(src):
+            dep_file = name_to_target_file.get(ref_name)
+            if dep_file and dep_file != target_file and dep_file in file_entity_names:
+                deps[target_file].add(dep_file)
 
 
 def _extract_shared_helpers(
@@ -1013,6 +1032,26 @@ def _extract_shared_helpers(
     # Build the initial inter-file dependency graph from migrated-entity
     # cross-references (before any helper placement).  This is the baseline for
     # the cycle-aware candidate selection below.
+    return _place_helper_scc_group(
+        entity_map,
+        entity_source_map,
+        file_entity_names,
+        migrated_names,
+        name_to_target_file,
+        sccs,
+        wanting,
+    )
+
+
+def _place_helper_scc_group(
+    entity_map,
+    entity_source_map,
+    file_entity_names,
+    migrated_names,
+    name_to_target_file,
+    sccs,
+    wanting,
+):
     file_deps: Dict[str, Set[str]] = {f: set() for f in file_entity_names}
     for target_file, ent_names in file_entity_names.items():
         for ent_name in ent_names:
@@ -1044,19 +1083,16 @@ def _extract_shared_helpers(
             trial_deps: Dict[str, Set[str]] = {
                 f: set(deps) for f, deps in file_deps.items()
             }
-            for wanting_file in scc_wanting:
-                if wanting_file != candidate:
-                    trial_deps[wanting_file].add(candidate)
-            for helper_name in scc:
-                src = entity_source_map.get(helper_name, "")
-                for ref_name in _collect_name_loads(src):
-                    dep_file = name_to_target_file.get(ref_name)
-                    if (
-                        dep_file
-                        and dep_file != candidate
-                        and dep_file in file_entity_names
-                    ):
-                        trial_deps[candidate].add(dep_file)
+            _update_deps_for_scc(
+                trial_deps,
+                candidate,
+                scc_wanting,
+                scc,
+                entity_source_map,
+                name_to_target_file,
+                file_entity_names,
+                _collect_name_loads,
+            )
             if not any(len(s) > 1 for s in find_sccs(trial_deps)):
                 chosen = candidate
                 break
@@ -1065,15 +1101,16 @@ def _extract_shared_helpers(
             continue  # No cycle-free placement — leave helpers in original file.
 
         # Apply the chosen placement: update file_deps for subsequent SCC decisions.
-        for wanting_file in scc_wanting:
-            if wanting_file != chosen:
-                file_deps[wanting_file].add(chosen)
-        for helper_name in scc:
-            src = entity_source_map.get(helper_name, "")
-            for ref_name in _collect_name_loads(src):
-                dep_file = name_to_target_file.get(ref_name)
-                if dep_file and dep_file != chosen and dep_file in file_entity_names:
-                    file_deps[chosen].add(dep_file)
+        _update_deps_for_scc(
+            file_deps,
+            chosen,
+            scc_wanting,
+            scc,
+            entity_source_map,
+            name_to_target_file,
+            file_entity_names,
+            _collect_name_loads,
+        )
 
         # Prepend extracted helpers so they appear before the functions that use them.
         file_entity_names[chosen] = list(scc) + file_entity_names[chosen]
@@ -1171,7 +1208,10 @@ def _prune_inline_redundant_imports(source: str) -> str:
             else:
                 new_line = f"{indent}import {', '.join(alias_strs)}\n"
             line_ops[stmt.lineno] = new_line
+    return _apply_line_replacements(line_ops, lines, source)
 
+
+def _apply_line_replacements(line_ops, lines, source):
     if not line_ops:
         return source
 
@@ -1718,6 +1758,18 @@ def _merge_conftest_sources(existing: str, new_content: str) -> str:
     return result
 
 
+def _init_rewrite_state(src: str, rewrites: Dict[str, str]):
+    if not rewrites:
+        return src
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+    lines = src.splitlines(keepends=True)
+    edits: List[Tuple[int, int, int, str]] = []
+    return tree, lines, edits
+
+
 def _rewrite_module_var_names(src: str, rewrites: Dict[str, str]) -> str:
     """Replace bare ``Name`` loads with ``module.name`` attribute accesses.
 
@@ -1736,18 +1788,10 @@ def _rewrite_module_var_names(src: str, rewrites: Dict[str, str]) -> str:
     callers can fall back to direct-import semantics rather than corrupt
     the output.
     """
-    if not rewrites:
-        return src
-    try:
-        tree = ast.parse(src)
-    except SyntaxError:
-        return src
-
-    lines = src.splitlines(keepends=True)
-
-    # Collect (lineno, col_offset, end_col_offset, new_text).
-    # ast uses 1-indexed lineno and 0-indexed col_offset / end_col_offset.
-    edits: List[Tuple[int, int, int, str]] = []
+    _init_result = _init_rewrite_state(src, rewrites)
+    if isinstance(_init_result, str):
+        return _init_result
+    tree, lines, edits = _init_result
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Name)
@@ -1800,14 +1844,10 @@ def _rewrite_module_level_stores(src: str, rewrites: Dict[str, str]) -> str:
     canonical value in the sub-file rather than creating an orphaned local
     binding.
     """
-    if not rewrites:
-        return src
-    try:
-        tree = ast.parse(src)
-    except SyntaxError:
-        return src
-    lines = src.splitlines(keepends=True)
-    edits: List[Tuple[int, int, int, str]] = []
+    _init_result = _init_rewrite_state(src, rewrites)
+    if isinstance(_init_result, str):
+        return _init_result
+    tree, lines, edits = _init_result
     for node in tree.body:
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -1935,6 +1975,42 @@ def generate_file_splits(
     # For test-file subdir splits the original test file stays on disk (runner.py
     # does not redirect it to __init__.py), so non-migrated names still live in
     # the original file (e.g. "test_runner.py"), not in the package __init__.py.
+    return _compute_file_splits(
+        all_entity_names,
+        classified,
+        entity_map,
+        entity_source_map,
+        has_main,
+        import_infos,
+        is_test_file,
+        original_basename,
+        original_path,
+        plan,
+        post_source,
+        pytest_conftest,
+        reexport_mode,
+        shebang,
+        subdir_name,
+    )
+
+
+def _compute_file_splits(
+    all_entity_names,
+    classified,
+    entity_map,
+    entity_source_map,
+    has_main,
+    import_infos,
+    is_test_file,
+    original_basename,
+    original_path,
+    plan,
+    post_source,
+    pytest_conftest,
+    reexport_mode,
+    shebang,
+    subdir_name,
+):
     non_migrated_home = (
         Path(original_path).name
         if (subdir_name and is_test_file)

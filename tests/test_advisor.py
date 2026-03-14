@@ -127,11 +127,9 @@ def test_plan_api_key_error_propagates(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
-def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
-    """set_2 groups only: no set3 call; propose + assign = 2 LLM calls."""
+def _setup_mock_llm_calls(
+    mock_key, mock_client, mock_call, *, entities=None, set_2_groups=None
+):
     mock_key.return_value = "key"
     mock_client.return_value = MagicMock()
     mock_call.side_effect = [
@@ -139,9 +137,18 @@ def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
         {"placements": [{"group_id": 0, "target_file": "utils.py"}]},
     ]
     c = _classified(
-        entities=[_make_entity("foo", 1, 10)],
-        set_2_groups=[["foo"]],
+        entities=entities or [_make_entity("foo", 1, 10)],
+        set_2_groups=set_2_groups or [["foo"]],
     )
+    return c, mock_call
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
+    """set_2 groups only: no set3 call; propose + assign = 2 LLM calls."""
+    c, mock_call = _setup_mock_llm_calls(mock_key, mock_client, mock_call)
     plan = advise_file_limiter(c, "src/big.py", _CONFIG)
 
     assert plan.abort is False
@@ -563,17 +570,7 @@ def test_plan_placement_prev_failure_appended_to_prompt(
     mock_key, mock_client, mock_call
 ):
     """prev_placement_failure is appended to the assignment prompt (last call)."""
-    mock_key.return_value = "key"
-    mock_client.return_value = MagicMock()
-    mock_call.side_effect = [
-        _propose_ok("utils.py"),
-        {"placements": [{"group_id": 0, "target_file": "utils.py"}]},
-    ]
-
-    c = _classified(
-        entities=[_make_entity("foo", 1, 10)],
-        set_2_groups=[["foo"]],
-    )
+    c, mock_call = _setup_mock_llm_calls(mock_key, mock_client, mock_call)
     advise_file_limiter(
         c, "src/big.py", _CONFIG, prev_placement_failure="sentinel text"
     )
@@ -1370,14 +1367,7 @@ def test_assign_placements_chunk_no_counter(mock_client, mock_call):
     assert result[0].target_file == "utils.py"
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_assign_placements_chunk_subdir_name(mock_client, mock_call):
-    """subdir_name is included in the prompt and suppresses the plain directory rule."""
-    mock_client.return_value = MagicMock()
-    mock_call.return_value = {
-        "placements": [{"group_id": 0, "target_file": "detection_flow.py"}]
-    }
+def _run_assign_placements_chunk_test(mock_client, subdir_name="duplicate_extractor"):
     c = _classified(entities=[_make_entity("foo", 1, 5)])
     result = _assign_placements_chunk(
         [["foo"]],
@@ -1386,10 +1376,22 @@ def test_assign_placements_chunk_subdir_name(mock_client, mock_call):
         frozenset(),
         mock_client(),
         _CONFIG,
-        subdir_name="duplicate_extractor",
+        subdir_name=subdir_name,
     )
     assert result is not None
     assert result[0].target_file == "detection_flow.py"
+    return result
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+def test_assign_placements_chunk_subdir_name(mock_client, mock_call):
+    """subdir_name is included in the prompt and suppresses the plain directory rule."""
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = {
+        "placements": [{"group_id": 0, "target_file": "detection_flow.py"}]
+    }
+    result = _run_assign_placements_chunk_test(mock_client)
     # The prompt should mention the subdirectory and warn against repeating its name.
     prompt = mock_call.call_args[0][6][0]["content"]
     assert "duplicate_extractor/" in prompt
@@ -1406,18 +1408,7 @@ def test_assign_placements_chunk_strips_subdir_prefix(mock_client, mock_call):
             {"group_id": 0, "target_file": "duplicate_extractor/detection_flow.py"}
         ]
     }
-    c = _classified(entities=[_make_entity("foo", 1, 5)])
-    result = _assign_placements_chunk(
-        [["foo"]],
-        c,
-        "tests/test_duplicate_extractor.py",
-        frozenset(),
-        mock_client(),
-        _CONFIG,
-        subdir_name="duplicate_extractor",
-    )
-    assert result is not None
-    assert result[0].target_file == "detection_flow.py"
+    result = _run_assign_placements_chunk_test(mock_client)
 
 
 # ---------------------------------------------------------------------------
@@ -1918,6 +1909,23 @@ def test_refine_merge_tiny_verbose(mock_client, mock_call, capsys):
 # ---------------------------------------------------------------------------
 
 
+def _run_assign_placements_chunk_with_existing(
+    mock_client, existing_files, comment=None
+):
+    entity = _make_entity("foo", 1, 10)
+    c = _classified(entities=[entity], set_2_groups=[["foo"]])
+    result = _assign_placements_chunk(
+        [["foo"]],
+        c,
+        "src/big.py",
+        frozenset(existing_files),
+        mock_client,
+        _CONFIG,
+        proposed_files=None,
+    )
+    return result
+
+
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
 def test_assign_placements_chunk_existing_files_exclude_section(mock_client, mock_call):
@@ -1926,16 +1934,9 @@ def test_assign_placements_chunk_existing_files_exclude_section(mock_client, moc
     mock_call.return_value = {
         "placements": [{"group_id": 0, "target_file": "helpers.py"}]
     }
-    entity = _make_entity("foo", 1, 10)
-    c = _classified(entities=[entity], set_2_groups=[["foo"]])
-    result = _assign_placements_chunk(
-        [["foo"]],
-        c,
-        "src/big.py",
-        frozenset({"existing.py"}),  # non-empty existing_files
+    result = _run_assign_placements_chunk_with_existing(
         mock_client(),
-        _CONFIG,
-        proposed_files=None,  # free-form mode
+        {"existing.py"},  # non-empty existing_files
     )
     assert result is not None
     assert result[0].target_file == "helpers.py"
@@ -1951,16 +1952,9 @@ def test_assign_placements_chunk_target_in_existing_files_returns_none(
     mock_call.return_value = {
         "placements": [{"group_id": 0, "target_file": "existing.py"}]
     }
-    entity = _make_entity("foo", 1, 10)
-    c = _classified(entities=[entity], set_2_groups=[["foo"]])
-    result = _assign_placements_chunk(
-        [["foo"]],
-        c,
-        "src/big.py",
-        frozenset({"existing.py"}),  # target collides with existing file
+    result = _run_assign_placements_chunk_with_existing(
         mock_client(),
-        _CONFIG,
-        proposed_files=None,  # free-form mode
+        {"existing.py"},  # target collides with existing file
     )
     assert result is None
 
