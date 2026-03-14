@@ -425,6 +425,21 @@ def _filter_maximal_groups(groups: List[List[_SeqInfo]]) -> List[List[_SeqInfo]]
     return result
 
 
+def _has_internal_overlap(seqs: List[_SeqInfo]) -> bool:
+    """Return True if any two sequences in the group overlap each other.
+
+    Overlapping sequences within a group indicate sequential repetition
+    (e.g. [A,B] and [B,C] both matching) rather than true duplication at
+    distinct call sites.  Extracting a helper from such a group would leave
+    part of the original pattern unreplaced.
+    """
+    sorted_seqs = sorted(seqs, key=lambda s: s.start_line)
+    for i in range(len(sorted_seqs) - 1):
+        if sorted_seqs[i].end_line >= sorted_seqs[i + 1].start_line:
+            return True
+    return False
+
+
 def _find_duplicate_groups(
     sequences: List[_SeqInfo],
     changed_ranges: List[Tuple[int, int]],
@@ -438,6 +453,8 @@ def _find_duplicate_groups(
         if len(seqs) < 2:
             continue
         if not any(_overlaps_diff(s, changed_ranges) for s in seqs):
+            continue
+        if _has_internal_overlap(seqs):
             continue
         groups.append(seqs)
     groups = _filter_maximal_groups(groups)

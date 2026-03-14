@@ -27,6 +27,7 @@ from crispen.refactors.duplicate_extractor import (
     _collect_called_names,
     _filter_maximal_groups,
     _find_duplicate_groups,
+    _has_internal_overlap,
     _find_insertion_point,
     _skip_class_docstring,
     _generate_no_arg_call,
@@ -335,6 +336,54 @@ def test_find_duplicate_groups_valid():
     groups = _find_duplicate_groups([s1, s2], [(1, 3)])
     assert len(groups) == 1
     assert set(id(s) for s in groups[0]) == {id(s1), id(s2)}
+
+
+# ---------------------------------------------------------------------------
+# _has_internal_overlap
+# ---------------------------------------------------------------------------
+
+
+def test_has_internal_overlap_no_overlap():
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1")
+    assert not _has_internal_overlap([s1, s2])
+
+
+def test_has_internal_overlap_adjacent_no_overlap():
+    # end_line of s1 == start_line - 1 of s2: not overlapping
+    s1 = _SeqInfo([], 1, 5, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 6, 10, "<module>", "", "fp1")
+    assert not _has_internal_overlap([s1, s2])
+
+
+def test_has_internal_overlap_touching():
+    # end_line of s1 == start_line of s2: overlap (shared boundary line)
+    s1 = _SeqInfo([], 1, 5, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 5, 9, "<module>", "", "fp1")
+    assert _has_internal_overlap([s1, s2])
+
+
+def test_has_internal_overlap_proper_overlap():
+    s1 = _SeqInfo([], 27, 30, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 29, 32, "<module>", "", "fp1")
+    assert _has_internal_overlap([s1, s2])
+
+
+def test_has_internal_overlap_unsorted_order():
+    # Sequences given in reverse order — function must sort before checking.
+    s1 = _SeqInfo([], 29, 32, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 27, 30, "<module>", "", "fp1")
+    assert _has_internal_overlap([s1, s2])
+
+
+def test_find_duplicate_groups_skips_internally_overlapping():
+    # Simulate the op_range pattern: two pairs [A,B] and [B,C] that share a
+    # statement.  The group has internal overlap and must be filtered out.
+    s1 = _SeqInfo([], 27, 30, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 29, 32, "<module>", "", "fp1")
+    # Diff covers both sequences.
+    groups = _find_duplicate_groups([s1, s2], [(27, 32)])
+    assert groups == []
 
 
 def test_find_duplicate_groups_caps_at_max_groups():
