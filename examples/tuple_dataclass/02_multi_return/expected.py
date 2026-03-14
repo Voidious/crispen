@@ -17,5 +17,5 @@ def _parse_color(text):
         g = int(text[3:5], 16)
         b = int(text[5:7], 16)
         a = 255
-        return ParseColorResult(r = r, g = g, b = b, a = a)
-    return ParseColorResult(r = 128, g = 128, b = 128, a = 255)
+        return ParseColorResult(r=r, g=g, b=b, a=a)
+    return ParseColorResult(r=128, g=128, b=128, a=255)

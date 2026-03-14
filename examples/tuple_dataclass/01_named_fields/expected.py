@@ -17,4 +17,4 @@ def _parse_config(path):
     port = int(data["port"])
     db = data.get("database", "default")
     timeout = float(data.get("timeout", 30))
-    return ParseConfigResult(host = host, port = port, db = db, timeout = timeout)
+    return ParseConfigResult(host=host, port=port, db=db, timeout=timeout)
