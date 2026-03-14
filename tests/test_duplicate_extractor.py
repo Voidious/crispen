@@ -5652,6 +5652,43 @@ def test_llm_verify_timeout_silent(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Underscore enforcement on extracted helper names
+# ---------------------------------------------------------------------------
+
+
+def test_llm_name_without_underscore_is_prefixed(monkeypatch):
+    """LLM returns a name without a leading '_'; extractor prepends one."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "helper",  # no underscore
+                    "placement": "module_level",
+                    "helper_source": "def helper(data):\n    pass\n",
+                    "call_site_replacements": [
+                        "    helper(data)\n",
+                        "    helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _DUP_RANGES, source=_DUP_SOURCE, extraction_retries=0, llm_verify_retries=0
+        )
+
+    assert de._new_source is not None
+    assert "def _helper(" in de._new_source
+    assert "def helper(" not in de._new_source
+    assert "_helper(data)" in de._new_source
+
+
+# ---------------------------------------------------------------------------
 # _would_create_proxy_wrappers
 # ---------------------------------------------------------------------------
 

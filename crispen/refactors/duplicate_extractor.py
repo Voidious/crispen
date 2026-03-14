@@ -885,6 +885,10 @@ def _llm_verify_extraction(
         "7. No line from the helper body is duplicated verbatim in the call site "
         "replacement. If setup lines were extracted into the helper, they must not "
         "also appear before or after the call — otherwise the extraction is wrong.\n"
+        "8. Does the function name clearly and accurately describe what the body "
+        "does? Flag the name if it is misleading, too generic, or omits a crucial "
+        "detail — for example, an important side-effect that the name gives no hint "
+        "of (e.g. a function named 'compute_total' that also writes to a database).\n"
         "If correct, set is_correct=True and issues=[]. "
         "Otherwise set is_correct=False and list each specific issue."
     )
@@ -2333,6 +2337,16 @@ class DuplicateExtractor(Refactor):
                 call_replacements = extraction["call_site_replacements"]
                 placement = extraction.get("placement", "module_level")
                 func_name = extraction["function_name"]
+
+                # Helpers are always file-internal; enforce a leading underscore.
+                if not func_name.startswith("_"):
+                    _old_name = func_name
+                    func_name = "_" + func_name
+                    _rename_pat = re.compile(r"\b" + re.escape(_old_name) + r"\b")
+                    helper_source = _rename_pat.sub(func_name, helper_source)
+                    call_replacements = [
+                        _rename_pat.sub(func_name, r) for r in call_replacements
+                    ]
 
                 _check_failed = False
                 _failures: List[str] = []
