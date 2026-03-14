@@ -342,9 +342,12 @@ def run_file_limiter(
     existing_files: frozenset = frozenset(
         p.name for p in source_dir.glob("*.py") if p.name != source_name
     )
-    existing_dirs: frozenset = frozenset(
-        p.name for p in source_dir.iterdir() if p.is_dir()
-    )
+    try:
+        existing_dirs: frozenset = frozenset(
+            p.name for p in source_dir.iterdir() if p.is_dir()
+        )
+    except FileNotFoundError:
+        existing_dirs = frozenset()
 
     if verbose:
         n_set2 = len(classified.set_2_groups)

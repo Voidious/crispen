@@ -14,6 +14,7 @@ import libcst as cst
 from libcst.metadata import MetadataWrapper, PositionProvider
 
 from .. import llm_client as _llm_client
+from ..import_sort import _sort_imports_pep8
 from .base import Refactor
 
 _MODEL = "claude-sonnet-4-6"
@@ -259,6 +260,8 @@ class _SequenceCollector(cst.CSTVisitor):
                 start_line = stmt_info[start_i][1]
                 end_line = stmt_info[end_i - 1][2]
                 seq_source = "".join(self._source_lines[start_line - 1 : end_line])
+                if _seq_source_contains_yield(seq_source):
+                    continue
                 self.sequences.append(
                     _SeqInfo(
                         stmts=window,
@@ -422,6 +425,21 @@ def _filter_maximal_groups(groups: List[List[_SeqInfo]]) -> List[List[_SeqInfo]]
     return result
 
 
+def _has_internal_overlap(seqs: List[_SeqInfo]) -> bool:
+    """Return True if any two sequences in the group overlap each other.
+
+    Overlapping sequences within a group indicate sequential repetition
+    (e.g. [A,B] and [B,C] both matching) rather than true duplication at
+    distinct call sites.  Extracting a helper from such a group would leave
+    part of the original pattern unreplaced.
+    """
+    sorted_seqs = sorted(seqs, key=lambda s: s.start_line)
+    for i in range(len(sorted_seqs) - 1):
+        if sorted_seqs[i].end_line >= sorted_seqs[i + 1].start_line:
+            return True
+    return False
+
+
 def _find_duplicate_groups(
     sequences: List[_SeqInfo],
     changed_ranges: List[Tuple[int, int]],
@@ -435,6 +453,8 @@ def _find_duplicate_groups(
         if len(seqs) < 2:
             continue
         if not any(_overlaps_diff(s, changed_ranges) for s in seqs):
+            continue
+        if _has_internal_overlap(seqs):
             continue
         groups.append(seqs)
     groups = _filter_maximal_groups(groups)
@@ -665,29 +685,23 @@ def _llm_extract(
     failures_note = ""
     if prev_failures:
         failures_str = "\n".join(f"- {f}" for f in prev_failures)
-        if prev_output is not None:
-            prior_helper = prev_output.get("helper_source", "")
-            prior_repls = prev_output.get("call_site_replacements", [])
-            repls_text = "\n".join(
-                f"  [{i + 1}] {r!r}" for i, r in enumerate(prior_repls)
-            )
-            failures_note = (
-                f"\n\nThe previous extraction attempt produced:\n\n"
-                f"helper_source:\n```python\n{prior_helper}```\n\n"
-                f"call_site_replacements:\n{repls_text}\n\n"
-                f"But failed verification with these issues:\n{failures_str}\n\n"
-                f"Please correct these issues in your new attempt."
-            )
-        else:
-            failures_note = (
-                f"\n\nThe previous extraction attempt failed. Please correct these "
-                f"issues:\n{failures_str}"
-            )
+        prior_helper = prev_output.get("helper_source", "")
+        prior_repls = prev_output.get("call_site_replacements", [])
+        repls_text = "\n".join(f"  [{i + 1}] {r!r}" for i, r in enumerate(prior_repls))
+        failures_note = (
+            f"\n\nThe previous extraction attempt produced:\n\n"
+            f"helper_source:\n```python\n{prior_helper}```\n\n"
+            f"call_site_replacements:\n{repls_text}\n\n"
+            f"But failed these checks:\n{failures_str}\n\n"
+            f"Please correct these issues in your new attempt."
+        )
     class_scopes = {s.class_scope for s in group}
     all_same_class = len(class_scopes) == 1 and None not in class_scopes
     if all_same_class:
+        same_class_name = next(iter(class_scopes))
         staticmethod_instruction = (
-            "If all call sites are inside the same class, use a @staticmethod. "
+            f"All call sites are inside class '{same_class_name}'. "
+            f"You MUST use placement 'staticmethod:{same_class_name}'. "
         )
     else:
         staticmethod_instruction = (
@@ -847,14 +861,20 @@ def _llm_verify_extraction(
         f"Replacement for block {i + 1}:\n```python\n{r.rstrip()}\n```"
         for i, r in enumerate(call_replacements)
     )
-    snippet = full_source[:2000] if len(full_source) > 2000 else full_source
+    src_lines = full_source.splitlines(keepends=True)
+    min_start = min(s.start_line for s in group)
+    max_end = max(s.end_line for s in group)
+    window_start = max(0, min_start - 30)
+    window_end = min(len(src_lines), max_end + 100)
+    snippet = "".join(src_lines[window_start:window_end])
     prompt = (
         "Verify that the following helper function extraction is semantically "
         "correct by tracing through the code carefully.\n\n"
         f"Original duplicate blocks:\n{blocks_text}\n\n"
         f"Extracted helper:\n```python\n{helper_source.rstrip()}\n```\n\n"
         f"Call site replacements:\n{replacements_text}\n\n"
-        f"File context (truncated):\n```python\n{snippet}\n```\n\n"
+        f"Source context around duplicate blocks "
+        f"(lines {window_start + 1}–{window_end}):\n```python\n{snippet}\n```\n\n"
         "Check each of the following:\n"
         "1. Every variable read (but not locally assigned) in the original block "
         "is passed as a parameter to the helper\n"
@@ -871,6 +891,13 @@ def _llm_verify_extraction(
         "Same-type variables (e.g. two dicts, two strings) that are both in scope "
         "are a swap risk: confirm neither was substituted for the other across call "
         "sites.\n"
+        "7. No line from the helper body is duplicated verbatim in the call site "
+        "replacement. If setup lines were extracted into the helper, they must not "
+        "also appear before or after the call — otherwise the extraction is wrong.\n"
+        "8. Does the function name clearly and accurately describe what the body "
+        "does? Flag the name if it is misleading, too generic, or omits a crucial "
+        "detail — for example, an important side-effect that the name gives no hint "
+        "of (e.g. a function named 'compute_total' that also writes to a database).\n"
         "If correct, set is_correct=True and issues=[]. "
         "Otherwise set is_correct=False and list each specific issue."
     )
@@ -911,6 +938,174 @@ def _normalize_replacement_indentation(seq: _SeqInfo, replacement: str) -> str:
     if not expected_indent:
         return dedented
     return textwrap.indent(dedented, expected_indent)
+
+
+def _collect_ast_store_names(node: ast.AST, names: List[str]) -> None:
+    """Recursively collect Name ids from an assignment target (Store context)."""
+    if isinstance(node, ast.Name):
+        names.append(node.id)
+    elif isinstance(node, (ast.Tuple, ast.List)):
+        for elt in node.elts:
+            _collect_ast_store_names(elt, names)
+
+
+def _replace_unused_in_target(
+    target: ast.AST, following_src: str
+) -> Tuple[ast.AST, bool, bool]:
+    """Replace unused Name nodes in *target* with ``_``.
+
+    Returns ``(new_target, all_replaced, any_replaced)`` where:
+    - *all_replaced*: every name in the target was replaced (all unused).
+    - *any_replaced*: at least one name was replaced.
+
+    Non-Name, non-Tuple/List targets (Attribute, Subscript, …) are treated as
+    *used* so we never accidentally strip an assignment we cannot analyse.
+    """
+    if isinstance(target, ast.Name):
+        if re.search(r"\b" + re.escape(target.id) + r"\b", following_src):
+            return target, False, False  # used → keep
+        return ast.Name(id="_", ctx=ast.Store()), True, True  # unused → _
+    if isinstance(target, (ast.Tuple, ast.List)):
+        new_elts: List[ast.AST] = []
+        all_replaced = True
+        any_replaced = False
+        for elt in target.elts:
+            new_elt, elt_all, elt_any = _replace_unused_in_target(elt, following_src)
+            new_elts.append(new_elt)
+            if not elt_all:
+                all_replaced = False
+            if elt_any:
+                any_replaced = True
+        new_target = type(target)(elts=new_elts, ctx=ast.Store())
+        return new_target, all_replaced, any_replaced
+    # Attribute, Subscript, Starred, etc. — treat as used.
+    return target, False, False
+
+
+def _scope_end_line(source_lines: List[str], scope: str, after_line: int) -> int:
+    """Return the exclusive slice index into *source_lines* for the end of *scope*.
+
+    ``after_line`` is the 1-based line number of the last line of the replaced
+    block.  The returned index is suitable for ``source_lines[after_line:idx]``
+    to get only the lines inside the enclosing scope that follow the block.
+
+    For ``"<module>"`` scope the whole rest of the file is in scope, so
+    ``len(source_lines)`` is returned.  For named function/class scopes the
+    innermost definition whose name matches *scope* and that contains
+    *after_line* is located via the AST; its end line is returned as the
+    exclusive slice bound (1-based end_lineno used directly as a 0-based
+    exclusive index is correct because line N is at index N-1, so slicing up
+    to index N includes line N).  Falls back to ``len(source_lines)`` on any
+    parse error or if no matching scope is found.
+    """
+    if scope == "<module>":
+        return len(source_lines)
+
+    source = "".join(source_lines)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return len(source_lines)
+
+    # ast.walk is BFS, so outer scopes are visited before inner ones.  Always
+    # overwriting best_end means the last match wins — which is the innermost
+    # (smallest) scope that still contains after_line.
+    best_end: int = len(source_lines)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if node.name != scope:
+            continue
+        if not (node.lineno <= after_line <= node.end_lineno):
+            continue
+        best_end = node.end_lineno
+
+    return best_end
+
+
+def _strip_unused_call_assignments(replacement: str, following_lines: List[str]) -> str:
+    """Clean up unused assignment targets in a call-site replacement.
+
+    For each ``Assign`` node whose right-hand side is a ``Call``:
+
+    * **Single target** — unused ``Name`` elements in the target are replaced
+      with ``_``.  If every element is unused the whole assignment is dropped
+      and only the call expression is emitted.  Example::
+
+          result = _helper(x)          →  _helper(x)
+          a, b   = _helper(x)  (b used)  →  a, _ = _helper(x)
+
+    * **Chained assignment** (``a = b = call()``) — stripped to just the call
+      only when every name across every target is unused; otherwise left alone.
+
+    Augmented (``+=``) and annotated assignments are never touched.  Assignment
+    targets that are not plain names or tuples/lists (e.g. ``self.x``) are
+    treated as *used* so we never accidentally remove live assignments.
+
+    This prevents flake8 F841 "local variable assigned but never used" errors
+    introduced by the extraction.
+    """
+    following_src = "".join(following_lines)
+    try:
+        dedented = textwrap.dedent(replacement)
+        tree = ast.parse(dedented)
+    except SyntaxError:
+        return replacement
+
+    # Build a list of (start_ln, end_ln, new_src) edits.  new_src is the
+    # replacement text for that statement (without leading indentation).
+    edits: List[Tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        value_node = node.value
+        if isinstance(value_node, ast.Await) and isinstance(value_node.value, ast.Call):
+            pass  # treat `result = await helper(...)` like `result = helper(...)`
+        elif not isinstance(value_node, ast.Call):
+            continue
+
+        call_src = ast.unparse(value_node)
+
+        if len(node.targets) == 1:
+            new_target, all_replaced, any_replaced = _replace_unused_in_target(
+                node.targets[0], following_src
+            )
+            if all_replaced:
+                edits.append((node.lineno, node.end_lineno, call_src))
+            elif any_replaced:
+                edits.append(
+                    (
+                        node.lineno,
+                        node.end_lineno,
+                        ast.unparse(new_target) + " = " + call_src,
+                    )
+                )
+        else:
+            # Chained assignment: strip only when every name is unused.
+            all_names: List[str] = []
+            for t in node.targets:
+                _collect_ast_store_names(t, all_names)
+            if not all_names:
+                continue
+            if not any(
+                re.search(r"\b" + re.escape(n) + r"\b", following_src)
+                for n in all_names
+            ):
+                edits.append((node.lineno, node.end_lineno, call_src))
+
+    if not edits:
+        return replacement
+
+    # Determine the leading indentation from the first non-empty line.
+    first_content = next((ln for ln in replacement.splitlines() if ln.strip()), "")
+    indent = first_content[: len(first_content) - len(first_content.lstrip())]
+
+    # Apply edits in reverse line order so earlier indices stay valid.
+    dedented_lines = dedented.splitlines(keepends=True)
+    for start_ln, end_ln, new_src in sorted(edits, key=lambda x: x[0], reverse=True):
+        dedented_lines[start_ln - 1 : end_ln] = [new_src + "\n"]
+
+    return textwrap.indent("".join(dedented_lines), indent)
 
 
 _MUTABLE_CONSTRUCTORS = frozenset({"set", "list", "dict", "frozenset", "bytearray"})
@@ -971,6 +1166,21 @@ def _collect_called_attr_names(source: str) -> set:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
+
+
+def _has_funcdef(func_name: str, source: str) -> bool:
+    """Return True if func_name is defined anywhere in source."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == func_name
+        ):
+            return True
+    return False
 
 
 def _has_call_to(func_name: str, source: str) -> bool:
@@ -1110,6 +1320,119 @@ def _pyflakes_new_undefined_names(original: str, candidate: str) -> set:
     return after.names - before.names
 
 
+def _is_pure_literal(node: ast.expr) -> bool:
+    """Return True if *node* is a side-effect-free literal expression.
+
+    Covers ``ast.Constant`` (numbers, strings, bytes, True/False/None) and
+    recursively-pure container literals (list, tuple, set, dict).  Anything
+    involving a function call or attribute access returns False.
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_pure_literal(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            (k is None or _is_pure_literal(k)) and _is_pure_literal(v)
+            for k, v in zip(node.keys, node.values)
+        )
+    return False
+
+
+def _names_in_edit_texts(extraction_groups) -> set:
+    """Return all bare ``Name`` ids found in every edit text of *extraction_groups*.
+
+    ``extraction_groups`` is the list of ``(func_name, group_edits, msg)``
+    tuples accepted at the end of ``DuplicateExtractor._transform``.  Each
+    ``group_edits`` entry is a ``(start, end, text)`` triple; *text* may be
+    the helper function source or a call-site replacement.  Collecting names
+    from all of them gives the set of variables that the extraction actually
+    touched.
+    """
+    names: set = set()
+    for _, g_edits, _ in extraction_groups:
+        for _start, _end, text in g_edits:
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    names.add(node.id)
+    return names
+
+
+def _pyflakes_strip_unused_simple_assigns(source: str, allowed_names: set) -> str:
+    """Remove simple literal initializations that became unused after extraction.
+
+    Only considers assignments whose target name is in *allowed_names* — the
+    set of variable names that the extraction actually touched.  This prevents
+    the cleaner from making unrelated changes to variables that were already
+    unused before the extraction ran.
+
+    Runs pyflakes ``UnusedVariable`` (F841) detection on *source* and strips
+    any ``Assign`` statement whose right-hand side is a pure literal (no
+    function calls, no attribute accesses), so we never discard side effects.
+
+    A ``compile()`` check guards against the rare case where the removed line
+    was the only statement in its block — if the result is invalid Python the
+    original source is returned unchanged.
+    """
+    import pyflakes.api
+    import pyflakes.messages
+
+    class _Collector:
+        def __init__(self):
+            self.linenos: set = set()
+
+        def unexpectedError(self, filename, msg):  # pragma: no cover
+            pass
+
+        def syntaxError(self, filename, msg, lineno, offset, text):  # pragma: no cover
+            pass
+
+        def flake(self, msg):
+            if isinstance(msg, pyflakes.messages.UnusedVariable):
+                self.linenos.add(msg.lineno)
+
+    reporter = _Collector()
+    pyflakes.api.check(source, "<candidate>", reporter=reporter)
+    if not reporter.linenos:
+        return source
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # pragma: no cover
+        return source  # pragma: no cover
+
+    lines_to_remove: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if node.lineno not in reporter.linenos:
+            continue
+        # Restrict to names the extraction actually touched.
+        assigned: List[str] = []
+        _collect_ast_store_names(node.targets[0], assigned)
+        if not assigned or not set(assigned).issubset(allowed_names):
+            continue
+        if _is_pure_literal(node.value):
+            lines_to_remove.update(range(node.lineno, node.end_lineno + 1))
+
+    if not lines_to_remove:
+        return source
+
+    lines = source.splitlines(keepends=True)
+    cleaned = "".join(
+        line for i, line in enumerate(lines, 1) if i not in lines_to_remove
+    )
+    try:
+        compile(cleaned, "<stripped>", "exec")
+    except SyntaxError:
+        return source
+    return cleaned
+
+
 def _missing_free_vars(
     block_src: str, call_srcs: List[str], helper_src: str, source: str
 ) -> set:
@@ -1212,6 +1535,39 @@ def _seq_ends_with_return(seq: _SeqInfo) -> bool:
     if isinstance(last.value, ast.Constant) and last.value.value is None:
         return False
     return True
+
+
+def _seq_source_contains_yield(source: str) -> bool:
+    """Return True if *source* contains ``yield`` or ``yield from`` outside
+    any nested function definition.
+
+    Sequences with a yield cannot be safely extracted into a plain helper
+    function: extraction would make the helper a generator, forcing call sites
+    to iterate via ``for``/``async for`` instead of calling it directly.  This
+    is a semantic transformation (e.g. ``async with X as c: yield c`` →
+    ``async for c in helper(): yield c``) that the extractor must not attempt.
+    """
+    wrapped = "def _f():\n" + textwrap.indent(textwrap.dedent(source), "    ")
+    try:
+        tree = ast.parse(wrapped)
+    except SyntaxError:
+        return False
+    if not tree.body or not isinstance(
+        tree.body[0], ast.FunctionDef
+    ):  # pragma: no cover
+        return False
+
+    def _walk(nodes):
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue  # don't cross into nested scope
+            if isinstance(node, (ast.Yield, ast.YieldFrom)):
+                return True
+            if _walk(ast.iter_child_nodes(node)):
+                return True
+        return False
+
+    return _walk(tree.body[0].body)
 
 
 def _replacement_contains_return(replacement: str) -> bool:
@@ -1319,6 +1675,171 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
     return bool(new_helper_imports & orig_params)
 
 
+def _lift_and_dedup_imports(source: str) -> str:
+    """Lift misplaced module-level imports to the import block and deduplicate.
+
+    When a helper is inserted before a function that is not the first in the
+    file, its leading ``from X import Y`` lines land after the first
+    ``def``/``class``, violating PEP 8.  When a helper re-imports names
+    already present at the top, flake8 reports F811.  This function fixes both:
+
+    1. Collect every simple, unindented ``from X import …`` / ``import X``
+       line from anywhere in the file.
+    2. Merge names for the same module (deduplicate).
+    3. Emit the merged set within the top-of-file import block (before the
+       first ``def``/``class``), removing all later occurrences.
+
+    Only single-line imports without parentheses, backslash continuations, or
+    inline comments are handled.  Indented imports (``if TYPE_CHECKING:``,
+    function-local lazy imports, etc.) and wildcard imports are left untouched.
+    """
+    lines = source.splitlines(keepends=True)
+    n = len(lines)
+
+    # ── pass 1: find the import block boundary ──────────────────────────────
+    # The import block ends at the first unindented def/class line.
+    first_funcdef_idx = n
+    for i, line in enumerate(lines):
+        if line[:1] in (" ", "\t"):
+            continue
+        if re.match(r"^(?:async\s+def|def|class)\s", line.strip()):
+            first_funcdef_idx = i
+            break
+
+    # ── pass 2: collect simple unindented import lines ──────────────────────
+    _FROM_RE = re.compile(r"^from\s+(\S+)\s+import\s+([^(\\#]+)$")
+    _PLAIN_RE = re.compile(r"^import\s+(\S+)$")
+
+    all_imports: List[Tuple[int, str]] = []  # (line_idx, stripped_text)
+    import_indices: set = set()
+    last_block_import_idx = -1
+
+    for i, line in enumerate(lines):
+        if line[:1] in (" ", "\t"):
+            continue
+        stripped = line.strip()
+        mf = _FROM_RE.match(stripped)
+        if mf:
+            names_str = mf.group(2).strip()
+            if not names_str or names_str == "*":
+                continue
+            names = [nm.strip() for nm in names_str.split(",") if nm.strip()]
+            if not names:
+                continue
+            all_imports.append((i, stripped))
+            import_indices.add(i)
+            if i < first_funcdef_idx:
+                last_block_import_idx = i
+            continue
+        mp = _PLAIN_RE.match(stripped)
+        if mp:
+            all_imports.append((i, stripped))
+            import_indices.add(i)
+            if i < first_funcdef_idx:
+                last_block_import_idx = i
+
+    if not all_imports:
+        return source
+
+    # ── pass 3: build merged import map (ordered by first appearance) ───────
+    from_map: Dict[str, List[str]] = {}  # module -> merged name list
+    from_order: List[str] = []
+    plain_order: List[str] = []
+    plain_seen: set = set()
+
+    for _, text in all_imports:
+        mf = _FROM_RE.match(text)
+        if mf:
+            module = mf.group(1)
+            names = [nm.strip() for nm in mf.group(2).split(",") if nm.strip()]
+            if module not in from_map:
+                from_map[module] = list(names)
+                from_order.append(module)
+            else:
+                existing_set = set(from_map[module])
+                for name in names:
+                    if name not in existing_set:
+                        from_map[module].append(name)
+                        existing_set.add(name)
+        else:
+            # Must be a plain import — guaranteed by pass 2 filter.
+            module = _PLAIN_RE.match(text).group(1)  # type: ignore[union-attr]
+            if module not in plain_seen:
+                plain_order.append(module)
+                plain_seen.add(module)
+
+    # ── early exit if nothing to do ─────────────────────────────────────────
+    has_misplaced = any(i >= first_funcdef_idx for i, _ in all_imports)
+    from_counts: Dict[str, int] = {}
+    plain_counts: Dict[str, int] = {}
+    for _, text in all_imports:
+        mf = _FROM_RE.match(text)
+        if mf:
+            mod = mf.group(1)
+            from_counts[mod] = from_counts.get(mod, 0) + 1
+        else:
+            mod = _PLAIN_RE.match(text).group(1)  # type: ignore[union-attr]
+            plain_counts[mod] = plain_counts.get(mod, 0) + 1
+    if not (
+        has_misplaced
+        or any(v > 1 for v in from_counts.values())
+        or any(v > 1 for v in plain_counts.values())
+    ):
+        return source
+
+    # ── pass 4: build the complete sorted import block ──────────────────────
+    # Combine every merged import (existing block + newly lifted) and sort the
+    # whole list so stdlib never ends up after third-party just because it was
+    # a newly lifted import appended at the end.
+    all_final_imports = [
+        f"from {mod} import {', '.join(from_map[mod])}" for mod in from_order
+    ] + [f"import {mod}" for mod in plain_order]
+    sorted_imports = _sort_imports_pep8(all_final_imports)
+
+    first_block_import_idx = min(
+        (i for i, _ in all_imports if i < first_funcdef_idx), default=-1
+    )
+
+    # ── pass 5: rebuild source ───────────────────────────────────────────────
+    # Emit the sorted block at the first block import position (or just before
+    # the first def/class if there are no block imports).  Skip all original
+    # import lines and blank lines within the original block region — the
+    # sorted block replaces them entirely.
+    result: List[str] = []
+    import_block_emitted = False
+
+    for i, line in enumerate(lines):
+        # Edge case: no block imports — insert before the first def/class.
+        if i == first_funcdef_idx and not import_block_emitted:
+            for imp in sorted_imports:
+                result.append(imp + "\n")
+            import_block_emitted = True
+
+        # Emit the sorted block at the position of the first block import.
+        if i == first_block_import_idx:
+            for imp in sorted_imports:
+                result.append(imp + "\n")
+            import_block_emitted = True
+            continue  # the original import line is replaced by the block above
+
+        # Drop all other import lines (block duplicates and misplaced).
+        if i in import_indices:
+            continue
+
+        # Drop blank lines that fell between import lines in the original block
+        # — they were section separators that the sorted block supersedes.
+        if (
+            first_block_import_idx >= 0
+            and first_block_import_idx < i <= last_block_import_idx
+            and not line.strip()
+        ):
+            continue
+
+        result.append(line)
+
+    return "".join(result)
+
+
 def _names_assigned_in(block_source: str) -> set:
     """Return names assigned at the top level of block_source.
 
@@ -1413,6 +1934,38 @@ def _extract_defined_names(source: str) -> set:
     }
 
 
+def _would_create_proxy_wrappers(
+    group: List[_SeqInfo], all_functions: List[_FunctionInfo]
+) -> bool:
+    """Return True if extracting this group would leave *some but not all* members
+    as trivial proxy wrappers.
+
+    A function becomes a trivial proxy wrapper when its entire body is the
+    extracted block — after extraction it would contain only a single call to
+    the new helper, with no meaningful logic of its own.
+
+    When *every* member of the group would become a proxy, extraction is still
+    worthwhile: all functions delegate to the same helper, which eliminates the
+    duplication.  The problematic case is a mixed group where some members lose
+    all their logic while others keep meaningful bodies.
+    """
+    proxy_count = 0
+    non_module_count = 0
+    for seq in group:
+        if seq.scope == "<module>":
+            continue
+        non_module_count += 1
+        func_outer_scope = (
+            seq.class_scope if seq.class_scope is not None else "<module>"
+        )
+        for func in all_functions:
+            if func.name == seq.scope and func.scope == func_outer_scope:
+                if len(seq.stmts) == func.body_stmt_count:
+                    proxy_count += 1
+                break
+    return 0 < proxy_count < non_module_count
+
+
 # ---------------------------------------------------------------------------
 # Text editing
 # ---------------------------------------------------------------------------
@@ -1426,9 +1979,14 @@ def _build_helper_insertion(
 ) -> Tuple[int, int, str]:
     """Build an edit tuple that inserts helper_source with correct surrounding blanks.
 
-    Absorbs existing blank lines around the insertion point so the result has
-    exactly 2 blank lines before and after module-level helpers, or 1 blank
-    line for staticmethod insertions inside a class body.
+    Always returns a pure insertion (start == end) so that two groups inserting
+    before the same scope are never in conflict: pure insertions are not subject
+    to the overlap-skip logic in _apply_edits.
+
+    The insertion point is placed after all blank lines that already exist
+    around insert_pos (right before the def/decorator line).  Leading blank
+    lines are prepended only to make up the difference so the result always
+    has exactly ``blank_lines`` blank lines before the helper.
     """
     blank_lines = 1 if placement.startswith("staticmethod:") else 2
 
@@ -1446,12 +2004,13 @@ def _build_helper_insertion(
         after_blanks += 1
         i += 1
 
-    # Replace surrounding blank lines so we don't double-count them.
-    start = insert_pos - before_blanks
-    end = insert_pos + after_blanks
+    # Insert right before the def/decorator (after all surrounding blanks).
+    insert_at = insert_pos + after_blanks
+    # Prepend only as many blank lines as are still missing.
+    leading = max(0, blank_lines - (before_blanks + after_blanks))
     clean = helper_source.strip("\n") + "\n"
-    text = "\n" * blank_lines + clean + "\n" * blank_lines
-    return (start, end, text)
+    text = "\n" * leading + clean + "\n" * blank_lines
+    return (insert_at, insert_at, text)
 
 
 def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
@@ -1478,6 +2037,45 @@ def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
         lines[start:end] = new_lines
 
     return "".join(lines)
+
+
+def _skip_class_docstring(source_lines: List[str], after_class_line: int) -> int:
+    """Return the 0-based line index after the class docstring, if any.
+
+    Given the line immediately after ``class Foo:`` (or its colon line),
+    advance past any leading blank lines and then past a string-literal
+    docstring (single- or triple-quoted).  If no docstring is present,
+    returns ``after_class_line`` unchanged.
+    """
+    i = after_class_line
+    n = len(source_lines)
+    # Skip blank lines inside the class body.
+    while i < n and not source_lines[i].strip():
+        i += 1
+    if i >= n:
+        return after_class_line
+    stripped = source_lines[i].lstrip()
+    # Check for a triple-quoted docstring.
+    for q in ('"""', "'''"):
+        if stripped.startswith(q):
+            # Check whether the closing quote is on the same line (after the
+            # opening).
+            rest = stripped[len(q) :]
+            if q in rest:
+                # Single-line triple-quoted docstring.
+                return i + 1
+            # Multi-line: scan forward for the closing triple-quote.
+            i += 1
+            while i < n:
+                if q in source_lines[i]:
+                    return i + 1
+                i += 1
+            return i  # malformed, best-effort
+    # Single-quoted docstring (rare but valid).
+    for q in ('"', "'"):
+        if stripped.startswith(q) and not stripped.startswith(q * 2):
+            return i + 1
+    return after_class_line
 
 
 def _find_insertion_point(source: str, scope: str) -> int:
@@ -1765,6 +2363,19 @@ class DuplicateExtractor(Refactor):
             # Compute escaping vars algorithmically before any LLM call so the
             # extraction prompt can instruct the LLM to return them.
             escaping_vars = frozenset(_find_escaping_vars(group, source_lines))
+
+            # Skip groups that would leave a function as a trivial proxy wrapper
+            # (i.e. the extracted block is the function's entire body).
+            if _would_create_proxy_wrappers(group, all_functions):
+                if self.verbose:
+                    print(
+                        "crispen: DuplicateExtractor: skipping group — "
+                        "extraction would leave a trivial proxy wrapper",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+
             if self.verbose:
                 ranges_str = ", ".join(
                     f"lines {s.start_line}-{s.end_line}" for s in group
@@ -1847,14 +2458,35 @@ class DuplicateExtractor(Refactor):
                     helper_source = _strip_helper_docstring(helper_source)
                 call_replacements = extraction["call_site_replacements"]
                 placement = extraction.get("placement", "module_level")
+                # Auto-indent 0-indent helpers for staticmethod: placement.
+                # The LLM sometimes writes a module-level def even when it
+                # selects staticmethod:ClassName.  Inserting 0-indent code
+                # inside the class body ends the class silently and makes all
+                # subsequent methods nested inside the helper — valid syntax
+                # but semantically broken, so compile() does not catch it.
+                if placement.startswith("staticmethod:") and helper_source:
+                    first_code = next(
+                        (ln for ln in helper_source.splitlines() if ln.strip()), ""
+                    )
+                    if first_code and not first_code[0].isspace():
+                        helper_source = textwrap.indent(helper_source, "    ")
                 func_name = extraction["function_name"]
+
+                # Helpers are always file-internal; enforce a leading underscore.
+                if not func_name.startswith("_"):
+                    _old_name = func_name
+                    func_name = "_" + func_name
+                    _rename_pat = re.compile(r"\b" + re.escape(_old_name) + r"\b")
+                    helper_source = _rename_pat.sub(func_name, helper_source)
+                    call_replacements = [
+                        _rename_pat.sub(func_name, r) for r in call_replacements
+                    ]
 
                 _check_failed = False
                 _failures: List[str] = []
 
                 # Check 1: name collision
-                # Pre-check: staticmethod placement is invalid when sequences span
-                # multiple class scopes — flag it so the retry loop can correct it.
+                # Pre-check: placement consistency with call-site class scopes.
                 if placement.startswith("staticmethod:"):
                     group_class_scopes = {s.class_scope for s in group}
                     if len(group_class_scopes) != 1 or None in group_class_scopes:
@@ -1866,6 +2498,55 @@ class DuplicateExtractor(Refactor):
                             print(
                                 "crispen: DuplicateExtractor: extraction FAILED — "
                                 "staticmethod placement invalid for cross-class group",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
+                    elif placement.split(":", 1)[1] != next(iter(group_class_scopes)):
+                        named_class = placement.split(":", 1)[1]
+                        actual_class = next(iter(group_class_scopes))
+                        _failures.append(
+                            f"staticmethod names class '{named_class}' but all call "
+                            f"sites are in '{actual_class}'; use "
+                            f"'staticmethod:{actual_class}' instead"
+                        )
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor: extraction FAILED — "
+                                f"staticmethod names wrong class '{named_class}' "
+                                f"(actual: '{actual_class}')",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        _check_failed = True
+                if placement == "module_level":
+                    # Reject if any call site invokes the helper as an instance
+                    # method (self.<func_name>(...)) — that is inconsistent with
+                    # module-level placement and will fail at runtime.
+                    _self_call_pat = re.compile(rf"\bself\.{re.escape(func_name)}\s*\(")
+                    if any(_self_call_pat.search(r) for r in call_replacements):
+                        group_class_scopes = {s.class_scope for s in group}
+                        if (
+                            len(group_class_scopes) == 1
+                            and None not in group_class_scopes
+                        ):
+                            only_class = next(iter(group_class_scopes))
+                            placement_hint = f"use 'staticmethod:{only_class}' instead"
+                        else:
+                            placement_hint = (
+                                f"change call sites to call "
+                                f"'{func_name}(...)' directly"
+                            )
+                        _failures.append(
+                            f"module_level placement is inconsistent with call "
+                            f"sites that invoke the helper as "
+                            f"'self.{func_name}(...)'; {placement_hint}"
+                        )
+                        if self.verbose:
+                            print(
+                                f"crispen: DuplicateExtractor: extraction FAILED"
+                                f" — module_level placement conflicts with "
+                                f"self.{func_name}() call sites",
                                 file=sys.stderr,
                                 flush=True,
                             )
@@ -1919,6 +2600,23 @@ class DuplicateExtractor(Refactor):
                     # valid Python.
                     call_replacements = [
                         _normalize_replacement_indentation(seq, r)
+                        for seq, r in zip(group, call_replacements)
+                    ]
+
+                    # Strip unused variable assignments from call-site
+                    # replacements.  The LLM may assign return values that are
+                    # never used after the block (e.g. when the helper returns a
+                    # value only needed at some call sites), which would produce
+                    # flake8 F841 warnings.
+                    call_replacements = [
+                        _strip_unused_call_assignments(
+                            r,
+                            source_lines[
+                                seq.end_line : _scope_end_line(
+                                    source_lines, seq.scope, seq.end_line
+                                )
+                            ],
+                        )
                         for seq, r in zip(group, call_replacements)
                     ]
 
@@ -2052,9 +2750,11 @@ class DuplicateExtractor(Refactor):
                         )
                     first_seq = min(group, key=lambda s: s.start_line)
                     if placement.startswith("staticmethod:"):
-                        # Insert inside the class body, one line after "class Foo:".
+                        # Insert inside the class body, after "class Foo:" and
+                        # any class docstring (which must remain first).
                         scope = placement.split(":", 1)[1]
-                        insert_pos = _find_insertion_point(source, scope) + 1
+                        class_line = _find_insertion_point(source, scope)
+                        insert_pos = _skip_class_docstring(source_lines, class_line + 1)
                     else:
                         scope = first_seq.scope
                         insert_pos = _find_insertion_point(source, scope)
@@ -2066,6 +2766,42 @@ class DuplicateExtractor(Refactor):
                     # Compile the per-group candidate independently so one bad
                     # extraction doesn't discard valid ones for the same file.
                     candidate = _apply_edits(source, group_edits)
+
+                    # Re-strip unused variable assignments using the assembled
+                    # candidate's following lines.  The initial pass (above)
+                    # used the original source, which can incorrectly retain an
+                    # assignment when another call site's original block
+                    # referenced the same name.  Re-running with candidate
+                    # following lines also handles partial-tuple targets
+                    # (``a, _ = helper()``) the same way the initial pass does.
+                    cand_lines = candidate.splitlines(keepends=True)
+                    restripped = []
+                    for seq, repl in zip(group, call_replacements):
+                        cs0 = seq.start_line - 1
+                        offset = sum(
+                            len(et.splitlines(keepends=True)) - (ee - es)
+                            for (es, ee, et) in group_edits
+                            if es < cs0
+                        )
+                        new_end = cs0 + offset + len(repl.splitlines(keepends=True))
+                        scope_end = _scope_end_line(cand_lines, seq.scope, new_end)
+                        restripped.append(
+                            _strip_unused_call_assignments(
+                                repl, cand_lines[new_end:scope_end]
+                            )
+                        )
+                    if restripped != call_replacements:
+                        call_replacements = restripped
+                        group_edits = [
+                            (seq.start_line - 1, seq.end_line, r)
+                            for seq, r in zip(group, call_replacements)
+                        ]
+                        group_edits.append(
+                            _build_helper_insertion(
+                                source_lines, insert_pos, helper_source, placement
+                            )
+                        )
+                        candidate = _apply_edits(source, group_edits)
 
                     # Check 9: assembled output is valid Python
                     try:
@@ -2132,7 +2868,7 @@ class DuplicateExtractor(Refactor):
                     if alg_retries_left > 0:
                         alg_retries_left -= 1
                         prev_failures = _failures
-                        prev_output = None
+                        prev_output = extraction
                         if self.verbose:
                             print(
                                 f"crispen: DuplicateExtractor:   → retrying"
@@ -2258,12 +2994,47 @@ class DuplicateExtractor(Refactor):
                     all_edits.extend(g_edits)
                 combined = _apply_edits(source, all_edits)
 
+            # Drop any extraction group whose helper function is not defined in
+            # the combined output.  This happens when two groups insert helpers
+            # before the same scope: _build_helper_insertion absorbs surrounding
+            # blank lines into a replacement edit, so the second group's helper
+            # insertion is silently skipped by the overlap detector — leaving a
+            # call to the helper but no definition.
+            undefined_helpers = {
+                name
+                for name, _, _ in extraction_groups
+                if not _has_funcdef(name, combined)
+            }
+            if undefined_helpers:
+                for name in sorted(undefined_helpers):
+                    if self.verbose:
+                        print(
+                            f"crispen: DuplicateExtractor: extraction DROPPED — "
+                            f"'{name}' not defined in combined output "
+                            f"(helper insertion blocked by overlapping edit)",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                extraction_groups = [
+                    (n, g, m)
+                    for n, g, m in extraction_groups
+                    if n not in undefined_helpers
+                ]
+                all_edits = list(edits)
+                for _, g_edits, _ in extraction_groups:
+                    all_edits.extend(g_edits)
+                combined = _apply_edits(source, all_edits)
+
             all_pending = list(pending_changes)
             for _, _, msg in extraction_groups:
                 all_pending.append(msg)
 
             if all_edits:
-                self._new_source = combined
+                _extracted_names = _names_in_edit_texts(extraction_groups)
+                combined = _pyflakes_strip_unused_simple_assigns(
+                    combined, _extracted_names
+                )
+                self._new_source = _lift_and_dedup_imports(combined)
                 self.changes_made.extend(all_pending)
 
     def get_rewritten_source(self) -> Optional[str]:

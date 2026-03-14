@@ -11,8 +11,12 @@ from crispen.errors import CrispenAPIError
 from crispen.refactors.duplicate_extractor import (
     _ApiTimeout,
     _build_helper_insertion,
+    _has_funcdef,
     _collect_attribute_names,
     _collect_called_attr_names,
+    _collect_ast_store_names,
+    _replace_unused_in_target,
+    _scope_end_line,
     _extract_defined_names,
     _FunctionCollector,
     _FunctionInfo,
@@ -23,7 +27,9 @@ from crispen.refactors.duplicate_extractor import (
     _collect_called_names,
     _filter_maximal_groups,
     _find_duplicate_groups,
+    _has_internal_overlap,
     _find_insertion_point,
+    _skip_class_docstring,
     _generate_no_arg_call,
     _has_call_to,
     _has_def,
@@ -38,15 +44,22 @@ from crispen.refactors.duplicate_extractor import (
     _normalize_source,
     _overlaps_diff,
     _missing_free_vars,
+    _is_pure_literal,
+    _names_in_edit_texts,
     _pyflakes_new_undefined_names,
+    _pyflakes_strip_unused_simple_assigns,
     _run_with_timeout,
     _sequence_weight,
     _seq_ends_with_return,
+    _seq_source_contains_yield,
     _replacement_contains_return,
     _replacement_steals_post_block_line,
+    _lift_and_dedup_imports,
     _helper_imports_local_name,
     _strip_helper_docstring,
+    _strip_unused_call_assignments,
     _verify_extraction,
+    _would_create_proxy_wrappers,
     DuplicateExtractor,
 )
 
@@ -326,6 +339,54 @@ def test_find_duplicate_groups_valid():
     groups = _find_duplicate_groups([s1, s2], [(1, 3)])
     assert len(groups) == 1
     assert set(id(s) for s in groups[0]) == {id(s1), id(s2)}
+
+
+# ---------------------------------------------------------------------------
+# _has_internal_overlap
+# ---------------------------------------------------------------------------
+
+
+def test_has_internal_overlap_no_overlap():
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1")
+    assert not _has_internal_overlap([s1, s2])
+
+
+def test_has_internal_overlap_adjacent_no_overlap():
+    # end_line of s1 == start_line - 1 of s2: not overlapping
+    s1 = _SeqInfo([], 1, 5, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 6, 10, "<module>", "", "fp1")
+    assert not _has_internal_overlap([s1, s2])
+
+
+def test_has_internal_overlap_touching():
+    # end_line of s1 == start_line of s2: overlap (shared boundary line)
+    s1 = _SeqInfo([], 1, 5, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 5, 9, "<module>", "", "fp1")
+    assert _has_internal_overlap([s1, s2])
+
+
+def test_has_internal_overlap_proper_overlap():
+    s1 = _SeqInfo([], 27, 30, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 29, 32, "<module>", "", "fp1")
+    assert _has_internal_overlap([s1, s2])
+
+
+def test_has_internal_overlap_unsorted_order():
+    # Sequences given in reverse order — function must sort before checking.
+    s1 = _SeqInfo([], 29, 32, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 27, 30, "<module>", "", "fp1")
+    assert _has_internal_overlap([s1, s2])
+
+
+def test_find_duplicate_groups_skips_internally_overlapping():
+    # Simulate the op_range pattern: two pairs [A,B] and [B,C] that share a
+    # statement.  The group has internal overlap and must be filtered out.
+    s1 = _SeqInfo([], 27, 30, "<module>", "", "fp1")
+    s2 = _SeqInfo([], 29, 32, "<module>", "", "fp1")
+    # Diff covers both sequences.
+    groups = _find_duplicate_groups([s1, s2], [(27, 32)])
+    assert groups == []
 
 
 def test_find_duplicate_groups_caps_at_max_groups():
@@ -613,6 +674,27 @@ def test_has_call_to_syntax_error():
 
 
 # ---------------------------------------------------------------------------
+# _has_funcdef
+# ---------------------------------------------------------------------------
+
+
+def test_has_funcdef_present():
+    assert _has_funcdef("_helper", "def _helper(x):\n    pass\n") is True
+
+
+def test_has_funcdef_async():
+    assert _has_funcdef("_helper", "async def _helper(x):\n    pass\n") is True
+
+
+def test_has_funcdef_missing():
+    assert _has_funcdef("_helper", "def other(x):\n    pass\n") is False
+
+
+def test_has_funcdef_syntax_error():
+    assert _has_funcdef("_helper", "def f(x:") is False
+
+
+# ---------------------------------------------------------------------------
 # _normalize_replacement_indentation
 # ---------------------------------------------------------------------------
 
@@ -714,6 +796,174 @@ def test_pyflakes_new_undefined_names_detects_introduced_name():
     # candidate removes the assignment, leaving x undefined at the call site
     candidate = "def _h():\n    x = 1\n\ndef foo():\n    _h(x)\n    return x\n"
     assert "x" in _pyflakes_new_undefined_names(original, candidate)
+
+
+# ---------------------------------------------------------------------------
+# _is_pure_literal
+# ---------------------------------------------------------------------------
+
+
+def test_is_pure_literal_constant():
+    import ast
+
+    assert _is_pure_literal(ast.parse("0", mode="eval").body)
+    assert _is_pure_literal(ast.parse('"s"', mode="eval").body)
+    assert _is_pure_literal(ast.parse("None", mode="eval").body)
+    assert _is_pure_literal(ast.parse("True", mode="eval").body)
+
+
+def test_is_pure_literal_containers():
+    import ast
+
+    assert _is_pure_literal(ast.parse("[]", mode="eval").body)
+    assert _is_pure_literal(ast.parse("(1, 2)", mode="eval").body)
+    assert _is_pure_literal(ast.parse("{1: 2}", mode="eval").body)
+    assert _is_pure_literal(ast.parse("{1, 2}", mode="eval").body)
+
+
+def test_is_pure_literal_call_is_false():
+    import ast
+
+    assert not _is_pure_literal(ast.parse("func()", mode="eval").body)
+
+
+def test_is_pure_literal_name_is_false():
+    import ast
+
+    assert not _is_pure_literal(ast.parse("x", mode="eval").body)
+
+
+def test_is_pure_literal_nested_call_is_false():
+    import ast
+
+    assert not _is_pure_literal(ast.parse("[func()]", mode="eval").body)
+
+
+# ---------------------------------------------------------------------------
+# _pyflakes_strip_unused_simple_assigns
+# ---------------------------------------------------------------------------
+
+
+def test_pyflakes_strip_unused_simple_assigns_removes_literal_init():
+    # last_import_line = 0 becomes unused after extraction.
+    source = textwrap.dedent(
+        """\
+        def foo(source):
+            last_import_line = 0
+            lines = source.splitlines()
+            return lines
+    """
+    )
+    result = _pyflakes_strip_unused_simple_assigns(source, {"last_import_line"})
+    assert "last_import_line" not in result
+    assert "lines = source.splitlines()" in result
+
+
+def test_pyflakes_strip_unused_simple_assigns_keeps_call_rhs():
+    # x = func() must NOT be stripped — it has side effects.
+    source = textwrap.dedent(
+        """\
+        def foo():
+            x = side_effect()
+            return 1
+    """
+    )
+    result = _pyflakes_strip_unused_simple_assigns(source, {"x"})
+    assert "x = side_effect()" in result
+
+
+def test_pyflakes_strip_unused_simple_assigns_no_change_when_used():
+    source = textwrap.dedent(
+        """\
+        def foo(source):
+            last_import_line = 0
+            for line in source.splitlines():
+                last_import_line += 1
+            return last_import_line
+    """
+    )
+    result = _pyflakes_strip_unused_simple_assigns(source, {"last_import_line"})
+    assert result == source
+
+
+def test_pyflakes_strip_unused_simple_assigns_fallback_on_empty_block():
+    # If stripping would leave a block with no statements (syntax error),
+    # the original source is returned unchanged.
+    source = textwrap.dedent(
+        """\
+        def foo():
+            x = 0
+    """
+    )
+    # After stripping x = 0 the function body is empty — SyntaxError.
+    result = _pyflakes_strip_unused_simple_assigns(source, {"x"})
+    assert result == source
+
+
+def test_pyflakes_strip_unused_simple_assigns_module_level_unchanged():
+    # Module-level assignments are not flagged as UnusedVariable by pyflakes.
+    source = "x = 0\n"
+    result = _pyflakes_strip_unused_simple_assigns(source, {"x"})
+    assert result == source
+
+
+def test_pyflakes_strip_unused_simple_assigns_skips_unrelated_names():
+    # A variable unused after extraction but NOT in allowed_names is preserved.
+    source = textwrap.dedent(
+        """\
+        def foo(source):
+            unrelated = 0
+            lines = source.splitlines()
+            return lines
+    """
+    )
+    # "unrelated" is not in the allowed set → must not be removed.
+    result = _pyflakes_strip_unused_simple_assigns(source, {"last_import_line"})
+    assert "unrelated = 0" in result
+
+
+def test_pyflakes_strip_unused_simple_assigns_empty_allowed():
+    # Empty allowed_names means nothing can be stripped.
+    source = textwrap.dedent(
+        """\
+        def foo(source):
+            x = 0
+            lines = source.splitlines()
+            return lines
+    """
+    )
+    result = _pyflakes_strip_unused_simple_assigns(source, set())
+    assert result == source
+
+
+# ---------------------------------------------------------------------------
+# _names_in_edit_texts
+# ---------------------------------------------------------------------------
+
+
+def test_names_in_edit_texts_collects_from_all_edits():
+    groups = [
+        (
+            "_helper",
+            [
+                (1, 3, "def _helper(last_import_line):\n    return last_import_line\n"),
+                (5, 6, "result = _helper(x)\n"),
+            ],
+            "msg",
+        )
+    ]
+    names = _names_in_edit_texts(groups)
+    assert "last_import_line" in names
+    assert "_helper" in names
+    assert "result" in names
+    assert "x" in names
+
+
+def test_names_in_edit_texts_skips_syntax_errors():
+    groups = [("_h", [(1, 2, "def (\n")], "msg")]
+    # Should not raise — returns whatever names were parseable.
+    names = _names_in_edit_texts(groups)
+    assert isinstance(names, set)
 
 
 # ---------------------------------------------------------------------------
@@ -1179,20 +1429,92 @@ def test_find_insertion_point_skips_over_multiline_decorator():
 
 
 # ---------------------------------------------------------------------------
+# _skip_class_docstring
+# ---------------------------------------------------------------------------
+
+
+def test_skip_class_docstring_no_docstring():
+    source = "class Foo:\n    def method(self):\n        pass\n"
+    lines = source.splitlines()
+    # after_class_line=1 (line "    def method..."), no docstring → unchanged
+    assert _skip_class_docstring(lines, 1) == 1
+
+
+def test_skip_class_docstring_triple_double_quote_single_line():
+    source = 'class Foo:\n    """A docstring."""\n    def method(self):\n        pass\n'
+    lines = source.splitlines()
+    # after_class_line=1 is the docstring line; should return 2
+    assert _skip_class_docstring(lines, 1) == 2
+
+
+def test_skip_class_docstring_triple_single_quote_single_line():
+    source = "class Foo:\n    '''A docstring.'''\n    def method(self):\n        pass\n"
+    lines = source.splitlines()
+    assert _skip_class_docstring(lines, 1) == 2
+
+
+def test_skip_class_docstring_triple_quote_multiline():
+    source = (
+        "class Foo:\n"
+        '    """First line.\n'
+        "    Second line.\n"
+        '    """\n'
+        "    def method(self):\n"
+        "        pass\n"
+    )
+    lines = source.splitlines()
+    # Closing """ is on line 3 (0-based); should return 4
+    assert _skip_class_docstring(lines, 1) == 4
+
+
+def test_skip_class_docstring_with_leading_blank_line():
+    source = 'class Foo:\n\n    """Docstring."""\n    def method(self):\n        pass\n'
+    lines = source.splitlines()
+    # Line 1 is blank, line 2 is the docstring; should return 3
+    assert _skip_class_docstring(lines, 1) == 3
+
+
+def test_skip_class_docstring_empty_class():
+    source = "class Foo:\n    pass\n"
+    lines = source.splitlines()
+    assert _skip_class_docstring(lines, 1) == 1
+
+
+def test_skip_class_docstring_only_blank_lines():
+    # after_class_line points past end of file after skipping blanks
+    lines = ["class Foo:", "    "]
+    assert _skip_class_docstring(lines, 1) == 1
+
+
+def test_skip_class_docstring_malformed_multiline_no_close():
+    # Triple-quoted docstring that never closes (malformed) — returns end-of-lines
+    lines = ["class Foo:", '    """This never closes', "    still going"]
+    result = _skip_class_docstring(lines, 1)
+    assert result == 3  # past end of lines, best-effort
+
+
+def test_skip_class_docstring_single_quote():
+    # Single-quoted one-liner docstring
+    lines = ["class Foo:", '    "A brief note."', "    def method(self): pass"]
+    assert _skip_class_docstring(lines, 1) == 2
+
+
+# ---------------------------------------------------------------------------
 # _build_helper_insertion
 # ---------------------------------------------------------------------------
 
 
-def test_build_helper_insertion_absorbs_blank_before_function():
-    # Blank line between import and def is absorbed; 2 blank lines ensured.
+def test_build_helper_insertion_blank_before_insert_pos():
+    # Blank line at index 1 is before insert_pos=2 (before_blanks=1, after_blanks=0).
+    # insert_at=2 (pure insertion), leading=max(0,2-1)=1 so text starts with "\n".
     source = "import os\n\ndef foo():\n    pass\n"
     lines = source.splitlines(keepends=True)
     helper = "def _helper():\n    pass\n"
     start, end, text = _build_helper_insertion(lines, 2, helper, "module_level")
-    # Blank line at index 1 is before insert_pos=2, so before_blanks=1 → start=1.
-    assert start == 1
-    assert end == 2  # no blanks after insert_pos (def foo starts there)
-    assert text.startswith("\n\n")
+    assert start == 2
+    assert end == 2  # pure insertion
+    assert text.startswith("\n")
+    assert not text.startswith("\n\n")  # only 1 leading blank needed
     assert text.endswith("\n\n")
     assert "def _helper():" in text
 
@@ -1222,16 +1544,17 @@ def test_build_helper_insertion_staticmethod_uses_one_blank():
     assert text.endswith("\n\n")  # clean + 1 trailing blank = \n + \n
 
 
-def test_build_helper_insertion_absorbs_blank_at_insert_pos():
-    # When insert_pos itself is a blank line, after_blanks counts it.
+def test_build_helper_insertion_blank_at_insert_pos():
+    # insert_pos=1 is the blank line itself (after_blanks=1, before_blanks=0).
+    # insert_at=1+1=2 (pure insertion after the blank), leading=max(0,2-1)=1.
     source = "import os\n\ndef foo():\n    pass\n"
     lines = source.splitlines(keepends=True)
     helper = "def _helper():\n    pass\n"
-    # insert_pos=1 lands on the blank line: after_blanks=1, end=2.
     start, end, text = _build_helper_insertion(lines, 1, helper, "module_level")
-    assert start == 1
-    assert end == 2
-    assert text.startswith("\n\n")
+    assert start == 2
+    assert end == 2  # pure insertion
+    assert text.startswith("\n")
+    assert not text.startswith("\n\n")  # only 1 leading blank needed
     assert text.endswith("\n\n")
 
 
@@ -1246,18 +1569,40 @@ def test_build_helper_insertion_strips_extra_newlines_from_helper():
     assert "\n\n\n\ndef _helper" not in text  # no extra leading blanks inside text
 
 
+def test_build_helper_insertion_two_at_same_scope():
+    # Two helpers inserted before the same def via _apply_edits: both must appear.
+    source = "import os\n\n\ndef foo():\n    pass\n"
+    lines = source.splitlines(keepends=True)
+    edits = [
+        _build_helper_insertion(lines, 3, "def _h1():\n    pass\n", "module_level"),
+        _build_helper_insertion(lines, 3, "def _h2():\n    pass\n", "module_level"),
+    ]
+    result = _apply_edits(source, edits)
+    assert "def _h1():" in result
+    assert "def _h2():" in result
+    assert "def foo():" in result
+
+
 def test_successful_extraction_has_two_blank_lines(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    # Each function has 4 statements. The first statement is STRUCTURALLY different
+    # between them (if-block vs assignment), so the normalizer produces different
+    # fingerprints for the full 4-stmt body. Only the trailing 3-stmt block
+    # (compute/transform/finalize) is duplicated, so the proxy-wrapper guard
+    # does not trigger (3 stmts < body_stmt_count 4).
     source = textwrap.dedent(
         """\
         import os
 
         def foo():
+            if debug:
+                validate(data)
             x = compute(data)
             y = transform(x)
             z = finalize(y)
 
         def bar():
+            result = validate(data)
             x = compute(data)
             y = transform(x)
             z = finalize(y)
@@ -1283,7 +1628,7 @@ def test_successful_extraction_has_two_blank_lines(monkeypatch):
             ),
             _make_verify_response(True, []),
         ]
-        de = DuplicateExtractor([(9, 11)], source=source)
+        de = DuplicateExtractor([(12, 14)], source=source)
 
     assert de._new_source is not None
     # Exactly 2 blank lines before and after the inserted helper.
@@ -1307,12 +1652,15 @@ def test_helper_placed_before_class_not_inside(monkeypatch):
 
         class MyClass:
             def method_a(self, x):
+                if self.debug:
+                    pass
                 a = compute(x)
                 b = transform(a)
                 c = finalize(b)
                 return c
 
             def method_b(self, x):
+                result = None
                 a = compute(x)
                 b = transform(a)
                 c = finalize(b)
@@ -1630,17 +1978,20 @@ def test_no_duplicates_no_llm_calls(monkeypatch):
 _DUP_SOURCE = textwrap.dedent(
     """\
     def foo():
+        if debug:
+            pass
         x = compute(data)
         y = transform(x)
         z = finalize(y)
 
     def bar():
+        result = None
         x = compute(data)
         y = transform(x)
         z = finalize(y)
     """
 )
-_DUP_RANGES = [(7, 9)]  # overlaps bar's body
+_DUP_RANGES = [(10, 12)]  # overlaps bar's duplicate block (x/y/z lines)
 
 # Source where foo's duplicate block assigns z, and foo uses z after the block.
 # _has_escaping_vars should detect this and skip the extraction.
@@ -1653,12 +2004,13 @@ _ESC_SOURCE = textwrap.dedent(
         assert z == expected
 
     def bar():
+        result = None
         x = compute(data)
         y = transform(x)
         z = finalize(y)
     """
 )
-_ESC_RANGES = [(8, 10)]  # overlaps bar's body
+_ESC_RANGES = [(9, 11)]  # overlaps bar's duplicate block (x/y/z lines)
 
 
 def test_missing_api_key_raises(monkeypatch):
@@ -2347,6 +2699,112 @@ def test_uncalled_in_combined_drops_group_verbose_false(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# DuplicateExtractor — helper defined in per-group candidate but missing from
+# combined output (insertion blocked by overlapping blank-line replacement)
+# ---------------------------------------------------------------------------
+
+
+def _make_undefined_in_combined_extractor(monkeypatch, verbose=True):
+    """Simulate: per-group checks all pass but helper definition is absent from
+    the combined output (insertion edit blocked by overlap detector).
+
+    Achieved by patching _has_funcdef: returns True for the per-group pyflakes
+    check (not called there directly, but we patch the combined check) and
+    False for the final combined check.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with (
+        patch("crispen.llm_client.anthropic") as mock_anthropic,
+        patch(
+            "crispen.refactors.duplicate_extractor._has_funcdef",
+            side_effect=[False],
+        ),
+    ):
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": "def _helper(data):\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper(data)\n",
+                        "    _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        return DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=verbose)
+
+
+def test_undefined_helper_in_combined_drops_group_verbose(monkeypatch, capsys):
+    de = _make_undefined_in_combined_extractor(monkeypatch, verbose=True)
+    assert de._new_source is None
+    assert "not defined in combined output" in capsys.readouterr().err
+
+
+def test_undefined_helper_in_combined_drops_group_verbose_false(monkeypatch):
+    de = _make_undefined_in_combined_extractor(monkeypatch, verbose=False)
+    assert de._new_source is None
+
+
+def test_undefined_helper_in_combined_two_groups_one_dropped(monkeypatch):
+    """Two groups: first group's helper missing from combined, second kept.
+
+    _has_funcdef returns [False, True]: first group dropped, second kept.
+    This exercises the all_edits.extend(g_edits) loop after the drop (line 2304).
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with (
+        patch("crispen.llm_client.anthropic") as mock_anthropic,
+        patch(
+            "crispen.refactors.duplicate_extractor._has_funcdef",
+            side_effect=[False, True],
+        ),
+    ):
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper1",
+                    "placement": "module_level",
+                    "helper_source": "def _helper1():\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper1()\n",
+                        "    _helper1()\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "_helper2",
+                    "placement": "module_level",
+                    "helper_source": "def _helper2():\n    pass\n",
+                    "call_site_replacements": [
+                        "    _helper2()\n",
+                        "    _helper2()\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _TWO_PAIR_RANGES, source=_TWO_PAIR_SOURCE, verbose=False
+        )
+    # First group dropped (undefined), second group kept → new source written
+    assert de._new_source is not None
+
+
+# ---------------------------------------------------------------------------
 # DuplicateExtractor — two groups, one dropped in combined check (line 1533)
 # ---------------------------------------------------------------------------
 
@@ -2360,27 +2818,33 @@ _TWO_PAIR_SOURCE = textwrap.dedent(
     import os
 
     def foo():
+        if debug:
+            pass
         x = compute(data, config)
         y = transform(x, scale)
         z = finalize(y, mode)
 
     def bar():
+        result = None
         x = compute(data, config)
         y = transform(x, scale)
         z = finalize(y, mode)
 
     def baz():
+        if debug:
+            pass
         a = process(item, key, idx)
         b = convert(a, fmt, enc)
         c = export(b, path, opts)
 
     def qux():
+        result = None
         a = process(item, key, idx)
         b = convert(a, fmt, enc)
         c = export(b, path, opts)
     """
 )
-_TWO_PAIR_RANGES = [(4, 21)]  # overlaps all duplicate sequences
+_TWO_PAIR_RANGES = [(4, 30)]  # overlaps all duplicate sequences
 
 
 def _make_two_group_drop_extractor(monkeypatch, verbose=True):
@@ -2457,11 +2921,14 @@ def test_successful_extraction_module_level(monkeypatch, tmp_path):
         import os
 
         def foo():
+            if debug:
+                pass
             x = compute(data)
             y = transform(x)
             z = finalize(y)
 
         def bar():
+            result = None
             x = compute(data)
             y = transform(x)
             z = finalize(y)
@@ -2488,7 +2955,7 @@ def test_successful_extraction_module_level(monkeypatch, tmp_path):
             _make_verify_response(True, []),
         ]
 
-        de = DuplicateExtractor([(9, 11)], source=source)
+        de = DuplicateExtractor([(12, 14)], source=source)
 
     assert de._new_source is not None
     assert "_helper" in de._new_source
@@ -2508,11 +2975,14 @@ def test_staticmethod_placement(monkeypatch):
         """\
         class MyClass:
             def foo(self):
+                if self.debug:
+                    pass
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
 
             def bar(self):
+                result = None
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
@@ -2539,9 +3009,73 @@ def test_staticmethod_placement(monkeypatch):
             _make_verify_response(True, []),
         ]
 
-        de = DuplicateExtractor([(8, 10)], source=source)
+        de = DuplicateExtractor([(11, 13)], source=source)
 
     assert de._new_source is not None
+
+
+def test_staticmethod_placement_zero_indent_helper_auto_indented(monkeypatch):
+    """0-indent helper with staticmethod: placement is auto-indented into the class."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class MyClass:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    # LLM generates a 0-indent (module-level) def even though it requested
+    # staticmethod:MyClass placement.  Without auto-indent this would end the
+    # class body at the docstring, making foo/bar nested inside the helper.
+    helper_zero_indent = "def _helper(self, data):\n    return compute(data)\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:MyClass",
+                    "helper_source": helper_zero_indent,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+
+        de = DuplicateExtractor([(11, 13)], source=source)
+
+    assert de._new_source is not None
+    # foo and bar must remain real class methods, not nested inside the helper.
+    import ast as _ast
+
+    tree = _ast.parse(de._new_source)
+    class_def = next(
+        n
+        for n in _ast.walk(tree)
+        if isinstance(n, _ast.ClassDef) and n.name == "MyClass"
+    )
+    top_level_methods = {
+        n.name for n in class_def.body if isinstance(n, _ast.FunctionDef)
+    }
+    assert "foo" in top_level_methods
+    assert "bar" in top_level_methods
+    assert "_helper" in top_level_methods
 
 
 def test_cross_class_duplicates_use_module_level_placement(monkeypatch):
@@ -2551,12 +3085,15 @@ def test_cross_class_duplicates_use_module_level_placement(monkeypatch):
         """\
         class ClassA:
             def foo(self):
+                if self.debug:
+                    pass
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
 
         class ClassB:
             def bar(self):
+                result = None
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
@@ -2601,12 +3138,15 @@ def test_cross_class_staticmethod_placement_rejected(monkeypatch):
         """\
         class ClassA:
             def foo(self):
+                if self.debug:
+                    pass
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
 
         class ClassB:
             def bar(self):
+                result = None
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
@@ -2662,12 +3202,15 @@ def test_cross_class_staticmethod_placement_rejected_non_verbose(monkeypatch):
         """\
         class ClassA:
             def foo(self):
+                if self.debug:
+                    pass
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
 
         class ClassB:
             def bar(self):
+                result = None
                 x = compute(data)
                 y = transform(x)
                 z = finalize(y)
@@ -2708,6 +3251,311 @@ def test_cross_class_staticmethod_placement_rejected_non_verbose(monkeypatch):
         ]
         mock_client.messages.create.side_effect = responses
         de = DuplicateExtractor([(3, 5)], source=source, verbose=False)
+
+    assert de._new_source is not None
+
+
+def test_same_class_module_level_placement_rejected(monkeypatch):
+    """module_level placement with self.<name>() call sites is rejected and retried."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class MyClass:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper_module = "def _helper(data):\n    pass\n"
+    helper_static = "    @staticmethod\n    def _helper(data):\n        pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            # First attempt: module_level placement but call sites use self._helper()
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper_module,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            # Second attempt: correct staticmethod placement
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:MyClass",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(11, 13)], source=source)
+
+    assert de._new_source is not None
+    # veto + two extraction attempts + verify
+    assert mock_client.messages.create.call_count == 4
+
+
+def test_same_class_module_level_placement_rejected_non_verbose(monkeypatch):
+    """Same inconsistency rejection works when verbose=False."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class MyClass:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper_static = "    @staticmethod\n    def _helper(data):\n        pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": "def _helper(data):\n    pass\n",
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:MyClass",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(11, 13)], source=source, verbose=False)
+
+    assert de._new_source is not None
+
+
+def test_cross_class_module_level_self_call_rejected(monkeypatch):
+    """module_level with self.<name>() call sites in a cross-class group is rejected."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class ClassA:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+        class ClassB:
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper = "def _helper(data):\n    pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            # First attempt: module_level but call sites use self._helper()
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            # Second attempt: correct call sites
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        "        _helper(data)\n",
+                        "        _helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(3, 5)], source=source)
+
+    assert de._new_source is not None
+    assert mock_client.messages.create.call_count == 4
+
+
+def test_staticmethod_wrong_class_rejected(monkeypatch):
+    """LLM naming the wrong class in staticmethod:X is rejected and retried."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class ClassA:
+            def setup(self):
+                pass
+
+        class ClassB:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper_static = "    @staticmethod\n    def _helper(data):\n        pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            # First attempt: LLM names the wrong class
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:ClassA",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            # Second attempt: correct class name
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:ClassB",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(14, 16)], source=source)
+
+    assert de._new_source is not None
+    assert mock_client.messages.create.call_count == 4
+
+
+def test_staticmethod_wrong_class_rejected_non_verbose(monkeypatch):
+    """Wrong-class staticmethod rejection works when verbose=False."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        class ClassA:
+            def setup(self):
+                pass
+
+        class ClassB:
+            def foo(self):
+                if self.debug:
+                    pass
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+
+            def bar(self):
+                result = None
+                x = compute(data)
+                y = transform(x)
+                z = finalize(y)
+        """
+    )
+    helper_static = "    @staticmethod\n    def _helper(data):\n        pass\n"
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        responses = [
+            _make_veto_response(True),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:ClassA",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_extract_response(
+                {
+                    "function_name": "_helper",
+                    "placement": "staticmethod:ClassB",
+                    "helper_source": helper_static,
+                    "call_site_replacements": [
+                        "        self._helper(data)\n",
+                        "        self._helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        mock_client.messages.create.side_effect = responses
+        de = DuplicateExtractor([(14, 16)], source=source, verbose=False)
 
     assert de._new_source is not None
 
@@ -2813,11 +3661,14 @@ def test_verbose_false_suppresses_stderr(monkeypatch):
         import os
 
         def foo():
+            if debug:
+                pass
             x = compute(data)
             y = transform(x)
             z = finalize(y)
 
         def bar():
+            result = None
             x = compute(data)
             y = transform(x)
             z = finalize(y)
@@ -2844,7 +3695,7 @@ def test_verbose_false_suppresses_stderr(monkeypatch):
             _make_verify_response(True, []),
         ]
 
-        de = DuplicateExtractor([(9, 11)], source=source, verbose=False)
+        de = DuplicateExtractor([(12, 14)], source=source, verbose=False)
 
     assert de._new_source is not None
     assert "_helper" in de._new_source
@@ -2894,7 +3745,7 @@ def test_cli_exits_on_api_error(tmp_path, monkeypatch):
         f"""\
         --- a/{f}
         +++ b/{f}
-        @@ -7,3 +7,3 @@
+        @@ -10,3 +10,3 @@
         -    x = compute(data)
         +    x = compute(data)
              y = transform(x)
@@ -3238,6 +4089,7 @@ _FUNC_MATCH_THEN_DUP_SOURCE = textwrap.dedent(
         z = finalize(y)
 
     def bar():
+        a = setup(items)
         if condition:
             result = process(items)
         else:
@@ -3245,6 +4097,8 @@ _FUNC_MATCH_THEN_DUP_SOURCE = textwrap.dedent(
         store(result)
 
     def baz():
+        if quick_check:
+            pass
         if condition:
             result = process(items)
         else:
@@ -3255,7 +4109,7 @@ _FUNC_MATCH_THEN_DUP_SOURCE = textwrap.dedent(
         _setup()
     """
 )
-_FUNC_MATCH_THEN_DUP_RANGES = [(2, 23)]  # covers foo, bar, baz bodies
+_FUNC_MATCH_THEN_DUP_RANGES = [(2, 30)]  # covers foo, bar, baz bodies
 
 
 # ---------------------------------------------------------------------------
@@ -3496,17 +4350,20 @@ _COLLISION_SOURCE = textwrap.dedent(
         return x
 
     def foo():
+        if debug:
+            pass
         x = compute(data)
         y = transform(x)
         z = finalize(y)
 
     def bar():
+        result = None
         x = compute(data)
         y = transform(x)
         z = finalize(y)
     """
 )
-_COLLISION_RANGES = [(9, 11)]  # overlaps bar's body
+_COLLISION_RANGES = [(12, 14)]  # overlaps bar's duplicate block
 
 
 def test_extraction_name_collision_skipped(monkeypatch, capsys):
@@ -3615,6 +4472,397 @@ def test_strip_helper_docstring_docstring_only_body():
     source = 'def _helper():\n    """Only doc."""\n'
     result = _strip_helper_docstring(source)
     assert '"""Only doc."""' in result
+
+
+# ---------------------------------------------------------------------------
+# _collect_ast_store_names
+# ---------------------------------------------------------------------------
+
+
+def test_collect_ast_store_names_simple_name():
+    import ast
+
+    node = ast.parse("x = 1").body[0].targets[0]
+    names: list = []
+    _collect_ast_store_names(node, names)
+    assert names == ["x"]
+
+
+def test_collect_ast_store_names_tuple():
+    import ast
+
+    node = ast.parse("a, b = 1, 2").body[0].targets[0]
+    names: list = []
+    _collect_ast_store_names(node, names)
+    assert set(names) == {"a", "b"}
+
+
+def test_collect_ast_store_names_nested_tuple():
+    import ast
+
+    node = ast.parse("(a, (b, c)) = x").body[0].targets[0]
+    names: list = []
+    _collect_ast_store_names(node, names)
+    assert set(names) == {"a", "b", "c"}
+
+
+def test_collect_ast_store_names_non_name_non_tuple_noop():
+    # ast.Attribute target (e.g. self.x) → nothing collected.
+    import ast
+
+    node = ast.parse("self.x = 1").body[0].targets[0]
+    names: list = []
+    _collect_ast_store_names(node, names)
+    assert names == []
+
+
+# ---------------------------------------------------------------------------
+# _scope_end_line
+# ---------------------------------------------------------------------------
+
+
+def _make_source_lines(src: str):
+    return src.splitlines(keepends=True)
+
+
+def test_scope_end_line_module_returns_full_length():
+    lines = _make_source_lines("x = 1\ny = 2\n")
+    assert _scope_end_line(lines, "<module>", 1) == len(lines)
+
+
+def test_scope_end_line_function_scope():
+    src = "def foo():\n    x = 1\n    y = 2\n\ndef bar():\n    z = 3\n"
+    lines = _make_source_lines(src)
+    # Block ends at line 2 (inside foo). foo ends at line 3.
+    assert _scope_end_line(lines, "foo", 2) == 3
+
+
+def test_scope_end_line_does_not_bleed_into_next_function():
+    src = "def foo():\n    x = 1\n\ndef bar():\n    x = 2\n"
+    lines = _make_source_lines(src)
+    # Searching for `x` after line 2 should stop at end of foo (line 2), not
+    # reach bar where `x` also appears.
+    end = _scope_end_line(lines, "foo", 2)
+    assert end == 2  # foo ends at line 2; bar's x is excluded
+
+
+def test_scope_end_line_picks_innermost_matching_scope():
+    # Two functions named "inner" — one nested inside outer, one at module level.
+    src = (
+        "def outer():\n"
+        "    def inner():\n"
+        "        a = 1\n"
+        "    inner()\n"
+        "\n"
+        "def inner():\n"
+        "    b = 2\n"
+    )
+    lines = _make_source_lines(src)
+    # Block at line 3 is inside the nested inner (lines 2-3). That is the
+    # smallest matching span, so end_lineno == 3 is returned.
+    assert _scope_end_line(lines, "inner", 3) == 3
+
+
+def test_scope_end_line_class_scope():
+    src = "class Foo:\n    x = 1\n    y = 2\n\nclass Bar:\n    x = 3\n"
+    lines = _make_source_lines(src)
+    assert _scope_end_line(lines, "Foo", 2) == 3
+
+
+def test_scope_end_line_no_match_returns_full_length():
+    src = "def foo():\n    x = 1\n"
+    lines = _make_source_lines(src)
+    # Scope name doesn't match any definition.
+    assert _scope_end_line(lines, "bar", 1) == len(lines)
+
+
+def test_scope_end_line_syntax_error_returns_full_length():
+    lines = _make_source_lines("def (\n    x = 1\n")
+    assert _scope_end_line(lines, "foo", 1) == len(lines)
+
+
+# ---------------------------------------------------------------------------
+# _replace_unused_in_target
+# ---------------------------------------------------------------------------
+
+
+def test_replace_unused_in_target_name_used():
+    import ast
+
+    target = ast.parse("result = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "print(result)\n")
+    assert all_r is False and any_r is False
+    assert ast.unparse(new_t) == "result"
+
+
+def test_replace_unused_in_target_name_unused():
+    import ast
+
+    target = ast.parse("result = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "return None\n")
+    assert all_r is True and any_r is True
+    assert ast.unparse(new_t) == "_"
+
+
+def test_replace_unused_in_target_tuple_all_unused():
+    import ast
+
+    target = ast.parse("a, b = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "return None\n")
+    assert all_r is True and any_r is True
+    assert ast.unparse(new_t) == "(_, _)"
+
+
+def test_replace_unused_in_target_tuple_some_unused():
+    import ast
+
+    target = ast.parse("a, b = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "print(a)\n")
+    assert all_r is False and any_r is True
+    assert ast.unparse(new_t) == "(a, _)"
+
+
+def test_replace_unused_in_target_tuple_all_used():
+    import ast
+
+    target = ast.parse("a, b = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "print(a, b)\n")
+    assert all_r is False and any_r is False
+
+
+def test_replace_unused_in_target_attribute_treated_as_used():
+    import ast
+
+    target = ast.parse("self.x = 1").body[0].targets[0]
+    new_t, all_r, any_r = _replace_unused_in_target(target, "return None\n")
+    assert all_r is False and any_r is False
+
+
+# ---------------------------------------------------------------------------
+# _strip_unused_call_assignments
+# ---------------------------------------------------------------------------
+
+
+def test_strip_unused_call_assignments_removes_unused_single():
+    # `result` never appears after the block → assignment stripped.
+    replacement = "    result = _helper(x, y)\n"
+    following = ["    do_something()\n", "    return z\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    _helper(x, y)\n"
+
+
+def test_strip_unused_call_assignments_keeps_used_single():
+    # `result` is referenced after the block → assignment kept.
+    replacement = "    result = _helper(x, y)\n"
+    following = ["    print(result)\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_removes_unused_tuple():
+    # Both names unused after the block → assignment stripped entirely.
+    replacement = "    a, b = _helper(x)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_partial_tuple_replaces_with_underscore():
+    # One name used, one unused → replace unused with _.
+    replacement = "    a, b = _helper(x)\n"
+    following = ["    print(a)\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    (a, _) = _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_attribute_target_unchanged():
+    # Target is an attribute (self.x = call()) → treated as used → left unchanged.
+    replacement = "    self.result = _helper(x)\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_non_call_rhs_unchanged():
+    # RHS is not a Call → leave unchanged.
+    replacement = "    result = x + y\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_chained_all_unused_stripped():
+    # Chained assignment where every name is unused → stripped to just the call.
+    replacement = "    a = b = _helper(x)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_chained_some_used_unchanged():
+    # Chained assignment where one name is used → left unchanged.
+    replacement = "    a = b = _helper(x)\n"
+    following = ["    print(a)\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_chained_no_names_unchanged():
+    # Chained assignment whose targets yield no names (e.g. attributes) → unchanged.
+    replacement = "    self.a = self.b = _helper(x)\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_no_assignment_unchanged():
+    # Replacement is already just a call → returned as-is.
+    replacement = "    _helper(x, y)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_syntax_error_unchanged():
+    # Unparseable replacement → returned unchanged.
+    replacement = "    def (\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_multiline_replacement():
+    # Multi-statement replacement: only the unused assignment is stripped.
+    replacement = "    result = _helper(x)\n    do_other()\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    _helper(x)\n    do_other()\n"
+
+
+def test_strip_unused_call_assignments_preserves_indentation():
+    # Indentation of stripped replacement matches original block indent.
+    replacement = "        result = _helper(x)\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "        _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_leading_blank_line():
+    # Replacement with a blank leading line: indent is read from first content line.
+    replacement = "\n    result = _helper(x)\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "\n    _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_await_unused_stripped():
+    # `result = await _helper(x)` and `result` never used → strip assignment.
+    replacement = "    result = await _helper(x)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    await _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_await_used_kept():
+    # `result = await _helper(x)` and `result` is used → keep assignment.
+    replacement = "    result = await _helper(x)\n"
+    following = ["    print(result)\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+def test_strip_unused_call_assignments_await_tuple_unused_stripped():
+    # `a, b = await _helper(x)` and neither name is used → strip assignment.
+    replacement = "    a, b = await _helper(x)\n"
+    following = ["    return None\n"]
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == "    await _helper(x)\n"
+
+
+def test_strip_unused_call_assignments_await_non_call_unchanged():
+    # `result = await some_awaitable` (not a call) → left unchanged.
+    replacement = "    result = await some_awaitable\n"
+    following = []
+    out = _strip_unused_call_assignments(replacement, following)
+    assert out == replacement
+
+
+# ---------------------------------------------------------------------------
+# Re-strip with candidate following lines (end-to-end)
+# ---------------------------------------------------------------------------
+
+
+def test_restrip_drops_assignment_unused_only_after_all_call_sites_replaced(
+    monkeypatch,
+):
+    # Regression: when two call sites reference the same variable name, the
+    # per-call-site strip (which uses original following lines) sees the name
+    # in the other call site's original block and keeps the assignment.  After
+    # all replacements are assembled the variable is truly unused, so the
+    # re-strip pass must drop it.
+    #
+    # Source:  test_f has two identical 2-line blocks.
+    # LLM returns:
+    #   - call site 1 replacement: ``data = assert_error(result)``
+    #   - call site 2 replacement: ``assert_error(result2)``   (no assignment)
+    # After initial per-call-site strip, call site 1 keeps the assignment
+    # because "data" appears in the original following source (inside call
+    # site 2's original block).  The re-strip must then drop it.
+    # Using function parameters avoids the SequenceCollector merging the
+    # assignment lines into the duplicate block.
+    # Use 3-statement blocks (weight=3 ≥ min_weight) so the SequenceCollector
+    # finds the duplicate group.  Mirroring the real lever-mcp pattern:
+    # json.loads + two asserts.  Both result and result2 are function
+    # parameters so the SequenceCollector cannot absorb the assignment lines
+    # into the duplicate block.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    source = textwrap.dedent(
+        """\
+        def test_f(result, result2):
+            rd = json.loads(result)
+            assert rd["value"] is None
+            assert "error" in rd
+            rd = json.loads(result2)
+            assert rd["value"] is None
+            assert "error" in rd
+        """
+    )
+    helper = textwrap.dedent(
+        """\
+        def assert_error_result(result):
+            rd = json.loads(result)
+            assert rd["value"] is None
+            assert "error" in rd
+        """
+    )
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "identical blocks"),
+            _make_extract_response(
+                {
+                    "function_name": "assert_error_result",
+                    "placement": "module_level",
+                    "helper_source": helper,
+                    "call_site_replacements": [
+                        # LLM assigns the return value at call site 1 …
+                        "    rd = assert_error_result(result)\n",
+                        # … but not at call site 2 (helper returns None).
+                        "    assert_error_result(result2)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor([(2, 4), (5, 7)], source=source)
+
+    assert de._new_source is not None
+    # The re-strip must have dropped the unused assignment at call site 1.
+    assert "rd = assert_error_result(result)" not in de._new_source
+    assert "assert_error_result(result)" in de._new_source
+    assert "assert_error_result(result2)" in de._new_source
 
 
 # ---------------------------------------------------------------------------
@@ -3775,6 +5023,59 @@ def test_seq_ends_with_return_return_none():
 
 
 # ---------------------------------------------------------------------------
+# _seq_source_contains_yield
+# ---------------------------------------------------------------------------
+
+
+def test_seq_source_contains_yield_async_with_yield():
+    # The exact pattern that triggered the bug: async with ... as c: yield c
+    src = "    async with Client(mcp) as c:\n        yield c\n"
+    assert _seq_source_contains_yield(src) is True
+
+
+def test_seq_source_contains_yield_plain_yield():
+    assert _seq_source_contains_yield("    yield x\n") is True
+
+
+def test_seq_source_contains_yield_from():
+    assert _seq_source_contains_yield("    yield from something()\n") is True
+
+
+def test_seq_source_contains_yield_no_yield():
+    assert _seq_source_contains_yield("    x = 1\n    y = 2\n") is False
+
+
+def test_seq_source_contains_yield_nested_funcdef_not_counted():
+    # yield inside a nested def must NOT trigger the guard
+    src = "    def inner():\n        yield 1\n"
+    assert _seq_source_contains_yield(src) is False
+
+
+def test_seq_source_contains_yield_syntax_error():
+    assert _seq_source_contains_yield("    (\n") is False
+
+
+def test_collector_skips_yield_sequences():
+    # Sequences whose source contains yield should never be collected.
+    source = textwrap.dedent(
+        """\
+        async def make_client():
+            x = setup()
+            async with Client(x) as c:
+                yield c
+
+        async def make_client2():
+            x = setup()
+            async with Client(x) as c:
+                yield c
+        """
+    )
+    seqs = _collect_sequences(source)
+    for seq in seqs:
+        assert not _seq_source_contains_yield(seq.source)
+
+
+# ---------------------------------------------------------------------------
 # _replacement_contains_return
 # ---------------------------------------------------------------------------
 
@@ -3925,17 +5226,20 @@ def test_helper_imports_local_name_kwarg():
 _RETURN_BLOCK_SOURCE = textwrap.dedent(
     """\
     def foo():
+        if debug:
+            pass
         x = compute(data)
         y = transform(x)
         return y
 
     def bar():
+        result = None
         x = compute(data)
         y = transform(x)
         return y
     """
 )
-_RETURN_BLOCK_RANGES = [(7, 9)]  # overlaps bar's body
+_RETURN_BLOCK_RANGES = [(10, 12)]  # overlaps bar's duplicate block (x/y/return lines)
 
 
 def _make_return_block_extract_response():
@@ -4007,17 +5311,20 @@ def test_block_ends_with_return_guard_skips_silent(monkeypatch):
 _PARAM_DUP_SOURCE = textwrap.dedent(
     """\
     def test_a(mock_client):
+        if debug:
+            pass
         x = compute(data)
         y = transform(x)
         z = finalize(y)
 
     def test_b(mock_client):
+        result = None
         x = compute(data)
         y = transform(x)
         z = finalize(y)
     """
 )
-_PARAM_DUP_RANGES = [(7, 9)]  # overlaps test_b's body
+_PARAM_DUP_RANGES = [(10, 12)]  # overlaps test_b's duplicate block
 
 
 def _make_import_local_extract_response():
@@ -4081,6 +5388,243 @@ def test_helper_imports_local_guard_skips_silent(monkeypatch):
             llm_verify_retries=0,
         )
     assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# _lift_and_dedup_imports
+# ---------------------------------------------------------------------------
+
+
+def test_lift_and_dedup_no_changes_needed():
+    src = "import os\nfrom typing import Any, Dict\nx = 1\n"
+    assert _lift_and_dedup_imports(src) == src
+
+
+def test_lift_and_dedup_exact_from_duplicate():
+    src = "from typing import Any\nfrom typing import Any\n"
+    assert _lift_and_dedup_imports(src) == "from typing import Any\n"
+
+
+def test_lift_and_dedup_partial_overlap_adds_new_names():
+    # Original F811 trigger: helper adds Any+Dict+Optional, file had Any+Dict
+    src = "from typing import Any, Dict\nfrom typing import Any, Dict, Optional\n"
+    assert _lift_and_dedup_imports(src) == "from typing import Any, Dict, Optional\n"
+
+
+def test_lift_and_dedup_second_adds_only_new_names():
+    src = "from typing import Any\nfrom typing import Optional\n"
+    assert _lift_and_dedup_imports(src) == "from typing import Any, Optional\n"
+
+
+def test_lift_and_dedup_multiple_modules_independent():
+    src = (
+        "from typing import Any\n"
+        "from os.path import join\n"
+        "from typing import Dict\n"
+        "from os.path import exists\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == "from typing import Any, Dict\nfrom os.path import join, exists\n"
+
+
+def test_lift_and_dedup_plain_import_deduped():
+    # Unlike the old _dedup_from_imports, plain 'import X' dups are now removed
+    src = "import os\nimport os\n"
+    assert _lift_and_dedup_imports(src) == "import os\n"
+
+
+def test_lift_and_dedup_skips_multiline_parens():
+    src = "from typing import (\n    Any,\n    Dict,\n)\nfrom typing import Any\n"
+    # Paren form not matched; single-line import stands alone — no change
+    assert _lift_and_dedup_imports(src) == src
+
+
+def test_lift_and_dedup_skips_wildcard():
+    src = "from typing import *\nfrom typing import *\n"
+    assert _lift_and_dedup_imports(src) == src
+
+
+def test_lift_and_dedup_skips_commented_import_line():
+    # Inline comment prevents matching; both lines are left alone
+    src = "from typing import Any  # noqa\nfrom typing import Any\n"
+    assert _lift_and_dedup_imports(src) == src
+
+
+def test_lift_and_dedup_skips_indented_imports():
+    # Indented imports (TYPE_CHECKING blocks, try/except, etc.) are not touched
+    src = "    from typing import Any\n    from typing import Dict\n"
+    assert _lift_and_dedup_imports(src) == src
+
+
+def test_lift_and_dedup_empty_names_skipped():
+    # Malformed import with no names: left unchanged
+    src = "from typing import ,\nfrom typing import ,\n"
+    assert _lift_and_dedup_imports(src) == src
+
+
+def test_lift_and_dedup_non_import_lines_preserved():
+    src = "from typing import Any\nx = 1\nfrom typing import Dict\ny = 2\n"
+    result = _lift_and_dedup_imports(src)
+    assert result == "from typing import Any, Dict\nx = 1\ny = 2\n"
+
+
+def test_lift_and_dedup_lifts_misplaced_existing_module():
+    # Helper inserted before second_fn lands after def first_fn → misplaced
+    # The import merges into the block and the misplaced copy is removed.
+    src = (
+        "from typing import Any\n"
+        "\n"
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "from typing import Optional\n"  # misplaced — helper preamble
+        "def _helper():\n"
+        "    pass\n"
+        "\n"
+        "def second_fn():\n"
+        "    pass\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == (
+        "from typing import Any, Optional\n"
+        "\n"
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "def _helper():\n"
+        "    pass\n"
+        "\n"
+        "def second_fn():\n"
+        "    pass\n"
+    )
+
+
+def test_lift_and_dedup_lifts_misplaced_new_module():
+    # Helper introduces a brand-new import mid-file → moved to after block.
+    src = (
+        "from typing import Any\n"
+        "\n"
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "from collections import OrderedDict\n"  # misplaced — new module
+        "def _helper():\n"
+        "    pass\n"
+        "\n"
+        "def second_fn():\n"
+        "    pass\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == (
+        "from typing import Any\n"
+        "from collections import OrderedDict\n"  # lifted after last block import
+        "\n"
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "def _helper():\n"
+        "    pass\n"
+        "\n"
+        "def second_fn():\n"
+        "    pass\n"
+    )
+
+
+def test_lift_and_dedup_lifts_misplaced_plain_import_new_module():
+    # Covers: misplaced plain 'import X' (i >= first_funcdef_idx branch) and
+    # the new_plain_modules emission path inside _emit_new_imports.
+    src = (
+        "from typing import Any\n"
+        "\n"
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "import os\n"  # misplaced plain import — new module
+        "def _helper():\n"
+        "    pass\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == (
+        "from typing import Any\n"
+        "import os\n"  # lifted after last block import
+        "\n"
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "def _helper():\n"
+        "    pass\n"
+    )
+
+
+def test_lift_and_dedup_sorts_new_imports_by_pep8_section():
+    # New lifted imports are sorted future→stdlib→third-party→local regardless
+    # of the order they were encountered.
+    src = (
+        "from typing import Any\n"  # block stdlib import
+        "\n"
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "import requests\n"  # misplaced third-party
+        "from collections import OrderedDict\n"  # misplaced stdlib
+        "def _helper():\n"
+        "    pass\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == (
+        "from typing import Any\n"
+        "from collections import OrderedDict\n"  # stdlib before third-party
+        "import requests\n"
+        "\n"
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "def _helper():\n"
+        "    pass\n"
+    )
+
+
+def test_lift_and_dedup_blank_lines_in_block_dropped():
+    # Blank lines between import lines in the block are removed when the block
+    # is rebuilt — covers the blank-line-dropping branch in pass 5.
+    src = (
+        "import os\n"
+        "\n"  # blank between block imports → dropped on rebuild
+        "from typing import Any\n"
+        "from typing import Dict\n"  # duplicate module → merged
+        "x = 1\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    # PEP 8 sort: both are stdlib (group 1); from_order precedes plain_order in
+    # all_final_imports so stable sort keeps 'from typing' before 'import os'.
+    assert result == ("from typing import Any, Dict\n" "import os\n" "x = 1\n")
+
+
+def test_lift_and_dedup_no_block_imports_inserts_before_first_funcdef():
+    # File has no imports at all; helper adds one mid-file → moved to very top.
+    src = (
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "from collections import OrderedDict\n"  # misplaced
+        "def _helper():\n"
+        "    pass\n"
+        "\n"
+        "def second_fn():\n"
+        "    pass\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == (
+        "from collections import OrderedDict\n"  # inserted before first funcdef
+        "def first_fn():\n"
+        "    pass\n"
+        "\n"
+        "def _helper():\n"
+        "    pass\n"
+        "\n"
+        "def second_fn():\n"
+        "    pass\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4389,3 +5933,177 @@ def test_llm_verify_timeout_silent(monkeypatch):
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
 
     assert de._new_source is not None
+
+
+# ---------------------------------------------------------------------------
+# Underscore enforcement on extracted helper names
+# ---------------------------------------------------------------------------
+
+
+def test_llm_name_without_underscore_is_prefixed(monkeypatch):
+    """LLM returns a name without a leading '_'; extractor prepends one."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same logic"),
+            _make_extract_response(
+                {
+                    "function_name": "helper",  # no underscore
+                    "placement": "module_level",
+                    "helper_source": "def helper(data):\n    pass\n",
+                    "call_site_replacements": [
+                        "    helper(data)\n",
+                        "    helper(data)\n",
+                    ],
+                }
+            ),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _DUP_RANGES, source=_DUP_SOURCE, extraction_retries=0, llm_verify_retries=0
+        )
+
+    assert de._new_source is not None
+    assert "def _helper(" in de._new_source
+    assert "def helper(" not in de._new_source
+    assert "_helper(data)" in de._new_source
+
+
+# ---------------------------------------------------------------------------
+# _would_create_proxy_wrappers
+# ---------------------------------------------------------------------------
+
+
+def _make_proxy_seq(stmts_count: int, scope: str, class_scope=None) -> _SeqInfo:
+    """Build a _SeqInfo with a synthetic stmts list of the given length."""
+    return _SeqInfo(
+        stmts=[None] * stmts_count,  # type: ignore[list-item]
+        start_line=1,
+        end_line=stmts_count,
+        scope=scope,
+        source="",
+        fingerprint="",
+        class_scope=class_scope,
+    )
+
+
+def _make_proxy_func(
+    name: str, body_stmt_count: int, scope: str = "<module>"
+) -> _FunctionInfo:
+    return _FunctionInfo(
+        name=name,
+        source=f"def {name}(): pass\n",
+        scope=scope,
+        body_source="    pass\n",
+        body_stmt_count=body_stmt_count,
+        params=[],
+    )
+
+
+def test_would_create_proxy_wrappers_false_single_full_body():
+    """Single-member group where the seq covers the entire function body.
+
+    All members are proxies, so extraction is still worthwhile → False.
+    """
+    seq = _make_proxy_seq(3, scope="foo")
+    func = _make_proxy_func("foo", body_stmt_count=3, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is False
+
+
+def test_would_create_proxy_wrappers_false_all_full_bodies():
+    """All group members cover entire function bodies → False.
+
+    When every member becomes a proxy the group is all-or-nothing: extracting
+    a shared helper is still worthwhile, so the guard should not block it.
+    """
+    seq1 = _make_proxy_seq(3, scope="process", class_scope="ClassA")
+    seq2 = _make_proxy_seq(3, scope="process", class_scope="ClassB")
+    func1 = _make_proxy_func("process", body_stmt_count=3, scope="ClassA")
+    func2 = _make_proxy_func("process", body_stmt_count=3, scope="ClassB")
+    assert _would_create_proxy_wrappers([seq1, seq2], [func1, func2]) is False
+
+
+def test_would_create_proxy_wrappers_false_partial_body():
+    """A seq that covers only part of a function body → False."""
+    seq = _make_proxy_seq(2, scope="foo")
+    func = _make_proxy_func("foo", body_stmt_count=4, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is False
+
+
+def test_would_create_proxy_wrappers_false_module_scope():
+    """A seq at module scope (not inside a function) is never a proxy → False."""
+    seq = _make_proxy_seq(3, scope="<module>")
+    func = _make_proxy_func("foo", body_stmt_count=3, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is False
+
+
+def test_would_create_proxy_wrappers_false_no_matching_func():
+    """No function with matching name → False."""
+    seq = _make_proxy_seq(3, scope="foo")
+    func = _make_proxy_func("bar", body_stmt_count=3, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is False
+
+
+def test_would_create_proxy_wrappers_false_scope_mismatch():
+    """Seq in class method but func is module-level with same name → False."""
+    seq = _make_proxy_seq(3, scope="foo", class_scope="MyClass")
+    func = _make_proxy_func("foo", body_stmt_count=3, scope="<module>")
+    assert _would_create_proxy_wrappers([seq], [func]) is False
+
+
+def test_would_create_proxy_wrappers_group_with_one_proxy():
+    """A group with multiple seqs, one of which covers an entire body → True."""
+    seq_partial = _make_proxy_seq(2, scope="foo")
+    seq_full = _make_proxy_seq(3, scope="bar")
+    func_foo = _make_proxy_func("foo", body_stmt_count=5, scope="<module>")
+    func_bar = _make_proxy_func("bar", body_stmt_count=3, scope="<module>")
+    assert (
+        _would_create_proxy_wrappers([seq_partial, seq_full], [func_foo, func_bar])
+        is True
+    )
+
+
+# DuplicateExtractor: proxy wrapper guard skips groups without LLM calls
+
+
+_PROXY_SOURCE = textwrap.dedent(
+    """\
+    def foo():
+        setup = prepare(data)
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+        return setup, z
+
+    def bar():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+# overlaps foo: foo has 5 stmts but duplicate block is only 3 of them (not a proxy);
+# bar has 3 stmts = its entire body (would become a proxy) → mixed → guard fires.
+_PROXY_RANGES = [(1, 11)]
+
+
+def test_proxy_wrapper_guard_skips_group_verbose(monkeypatch, capsys):
+    """Groups that would leave a function as a trivial proxy are skipped (verbose)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic.Anthropic"):
+        de = DuplicateExtractor(_PROXY_RANGES, source=_PROXY_SOURCE, verbose=True)
+
+    assert de._new_source is None
+    captured = capsys.readouterr()
+    assert "trivial proxy wrapper" in captured.err
+
+
+def test_proxy_wrapper_guard_skips_group_silent(monkeypatch):
+    """Groups that would leave a trivial proxy are skipped with verbose=False."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic.Anthropic"):
+        de = DuplicateExtractor(_PROXY_RANGES, source=_PROXY_SOURCE, verbose=False)
+
+    assert de._new_source is None

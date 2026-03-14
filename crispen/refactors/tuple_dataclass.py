@@ -359,7 +359,14 @@ class TupleDataclass(Refactor):
 
         # Build replacement call: ClassName(field=val, ...)
         args = [
-            cst.Arg(keyword=cst.Name(fname), value=val)
+            cst.Arg(
+                keyword=cst.Name(fname),
+                value=val,
+                equal=cst.AssignEqual(
+                    whitespace_before=cst.SimpleWhitespace(""),
+                    whitespace_after=cst.SimpleWhitespace(""),
+                ),
+            )
             for fname, val in zip(field_names, values)
         ]
         # Add commas between args

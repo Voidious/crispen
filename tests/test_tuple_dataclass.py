@@ -156,7 +156,7 @@ def test_field_names_inferred_from_variables():
     assert "age: Any" in result
     assert "shoes: Any" in result
     assert "pants: Any" in result
-    assert "age = age" in result or "age=age" in result
+    assert "age=age" in result
 
 
 def test_field_names_fallback_for_literals():
