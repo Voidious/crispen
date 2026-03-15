@@ -128,6 +128,11 @@ class CrispenConfig:
     # Ignored when enabled_refactors is non-empty.
     disabled_refactors: List[str] = field(default_factory=list)
 
+    # Timing output level: "off" disables timing output entirely.
+    # "basic" shows total run time, total LLM time, and total token counts.
+    # "detailed" adds per-call-type, per-refactor, and per-file breakdowns.
+    timing: str = "detailed"
+
 
 def _read_toml(path: Path) -> dict:
     """Read a TOML file; return empty dict if missing or unparseable."""

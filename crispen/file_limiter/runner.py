@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from ..config import CrispenConfig
-from .advisor import GroupPlacement, advise_file_limiter, resolve_naming_conflicts
+from .advisor import (
+    GroupPlacement,
+    _LLMAccumulator,
+    advise_file_limiter,
+    resolve_naming_conflicts,
+)
 from .classifier import classify_entities
 from .code_gen import SplitResult, _rewrite_module_var_names, generate_file_splits
 from .entity_parser import Entity, EntityKind
@@ -26,6 +31,9 @@ class FileLimiterResult:
     subdir_name: Optional[str] = None  # set when files go into a subdirectory
     has_main: bool = False  # True when file has __main__ and original is kept
     llm_calls: int = 0
+    llm_elapsed: float = 0.0
+    llm_input_tokens: int = 0
+    llm_output_tokens: int = 0
     verified_functions: int = 0
     verified_classes: int = 0
     verified_lines: int = 0
@@ -286,6 +294,7 @@ def run_file_limiter(
     diff_ranges: List[Tuple[int, int]],
     config: CrispenConfig,
     verbose: bool = False,
+    timing: str = "detailed",
 ) -> FileLimiterResult:
     """Run all FileLimiter phases on a single file.
 
@@ -460,8 +469,9 @@ def run_file_limiter(
     prev_set3_failure: str = ""
     prev_placement_failure: str = ""
     total_llm_calls: int = 0
-    # Mutable counter shared with resolve_naming_conflicts LLM calls.
-    resolve_counter: List[int] = [0]
+    total_llm_elapsed: float = 0.0
+    total_llm_input_tokens: int = 0
+    total_llm_output_tokens: int = 0
 
     for _attempt in range(max_attempts):
         plan = advise_file_limiter(
@@ -472,9 +482,13 @@ def run_file_limiter(
             prev_set3_failure=prev_set3_failure,
             prev_placement_failure=prev_placement_failure,
             verbose=verbose,
+            timing=timing,
             subdir_name=subdir_name,
         )
         total_llm_calls += plan.llm_calls
+        total_llm_elapsed += plan.llm_elapsed
+        total_llm_input_tokens += plan.llm_input_tokens
+        total_llm_output_tokens += plan.llm_output_tokens
 
         if plan.abort:
             reason = f": {plan.abort_reason}" if plan.abort_reason else ""
@@ -514,6 +528,9 @@ def run_file_limiter(
                 abort=False,
                 messages=[],
                 llm_calls=total_llm_calls,
+                llm_elapsed=total_llm_elapsed,
+                llm_input_tokens=total_llm_input_tokens,
+                llm_output_tokens=total_llm_output_tokens,
             )
 
         # Apply test_ prefix and strip _tests suffix so pytest can discover moved
@@ -555,6 +572,7 @@ def run_file_limiter(
         )
         if conflicts:
             conflict_desc = "; ".join(conflicts)
+            resolve_acc = _LLMAccumulator()
             resolved = resolve_naming_conflicts(
                 plan.placements,
                 classified,
@@ -563,10 +581,13 @@ def run_file_limiter(
                 existing_dirs,
                 config,
                 verbose=verbose,
-                _counter=resolve_counter,
+                timing=timing,
+                _acc=resolve_acc,
             )
-            total_llm_calls += resolve_counter[0]
-            resolve_counter[0] = 0
+            total_llm_calls += resolve_acc.calls
+            total_llm_elapsed += resolve_acc.elapsed
+            total_llm_input_tokens += resolve_acc.input_tokens
+            total_llm_output_tokens += resolve_acc.output_tokens
             if resolved is not None:
                 plan.placements = resolved  # fall through to generate_file_splits
             else:
@@ -648,6 +669,9 @@ def run_file_limiter(
             messages=retry_msgs,
             abort=last_abort,
             llm_calls=total_llm_calls,
+            llm_elapsed=total_llm_elapsed,
+            llm_input_tokens=total_llm_input_tokens,
+            llm_output_tokens=total_llm_output_tokens,
         )
 
     # For non-test subdir splits without __main__: redirect the post-split
@@ -677,6 +701,9 @@ def run_file_limiter(
             messages=[f"SKIP {filepath} (FileLimiter): verification failed\n{detail}"],
             abort=True,
             llm_calls=total_llm_calls,
+            llm_elapsed=total_llm_elapsed,
+            llm_input_tokens=total_llm_input_tokens,
+            llm_output_tokens=total_llm_output_tokens,
         )
 
     # Use actual_placements (after conftest routing) for accurate target files.
@@ -695,6 +722,9 @@ def run_file_limiter(
         subdir_name=subdir_name,
         has_main=has_main,
         llm_calls=total_llm_calls,
+        llm_elapsed=total_llm_elapsed,
+        llm_input_tokens=total_llm_input_tokens,
+        llm_output_tokens=total_llm_output_tokens,
         verified_functions=vr.verified_functions,
         verified_classes=vr.verified_classes,
         verified_lines=vr.verified_lines,

@@ -568,6 +568,7 @@ def run_engine(
                         tool_choice=config.tool_choice,
                         api_timeout=config.api_timeout,
                         match_functions=_should_run("match_function", config),
+                        timing=config.timing,
                     )
                 elif RefactorClass is FunctionSplitter:
                     transformer = FunctionSplitter(
@@ -586,6 +587,8 @@ def run_engine(
                     transformer = RefactorClass(
                         ranges, source=current_source, verbose=verbose
                     )
+                transformer.current_file = filepath
+                transformer.timing = config.timing
                 new_tree = wrapper.visit(transformer)
             except CrispenAPIError:
                 raise
@@ -820,11 +823,21 @@ def run_engine(
                     diff_ranges=state["ranges"],
                     config=config,
                     verbose=verbose,
+                    timing=config.timing,
                 )
             except CrispenAPIError:
                 raise
 
             _stats.file_limiter_llm_calls += fl_result.llm_calls
+            if fl_result.llm_elapsed > 0 or fl_result.llm_input_tokens > 0:
+                _stats.record_llm_call(
+                    fl_result.llm_elapsed,
+                    fl_result.llm_input_tokens,
+                    fl_result.llm_output_tokens,
+                    "file_limiter",
+                    "file_limiter",
+                    filepath,
+                )
             _fl_verified_func_names |= fl_result.verified_function_names
             _fl_verified_class_names |= fl_result.verified_class_names
             _fl_verified_entity_lines.update(fl_result.verified_entity_line_counts)
@@ -892,6 +905,15 @@ def run_engine(
                 raise
 
             _stats.file_limiter_llm_calls += r_result.llm_calls
+            if r_result.llm_elapsed > 0 or r_result.llm_input_tokens > 0:
+                _stats.record_llm_call(
+                    r_result.llm_elapsed,
+                    r_result.llm_input_tokens,
+                    r_result.llm_output_tokens,
+                    "file_limiter",
+                    "file_limiter",
+                    r_path,
+                )
             _fl_verified_func_names |= r_result.verified_function_names
             _fl_verified_class_names |= r_result.verified_class_names
             _fl_verified_entity_lines.update(r_result.verified_entity_line_counts)

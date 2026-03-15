@@ -584,6 +584,7 @@ def _llm_veto(
     model: str = _MODEL,
     provider: str = "anthropic",
     tool_choice_override: Optional[str] = None,
+    _timing_out=None,
 ) -> Tuple[bool, str, str]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
@@ -612,11 +613,13 @@ def _llm_veto(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is not None:
+    if _timing_out is not None:
+        _timing_out.append(result)
+    if result.tool_input is not None:
         return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
+            result.tool_input["is_valid_duplicate"],
+            result.tool_input.get("reason", ""),
+            result.tool_input.get("extraction_notes", ""),
         )
     return False, "no tool response", ""  # pragma: no cover
 
@@ -634,6 +637,7 @@ def _llm_extract(
     prev_failures: List[str] = [],
     prev_output: Optional[dict] = None,
     tool_choice_override: Optional[str] = None,
+    _timing_out=None,
 ) -> Optional[dict]:
     src_lines = full_source.splitlines(keepends=True)
     block_entries = []
@@ -734,7 +738,7 @@ def _llm_extract(
         f"{veto_notes_note}"
         f"{failures_note}"
     )
-    return _llm_client.call_with_tool(
+    result = _llm_client.call_with_tool(
         client,
         provider,
         model,
@@ -745,6 +749,9 @@ def _llm_extract(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
+    if _timing_out is not None:
+        _timing_out.append(result)
+    return result.tool_input
 
 
 def _llm_veto_func_match(
@@ -755,6 +762,7 @@ def _llm_veto_func_match(
     model: str = _MODEL,
     provider: str = "anthropic",
     tool_choice_override: Optional[str] = None,
+    _timing_out=None,
 ) -> Tuple[bool, str, str]:
     """Ask the LLM whether *seq* performs the same operation as *func*'s body."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -781,11 +789,13 @@ def _llm_veto_func_match(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is not None:
+    if _timing_out is not None:
+        _timing_out.append(result)
+    if result.tool_input is not None:
         return (
-            result["is_valid_duplicate"],
-            result.get("reason", ""),
-            result.get("extraction_notes", ""),
+            result.tool_input["is_valid_duplicate"],
+            result.tool_input.get("reason", ""),
+            result.tool_input.get("extraction_notes", ""),
         )
     return False, "no tool response", ""  # pragma: no cover
 
@@ -805,6 +815,7 @@ def _llm_generate_call(
     model: str = _MODEL,
     provider: str = "anthropic",
     tool_choice_override: Optional[str] = None,
+    _timing_out=None,
 ) -> Optional[str]:
     """Ask the LLM to generate a call expression replacing *seq* with *func*."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -830,8 +841,10 @@ def _llm_generate_call(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is not None:
-        return result["replacement"]
+    if _timing_out is not None:
+        _timing_out.append(result)
+    if result.tool_input is not None:
+        return result.tool_input["replacement"]
     return None  # pragma: no cover
 
 
@@ -844,6 +857,7 @@ def _llm_verify_extraction(
     model: str = _MODEL,
     provider: str = "anthropic",
     tool_choice_override: Optional[str] = None,
+    _timing_out=None,
 ) -> Tuple[bool, List[str]]:
     """Ask the LLM to verify the extraction is semantically correct.
 
@@ -912,9 +926,11 @@ def _llm_verify_extraction(
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
     )
-    if result is None:
+    if _timing_out is not None:
+        _timing_out.append(result)
+    if result.tool_input is None:
         return True, []  # pragma: no cover
-    return result["is_correct"], result.get("issues", [])
+    return result.tool_input["is_correct"], result.tool_input.get("issues", [])
 
 
 # ---------------------------------------------------------------------------
@@ -2166,8 +2182,10 @@ class DuplicateExtractor(Refactor):
         tool_choice: Optional[str] = None,
         api_timeout: float = 60.0,
         match_functions: bool = True,
+        timing: str = "detailed",
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
+        self.timing = timing
         self._min_weight = min_weight
         self._base_max_seq_len = max_seq_len
         self._model = model
@@ -2266,6 +2284,7 @@ class DuplicateExtractor(Refactor):
                         flush=True,
                     )
                 self.stats.llm_veto_calls += 1
+                timing: list = []
                 try:
                     is_valid, reason, _veto_notes = _run_with_timeout(
                         _llm_veto_func_match,
@@ -2277,7 +2296,18 @@ class DuplicateExtractor(Refactor):
                         self._model,
                         self._provider,
                         tool_choice_override=self._tool_choice,
+                        _timing_out=timing,
                     )
+                    if timing:
+                        lr = timing[0]
+                        self.stats.record_llm_call(
+                            lr.elapsed,
+                            lr.input_tokens,
+                            lr.output_tokens,
+                            "veto",
+                            "duplicate_extractor",
+                            self.current_file,
+                        )
                 except _ApiTimeout:
                     print(
                         "crispen: DuplicateExtractor:   → func-match veto timed out",
@@ -2287,14 +2317,23 @@ class DuplicateExtractor(Refactor):
                     continue
                 if self.verbose:
                     status = "ACCEPTED" if is_valid else "VETOED"
+                    timing_suffix = ""
+                    if self.timing == "detailed" and timing:
+                        lr = timing[0]
+                        timing_suffix = (
+                            f" [{lr.elapsed:.2f}s,"
+                            f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
+                        )
                     print(
-                        f"crispen: DuplicateExtractor:   → {status}: {reason}",
+                        f"crispen: DuplicateExtractor:   → {status}: {reason}"
+                        f"{timing_suffix}",
                         file=sys.stderr,
                         flush=True,
                     )
                 if not is_valid:
                     self.stats.llm_rejected += 1
                     continue
+                timing2: list = []
                 if func.scope == "<module>" and not func.params:
                     replacement = _generate_no_arg_call(seq, func)
                 else:
@@ -2310,7 +2349,18 @@ class DuplicateExtractor(Refactor):
                             self._model,
                             self._provider,
                             tool_choice_override=self._tool_choice,
+                            _timing_out=timing2,
                         )
+                        if timing2:
+                            lr = timing2[0]
+                            self.stats.record_llm_call(
+                                lr.elapsed,
+                                lr.input_tokens,
+                                lr.output_tokens,
+                                "edit",
+                                "duplicate_extractor",
+                                self.current_file,
+                            )
                     except _ApiTimeout:
                         print(
                             "crispen: DuplicateExtractor:"
@@ -2324,9 +2374,16 @@ class DuplicateExtractor(Refactor):
                 if not _verify_extraction(None, [replacement]):
                     continue
                 if self.verbose:
+                    timing_suffix = ""
+                    if self.timing == "detailed" and timing2:
+                        lr = timing2[0]
+                        timing_suffix = (
+                            f" [{lr.elapsed:.2f}s,"
+                            f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
+                        )
                     print(
                         f"crispen: DuplicateExtractor:   → replacing '{seq.scope}'"
-                        f" with '{func.name}()'",
+                        f" with '{func.name}()'{timing_suffix}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -2387,6 +2444,7 @@ class DuplicateExtractor(Refactor):
                     flush=True,
                 )
             self.stats.llm_veto_calls += 1
+            timing3: list = []
             try:
                 is_valid, reason, veto_notes = _run_with_timeout(
                     _llm_veto,
@@ -2396,7 +2454,18 @@ class DuplicateExtractor(Refactor):
                     self._model,
                     self._provider,
                     tool_choice_override=self._tool_choice,
+                    _timing_out=timing3,
                 )
+                if timing3:
+                    lr = timing3[0]
+                    self.stats.record_llm_call(
+                        lr.elapsed,
+                        lr.input_tokens,
+                        lr.output_tokens,
+                        "veto",
+                        "duplicate_extractor",
+                        self.current_file,
+                    )
             except _ApiTimeout:
                 print(
                     "crispen: DuplicateExtractor: API call timed out, skipping group",
@@ -2406,8 +2475,16 @@ class DuplicateExtractor(Refactor):
                 continue
             if self.verbose:
                 status = "ACCEPTED" if is_valid else "VETOED"
+                timing_suffix = ""
+                if self.timing == "detailed" and timing3:
+                    lr = timing3[0]
+                    timing_suffix = (
+                        f" [{lr.elapsed:.2f}s,"
+                        f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
+                    )
                 print(
-                    f"crispen: DuplicateExtractor:   → {status}: {reason}",
+                    f"crispen: DuplicateExtractor:   → {status}: {reason}"
+                    f"{timing_suffix}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -2425,6 +2502,7 @@ class DuplicateExtractor(Refactor):
 
             while True:
                 self.stats.llm_edit_calls += 1
+                timing4: list = []
                 try:
                     extraction = _run_with_timeout(
                         _llm_extract,
@@ -2441,7 +2519,18 @@ class DuplicateExtractor(Refactor):
                         prev_failures=prev_failures,
                         prev_output=prev_output,
                         tool_choice_override=self._tool_choice,
+                        _timing_out=timing4,
                     )
+                    if timing4:
+                        lr = timing4[0]
+                        self.stats.record_llm_call(
+                            lr.elapsed,
+                            lr.input_tokens,
+                            lr.output_tokens,
+                            "edit",
+                            "duplicate_extractor",
+                            self.current_file,
+                        )
                 except _ApiTimeout:
                     print(
                         "crispen: DuplicateExtractor: API call timed out,"
@@ -2452,6 +2541,16 @@ class DuplicateExtractor(Refactor):
                     break
                 if extraction is None:
                     break  # pragma: no cover
+
+                if self.verbose and self.timing == "detailed" and timing4:
+                    lr = timing4[0]
+                    print(
+                        f"crispen: DuplicateExtractor:   → extraction"
+                        f" [{lr.elapsed:.2f}s,"
+                        f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
                 helper_source = extraction["helper_source"]
                 if not self._helper_docstrings:
@@ -2883,6 +2982,7 @@ class DuplicateExtractor(Refactor):
 
                 # ---- LLM verification step ----
                 self.stats.llm_verify_calls += 1
+                timing5: list = []
                 try:
                     verify_ok, verify_issues = _run_with_timeout(
                         _llm_verify_extraction,
@@ -2895,7 +2995,18 @@ class DuplicateExtractor(Refactor):
                         self._model,
                         self._provider,
                         tool_choice_override=self._tool_choice,
+                        _timing_out=timing5,
                     )
+                    if timing5:
+                        lr = timing5[0]
+                        self.stats.record_llm_call(
+                            lr.elapsed,
+                            lr.input_tokens,
+                            lr.output_tokens,
+                            "verify",
+                            "duplicate_extractor",
+                            self.current_file,
+                        )
                 except _ApiTimeout:
                     if self.verbose:
                         print(
@@ -2908,8 +3019,16 @@ class DuplicateExtractor(Refactor):
 
                 if self.verbose:
                     v_status = "ACCEPTED" if verify_ok else "REJECTED"
+                    timing_suffix = ""
+                    if self.timing == "detailed" and timing5:
+                        lr = timing5[0]
+                        timing_suffix = (
+                            f" [{lr.elapsed:.2f}s,"
+                            f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
+                        )
                     print(
-                        f"crispen: DuplicateExtractor:   → verify {v_status}",
+                        f"crispen: DuplicateExtractor:   → verify {v_status}"
+                        f"{timing_suffix}",
                         file=sys.stderr,
                         flush=True,
                     )

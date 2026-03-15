@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import sys
 import textwrap
 import threading
 from dataclasses import dataclass
@@ -573,6 +574,7 @@ def _llm_name_helpers(
     provider: str,
     tasks: List[_SplitTask],
     tool_choice_override: Optional[str] = None,
+    _timing_out=None,
 ) -> List[str]:
     """Single LLM call to name all helper functions. Falls back on error."""
     task_texts = []
@@ -605,14 +607,16 @@ def _llm_name_helpers(
         caller="FunctionSplitter",
         tool_choice_override=tool_choice_override,
     )
+    if _timing_out is not None:
+        _timing_out.append(result)
 
     fallback = [f"{t.func_info.node.name.value}_helper" for t in tasks]
 
-    if result is None or "names" not in result:
+    if result.tool_input is None or "names" not in result.tool_input:
         return fallback
 
     name_map: Dict[str, str] = {}
-    for item in result["names"]:
+    for item in result.tool_input["names"]:
         try:
             raw = item["name"].lstrip("_")
             name_map[str(item["id"])] = raw if raw else "helper"
@@ -856,6 +860,7 @@ class FunctionSplitter(Refactor):
                     base_url=self._base_url,
                 )
                 self.stats.llm_edit_calls += 1
+                timing: list = []
                 names = _run_with_timeout(
                     _llm_name_helpers,
                     self._hard_timeout,
@@ -864,7 +869,26 @@ class FunctionSplitter(Refactor):
                     self._provider,
                     tasks,
                     tool_choice_override=self._tool_choice,
+                    _timing_out=timing,
                 )
+                if timing:  # pragma: no branch
+                    lr = timing[0]
+                    self.stats.record_llm_call(
+                        lr.elapsed,
+                        lr.input_tokens,
+                        lr.output_tokens,
+                        "edit",
+                        "function_splitter",
+                        self.current_file,
+                    )
+                if self.verbose and self.timing == "detailed" and timing:
+                    lr = timing[0]
+                    print(
+                        f"crispen: FunctionSplitter:   → naming [{lr.elapsed:.2f}s,"
+                        f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             except Exception:
                 names = [f"{t.func_info.node.name.value}_helper" for t in tasks]
 
