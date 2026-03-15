@@ -1,6 +1,6 @@
 """Tests for crispen.config — 100% branch coverage."""
 
-from crispen.config import CrispenConfig, _apply, _read_toml, load_config
+from crispen.config import CrispenConfig, _apply, _read_toml, format_header, load_config
 
 
 # ---------------------------------------------------------------------------
@@ -199,3 +199,29 @@ def test_crispen_toml_overrides_refactor_lists(tmp_path):
     cfg = load_config(project_root=tmp_path)
     assert cfg.enabled_refactors == []
     assert cfg.disabled_refactors == ["function_splitter"]
+
+
+# ---------------------------------------------------------------------------
+# format_header
+# ---------------------------------------------------------------------------
+
+
+def test_format_header_defaults():
+    cfg = CrispenConfig()
+    lines = format_header(cfg)
+    text = "\n".join(lines)
+    assert lines[0] == "--- crispen ---"
+    assert "anthropic" in text
+    assert "claude-sonnet-4-6" in text
+    assert "60.0s" in text
+    assert "extraction_retries:" in text
+    assert "llm_verify_retries:" in text
+    assert "file_limiter_retries:" in text
+    assert "base_url" not in text
+
+
+def test_format_header_with_base_url():
+    cfg = CrispenConfig(base_url="http://localhost:1234/v1")
+    lines = format_header(cfg)
+    text = "\n".join(lines)
+    assert "http://localhost:1234/v1" in text

@@ -2,6 +2,7 @@
 
 import ast
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ from .stats import RunStats
 import libcst as cst
 from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvider
 
-from .config import CrispenConfig, load_config
+from .config import CrispenConfig, format_header, load_config
 from .errors import CrispenAPIError
 from .file_limiter.runner import run_file_limiter
 from .refactors.caller_updater import CallerUpdater
@@ -23,6 +24,11 @@ from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
 
 # Single-file refactors applied in order before TupleDataclass.
 _REFACTORS = [IfNotElse, DuplicateExtractor, FunctionSplitter]
+
+# Refactor keys that invoke LLM calls (used to decide whether to print config).
+_LLM_REFACTOR_KEYS = frozenset(
+    {"duplicate_extractor", "function_splitter", "tuple_dataclass", "file_limiter"}
+)
 
 # Canonical snake_case name for each refactor class (used by _should_run).
 _REFACTOR_KEY: Dict[type, str] = {
@@ -520,6 +526,10 @@ def run_engine(
     if config is None:
         config = load_config()
     _stats = stats if stats is not None else RunStats()
+
+    if changed and any(_should_run(k, config) for k in _LLM_REFACTOR_KEYS):
+        for line in format_header(config):
+            print(line, file=sys.stderr, flush=True)
 
     # ------------------------------------------------------------------ #
     # Phase 1 — single-file refactors + TupleDataclass (private only)     #

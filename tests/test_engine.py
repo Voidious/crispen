@@ -10,6 +10,7 @@ import pytest
 from crispen.config import CrispenConfig
 from crispen.engine import (
     _EXCLUDED_DIR_NAMES,
+    _LLM_REFACTOR_KEYS,
     _apply_tuple_dataclass,
     _blocked_private_scopes,
     _build_alias_map,
@@ -34,6 +35,34 @@ from crispen.stats import RunStats
 
 def _run(changed):
     return list(run_engine(changed, config=CrispenConfig(min_tuple_size=3)))
+
+
+# ---------------------------------------------------------------------------
+# Config header printed to stderr
+# ---------------------------------------------------------------------------
+
+
+def test_config_header_printed_when_llm_refactors_enabled(tmp_path, capsys):
+    f = tmp_path / "simple.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    list(run_engine({str(f): [(1, 1)]}, config=CrispenConfig()))
+    err = capsys.readouterr().err
+    assert "--- crispen ---" in err
+    assert "provider:" in err
+    assert "model:" in err
+
+
+def test_config_header_suppressed_when_all_llm_refactors_disabled(tmp_path, capsys):
+    f = tmp_path / "simple.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    cfg = CrispenConfig(disabled_refactors=list(_LLM_REFACTOR_KEYS))
+    list(run_engine({str(f): [(1, 1)]}, config=cfg))
+    assert "--- crispen ---" not in capsys.readouterr().err
+
+
+def test_config_header_suppressed_when_changed_empty(capsys):
+    list(run_engine({}, config=CrispenConfig()))
+    assert "--- crispen ---" not in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
