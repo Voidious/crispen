@@ -60,19 +60,29 @@ _REL_IMPORT_RE = re.compile(r"^from (\.+)", re.MULTILINE)
 
 # Matches four or more consecutive newlines (= 3+ blank lines between entities).
 _EXCESS_BLANK_RE = re.compile(r"\n{4,}")
+# Matches 3+ consecutive newlines followed by indented content (= 2+ blank lines
+# inside a function/class body, where flake8 E303 allows at most one blank line).
+_EXCESS_BLANK_BODY_RE = re.compile(r"\n{3,}(?=[ \t])")
 
 
 def _normalize_blank_lines(source: str) -> str:
-    """Collapse runs of 3+ blank lines to 2; ensure exactly one trailing newline.
+    """Collapse excess blank lines; ensure exactly one trailing newline.
 
     Removes blank-line artefacts produced by entity removal (original file)
-    and entity-source stripping (new files).  PEP 8 / flake8 E303 allows at
-    most two blank lines between top-level definitions.
+    and entity-source stripping (new files):
+
+    - Strips leading blank lines at the start of the file (E303).
+    - Collapses 3+ consecutive blank lines between top-level definitions to 2
+      (E303; PEP 8 allows at most two blank lines at module level).
+    - Collapses 2+ consecutive blank lines inside indented bodies to 1
+      (E303; PEP 8 allows at most one blank line inside a function/class).
 
     Returns an empty string when *source* contains only whitespace, signalling
     that the file should be deleted rather than written with a lone blank line.
     """
     source = _EXCESS_BLANK_RE.sub("\n\n\n", source)
+    source = _EXCESS_BLANK_BODY_RE.sub("\n\n", source)
+    source = source.lstrip("\n")
     stripped = source.rstrip("\n")
     if not stripped.strip():
         return ""
@@ -122,6 +132,42 @@ def _strip_orphaned_section_headers(source: str) -> str:
     if not orphaned_0idx:
         return source
     return "".join(line for i, line in enumerate(lines) if i not in orphaned_0idx)
+
+
+def _strip_orphaned_indented_comments(source: str) -> str:
+    """Remove indented comment lines that appear at module level.
+
+    After FileLimiter moves a function to a new file using AST line ranges,
+    trailing comments that were inside the function body may be left behind
+    in the original file.  These comments retain their original indentation
+    (e.g. four spaces) even though they are now at module level, causing
+    flake8 E116 (unexpected indentation: comment).
+
+    This function uses ``ast.parse`` to build the set of line numbers covered
+    by any AST node.  Any comment line with leading whitespace whose line
+    number falls outside that set is considered orphaned and removed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    covered: Set[int] = set()
+    for node in ast.walk(tree):
+        if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+            for lineno in range(node.lineno, node.end_lineno + 1):
+                covered.add(lineno)
+
+    lines = source.splitlines(keepends=True)
+    result = []
+    for i, line in enumerate(lines):
+        lineno = i + 1  # 1-indexed
+        stripped = line.lstrip()
+        is_indented_comment = stripped.startswith("#") and len(line) > len(stripped)
+        if is_indented_comment and lineno not in covered:
+            continue
+        result.append(line)
+    return "".join(result)
 
 
 def _import_derived_names(source: str) -> Set[str]:
@@ -2477,6 +2523,11 @@ def generate_file_splits(
     # removal (nothing substantive remains beneath them).
     new_files = {f: _strip_orphaned_section_headers(s) for f, s in new_files.items()}
     updated = _strip_orphaned_section_headers(updated)
+
+    # Remove indented comment lines that ended up at module level after entity
+    # migration (flake8 E116: unexpected indentation: comment).
+    new_files = {f: _strip_orphaned_indented_comments(s) for f, s in new_files.items()}
+    updated = _strip_orphaned_indented_comments(updated)
 
     # When pytest_conftest is active and the test file's remaining content
     # contains only fixtures (no test functions, no other definitions), the

@@ -46,6 +46,8 @@ from crispen.file_limiter.code_gen import (
     _split_cross_imports_by_test,
     _source_is_only_docstring,
     _strip_module_docstring,
+    _normalize_blank_lines,
+    _strip_orphaned_indented_comments,
     _strip_orphaned_section_headers,
     _strip_top_level_import_lines,
     _target_module_name,
@@ -5452,3 +5454,78 @@ def test_strip_equals_single_line_header_orphaned():
     source = "def foo():\n    pass\n\n# === OLD SECTION ===\n"
     result = _strip_orphaned_section_headers(source)
     assert "# === OLD SECTION ===" not in result
+
+
+# ---------------------------------------------------------------------------
+# _normalize_blank_lines
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_blank_lines_strips_leading_blanks():
+    """Leading blank lines are removed (prevents E303 at top of file)."""
+    source = "\n\n\ndef foo():\n    pass\n"
+    result = _normalize_blank_lines(source)
+    assert result.startswith("def foo():")
+
+
+def test_normalize_blank_lines_collapses_excess_top_level():
+    """4+ consecutive newlines between top-level defs collapse to 3."""
+    source = "def foo():\n    pass\n\n\n\n\ndef bar():\n    pass\n"
+    result = _normalize_blank_lines(source)
+    assert "\n\n\n\n" not in result
+    assert "def foo():" in result
+    assert "def bar():" in result
+
+
+def test_normalize_blank_lines_collapses_body_blanks():
+    """2+ blank lines inside an indented body collapse to 1 (prevents E303 in body)."""
+    source = "def foo():\n    x = 1\n\n\n    y = 2\n"
+    result = _normalize_blank_lines(source)
+    assert "\n\n\n    y" not in result
+    assert "\n\n    y" in result
+
+
+def test_normalize_blank_lines_empty_source():
+    """Whitespace-only source returns empty string."""
+    assert _normalize_blank_lines("\n\n\n") == ""
+
+
+def test_normalize_blank_lines_trailing_newline():
+    """Result always ends with exactly one newline."""
+    source = "x = 1\n\n\n"
+    result = _normalize_blank_lines(source)
+    assert result.endswith("\n")
+    assert not result.endswith("\n\n")
+
+
+# ---------------------------------------------------------------------------
+# _strip_orphaned_indented_comments
+# ---------------------------------------------------------------------------
+
+
+def test_strip_orphaned_indented_comments_removes_orphan():
+    """Indented comment at module level (outside any AST node) is removed."""
+    source = "\n\n    # This comment was left behind after function removal\n"
+    result = _strip_orphaned_indented_comments(source)
+    assert "# This comment was left behind" not in result
+
+
+def test_strip_orphaned_indented_comments_keeps_inside_function():
+    """Indented comment inside a function body is preserved."""
+    source = "def foo():\n    # normal comment\n    pass\n"
+    result = _strip_orphaned_indented_comments(source)
+    assert "# normal comment" in result
+
+
+def test_strip_orphaned_indented_comments_keeps_module_level_comment():
+    """Non-indented module-level comment is preserved."""
+    source = "# module comment\ndef foo():\n    pass\n"
+    result = _strip_orphaned_indented_comments(source)
+    assert "# module comment" in result
+
+
+def test_strip_orphaned_indented_comments_syntax_error():
+    """SyntaxError in source returns source unchanged."""
+    source = "    # orphaned\ndef f(: pass\n"
+    result = _strip_orphaned_indented_comments(source)
+    assert result == source
