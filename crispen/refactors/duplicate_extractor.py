@@ -1853,7 +1853,16 @@ def _lift_and_dedup_imports(source: str) -> str:
 
         result.append(line)
 
-    return "".join(result)
+    result_str = "".join(result)
+    # When a misplaced import is removed, the blank line that visually separated
+    # it from the following def/class is left behind.  Combined with the two
+    # trailing blank lines already written after the previous helper, this
+    # produces three consecutive blank lines — a PEP 8 / E303 violation.
+    # Collapse any run of 3+ blank lines down to exactly 2 (the PEP 8 maximum
+    # between top-level definitions).  Four or more '\n' in a row means three
+    # or more blank lines; replace with exactly three '\n' (= two blank lines).
+    result_str = re.sub(r"\n{4,}", "\n\n\n", result_str)
+    return result_str
 
 
 def _names_assigned_in(block_source: str) -> set:
