@@ -245,7 +245,7 @@ class RunStats:
             )
             if timing == "detailed":
                 if self.llm_calls_by_category:
-                    lines.append("  by call type:")
+                    lines.append("  LLM by call type:")
                     for cat in ("veto", "edit", "verify", "file_limiter"):
                         calls = self.llm_calls_by_category.get(cat, 0)
                         if not calls:
@@ -259,7 +259,7 @@ class RunStats:
                             f"  {call_str:>8}  {in_tok:>7,} in / {out_tok:>6,} out"
                         )
                 if self.llm_elapsed_by_refactor:
-                    lines.append("  by refactor:")
+                    lines.append("  LLM by refactor:")
                     for refactor, elapsed in sorted(
                         self.llm_elapsed_by_refactor.items(), key=lambda x: -x[1]
                     ):
@@ -270,14 +270,15 @@ class RunStats:
                             f"  {in_tok:>7,} in / {out_tok:>6,} out"
                         )
                 if self.llm_elapsed_by_file:
-                    lines.append("  by file:")
+                    lines.append("  LLM by file:")
                     for filepath, elapsed in sorted(
                         self.llm_elapsed_by_file.items(), key=lambda x: -x[1]
                     ):
                         in_tok = self.llm_input_tokens_by_file.get(filepath, 0)
                         out_tok = self.llm_output_tokens_by_file.get(filepath, 0)
+                        pad = max(32, len(filepath) + 1)
                         lines.append(
-                            f"    {filepath:<32}{elapsed:.2f}s"
+                            f"    {filepath:<{pad}}{elapsed:.2f}s"
                             f"  {in_tok:>7,} in / {out_tok:>6,} out"
                         )
         return lines

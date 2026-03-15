@@ -290,11 +290,11 @@ def test_format_summary_detailed_timing():
     s.record_llm_call(1.0, 400, 200, "edit", "function_splitter", "bar.py")
     lines = s.format_summary(timing="detailed")
     text = "\n".join(lines)
-    assert "by call type:" in text
+    assert "LLM by call type:" in text
     assert "veto" in text
-    assert "by refactor:" in text
+    assert "LLM by refactor:" in text
     assert "duplicate_extractor" in text
-    assert "by file:" in text
+    assert "LLM by file:" in text
     assert "foo.py" in text
 
 
@@ -316,6 +316,6 @@ def test_format_summary_detailed_no_breakdowns():
     lines = s.format_summary(timing="detailed")
     text = "\n".join(lines)
     assert "timing:" in text
-    assert "by call type:" not in text
-    assert "by refactor:" not in text
-    assert "by file:" not in text
+    assert "LLM by call type:" not in text
+    assert "LLM by refactor:" not in text
+    assert "LLM by file:" not in text
