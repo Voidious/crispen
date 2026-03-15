@@ -30,5 +30,6 @@ def main() -> None:
         print(f"crispen: {exc}", file=sys.stderr)
         sys.exit(1)
     run_stats.total_elapsed = time.perf_counter() - _t0
-    for line in run_stats.format_summary(timing=config.timing):
-        print(line)
+    if run_stats.total_llm_calls > 0 or run_stats.total_edits > 0:
+        for line in run_stats.format_summary(timing=config.timing):
+            print(line)
