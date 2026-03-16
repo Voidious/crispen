@@ -579,6 +579,7 @@ def run_engine(
                         api_timeout=config.api_timeout,
                         match_functions=_should_run("match_function", config),
                         timing=config.timing,
+                        current_file=filepath,
                     )
                 elif RefactorClass is FunctionSplitter:
                     transformer = FunctionSplitter(
@@ -592,6 +593,7 @@ def run_engine(
                         base_url=config.base_url,
                         tool_choice=config.tool_choice,
                         api_timeout=config.api_timeout,
+                        current_file=filepath,
                     )
                 else:
                     transformer = RefactorClass(

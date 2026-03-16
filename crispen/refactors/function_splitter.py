@@ -771,8 +771,10 @@ class FunctionSplitter(Refactor):
         base_url: Optional[str] = None,
         tool_choice: Optional[str] = None,
         api_timeout: float = 60.0,
+        current_file: str = "",
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
+        self.current_file = current_file
         self._max_lines = max_lines
         self._model = model
         self._provider = provider

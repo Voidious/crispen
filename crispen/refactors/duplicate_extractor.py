@@ -2192,8 +2192,10 @@ class DuplicateExtractor(Refactor):
         api_timeout: float = 60.0,
         match_functions: bool = True,
         timing: str = "detailed",
+        current_file: str = "",
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
+        self.current_file = current_file
         self.timing = timing
         self._min_weight = min_weight
         self._base_max_seq_len = max_seq_len
