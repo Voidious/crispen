@@ -3568,6 +3568,23 @@ def test_prune_inline_preserves_indentation():
     assert inner[0].startswith("        from mymod import Bar")
 
 
+def test_prune_inline_preserves_type_checking_block():
+    # Imports inside 'if TYPE_CHECKING:' must never be stripped even when the
+    # same name is already imported at module level — removing them would leave
+    # an empty (and syntactically invalid) if-block.
+    source = textwrap.dedent(
+        """\
+        from typing import TYPE_CHECKING
+        from mymod import Foo
+
+        if TYPE_CHECKING:
+            from mymod import Foo
+        """
+    )
+    result = _prune_inline_redundant_imports(source)
+    assert result == source
+
+
 def test_generate_file_splits_removes_inline_redundant_imports():
     # When a split new file has both a top-level import and an inline re-import
     # of the same name, the inline one should be removed.

@@ -1312,12 +1312,29 @@ def _prune_inline_redundant_imports(source: str) -> str:
     if not top_level_names:
         return source
 
-    # Find all import nodes that are NOT at module level.
+    # Collect import node IDs inside module-level 'if TYPE_CHECKING:' blocks.
+    # These are intentional type-checking guards and must not be treated as
+    # redundant even when the same name is already imported at module level —
+    # removing them would leave an empty (and therefore invalid) if-block.
+    tc_guard_import_ids: Set[int] = set()
+    for node in tree.body:
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
+            for child in ast.walk(node):
+                if isinstance(child, (ast.Import, ast.ImportFrom)):
+                    tc_guard_import_ids.add(id(child))
+
+    # Find all import nodes that are NOT at module level and NOT inside a
+    # module-level 'if TYPE_CHECKING:' guard.
     inner_imports = [
         node
         for node in ast.walk(tree)
         if isinstance(node, (ast.Import, ast.ImportFrom))
         and id(node) not in top_level_node_ids
+        and id(node) not in tc_guard_import_ids
     ]
 
     if not inner_imports:
