@@ -15,6 +15,7 @@ from crispen.file_limiter.code_gen import (
     _class_has_test_methods,
     _collect_external_imported_names,
     _collect_name_loads,
+    _collect_quoted_annotation_names,
     _collect_name_stores,
     _inject_module_level_imports,
     _test_names_in_decorators,
@@ -22,12 +23,14 @@ from crispen.file_limiter.code_gen import (
     _extract_module_docstring,
     _extract_shared_helpers,
     _find_cross_file_imports,
+    _find_cross_file_type_checking_imports,
     _module_import_stmt,
     _rewrite_module_level_stores,
     _rewrite_module_var_names,
     _find_main_block_entity,
     _find_main_direct_callees,
     _find_needed_imports,
+    _find_type_checking_needed_imports,
     _find_project_root,
     _import_derived_names,
     _import_line_numbers,
@@ -46,6 +49,8 @@ from crispen.file_limiter.code_gen import (
     _split_cross_imports_by_test,
     _source_is_only_docstring,
     _strip_module_docstring,
+    _normalize_blank_lines,
+    _strip_orphaned_indented_comments,
     _strip_orphaned_section_headers,
     _strip_top_level_import_lines,
     _target_module_name,
@@ -171,6 +176,74 @@ def test_collect_name_loads_annotated_vararg_kwarg():
     names = _collect_name_loads(source)
     assert "VarType" in names
     assert "KwType" in names
+
+
+# ---------------------------------------------------------------------------
+# _collect_quoted_annotation_names
+# ---------------------------------------------------------------------------
+
+
+def test_collect_quoted_annotation_names_basic():
+    # "MyType" in a string annotation → detected.
+    source = 'def f(x: "MyType") -> None:\n    pass\n'
+    names = _collect_quoted_annotation_names(source)
+    assert "MyType" in names
+
+
+def test_collect_quoted_annotation_names_optional():
+    # Optional["_LLMAccumulator"] — the inner string is parsed.
+    source = 'def f(x: Optional["_LLMAccumulator"]) -> None:\n    pass\n'
+    names = _collect_quoted_annotation_names(source)
+    assert "_LLMAccumulator" in names
+
+
+def test_collect_quoted_annotation_names_return():
+    # Quoted return annotation.
+    source = 'def f() -> "ReturnType":\n    pass\n'
+    names = _collect_quoted_annotation_names(source)
+    assert "ReturnType" in names
+
+
+def test_collect_quoted_annotation_names_annassign():
+    # Variable annotation: x: "MyClass"
+    source = 'x: "MyClass"\n'
+    names = _collect_quoted_annotation_names(source)
+    assert "MyClass" in names
+
+
+def test_collect_quoted_annotation_names_unquoted_not_included():
+    # Normal (unquoted) annotation names are NOT returned by this function.
+    source = "def f(x: MyType) -> None:\n    pass\n"
+    names = _collect_quoted_annotation_names(source)
+    assert "MyType" not in names
+
+
+def test_collect_quoted_annotation_names_syntax_error():
+    # Unparseable source returns empty set (no crash).
+    assert _collect_quoted_annotation_names("def (invalid") == set()
+
+
+def test_collect_quoted_annotation_names_inner_syntax_error():
+    # A string annotation that isn't valid Python is silently ignored.
+    source = 'def f(x: "not valid python !!") -> None:\n    pass\n'
+    names = _collect_quoted_annotation_names(source)
+    assert names == set()
+
+
+def test_collect_quoted_annotation_names_vararg_kwarg():
+    # *args and **kwargs with quoted annotations.
+    source = 'def f(*args: "VarType", **kwargs: "KwType") -> None:\n    pass\n'
+    names = _collect_quoted_annotation_names(source)
+    assert "VarType" in names
+    assert "KwType" in names
+
+
+def test_collect_quoted_annotation_names_annassign_with_value():
+    # x: "MyClass" = SomeFactory() — annotation has quoted name AND there is a value.
+    # The _walk branch for AnnAssign with node.value must execute.
+    source = 'x: "MyClass" = object()\n'
+    names = _collect_quoted_annotation_names(source)
+    assert "MyClass" in names
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +502,97 @@ def test_find_needed_imports_entity_not_in_map():
     # Entity name not in entity_source_map → treated as empty source.
     infos = [ImportInfo(names=["os"], source="import os", is_future=False)]
     result = _find_needed_imports(["ghost"], {}, infos, set())
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _find_type_checking_needed_imports
+# ---------------------------------------------------------------------------
+
+
+def test_find_type_checking_needed_imports_quoted_only():
+    # "MyType" appears only in a quoted annotation, not a runtime load.
+    entity_src_map = {"foo": 'def foo(x: Optional["MyType"]) -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["MyType"], source="from models import MyType", is_future=False
+        )
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    assert "from models import MyType" in result
+
+
+def test_find_type_checking_needed_imports_runtime_excluded():
+    # When the name is used at runtime (not just in a quoted annotation),
+    # it should NOT appear in the TYPE_CHECKING-only list.
+    entity_src_map = {"foo": "def foo():\n    return MyType()\n"}
+    infos = [
+        ImportInfo(
+            names=["MyType"], source="from models import MyType", is_future=False
+        )
+    ]
+    # Pass the import as already in regular_needed_sources.
+    result = _find_type_checking_needed_imports(
+        ["foo"], entity_src_map, infos, {"from models import MyType"}
+    )
+    assert result == []
+
+
+def test_find_type_checking_needed_imports_no_annotations():
+    # No quoted annotations → result is empty.
+    entity_src_map = {"foo": "def foo():\n    pass\n"}
+    infos = [
+        ImportInfo(
+            names=["MyType"], source="from models import MyType", is_future=False
+        )
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    assert result == []
+
+
+def test_find_type_checking_needed_imports_future_excluded():
+    # __future__ imports are never returned (they're always in regular imports).
+    entity_src_map = {"foo": 'def foo(x: "MyType") -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["annotations"],
+            source="from __future__ import annotations",
+            is_future=True,
+        ),
+        ImportInfo(
+            names=["MyType"], source="from models import MyType", is_future=False
+        ),
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    assert "from __future__ import annotations" not in result
+    assert "from models import MyType" in result
+
+
+def test_find_type_checking_needed_imports_deduplicates():
+    # Two ImportInfo entries with the same source → only one returned.
+    entity_src_map = {"foo": 'def foo(x: "MyType") -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["MyType"], source="from models import MyType", is_future=False
+        ),
+        ImportInfo(
+            names=["MyType"], source="from models import MyType", is_future=False
+        ),
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    assert result.count("from models import MyType") == 1
+
+
+def test_find_type_checking_needed_imports_import_names_no_match():
+    # annotation_only has "MyType" but the ImportInfo names do not include it →
+    # the any() check on line 499 returns False → import is skipped.
+    entity_src_map = {"foo": 'def foo(x: "MyType") -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["OtherType"], source="from models import OtherType", is_future=False
+        )
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
     assert result == []
 
 
@@ -1871,6 +2035,83 @@ def test_generate_aborts_on_cycle_through_original_test_subdir():
     # re-exports _helper from svc/test_helpers.py → circular import → abort.
     assert result.abort is True
     assert result.new_files == {}
+
+
+# ---------------------------------------------------------------------------
+# generate_file_splits — TYPE_CHECKING imports for quoted annotations
+# ---------------------------------------------------------------------------
+
+
+def test_generate_file_splits_type_checking_for_quoted_annotation():
+    # _advise_set3 uses Optional["_LLMAccumulator"] (quoted annotation).
+    # _LLMAccumulator is migrated to models.py; _advise_set3 goes to placements.py.
+    # placements.py must get:
+    #   from typing import TYPE_CHECKING
+    #   if TYPE_CHECKING:
+    #       from .models import _LLMAccumulator
+    source = textwrap.dedent(
+        """\
+        from typing import Optional
+
+        class _LLMAccumulator:
+            pass
+
+        def _advise_set3(acc: Optional["_LLMAccumulator"]) -> None:
+            pass
+        """
+    )
+    e_acc = Entity(EntityKind.CLASS, "_LLMAccumulator", 3, 4, ["_LLMAccumulator"])
+    e_fn = Entity(EntityKind.FUNCTION, "_advise_set3", 6, 7, ["_advise_set3"])
+    c = _classified(entities=[e_acc, e_fn])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_LLMAccumulator"], target_file="models.py"),
+            GroupPlacement(group=["_advise_set3"], target_file="placements.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "advisor.py")
+
+    placements_src = result.new_files["placements.py"]
+    # TYPE_CHECKING may be merged into an existing "from typing import ..." line.
+    assert "TYPE_CHECKING" in placements_src
+    assert "if TYPE_CHECKING:" in placements_src
+    assert "from .models import _LLMAccumulator" in placements_src
+
+
+def test_generate_file_splits_type_checking_deduplication():
+    # Two functions in the same target file both reference "_LLMAccumulator"
+    # in quoted annotations.  The TYPE_CHECKING import should appear only once
+    # even though both entities trigger _find_cross_file_type_checking_imports.
+    source = textwrap.dedent(
+        """\
+        from typing import Optional
+
+        class _LLMAccumulator:
+            pass
+
+        def _fn_a(x: Optional["_LLMAccumulator"]) -> None:
+            pass
+
+        def _fn_b(y: Optional["_LLMAccumulator"]) -> None:
+            pass
+        """
+    )
+    e_acc = Entity(EntityKind.CLASS, "_LLMAccumulator", 3, 4, ["_LLMAccumulator"])
+    e_fna = Entity(EntityKind.FUNCTION, "_fn_a", 6, 7, ["_fn_a"])
+    e_fnb = Entity(EntityKind.FUNCTION, "_fn_b", 9, 10, ["_fn_b"])
+    c = _classified(entities=[e_acc, e_fna, e_fnb])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_LLMAccumulator"], target_file="models.py"),
+            GroupPlacement(group=["_fn_a", "_fn_b"], target_file="placements.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "advisor.py")
+
+    placements_src = result.new_files["placements.py"]
+    assert placements_src.count("from .models import _LLMAccumulator") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -3327,6 +3568,23 @@ def test_prune_inline_preserves_indentation():
     assert inner[0].startswith("        from mymod import Bar")
 
 
+def test_prune_inline_preserves_type_checking_block():
+    # Imports inside 'if TYPE_CHECKING:' must never be stripped even when the
+    # same name is already imported at module level — removing them would leave
+    # an empty (and syntactically invalid) if-block.
+    source = textwrap.dedent(
+        """\
+        from typing import TYPE_CHECKING
+        from mymod import Foo
+
+        if TYPE_CHECKING:
+            from mymod import Foo
+        """
+    )
+    result = _prune_inline_redundant_imports(source)
+    assert result == source
+
+
 def test_generate_file_splits_removes_inline_redundant_imports():
     # When a split new file has both a top-level import and an inline re-import
     # of the same name, the inline one should be removed.
@@ -3377,6 +3635,105 @@ def test_find_cross_file_imports_abs_pkg_root_level():
     assert from_imports == ["from block_1 import _MODEL"]
     assert module_imports == []
     assert rewrites == {}
+
+
+# ---------------------------------------------------------------------------
+# _find_cross_file_type_checking_imports
+# ---------------------------------------------------------------------------
+
+
+def test_find_cross_file_type_checking_imports_basic():
+    # _LLMAccumulator appears only in a quoted annotation in fn_a.
+    # It lives in block_1.py — a TYPE_CHECKING import should be generated.
+    entity_source_map = {
+        "fn_a": 'def fn_a(x: Optional["_LLMAccumulator"]) -> None:\n    pass\n'
+    }
+    name_to_target_file = {"_LLMAccumulator": "block_1.py"}
+    result = _find_cross_file_type_checking_imports(
+        ["fn_a"], entity_source_map, name_to_target_file, "placements.py"
+    )
+    assert result == ["from .block_1 import _LLMAccumulator"]
+
+
+def test_find_cross_file_type_checking_imports_same_file_excluded():
+    # _LLMAccumulator goes to the same target file — no import needed.
+    entity_source_map = {
+        "fn_a": 'def fn_a(x: Optional["_LLMAccumulator"]) -> None:\n    pass\n'
+    }
+    name_to_target_file = {"_LLMAccumulator": "placements.py"}
+    result = _find_cross_file_type_checking_imports(
+        ["fn_a"], entity_source_map, name_to_target_file, "placements.py"
+    )
+    assert result == []
+
+
+def test_find_cross_file_type_checking_imports_runtime_excluded():
+    # _LLMAccumulator is used at runtime (not just annotation) — excluded.
+    entity_source_map = {"fn_a": "def fn_a():\n    return _LLMAccumulator()\n"}
+    name_to_target_file = {"_LLMAccumulator": "block_1.py"}
+    result = _find_cross_file_type_checking_imports(
+        ["fn_a"], entity_source_map, name_to_target_file, "placements.py"
+    )
+    assert result == []
+
+
+def test_find_cross_file_type_checking_imports_no_annotations():
+    # No quoted annotations at all → empty result.
+    entity_source_map = {"fn_a": "def fn_a():\n    pass\n"}
+    name_to_target_file = {"_LLMAccumulator": "block_1.py"}
+    result = _find_cross_file_type_checking_imports(
+        ["fn_a"], entity_source_map, name_to_target_file, "placements.py"
+    )
+    assert result == []
+
+
+def test_find_cross_file_type_checking_imports_not_in_map():
+    # Referenced quoted name not in name_to_target_file → no import.
+    entity_source_map = {"fn_a": 'def fn_a(x: "UnknownType") -> None:\n    pass\n'}
+    result = _find_cross_file_type_checking_imports(
+        ["fn_a"], entity_source_map, {}, "placements.py"
+    )
+    assert result == []
+
+
+def test_find_cross_file_type_checking_imports_top_level_var_excluded():
+    # A name in top_level_var_names is skipped (handled separately).
+    entity_source_map = {
+        "fn_a": 'def fn_a(x: Optional["SAFE_MODE"]) -> None:\n    pass\n'
+    }
+    name_to_target_file = {"SAFE_MODE": "constants.py"}
+    result = _find_cross_file_type_checking_imports(
+        ["fn_a"],
+        entity_source_map,
+        name_to_target_file,
+        "placements.py",
+        top_level_var_names={"SAFE_MODE"},
+    )
+    assert result == []
+
+
+def test_find_cross_file_type_checking_imports_abs_pkg():
+    # With abs_pkg set, use absolute import style.
+    entity_source_map = {
+        "fn_a": 'def fn_a(x: Optional["_LLMAccumulator"]) -> None:\n    pass\n'
+    }
+    name_to_target_file = {"_LLMAccumulator": "block_1.py"}
+    result = _find_cross_file_type_checking_imports(
+        ["fn_a"],
+        entity_source_map,
+        name_to_target_file,
+        "test_fn.py",
+        abs_pkg="tests",
+    )
+    assert result == ["from tests.block_1 import _LLMAccumulator"]
+
+
+def test_find_cross_file_type_checking_imports_entity_not_in_map():
+    # Entity not in entity_source_map → treated as empty, no imports.
+    result = _find_cross_file_type_checking_imports(
+        ["ghost"], {}, {"_X": "other.py"}, "placements.py"
+    )
+    assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -5452,3 +5809,78 @@ def test_strip_equals_single_line_header_orphaned():
     source = "def foo():\n    pass\n\n# === OLD SECTION ===\n"
     result = _strip_orphaned_section_headers(source)
     assert "# === OLD SECTION ===" not in result
+
+
+# ---------------------------------------------------------------------------
+# _normalize_blank_lines
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_blank_lines_strips_leading_blanks():
+    """Leading blank lines are removed (prevents E303 at top of file)."""
+    source = "\n\n\ndef foo():\n    pass\n"
+    result = _normalize_blank_lines(source)
+    assert result.startswith("def foo():")
+
+
+def test_normalize_blank_lines_collapses_excess_top_level():
+    """4+ consecutive newlines between top-level defs collapse to 3."""
+    source = "def foo():\n    pass\n\n\n\n\ndef bar():\n    pass\n"
+    result = _normalize_blank_lines(source)
+    assert "\n\n\n\n" not in result
+    assert "def foo():" in result
+    assert "def bar():" in result
+
+
+def test_normalize_blank_lines_collapses_body_blanks():
+    """2+ blank lines inside an indented body collapse to 1 (prevents E303 in body)."""
+    source = "def foo():\n    x = 1\n\n\n    y = 2\n"
+    result = _normalize_blank_lines(source)
+    assert "\n\n\n    y" not in result
+    assert "\n\n    y" in result
+
+
+def test_normalize_blank_lines_empty_source():
+    """Whitespace-only source returns empty string."""
+    assert _normalize_blank_lines("\n\n\n") == ""
+
+
+def test_normalize_blank_lines_trailing_newline():
+    """Result always ends with exactly one newline."""
+    source = "x = 1\n\n\n"
+    result = _normalize_blank_lines(source)
+    assert result.endswith("\n")
+    assert not result.endswith("\n\n")
+
+
+# ---------------------------------------------------------------------------
+# _strip_orphaned_indented_comments
+# ---------------------------------------------------------------------------
+
+
+def test_strip_orphaned_indented_comments_removes_orphan():
+    """Indented comment at module level (outside any AST node) is removed."""
+    source = "\n\n    # This comment was left behind after function removal\n"
+    result = _strip_orphaned_indented_comments(source)
+    assert "# This comment was left behind" not in result
+
+
+def test_strip_orphaned_indented_comments_keeps_inside_function():
+    """Indented comment inside a function body is preserved."""
+    source = "def foo():\n    # normal comment\n    pass\n"
+    result = _strip_orphaned_indented_comments(source)
+    assert "# normal comment" in result
+
+
+def test_strip_orphaned_indented_comments_keeps_module_level_comment():
+    """Non-indented module-level comment is preserved."""
+    source = "# module comment\ndef foo():\n    pass\n"
+    result = _strip_orphaned_indented_comments(source)
+    assert "# module comment" in result
+
+
+def test_strip_orphaned_indented_comments_syntax_error():
+    """SyntaxError in source returns source unchanged."""
+    source = "    # orphaned\ndef f(: pass\n"
+    result = _strip_orphaned_indented_comments(source)
+    assert result == source

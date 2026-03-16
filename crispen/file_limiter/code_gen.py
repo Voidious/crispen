@@ -60,19 +60,29 @@ _REL_IMPORT_RE = re.compile(r"^from (\.+)", re.MULTILINE)
 
 # Matches four or more consecutive newlines (= 3+ blank lines between entities).
 _EXCESS_BLANK_RE = re.compile(r"\n{4,}")
+# Matches 3+ consecutive newlines followed by indented content (= 2+ blank lines
+# inside a function/class body, where flake8 E303 allows at most one blank line).
+_EXCESS_BLANK_BODY_RE = re.compile(r"\n{3,}(?=[ \t])")
 
 
 def _normalize_blank_lines(source: str) -> str:
-    """Collapse runs of 3+ blank lines to 2; ensure exactly one trailing newline.
+    """Collapse excess blank lines; ensure exactly one trailing newline.
 
     Removes blank-line artefacts produced by entity removal (original file)
-    and entity-source stripping (new files).  PEP 8 / flake8 E303 allows at
-    most two blank lines between top-level definitions.
+    and entity-source stripping (new files):
+
+    - Strips leading blank lines at the start of the file (E303).
+    - Collapses 3+ consecutive blank lines between top-level definitions to 2
+      (E303; PEP 8 allows at most two blank lines at module level).
+    - Collapses 2+ consecutive blank lines inside indented bodies to 1
+      (E303; PEP 8 allows at most one blank line inside a function/class).
 
     Returns an empty string when *source* contains only whitespace, signalling
     that the file should be deleted rather than written with a lone blank line.
     """
     source = _EXCESS_BLANK_RE.sub("\n\n\n", source)
+    source = _EXCESS_BLANK_BODY_RE.sub("\n\n", source)
+    source = source.lstrip("\n")
     stripped = source.rstrip("\n")
     if not stripped.strip():
         return ""
@@ -122,6 +132,42 @@ def _strip_orphaned_section_headers(source: str) -> str:
     if not orphaned_0idx:
         return source
     return "".join(line for i, line in enumerate(lines) if i not in orphaned_0idx)
+
+
+def _strip_orphaned_indented_comments(source: str) -> str:
+    """Remove indented comment lines that appear at module level.
+
+    After FileLimiter moves a function to a new file using AST line ranges,
+    trailing comments that were inside the function body may be left behind
+    in the original file.  These comments retain their original indentation
+    (e.g. four spaces) even though they are now at module level, causing
+    flake8 E116 (unexpected indentation: comment).
+
+    This function uses ``ast.parse`` to build the set of line numbers covered
+    by any AST node.  Any comment line with leading whitespace whose line
+    number falls outside that set is considered orphaned and removed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    covered: Set[int] = set()
+    for node in ast.walk(tree):
+        if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+            for lineno in range(node.lineno, node.end_lineno + 1):
+                covered.add(lineno)
+
+    lines = source.splitlines(keepends=True)
+    result = []
+    for i, line in enumerate(lines):
+        lineno = i + 1  # 1-indexed
+        stripped = line.lstrip()
+        is_indented_comment = stripped.startswith("#") and len(line) > len(stripped)
+        if is_indented_comment and lineno not in covered:
+            continue
+        result.append(line)
+    return "".join(result)
 
 
 def _import_derived_names(source: str) -> Set[str]:
@@ -206,6 +252,61 @@ def _collect_name_loads(source: str) -> Set[str]:
             _walk(child, excluded)
 
     _walk(tree, frozenset())
+    return names
+
+
+def _collect_quoted_annotation_names(source: str) -> Set[str]:
+    """Return names referenced inside quoted type annotations in *source*.
+
+    Finds names like ``_LLMAccumulator`` in ``Optional["_LLMAccumulator"]``
+    (string literals used as forward references in type annotations).  These
+    names are only needed at type-checking time — not at runtime — and should
+    be imported under ``if TYPE_CHECKING:`` rather than as regular imports.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+
+    def _scan_annotation(node: ast.AST) -> None:
+        """Recursively scan an annotation, extracting names from string constants."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            try:
+                inner = ast.parse(node.value, mode="eval")
+                for n in ast.walk(inner):
+                    if isinstance(n, ast.Name):
+                        names.add(n.id)
+            except SyntaxError:
+                pass
+            return
+        for child in ast.iter_child_nodes(node):
+            _scan_annotation(child)
+
+    def _walk(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = node.args
+            for arg in args.args + args.posonlyargs + args.kwonlyargs:
+                if arg.annotation:
+                    _scan_annotation(arg.annotation)
+            if args.vararg and args.vararg.annotation:
+                _scan_annotation(args.vararg.annotation)
+            if args.kwarg and args.kwarg.annotation:
+                _scan_annotation(args.kwarg.annotation)
+            if node.returns:
+                _scan_annotation(node.returns)
+            for child in node.body:
+                _walk(child)
+            return
+        if isinstance(node, ast.AnnAssign):
+            _scan_annotation(node.annotation)
+            if node.value:
+                _walk(node.value)
+            return
+        for child in ast.iter_child_nodes(node):
+            _walk(child)
+
+    _walk(tree)
     return names
 
 
@@ -359,6 +460,45 @@ def _find_needed_imports(
             needed.append(info.source)
             seen.add(info.source)
 
+    return needed
+
+
+def _find_type_checking_needed_imports(
+    entity_names: List[str],
+    entity_source_map: Dict[str, str],
+    import_infos: List[ImportInfo],
+    regular_needed_sources: Set[str],
+) -> List[str]:
+    """Return import statements needed only for quoted type annotations.
+
+    These should be placed under ``if TYPE_CHECKING:`` because the names are
+    only referenced inside string-valued annotations (forward references) and
+    are not needed at runtime.  *regular_needed_sources* is the set of import
+    source strings already emitted as regular imports (to avoid duplicates).
+    ``__future__`` imports are always excluded since they are handled by
+    ``_find_needed_imports``.
+    """
+    runtime: Set[str] = set()
+    quoted: Set[str] = set()
+    for name in entity_names:
+        src = entity_source_map.get(name, "")
+        runtime |= _collect_name_loads(src)
+        quoted |= _collect_quoted_annotation_names(src)
+
+    annotation_only = quoted - runtime
+    if not annotation_only:
+        return []
+
+    needed: List[str] = []
+    seen: Set[str] = set()
+    for info in import_infos:
+        if info.source in regular_needed_sources or info.source in seen:
+            continue
+        if info.is_future:
+            continue
+        if any(n in annotation_only for n in info.names):
+            needed.append(info.source)
+            seen.add(info.source)
     return needed
 
 
@@ -525,6 +665,58 @@ def _find_cross_file_imports(
         for name in names:
             rewrites[name] = f"{local_name}.{name}"
     return from_result, mod_result, rewrites
+
+
+def _find_cross_file_type_checking_imports(
+    entity_names: List[str],
+    entity_source_map: Dict[str, str],
+    name_to_target_file: Dict[str, str],
+    current_target: str,
+    abs_pkg: Optional[str] = None,
+    top_level_var_names: Optional[Set[str]] = None,
+) -> List[str]:
+    """Return cross-file imports for names only referenced in quoted annotations.
+
+    When an entity uses a name only inside a quoted type annotation (e.g.
+    ``Optional["_LLMAccumulator"]``) and that name is defined in another new
+    file produced by the same split, a ``from .other import Name`` statement
+    is generated here.  These should be placed under ``if TYPE_CHECKING:``
+    because they are not needed at runtime.
+
+    Names that also appear in regular (non-annotation) loads are excluded —
+    they already get a normal cross-file import from
+    ``_find_cross_file_imports``.  Top-level variable names (which require
+    module-alias imports) are also skipped here.
+    """
+    runtime_referenced: Set[str] = set()
+    quoted_referenced: Set[str] = set()
+    for name in entity_names:
+        src = entity_source_map.get(name, "")
+        runtime_referenced |= _collect_name_loads(src)
+        quoted_referenced |= _collect_quoted_annotation_names(src)
+
+    annotation_only = quoted_referenced - runtime_referenced
+    if not annotation_only:
+        return []
+
+    tc_files: Dict[str, List[str]] = {}
+    for ref_name in sorted(annotation_only):
+        source_file = name_to_target_file.get(ref_name)
+        if source_file and source_file != current_target:
+            # Top-level var names need module-alias imports, not handled here.
+            if top_level_var_names and ref_name in top_level_var_names:
+                continue
+            tc_files.setdefault(source_file, []).append(ref_name)
+
+    result: List[str] = []
+    for source_file, names in sorted(tc_files.items()):
+        if abs_pkg is not None:
+            mod = _target_module_name(source_file)
+            prefix = f"{abs_pkg}.{mod}" if abs_pkg else mod
+        else:
+            prefix = _relative_import_prefix(current_target, source_file)
+        result.append(f"from {prefix} import {', '.join(sorted(names))}")
+    return result
 
 
 _FROM_IMPORT_RE = re.compile(r"^(from\s+\S+)\s+import\s+(.*)")
@@ -1120,12 +1312,29 @@ def _prune_inline_redundant_imports(source: str) -> str:
     if not top_level_names:
         return source
 
-    # Find all import nodes that are NOT at module level.
+    # Collect import node IDs inside module-level 'if TYPE_CHECKING:' blocks.
+    # These are intentional type-checking guards and must not be treated as
+    # redundant even when the same name is already imported at module level —
+    # removing them would leave an empty (and therefore invalid) if-block.
+    tc_guard_import_ids: Set[int] = set()
+    for node in tree.body:
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
+            for child in ast.walk(node):
+                if isinstance(child, (ast.Import, ast.ImportFrom)):
+                    tc_guard_import_ids.add(id(child))
+
+    # Find all import nodes that are NOT at module level and NOT inside a
+    # module-level 'if TYPE_CHECKING:' guard.
     inner_imports = [
         node
         for node in ast.walk(tree)
         if isinstance(node, (ast.Import, ast.ImportFrom))
         and id(node) not in top_level_node_ids
+        and id(node) not in tc_guard_import_ids
     ]
 
     if not inner_imports:
@@ -2250,12 +2459,18 @@ def generate_file_splits(
         needed = _find_needed_imports(
             ent_names, entity_source_map, import_infos, all_entity_names
         )
+        needed_tc = _find_type_checking_needed_imports(
+            ent_names, entity_source_map, import_infos, set(needed)
+        )
         if subdir_name is not None:
             depth = len(Path(target_file).parts) - 1
             needed = [_bump_relative_imports(s, depth) for s in needed]
+            needed_tc = [_bump_relative_imports(s, depth) for s in needed_tc]
         entity_srcs = []
         top_cross: List[str] = []
         seen_top_cross: Set[str] = set()
+        all_tc_imports: List[str] = list(needed_tc)
+        seen_tc: Set[str] = set(needed_tc)
         for _ent_name in ent_names:
             _src = entity_source_map.get(_ent_name)
             if _src is None:
@@ -2287,6 +2502,17 @@ def generate_file_splits(
                 abs_pkg=abs_pkg_for_new_files,
                 top_level_var_names=top_level_var_names,
             )
+            for _tc_imp in _find_cross_file_type_checking_imports(
+                [_ent_name],
+                entity_source_map,
+                name_to_target_file,
+                target_file,
+                abs_pkg=abs_pkg_for_new_files,
+                top_level_var_names=top_level_var_names,
+            ):
+                if _tc_imp not in seen_tc:
+                    seen_tc.add(_tc_imp)
+                    all_tc_imports.append(_tc_imp)
             if entity_rewrites:
                 _src = _rewrite_module_var_names(_src, entity_rewrites)
                 entity_name_rewrites[_ent_name] = entity_rewrites
@@ -2336,9 +2562,16 @@ def generate_file_splits(
             entity_srcs.append(_src)
         entity_srcs = [s for s in entity_srcs if s]
         parts: List[str] = []
-        all_imports = _sort_imports_pep8(_merge_from_imports(needed + top_cross))
+        imports_for_sort = list(needed + top_cross)
+        if all_tc_imports:
+            imports_for_sort.append("from typing import TYPE_CHECKING")
+        all_imports = _sort_imports_pep8(_merge_from_imports(imports_for_sort))
         if all_imports:
             parts.append("\n".join(all_imports))
+        if all_tc_imports:
+            tc_sorted = _sort_imports_pep8(_merge_from_imports(all_tc_imports))
+            tc_block = "if TYPE_CHECKING:\n" + "\n".join("    " + s for s in tc_sorted)
+            parts.append(tc_block)
         parts.extend(entity_srcs)
         pruned = _prune_unused_imports("\n\n\n".join(parts) + "\n")
         new_files[target_file] = _prune_inline_redundant_imports(pruned)
@@ -2477,6 +2710,11 @@ def generate_file_splits(
     # removal (nothing substantive remains beneath them).
     new_files = {f: _strip_orphaned_section_headers(s) for f, s in new_files.items()}
     updated = _strip_orphaned_section_headers(updated)
+
+    # Remove indented comment lines that ended up at module level after entity
+    # migration (flake8 E116: unexpected indentation: comment).
+    new_files = {f: _strip_orphaned_indented_comments(s) for f, s in new_files.items()}
+    updated = _strip_orphaned_indented_comments(updated)
 
     # When pytest_conftest is active and the test file's remaining content
     # contains only fixtures (no test functions, no other definitions), the

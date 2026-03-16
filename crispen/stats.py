@@ -2,7 +2,7 @@
 
 import difflib
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List
 
 
 @dataclass
@@ -37,6 +37,72 @@ class RunStats:
     file_limiter_classes_verified: int = 0
     file_limiter_lines_verified: int = 0
 
+    # Timing
+    total_elapsed: float = 0.0
+    llm_elapsed: float = 0.0
+    llm_input_tokens: int = 0
+    llm_output_tokens: int = 0
+
+    # Detailed breakdowns (populated by record_llm_call)
+    llm_elapsed_by_category: Dict[str, float] = field(default_factory=dict)
+    llm_input_tokens_by_category: Dict[str, int] = field(default_factory=dict)
+    llm_output_tokens_by_category: Dict[str, int] = field(default_factory=dict)
+    llm_calls_by_category: Dict[str, int] = field(default_factory=dict)
+    llm_elapsed_by_refactor: Dict[str, float] = field(default_factory=dict)
+    llm_input_tokens_by_refactor: Dict[str, int] = field(default_factory=dict)
+    llm_output_tokens_by_refactor: Dict[str, int] = field(default_factory=dict)
+    llm_elapsed_by_file: Dict[str, float] = field(default_factory=dict)
+    llm_input_tokens_by_file: Dict[str, int] = field(default_factory=dict)
+    llm_output_tokens_by_file: Dict[str, int] = field(default_factory=dict)
+
+    def record_llm_call(
+        self,
+        elapsed: float,
+        input_tokens: int,
+        output_tokens: int,
+        category: str,
+        refactor: str,
+        file: str,
+    ) -> None:
+        """Record timing and token data for one LLM call into all breakdowns."""
+        self.llm_elapsed += elapsed
+        self.llm_input_tokens += input_tokens
+        self.llm_output_tokens += output_tokens
+
+        self.llm_elapsed_by_category[category] = (
+            self.llm_elapsed_by_category.get(category, 0.0) + elapsed
+        )
+        self.llm_input_tokens_by_category[category] = (
+            self.llm_input_tokens_by_category.get(category, 0) + input_tokens
+        )
+        self.llm_output_tokens_by_category[category] = (
+            self.llm_output_tokens_by_category.get(category, 0) + output_tokens
+        )
+        self.llm_calls_by_category[category] = (
+            self.llm_calls_by_category.get(category, 0) + 1
+        )
+
+        self.llm_elapsed_by_refactor[refactor] = (
+            self.llm_elapsed_by_refactor.get(refactor, 0.0) + elapsed
+        )
+        self.llm_input_tokens_by_refactor[refactor] = (
+            self.llm_input_tokens_by_refactor.get(refactor, 0) + input_tokens
+        )
+        self.llm_output_tokens_by_refactor[refactor] = (
+            self.llm_output_tokens_by_refactor.get(refactor, 0) + output_tokens
+        )
+
+        if file:
+            self.llm_elapsed_by_file[file] = (
+                self.llm_elapsed_by_file.get(file, 0.0) + elapsed
+            )
+            self.llm_input_tokens_by_file[file] = (
+                self.llm_input_tokens_by_file.get(file, 0) + input_tokens
+            )
+            self.llm_output_tokens_by_file[file] = (
+                self.llm_output_tokens_by_file.get(file, 0) + output_tokens
+            )
+
     def merge(self, other: "RunStats") -> None:
         """Add all counters from *other* into self (files_edited is not merged)."""
         self.if_not_else += other.if_not_else
@@ -56,6 +122,45 @@ class RunStats:
         self.file_limiter_functions_verified += other.file_limiter_functions_verified
         self.file_limiter_classes_verified += other.file_limiter_classes_verified
         self.file_limiter_lines_verified += other.file_limiter_lines_verified
+        self.llm_elapsed += other.llm_elapsed
+        self.llm_input_tokens += other.llm_input_tokens
+        self.llm_output_tokens += other.llm_output_tokens
+        for k, v in other.llm_elapsed_by_category.items():
+            self.llm_elapsed_by_category[k] = (
+                self.llm_elapsed_by_category.get(k, 0.0) + v
+            )
+        for k, v in other.llm_input_tokens_by_category.items():
+            self.llm_input_tokens_by_category[k] = (
+                self.llm_input_tokens_by_category.get(k, 0) + v
+            )
+        for k, v in other.llm_output_tokens_by_category.items():
+            self.llm_output_tokens_by_category[k] = (
+                self.llm_output_tokens_by_category.get(k, 0) + v
+            )
+        for k, v in other.llm_calls_by_category.items():
+            self.llm_calls_by_category[k] = self.llm_calls_by_category.get(k, 0) + v
+        for k, v in other.llm_elapsed_by_refactor.items():
+            self.llm_elapsed_by_refactor[k] = (
+                self.llm_elapsed_by_refactor.get(k, 0.0) + v
+            )
+        for k, v in other.llm_input_tokens_by_refactor.items():
+            self.llm_input_tokens_by_refactor[k] = (
+                self.llm_input_tokens_by_refactor.get(k, 0) + v
+            )
+        for k, v in other.llm_output_tokens_by_refactor.items():
+            self.llm_output_tokens_by_refactor[k] = (
+                self.llm_output_tokens_by_refactor.get(k, 0) + v
+            )
+        for k, v in other.llm_elapsed_by_file.items():
+            self.llm_elapsed_by_file[k] = self.llm_elapsed_by_file.get(k, 0.0) + v
+        for k, v in other.llm_input_tokens_by_file.items():
+            self.llm_input_tokens_by_file[k] = (
+                self.llm_input_tokens_by_file.get(k, 0) + v
+            )
+        for k, v in other.llm_output_tokens_by_file.items():
+            self.llm_output_tokens_by_file[k] = (
+                self.llm_output_tokens_by_file.get(k, 0) + v
+            )
 
     @property
     def total_edits(self) -> int:
@@ -92,7 +197,7 @@ class RunStats:
             elif line.startswith("-") and not line.startswith("---"):
                 self.lines_deleted += 1
 
-    def format_summary(self) -> List[str]:
+    def format_summary(self, timing: str = "detailed") -> List[str]:
         """Return a list of lines forming the human-readable run summary."""
         lines = ["--- crispen summary ---"]
         lines.append("edits:")
@@ -124,4 +229,56 @@ class RunStats:
         lines.append(f"  functions:           {self.file_limiter_functions_verified}")
         lines.append(f"  classes:             {self.file_limiter_classes_verified}")
         lines.append(f"  lines:               {self.file_limiter_lines_verified}")
+        if timing != "off":
+            lines.append("timing:")
+            lines.append(f"  total:               {self.total_elapsed:.2f}s")
+            if self.total_elapsed > 0:
+                pct = 100 * self.llm_elapsed / self.total_elapsed
+                lines.append(
+                    f"  LLM:                 {self.llm_elapsed:.2f}s ({pct:.0f}%)"
+                )
+            else:
+                lines.append(f"  LLM:                 {self.llm_elapsed:.2f}s")
+            lines.append(
+                f"  LLM tokens:          {self.llm_input_tokens:,} in"
+                f" / {self.llm_output_tokens:,} out"
+            )
+            if timing == "detailed":
+                if self.llm_calls_by_category:
+                    lines.append("  LLM by call type:")
+                    for cat in ("veto", "edit", "verify", "file_limiter"):
+                        calls = self.llm_calls_by_category.get(cat, 0)
+                        if not calls:
+                            continue
+                        elapsed = self.llm_elapsed_by_category.get(cat, 0.0)
+                        in_tok = self.llm_input_tokens_by_category.get(cat, 0)
+                        out_tok = self.llm_output_tokens_by_category.get(cat, 0)
+                        call_str = f"{calls} call" + ("s" if calls != 1 else " ")
+                        lines.append(
+                            f"    {cat:<16}{elapsed:.2f}s"
+                            f"  {call_str:>8}  {in_tok:>7,} in / {out_tok:>6,} out"
+                        )
+                if self.llm_elapsed_by_refactor:
+                    lines.append("  LLM by refactor:")
+                    for refactor, elapsed in sorted(
+                        self.llm_elapsed_by_refactor.items(), key=lambda x: -x[1]
+                    ):
+                        in_tok = self.llm_input_tokens_by_refactor.get(refactor, 0)
+                        out_tok = self.llm_output_tokens_by_refactor.get(refactor, 0)
+                        lines.append(
+                            f"    {refactor:<22}{elapsed:.2f}s"
+                            f"  {in_tok:>7,} in / {out_tok:>6,} out"
+                        )
+                if self.llm_elapsed_by_file:
+                    lines.append("  LLM by file:")
+                    for filepath, elapsed in sorted(
+                        self.llm_elapsed_by_file.items(), key=lambda x: -x[1]
+                    ):
+                        in_tok = self.llm_input_tokens_by_file.get(filepath, 0)
+                        out_tok = self.llm_output_tokens_by_file.get(filepath, 0)
+                        pad = max(32, len(filepath) + 1)
+                        lines.append(
+                            f"    {filepath:<{pad}}{elapsed:.2f}s"
+                            f"  {in_tok:>7,} in / {out_tok:>6,} out"
+                        )
         return lines

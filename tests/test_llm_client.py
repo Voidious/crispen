@@ -6,7 +6,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from crispen.errors import CrispenAPIError
-from crispen.llm_client import _token_param, call_with_tool, get_api_key, make_client
+from crispen.llm_client import (
+    _token_param,
+    call_with_tool,
+    get_api_key,
+    make_client,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +157,9 @@ def _make_anthropic_response(tool_name: str, input_data: dict) -> MagicMock:
     block.input = input_data
     resp = MagicMock()
     resp.content = [block]
+    resp.usage = MagicMock()
+    resp.usage.input_tokens = 100
+    resp.usage.output_tokens = 50
     return resp
 
 
@@ -169,7 +177,9 @@ def test_call_with_tool_anthropic_success():
         "evaluate_duplicate",
         _MESSAGES,
     )
-    assert result == {"is_valid_duplicate": True, "reason": "same"}
+    assert result.tool_input == {"is_valid_duplicate": True, "reason": "same"}
+    assert result.elapsed >= 0
+    assert isinstance(result.input_tokens, int)
 
 
 def test_call_with_tool_anthropic_skips_non_matching_blocks():
@@ -184,6 +194,9 @@ def test_call_with_tool_anthropic_skips_non_matching_blocks():
     matching_block.input = {"is_valid_duplicate": True, "reason": "ok"}
     resp = MagicMock()
     resp.content = [text_block, matching_block]
+    resp.usage = MagicMock()
+    resp.usage.input_tokens = 100
+    resp.usage.output_tokens = 50
     client.messages.create.return_value = resp
     result = call_with_tool(
         client,
@@ -194,7 +207,7 @@ def test_call_with_tool_anthropic_skips_non_matching_blocks():
         "evaluate_duplicate",
         _MESSAGES,
     )
-    assert result == {"is_valid_duplicate": True, "reason": "ok"}
+    assert result.tool_input == {"is_valid_duplicate": True, "reason": "ok"}
 
 
 def test_call_with_tool_anthropic_api_error():
@@ -215,6 +228,26 @@ def test_call_with_tool_anthropic_api_error():
             )
 
 
+def test_call_with_tool_anthropic_returns_timing_and_tokens():
+    client = MagicMock()
+    client.messages.create.return_value = _make_anthropic_response(
+        "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+    )
+    result = call_with_tool(
+        client,
+        "anthropic",
+        "claude-sonnet-4-6",
+        256,
+        _TOOL,
+        "evaluate_duplicate",
+        _MESSAGES,
+    )
+    assert result.tool_input == {"is_valid_duplicate": True, "reason": "same"}
+    assert result.elapsed >= 0
+    assert result.input_tokens == 100
+    assert result.output_tokens == 50
+
+
 # ---------------------------------------------------------------------------
 # call_with_tool — moonshot provider
 # ---------------------------------------------------------------------------
@@ -229,6 +262,9 @@ def _make_openai_response(tool_name: str, arguments: dict) -> MagicMock:
     choice.message = message
     resp = MagicMock()
     resp.choices = [choice]
+    resp.usage = MagicMock()
+    resp.usage.prompt_tokens = 80
+    resp.usage.completion_tokens = 40
     return resp
 
 
@@ -248,7 +284,7 @@ def test_call_with_tool_moonshot_success():
             "evaluate_duplicate",
             _MESSAGES,
         )
-    assert result == {"is_valid_duplicate": True, "reason": "same"}
+    assert result.tool_input == {"is_valid_duplicate": True, "reason": "same"}
     call_kwargs = client.chat.completions.create.call_args[1]
     assert call_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
     assert call_kwargs["tool_choice"] == {
@@ -287,6 +323,9 @@ def test_call_with_tool_moonshot_malformed_json():
         choice.message = message
         resp = MagicMock()
         resp.choices = [choice]
+        resp.usage = MagicMock()
+        resp.usage.prompt_tokens = 80
+        resp.usage.completion_tokens = 40
         client.chat.completions.create.return_value = resp
         result = call_with_tool(
             client,
@@ -297,7 +336,7 @@ def test_call_with_tool_moonshot_malformed_json():
             "evaluate_duplicate",
             _MESSAGES,
         )
-    assert result is None
+    assert result.tool_input is None
 
 
 # ---------------------------------------------------------------------------
@@ -321,13 +360,29 @@ def test_call_with_tool_openai_success():
             "evaluate_duplicate",
             _MESSAGES,
         )
-    assert result == {"is_valid_duplicate": True, "reason": "same"}
+    assert result.tool_input == {"is_valid_duplicate": True, "reason": "same"}
     call_kwargs = client.chat.completions.create.call_args[1]
     # extra_body must NOT be set for non-moonshot providers
     assert "extra_body" not in call_kwargs
     # gpt-4o requires max_completion_tokens, not max_tokens
     assert "max_completion_tokens" in call_kwargs
     assert "max_tokens" not in call_kwargs
+
+
+def test_call_with_tool_openai_returns_timing_and_tokens():
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.return_value = _make_openai_response(
+            "evaluate_duplicate", {"is_valid_duplicate": True}
+        )
+        result = call_with_tool(
+            client, "openai", "gpt-4o", 256, _TOOL, "evaluate_duplicate", _MESSAGES
+        )
+    assert result.tool_input == {"is_valid_duplicate": True}
+    assert result.elapsed >= 0
+    assert result.input_tokens == 80
+    assert result.output_tokens == 40
 
 
 def test_call_with_tool_openai_api_error():
@@ -346,6 +401,68 @@ def test_call_with_tool_openai_api_error():
                 _MESSAGES,
                 caller="Test",
             )
+
+
+def test_call_with_tool_openai_empty_choices_returns_none_tool_input():
+    """When choices is empty, tool_input is None."""
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        resp = MagicMock()
+        resp.choices = []
+        resp.usage.prompt_tokens = 80
+        resp.usage.completion_tokens = 40
+        client.chat.completions.create.return_value = resp
+        result = call_with_tool(
+            client,
+            "openai",
+            "gpt-4o",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+        )
+    assert result.tool_input is None
+
+
+def test_call_with_tool_anthropic_usage_attribute_error_returns_zero_tokens():
+    """When response.usage raises AttributeError, tokens default to 0."""
+    client = MagicMock()
+    resp = _make_anthropic_response("evaluate_duplicate", {"is_valid_duplicate": True})
+    del resp.usage  # make resp.usage raise AttributeError
+    client.messages.create.return_value = resp
+    result = call_with_tool(
+        client,
+        "anthropic",
+        "claude-sonnet-4-6",
+        256,
+        _TOOL,
+        "evaluate_duplicate",
+        _MESSAGES,
+    )
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
+
+
+def test_call_with_tool_openai_usage_attribute_error_returns_zero_tokens():
+    """When response.usage raises AttributeError, tokens default to 0."""
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        resp = _make_openai_response("evaluate_duplicate", {"is_valid_duplicate": True})
+        del resp.usage  # make resp.usage raise AttributeError
+        client.chat.completions.create.return_value = resp
+        result = call_with_tool(
+            client,
+            "openai",
+            "gpt-4o",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+        )
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
 
 
 def test_call_with_tool_tool_choice_override():

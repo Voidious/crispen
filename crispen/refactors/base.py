@@ -28,6 +28,8 @@ class Refactor(cst.CSTTransformer):
         self.changes_made: List[str] = []
         self.verbose = verbose
         self.stats: RunStats = RunStats()
+        self.current_file: str = ""
+        self.timing: str = "detailed"
 
     def _in_changed_range(self, node: cst.CSTNode) -> bool:
         """Return True if the node's start line overlaps any changed range."""

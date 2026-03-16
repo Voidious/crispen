@@ -1,6 +1,7 @@
 """CLI entry point: reads stdin diff, drives engine, reports to stdout."""
 
 import sys
+import time
 
 from .config import load_config
 from .diff_parser import parse_diff
@@ -21,11 +22,14 @@ def main() -> None:
 
     config = load_config()
     run_stats = RunStats()
+    _t0 = time.perf_counter()
     try:
         for message in run_engine(changed, config=config, stats=run_stats):
             print(message)
     except CrispenAPIError as exc:
         print(f"crispen: {exc}", file=sys.stderr)
         sys.exit(1)
-    for line in run_stats.format_summary():
-        print(line)
+    run_stats.total_elapsed = time.perf_counter() - _t0
+    if run_stats.total_llm_calls > 0 or run_stats.total_edits > 0:
+        for line in run_stats.format_summary(timing=config.timing):
+            print(line)

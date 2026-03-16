@@ -386,6 +386,31 @@ def test_runner_dashed_parent_dir_deep_skips(mock_classify):
 
 @patch(_PATCH_ADVISE)
 @patch(_PATCH_CLASSIFY)
+def test_runner_nonexistent_parent_dir_existing_dirs_empty(mock_classify, mock_advise):
+    """When source dir doesn't exist, iterdir raises FileNotFoundError → empty set."""
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[],
+        set_3_groups=[],
+        abort=True,
+    )
+    # /nonexistent/parent doesn't exist; iterdir() will raise FileNotFoundError.
+    result = run_file_limiter(
+        "/nonexistent/parent/module.py",
+        "",
+        "def foo(): pass\n",
+        [(1, 1)],
+        _CONFIG,
+    )
+    # Abort from classifier, but the FileNotFoundError branch was hit.
+    assert result.abort is True
+
+
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
 def test_runner_classifier_abort(mock_classify, mock_advise):
     # classified.abort=True → early return before LLM; advise never called.
     mock_classify.return_value = ClassifiedEntities(

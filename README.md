@@ -130,6 +130,13 @@ file_limiter_retries = 2
 # under the limit, aborted (cannot be split), or produces no further oversized files.
 file_limiter_recursive = true
 
+# Timing output printed at the end of each run (default: "detailed").
+# "off"      — no timing output.
+# "basic"    — total run time, total LLM time, and total token counts.
+# "detailed" — adds per-call timing lines during the run (in verbose mode)
+#              plus per-call-type, per-refactor, and per-file breakdowns.
+# timing = "detailed"
+
 # Run only specific refactors (default: run all).
 # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
 # "tuple_dataclass", "file_limiter", "match_function"

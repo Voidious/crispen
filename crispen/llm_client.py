@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import anthropic
@@ -16,6 +18,16 @@ _PROVIDER_BASE_URLS: dict[str, str] = {
     "deepseek": "https://api.deepseek.com/v1",
     "lmstudio": "http://localhost:1234/v1",
 }
+
+
+@dataclass
+class LLMCallResult:
+    """Timing and token data for a single LLM tool call."""
+
+    tool_input: Optional[dict]
+    elapsed: float
+    input_tokens: int
+    output_tokens: int
 
 
 # Maps provider name to its required environment variable.
@@ -84,11 +96,13 @@ def call_with_tool(
     messages: list,
     caller: str = "crispen",
     tool_choice_override: Optional[str] = None,
-) -> Optional[dict]:
-    """Call the LLM with forced tool use; return the tool input dict or None.
+) -> LLMCallResult:
+    """Call the LLM with forced tool use; return an LLMCallResult.
 
+    ``tool_input`` is None when the model did not invoke the tool.
     Raises CrispenAPIError on API errors.
     """
+    t0 = time.perf_counter()
     if provider == "anthropic":
         try:
             response = client.messages.create(
@@ -103,10 +117,22 @@ def call_with_tool(
                 f"{caller}: Anthropic API error: {exc}\n"
                 "Commit blocked. To skip all hooks: git commit --no-verify"
             ) from exc
+        tool_input = None
         for block in response.content:
             if block.type == "tool_use" and block.name == tool_name:
-                return block.input
-        return None  # pragma: no cover
+                tool_input = block.input
+                break
+        try:
+            in_tok = int(response.usage.input_tokens)
+            out_tok = int(response.usage.output_tokens)
+        except (AttributeError, TypeError, ValueError):
+            in_tok, out_tok = 0, 0
+        return LLMCallResult(
+            tool_input=tool_input,
+            elapsed=time.perf_counter() - t0,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+        )
     else:
         openai_tool = {
             "type": "function",
@@ -136,10 +162,21 @@ def call_with_tool(
                 f"{caller}: {provider} API error: {exc}\n"
                 "Commit blocked. To skip all hooks: git commit --no-verify"
             ) from exc
+        tool_input = None
         if response.choices and response.choices[0].message.tool_calls:
             tc = response.choices[0].message.tool_calls[0]
             try:
-                return json.loads(tc.function.arguments)
+                tool_input = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
-                return None
-        return None  # pragma: no cover
+                tool_input = None
+        try:
+            in_tok = int(response.usage.prompt_tokens)
+            out_tok = int(response.usage.completion_tokens)
+        except (AttributeError, TypeError, ValueError):
+            in_tok, out_tok = 0, 0
+        return LLMCallResult(
+            tool_input=tool_input,
+            elapsed=time.perf_counter() - t0,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+        )

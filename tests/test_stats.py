@@ -34,12 +34,44 @@ def _filled() -> RunStats:
 def test_merge_adds_all_counters():
     a = RunStats(if_not_else=1, tuple_to_dataclass=2, llm_veto_calls=3)
     b = RunStats(if_not_else=10, duplicate_extracted=5, llm_edit_calls=2)
+    b.llm_elapsed = 1.5
+    b.llm_input_tokens = 100
+    b.llm_output_tokens = 50
+    b.llm_elapsed_by_category["veto"] = 1.5
+    b.llm_calls_by_category["veto"] = 1
+    b.llm_elapsed_by_refactor["duplicate_extractor"] = 1.5
+    b.llm_elapsed_by_file["foo.py"] = 1.5
     a.merge(b)
     assert a.if_not_else == 11
     assert a.tuple_to_dataclass == 2
     assert a.duplicate_extracted == 5
     assert a.llm_veto_calls == 3
     assert a.llm_edit_calls == 2
+    assert a.llm_elapsed == 1.5
+    assert a.llm_input_tokens == 100
+    assert a.llm_elapsed_by_category["veto"] == 1.5
+    assert a.llm_calls_by_category["veto"] == 1
+    assert a.llm_elapsed_by_refactor["duplicate_extractor"] == 1.5
+    assert a.llm_elapsed_by_file["foo.py"] == 1.5
+
+
+def test_merge_adds_token_breakdown_dicts():
+    """Merging RunStats accumulates all per-category/refactor/file token dicts."""
+    a = RunStats()
+    b = RunStats()
+    b.llm_input_tokens_by_category["veto"] = 100
+    b.llm_output_tokens_by_category["veto"] = 50
+    b.llm_input_tokens_by_refactor["duplicate_extractor"] = 200
+    b.llm_output_tokens_by_refactor["duplicate_extractor"] = 80
+    b.llm_input_tokens_by_file["foo.py"] = 300
+    b.llm_output_tokens_by_file["foo.py"] = 90
+    a.merge(b)
+    assert a.llm_input_tokens_by_category["veto"] == 100
+    assert a.llm_output_tokens_by_category["veto"] == 50
+    assert a.llm_input_tokens_by_refactor["duplicate_extractor"] == 200
+    assert a.llm_output_tokens_by_refactor["duplicate_extractor"] == 80
+    assert a.llm_input_tokens_by_file["foo.py"] == 300
+    assert a.llm_output_tokens_by_file["foo.py"] == 90
 
 
 def test_merge_does_not_merge_files_edited():
@@ -181,3 +213,109 @@ def test_format_summary_no_files():
     lines = s.format_summary()
     text = "\n".join(lines)
     assert "files edited: none" in text
+
+
+# ---------------------------------------------------------------------------
+# record_llm_call
+# ---------------------------------------------------------------------------
+
+
+def test_record_llm_call_basic():
+    s = RunStats()
+    s.record_llm_call(1.5, 100, 50, "veto", "duplicate_extractor", "foo.py")
+    assert s.llm_elapsed == 1.5
+    assert s.llm_input_tokens == 100
+    assert s.llm_output_tokens == 50
+    assert s.llm_elapsed_by_category["veto"] == 1.5
+    assert s.llm_calls_by_category["veto"] == 1
+    assert s.llm_elapsed_by_refactor["duplicate_extractor"] == 1.5
+    assert s.llm_elapsed_by_file["foo.py"] == 1.5
+
+
+def test_record_llm_call_accumulates():
+    s = RunStats()
+    s.record_llm_call(1.0, 100, 50, "veto", "duplicate_extractor", "foo.py")
+    s.record_llm_call(0.5, 200, 30, "edit", "duplicate_extractor", "foo.py")
+    assert s.llm_elapsed == 1.5
+    assert s.llm_input_tokens == 300
+    assert s.llm_calls_by_category["veto"] == 1
+    assert s.llm_calls_by_category["edit"] == 1
+    assert s.llm_elapsed_by_refactor["duplicate_extractor"] == 1.5
+    assert s.llm_elapsed_by_file["foo.py"] == 1.5
+
+
+def test_record_llm_call_empty_file_skips_file_dict():
+    s = RunStats()
+    s.record_llm_call(1.0, 100, 50, "veto", "file_limiter", "")
+    assert s.llm_elapsed_by_file == {}
+
+
+# ---------------------------------------------------------------------------
+# format_summary timing section
+# ---------------------------------------------------------------------------
+
+
+def test_format_summary_basic_timing():
+    s = RunStats()
+    s.total_elapsed = 3.0
+    s.llm_elapsed = 2.0
+    s.llm_input_tokens = 1000
+    s.llm_output_tokens = 500
+    lines = s.format_summary(timing="basic")
+    text = "\n".join(lines)
+    assert "timing:" in text
+    assert "total:" in text
+    assert "3.00s" in text
+    assert "2.00s" in text
+    assert "67%" in text
+    assert "1,000 in" in text
+    assert "500 out" in text
+
+
+def test_format_summary_off_timing():
+    s = RunStats()
+    s.total_elapsed = 3.0
+    lines = s.format_summary(timing="off")
+    text = "\n".join(lines)
+    assert "timing:" not in text
+
+
+def test_format_summary_detailed_timing():
+    s = RunStats()
+    s.total_elapsed = 3.0
+    s.llm_elapsed = 2.0
+    s.llm_input_tokens = 1000
+    s.llm_output_tokens = 500
+    s.record_llm_call(1.0, 600, 300, "veto", "duplicate_extractor", "foo.py")
+    s.record_llm_call(1.0, 400, 200, "edit", "function_splitter", "bar.py")
+    lines = s.format_summary(timing="detailed")
+    text = "\n".join(lines)
+    assert "LLM by call type:" in text
+    assert "veto" in text
+    assert "LLM by refactor:" in text
+    assert "duplicate_extractor" in text
+    assert "LLM by file:" in text
+    assert "foo.py" in text
+
+
+def test_format_summary_timing_zero_total_elapsed():
+    """When total_elapsed=0 we don't divide, just show 0.00s."""
+    s = RunStats()
+    s.llm_elapsed = 0.0
+    lines = s.format_summary(timing="basic")
+    text = "\n".join(lines)
+    assert "timing:" in text
+    assert "total:               0.00s" in text
+    assert "LLM:                 0.00s" in text
+
+
+def test_format_summary_detailed_no_breakdowns():
+    """detailed timing with no calls shows timing header but no breakdowns."""
+    s = RunStats()
+    s.total_elapsed = 1.0
+    lines = s.format_summary(timing="detailed")
+    text = "\n".join(lines)
+    assert "timing:" in text
+    assert "LLM by call type:" not in text
+    assert "LLM by refactor:" not in text
+    assert "LLM by file:" not in text

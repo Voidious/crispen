@@ -128,6 +128,26 @@ class CrispenConfig:
     # Ignored when enabled_refactors is non-empty.
     disabled_refactors: List[str] = field(default_factory=list)
 
+    # Timing output level: "off" disables timing output entirely.
+    # "basic" shows total run time, total LLM time, and total token counts.
+    # "detailed" adds per-call-type, per-refactor, and per-file breakdowns.
+    timing: str = "detailed"
+
+
+def format_header(config: "CrispenConfig") -> List[str]:
+    """Return config lines printed to stderr before the first LLM call."""
+    w = 22
+    lines = ["--- crispen ---"]
+    lines.append(f"  {'provider:':<{w}}{config.provider}")
+    lines.append(f"  {'model:':<{w}}{config.model}")
+    lines.append(f"  {'api_timeout:':<{w}}{config.api_timeout}s")
+    lines.append(f"  {'extraction_retries:':<{w}}{config.extraction_retries}")
+    lines.append(f"  {'llm_verify_retries:':<{w}}{config.llm_verify_retries}")
+    lines.append(f"  {'file_limiter_retries:':<{w}}{config.file_limiter_retries}")
+    if config.base_url is not None:
+        lines.append(f"  {'base_url:':<{w}}{config.base_url}")
+    return lines
+
 
 def _read_toml(path: Path) -> dict:
     """Read a TOML file; return empty dict if missing or unparseable."""

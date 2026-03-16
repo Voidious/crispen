@@ -1678,3 +1678,74 @@ def test_function_splitter_skips_name_collision(mock_anthropic):
 
     # collision detected → task dropped → no rewrite
     assert splitter.get_rewritten_source() is None
+
+
+# ---------------------------------------------------------------------------
+# _llm_name_helpers with _timing_out
+# ---------------------------------------------------------------------------
+
+
+@patch("crispen.llm_client.anthropic")
+def test_llm_name_helpers_with_timing_out(mock_anthropic):
+    """_llm_name_helpers appends result to _timing_out when provided."""
+    mock_response = _make_mock_response(["process_tail"])
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = mock_response
+    mock_anthropic.APIError = Exception
+
+    tasks = [_make_task("my_func")]
+    client = mock_anthropic.Anthropic.return_value
+    timing: list = []
+    result = _llm_name_helpers(
+        client, "claude-sonnet-4-6", "anthropic", tasks, _timing_out=timing
+    )
+    assert result == ["process_tail"]
+    assert len(timing) == 1
+
+
+# ---------------------------------------------------------------------------
+# FunctionSplitter-level timing branch (if timing:)
+# ---------------------------------------------------------------------------
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_timing_recorded(mock_anthropic):
+    """FunctionSplitter records LLM timing after a successful split."""
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["process_tail"])
+    )
+    mock_anthropic.APIError = Exception
+
+    src = _make_long_func(80)
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=50
+        )
+
+    # The timing branch was hit; record_llm_call ran for the edit call.
+    assert splitter.stats.llm_edit_calls >= 1
+    # The elapsed time dict was populated.
+    assert "edit" in splitter.stats.llm_elapsed_by_category
+
+
+# ---------------------------------------------------------------------------
+# FunctionSplitter-level timing == "detailed" verbose print
+# ---------------------------------------------------------------------------
+
+
+@patch("crispen.llm_client.anthropic")
+def test_function_splitter_detailed_timing_print(mock_anthropic, capsys):
+    """FunctionSplitter prints per-call timing in verbose + detailed mode."""
+    mock_client = mock_anthropic.Anthropic.return_value
+    mock_client.messages.create.return_value = _make_mock_response(["process_tail"])
+    mock_anthropic.APIError = Exception
+
+    src = _make_long_func(80)
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        # Construct without source so _analyze is not called yet.
+        splitter = FunctionSplitter([(1, 1000)], source="", verbose=True, max_lines=50)
+        splitter.timing = "detailed"
+        # Now trigger _analyze with detailed timing in place.
+        splitter._analyze(src)
+
+    err = capsys.readouterr().err
+    assert "→ naming [" in err

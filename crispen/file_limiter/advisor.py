@@ -19,6 +19,16 @@ from .entity_parser import Entity
 
 
 @dataclass
+class _LLMAccumulator:
+    """Mutable accumulator for LLM call counts, timing, and token usage."""
+
+    calls: int = 0
+    elapsed: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
 class GroupPlacement:
     """Placement decision for one SCC group."""
 
@@ -38,6 +48,9 @@ class FileLimiterPlan:
     abort: bool
     abort_reason: str = ""  # human-readable explanation when abort=True
     llm_calls: int = 0  # number of LLM API calls made during planning
+    llm_elapsed: float = 0.0
+    llm_input_tokens: int = 0
+    llm_output_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +264,8 @@ def _advise_set3(
     config: CrispenConfig,
     prev_failure: str = "",
     verbose: bool = False,
-    _counter: Optional[List[int]] = None,
+    timing: str = "detailed",
+    _acc: Optional["_LLMAccumulator"] = None,
 ) -> Optional[List[List[str]]]:
     """Ask the LLM which Set 3 groups should migrate. Returns None on failure."""
     entity_map = {e.name: e for e in classified.entities}
@@ -302,8 +316,8 @@ def _advise_set3(
             file=sys.stderr,
             flush=True,
         )
-    if _counter is not None:
-        _counter[0] += 1
+    if _acc is not None:
+        _acc.calls += 1
     result = call_with_tool(
         client,
         config.provider,
@@ -315,11 +329,22 @@ def _advise_set3(
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
     )
-    if result is None:
+    if _acc is not None:
+        _acc.elapsed += result.elapsed
+        _acc.input_tokens += result.input_tokens
+        _acc.output_tokens += result.output_tokens
+    if verbose and timing == "detailed":
+        print(
+            f"crispen: FileLimiter:   → done [{result.elapsed:.2f}s,"
+            f" {result.input_tokens:,} in / {result.output_tokens:,} out]",
+            file=sys.stderr,
+            flush=True,
+        )
+    if result.tool_input is None:
         return None
 
     migrate_ids = set()
-    for decision in result.get("decisions", []):
+    for decision in result.tool_input.get("decisions", []):
         gid = decision.get("group_id")
         action = decision.get("action")
         if isinstance(gid, int) and 0 <= gid < len(classified.set_3_groups):
@@ -343,7 +368,8 @@ def _propose_files_step(
     config: CrispenConfig,
     prev_failure: str = "",
     verbose: bool = False,
-    _counter: Optional[List[int]] = None,
+    timing: str = "detailed",
+    _acc: Optional["_LLMAccumulator"] = None,
     subdir_name: Optional[str] = None,
 ) -> Optional[List[Tuple[str, str]]]:
     """Ask the LLM to propose a set of output filenames.
@@ -423,8 +449,8 @@ def _propose_files_step(
             file=sys.stderr,
             flush=True,
         )
-    if _counter is not None:
-        _counter[0] += 1
+    if _acc is not None:
+        _acc.calls += 1
     result = call_with_tool(
         client,
         config.provider,
@@ -436,12 +462,23 @@ def _propose_files_step(
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
     )
-    if result is None:
+    if _acc is not None:
+        _acc.elapsed += result.elapsed
+        _acc.input_tokens += result.input_tokens
+        _acc.output_tokens += result.output_tokens
+    if verbose and timing == "detailed":
+        print(
+            f"crispen: FileLimiter:   → done [{result.elapsed:.2f}s,"
+            f" {result.input_tokens:,} in / {result.output_tokens:,} out]",
+            file=sys.stderr,
+            flush=True,
+        )
+    if result.tool_input is None:
         return None
 
     proposed: List[Tuple[str, str]] = []
     seen: set = set()
-    for item in result.get("files", []):
+    for item in result.tool_input.get("files", []):
         filename = item.get("filename", "")
         description = item.get("description", "")
         if filename and filename not in seen and filename not in existing_files:
@@ -463,7 +500,8 @@ def _assign_placements_chunk(
     prev_failure: str = "",
     min_files: int = 2,
     verbose: bool = False,
-    _counter: Optional[List[int]] = None,
+    timing: str = "detailed",
+    _acc: Optional["_LLMAccumulator"] = None,
     subdir_name: Optional[str] = None,
     proposed_files: Optional[List[Tuple[str, str]]] = None,
 ) -> Optional[List[GroupPlacement]]:
@@ -576,8 +614,8 @@ def _assign_placements_chunk(
             file=sys.stderr,
             flush=True,
         )
-    if _counter is not None:
-        _counter[0] += 1
+    if _acc is not None:
+        _acc.calls += 1
     result = call_with_tool(
         client,
         config.provider,
@@ -589,7 +627,18 @@ def _assign_placements_chunk(
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
     )
-    if result is None:
+    if _acc is not None:
+        _acc.elapsed += result.elapsed
+        _acc.input_tokens += result.input_tokens
+        _acc.output_tokens += result.output_tokens
+    if verbose and timing == "detailed":
+        print(
+            f"crispen: FileLimiter:   → done [{result.elapsed:.2f}s,"
+            f" {result.input_tokens:,} in / {result.output_tokens:,} out]",
+            file=sys.stderr,
+            flush=True,
+        )
+    if result.tool_input is None:
         return None
 
     proposed_filenames = (
@@ -598,7 +647,7 @@ def _assign_placements_chunk(
 
     placements: List[GroupPlacement] = []
     placed_ids: set = set()
-    for item in result.get("placements", []):
+    for item in result.tool_input.get("placements", []):
         gid = item.get("group_id")
         target = item.get("target_file", "")
         if subdir_name and target.startswith(subdir_name + "/"):
@@ -632,7 +681,8 @@ def _refine_merge_tiny(
     client: object,
     config: CrispenConfig,
     verbose: bool = False,
-    _counter: Optional[List[int]] = None,
+    timing: str = "detailed",
+    _acc: Optional["_LLMAccumulator"] = None,
     subdir_name: Optional[str] = None,
 ) -> List[GroupPlacement]:
     """Reassign groups from tiny output files into larger files.
@@ -672,7 +722,8 @@ def _refine_merge_tiny(
         client,
         config,
         verbose=verbose,
-        _counter=_counter,
+        timing=timing,
+        _acc=_acc,
         subdir_name=subdir_name,
         proposed_files=ok_proposed,
     )
@@ -739,7 +790,8 @@ def _rename_conflicting_chunk(
     config: CrispenConfig,
     prev_failure: str = "",
     verbose: bool = False,
-    _counter: Optional[List[int]] = None,
+    timing: str = "detailed",
+    _acc: Optional["_LLMAccumulator"] = None,
 ) -> Optional[List[GroupPlacement]]:
     """Ask the LLM to rename conflicting placements in *chunk*.
 
@@ -807,8 +859,8 @@ def _rename_conflicting_chunk(
             file=sys.stderr,
             flush=True,
         )
-    if _counter is not None:
-        _counter[0] += 1
+    if _acc is not None:
+        _acc.calls += 1
     result = call_with_tool(
         client,
         config.provider,
@@ -820,12 +872,23 @@ def _rename_conflicting_chunk(
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
     )
-    if result is None:
+    if _acc is not None:
+        _acc.elapsed += result.elapsed
+        _acc.input_tokens += result.input_tokens
+        _acc.output_tokens += result.output_tokens
+    if verbose and timing == "detailed":
+        print(
+            f"crispen: FileLimiter:   → done [{result.elapsed:.2f}s,"
+            f" {result.input_tokens:,} in / {result.output_tokens:,} out]",
+            file=sys.stderr,
+            flush=True,
+        )
+    if result.tool_input is None:
         return None
 
     placements: List[GroupPlacement] = []
     placed_ids: set = set()
-    for item in result.get("placements", []):
+    for item in result.tool_input.get("placements", []):
         gid = item.get("group_id")
         target = item.get("target_file", "")
         if (
@@ -856,7 +919,8 @@ def _assign_placements(
     config: CrispenConfig,
     prev_failure: str = "",
     verbose: bool = False,
-    _counter: Optional[List[int]] = None,
+    timing: str = "detailed",
+    _acc: Optional["_LLMAccumulator"] = None,
     subdir_name: Optional[str] = None,
     target_files: int = 2,
 ) -> Optional[List[GroupPlacement]]:
@@ -892,7 +956,8 @@ def _assign_placements(
             config,
             prev_failure=prev_propose_failure,
             verbose=verbose,
-            _counter=_counter,
+            timing=timing,
+            _acc=_acc,
             subdir_name=subdir_name,
         )
         if proposed_files is not None:
@@ -920,7 +985,8 @@ def _assign_placements(
                 prev_failure,
                 min_files=2,
                 verbose=verbose,
-                _counter=_counter,
+                timing=timing,
+                _acc=_acc,
                 subdir_name=subdir_name,
                 proposed_files=proposed_files,
             )
@@ -939,7 +1005,8 @@ def _assign_placements(
         client,
         config,
         verbose=verbose,
-        _counter=_counter,
+        timing=timing,
+        _acc=_acc,
         subdir_name=subdir_name,
     )
 
@@ -959,7 +1026,8 @@ def resolve_naming_conflicts(
     existing_dirs: frozenset,
     config: CrispenConfig,
     verbose: bool = False,
-    _counter: Optional[List[int]] = None,
+    timing: str = "detailed",
+    _acc: Optional["_LLMAccumulator"] = None,
 ) -> Optional[List[GroupPlacement]]:
     """Attempt a targeted rename of only the placements with naming conflicts.
 
@@ -1010,7 +1078,8 @@ def resolve_naming_conflicts(
                 config,
                 prev_failure=prev_failure,
                 verbose=verbose,
-                _counter=_counter,
+                timing=timing,
+                _acc=_acc,
             )
             if chunk_result is not None:
                 break
@@ -1038,6 +1107,7 @@ def advise_file_limiter(
     prev_set3_failure: str = "",
     prev_placement_failure: str = "",
     verbose: bool = False,
+    timing: str = "detailed",
     subdir_name: Optional[str] = None,
 ) -> FileLimiterPlan:
     """Ask the LLM to plan entity placement across new files.
@@ -1061,7 +1131,7 @@ def advise_file_limiter(
         config.provider, api_key, timeout=config.api_timeout, base_url=config.base_url
     )
 
-    counter: List[int] = [0]
+    counter = _LLMAccumulator()
 
     # Call 1: advise Set 3 groups (only if set_3 is non-empty).
     # In a test-file subdir split every group must migrate — there is no public
@@ -1083,7 +1153,8 @@ def advise_file_limiter(
                 config,
                 prev_failure=prev_set3_failure,
                 verbose=verbose,
-                _counter=counter,
+                timing=timing,
+                _acc=counter,
             )
             if result is None:
                 return FileLimiterPlan(
@@ -1091,7 +1162,10 @@ def advise_file_limiter(
                     placements=[],
                     abort=True,
                     abort_reason="LLM failed to plan set-3 groups",
-                    llm_calls=counter[0],
+                    llm_calls=counter.calls,
+                    llm_elapsed=counter.elapsed,
+                    llm_input_tokens=counter.input_tokens,
+                    llm_output_tokens=counter.output_tokens,
                 )
             set3_migrate = result
 
@@ -1102,7 +1176,10 @@ def advise_file_limiter(
             set3_migrate=set3_migrate,
             placements=[],
             abort=False,
-            llm_calls=counter[0],
+            llm_calls=counter.calls,
+            llm_elapsed=counter.elapsed,
+            llm_input_tokens=counter.input_tokens,
+            llm_output_tokens=counter.output_tokens,
         )
 
     entity_map = {e.name: e for e in classified.entities}
@@ -1124,7 +1201,8 @@ def advise_file_limiter(
         config,
         prev_failure=prev_placement_failure,
         verbose=verbose,
-        _counter=counter,
+        timing=timing,
+        _acc=counter,
         subdir_name=subdir_name,
         target_files=original_target,
     )
@@ -1134,12 +1212,18 @@ def advise_file_limiter(
             placements=[],
             abort=True,
             abort_reason="LLM failed to assign file placements",
-            llm_calls=counter[0],
+            llm_calls=counter.calls,
+            llm_elapsed=counter.elapsed,
+            llm_input_tokens=counter.input_tokens,
+            llm_output_tokens=counter.output_tokens,
         )
 
     return FileLimiterPlan(
         set3_migrate=set3_migrate,
         placements=placements,
         abort=False,
-        llm_calls=counter[0],
+        llm_calls=counter.calls,
+        llm_elapsed=counter.elapsed,
+        llm_input_tokens=counter.input_tokens,
+        llm_output_tokens=counter.output_tokens,
     )
