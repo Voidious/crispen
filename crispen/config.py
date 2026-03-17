@@ -116,6 +116,20 @@ class CrispenConfig:
     #                 ``module.name`` is not scanned.
     file_limiter_reexports: str = "imported"
 
+    # Controls how @patch string literals in test files are updated after
+    # FileLimiter moves entities to new sub-modules.
+    #
+    # "ignore"  — Do nothing (default).  @patch strings are left as-is.
+    # "direct"  — Scan every *.py file in the repo and replace string
+    #             literals that reference a moved entity's old dotted path
+    #             (e.g. "pkg.old_module.MyClass") with the new canonical
+    #             path ("pkg.old_module.new_sub.MyClass").  Only strings
+    #             where the segment immediately after the old module path
+    #             is a moved entity name are updated; transitive
+    #             dependencies that ended up in multiple new files are
+    #             left unchanged.
+    file_limiter_patch_update: str = "ignore"
+
     # Refactor allow-list: if non-empty, only the named refactors are run.
     # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
     # "tuple_dataclass", "file_limiter", "match_function".

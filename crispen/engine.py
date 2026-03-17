@@ -15,7 +15,8 @@ from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvi
 
 from .config import CrispenConfig, format_header, load_config
 from .errors import CrispenAPIError
-from .file_limiter.runner import run_file_limiter
+from .file_limiter.runner import FileLimiterResult, run_file_limiter
+from .patch_updater import apply_patch_strings
 from .refactors.caller_updater import CallerUpdater
 from .refactors.duplicate_extractor import DuplicateExtractor
 from .refactors.function_splitter import FunctionSplitter
@@ -249,6 +250,30 @@ def _patch_inline_imports_after_test_deletion(
         if updated != content:
             fl_new_file_final[path] = updated
             Path(path).write_text(updated, encoding="utf-8")
+
+
+def _build_patch_map(
+    filepath: str,
+    fl_result: "FileLimiterResult",
+    original_dir: Path,
+) -> Dict[str, str]:
+    """Build old_dotted_path.EntityName → new_dotted_path.EntityName map.
+
+    Returns an empty dict when the module path cannot be determined or
+    when no entities were moved.
+    """
+    if not fl_result.entity_to_target:
+        return {}
+    old_module = _module_path_for_file(filepath)
+    if old_module is None:
+        return {}
+    patch_map: Dict[str, str] = {}
+    for entity_name, rel_target in fl_result.entity_to_target.items():
+        new_module = _module_path_for_file(str(original_dir / rel_target))
+        if new_module is None:
+            continue
+        patch_map[f"{old_module}.{entity_name}"] = f"{new_module}.{entity_name}"
+    return patch_map
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +835,7 @@ def run_engine(
     # ------------------------------------------------------------------ #
     # Phase 3 — FileLimiter: split files exceeding max_file_lines        #
     # ------------------------------------------------------------------ #
+    combined_patch_map: Dict[str, str] = {}
     if config.max_file_lines > 0 and _should_run("file_limiter", config):
         # Pending queue for recursive FileLimiter processing: (filepath, source)
         # pairs for newly-created files that are still over the limit.
@@ -879,6 +905,11 @@ def run_engine(
                     _fl_recursive.append((str(new_path), new_source))
 
             state["source"] = fl_result.original_source
+
+            if fl_result.entity_to_target:
+                combined_patch_map.update(
+                    _build_patch_map(filepath, fl_result, Path(filepath).parent)
+                )
 
             # For non-test whole-file subdir splits (without __main__), delete
             # the original file now that service/__init__.py takes its place as
@@ -950,6 +981,11 @@ def run_engine(
                 if len(new_source.splitlines()) > config.max_file_lines:
                     _fl_recursive.append((str(new_path), new_source))
 
+            if r_result.entity_to_target and not r_result.abort:
+                combined_patch_map.update(
+                    _build_patch_map(r_path, r_result, Path(r_path).parent)
+                )
+
             # Subdir split of a recursively-processed file: delete the file
             # that was replaced by a package __init__.py.  Handle before the
             # rewrite check so we don't write-then-delete (and double-count lines).
@@ -989,6 +1025,42 @@ def run_engine(
         _stats.file_limiter_classes_verified = len(_fl_verified_class_names)
         _stats.file_limiter_lines_verified = sum(_fl_verified_entity_lines.values())
         yield from _recursive_msgs
+
+    # ------------------------------------------------------------------ #
+    # Phase 4 — Update @patch strings after FileLimiter entity moves     #
+    # ------------------------------------------------------------------ #
+    if (
+        config.file_limiter_patch_update != "ignore"
+        and combined_patch_map
+        and repo_root
+    ):
+        # Update per_file sources still in memory (not yet written to disk).
+        for filepath, state in per_file.items():
+            new_src = apply_patch_strings(state["source"], combined_patch_map)
+            if new_src != state["source"]:
+                state["source"] = new_src
+                state["msgs"].append(
+                    f"{filepath}: patch_update: updated @patch strings"
+                )
+        # Scan every other *.py file in the repo and update on disk.
+        per_file_abs = {str(Path(f).resolve()) for f in per_file}
+        repo_root_path = Path(repo_root)
+        for py_file in sorted(repo_root_path.rglob("*.py")):
+            if str(py_file.resolve()) in per_file_abs:
+                continue
+            if any(
+                part in _EXCLUDED_DIR_NAMES
+                for part in py_file.relative_to(repo_root_path).parts[:-1]
+            ):
+                continue
+            try:
+                src = py_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            new_src = apply_patch_strings(src, combined_patch_map)
+            if new_src != src:
+                py_file.write_text(new_src, encoding="utf-8")
+                yield f"{py_file}: patch_update: updated @patch strings"
 
     # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #

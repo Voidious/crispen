@@ -40,6 +40,9 @@ class FileLimiterResult:
     verified_function_names: set = field(default_factory=set)
     verified_class_names: set = field(default_factory=set)
     verified_entity_line_counts: dict = field(default_factory=dict)
+    entity_to_target: Dict[str, str] = field(
+        default_factory=dict
+    )  # entity_name → rel_path
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +717,11 @@ def run_file_limiter(
         f"{filepath}: FileLimiter: moved {', '.join(p.group)} \u2192 {p.target_file}"
         for p in _report_placements
     ]
+    entity_to_target: Dict[str, str] = {
+        entity_name: p.target_file
+        for p in _report_placements
+        for entity_name in p.group
+    }
     return FileLimiterResult(
         original_source=split.original_source,
         new_files=split.new_files,
@@ -731,4 +739,5 @@ def run_file_limiter(
         verified_function_names=vr.verified_function_names,
         verified_class_names=vr.verified_class_names,
         verified_entity_line_counts=vr.verified_entity_line_counts,
+        entity_to_target=entity_to_target,
     )

@@ -40,6 +40,7 @@ file_limiter_recursive = true
 file_limiter_subdir_split = true
 file_limiter_pytest_conftest = true
 file_limiter_reexports = "imported"
+file_limiter_patch_update = "ignore"
 timing = "detailed"
 
 [tool.pytest.ini_options]

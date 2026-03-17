@@ -1921,3 +1921,67 @@ def test_runner_init_py_skips_subdir_split(mock_classify, tmp_path):
     assert result.abort is True
     assert result.subdir_name is None
     assert "already exists" not in " ".join(result.messages)
+
+
+# ---------------------------------------------------------------------------
+# run_file_limiter — entity_to_target
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_entity_to_target_populated_on_success(mock_classify, mock_advise, mock_gen):
+    """On a successful run, entity_to_target maps entity names to target files."""
+    source = "def foo():\n    pass\ndef bar():\n    pass\n"
+    entity_foo = _make_entity("foo", 1, 2)
+    entity_bar = _make_entity("bar", 3, 4)
+    mock_classify.return_value = _make_classified(entities=[entity_foo, entity_bar])
+    # Plan: foo → utils.py, bar → helpers.py
+    from crispen.file_limiter.advisor import FileLimiterPlan, GroupPlacement
+
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[],
+        placements=[
+            GroupPlacement(group=["foo"], target_file="utils.py"),
+            GroupPlacement(group=["bar"], target_file="helpers.py"),
+        ],
+        abort=False,
+    )
+    mock_gen.return_value = SplitResult(
+        new_files={
+            "utils.py": "def foo():\n    pass",
+            "helpers.py": "def bar():\n    pass",
+        },
+        original_source="# original updated\n",
+        abort=False,
+    )
+
+    result = run_file_limiter("big.py", "", source, [], _CONFIG)
+
+    assert result.abort is False
+    assert result.entity_to_target == {
+        "foo": "utils.py",
+        "bar": "helpers.py",
+    }
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_entity_to_target_empty_on_abort(mock_classify, mock_advise, mock_gen):
+    """Abort result has empty entity_to_target."""
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[],
+        set_3_groups=[],
+        abort=True,
+    )
+
+    result = run_file_limiter("big.py", "", "x = 1\n", [], _CONFIG_NO_RETRY)
+
+    assert result.abort is True
+    assert result.entity_to_target == {}

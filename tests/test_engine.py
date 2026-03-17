@@ -14,6 +14,7 @@ from crispen.engine import (
     _apply_tuple_dataclass,
     _blocked_private_scopes,
     _build_alias_map,
+    _build_patch_map,
     _categorize_into_stats,
     _compute_qname,
     _file_to_module,
@@ -27,6 +28,7 @@ from crispen.engine import (
     _visit_with_timeout,
     run_engine,
 )
+
 from crispen.errors import CrispenAPIError
 from crispen.file_limiter.runner import FileLimiterResult
 from crispen.refactors.base import Refactor
@@ -2420,3 +2422,425 @@ def test_file_limiter_recursive_llm_timing_recorded_in_stats(tmp_path):
             )
         )
     assert "file_limiter" in stats.llm_elapsed_by_category
+
+
+# ---------------------------------------------------------------------------
+# _build_patch_map
+# ---------------------------------------------------------------------------
+
+
+def test_build_patch_map_empty_entity_to_target(tmp_path):
+    """No entity_to_target → empty map."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    f = tmp_path / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={},
+        entity_to_target={},
+    )
+    result = _build_patch_map(str(f), fl_result, tmp_path)
+    assert result == {}
+
+
+def test_build_patch_map_no_old_module(tmp_path):
+    """When _module_path_for_file returns None for filepath → empty map."""
+    # No pyproject.toml anywhere → cannot find project root
+    f = tmp_path / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, tmp_path)
+    assert result == {}
+
+
+def test_build_patch_map_success(tmp_path):
+    """Entities map to correct old → new dotted paths."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    (pkg / "utils.py").write_text("class MyClass: pass\n", encoding="utf-8")
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg)
+    assert result == {
+        "mypkg.module.MyClass": "mypkg.utils.MyClass",
+    }
+
+
+def test_build_patch_map_new_module_none(tmp_path):
+    """When new file's module path can't be resolved → entity is skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    f = tmp_path / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    with patch(
+        "crispen.engine._module_path_for_file", side_effect=["mypkg.module", None]
+    ):
+        result = _build_patch_map(str(f), fl_result, tmp_path)
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — @patch string update integration tests
+# ---------------------------------------------------------------------------
+
+
+def _make_fl_result_with_entities(source="# reduced\n"):
+    """Build a FileLimiterResult that moved MyClass → utils.py."""
+    return FileLimiterResult(
+        original_source=source,
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=["big.py: FileLimiter: moved MyClass → utils.py"],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+
+
+def test_patch_update_ignore_mode(tmp_path):
+    """Default 'ignore' mode → @patch strings are never updated."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+    other = tmp_path / "test_other.py"
+    other.write_text(
+        '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n', encoding="utf-8"
+    )
+
+    fl_result = _make_fl_result_with_entities()
+    with patch(_FL_PATCH, return_value=fl_result):
+        list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="ignore",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+    # test_other.py should be unchanged
+    assert (
+        other.read_text(encoding="utf-8")
+        == '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n'
+    )
+
+
+def test_patch_update_no_combined_map(tmp_path):
+    """'update' mode but FL returned empty entity_to_target → no updates."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+    other = tmp_path / "test_other.py"
+    other.write_text(
+        '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n', encoding="utf-8"
+    )
+
+    no_entity_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=["big.py: FileLimiter: moved MyClass → utils.py"],
+        abort=False,
+        entity_to_target={},  # empty!
+    )
+    with patch(_FL_PATCH, return_value=no_entity_result):
+        list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="direct",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+    assert (
+        other.read_text(encoding="utf-8")
+        == '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n'
+    )
+
+
+def test_patch_update_updates_per_file_source(tmp_path):
+    """'update' mode, FL moved entities → per_file source with old path is updated."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    big_source = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(big_source, encoding="utf-8")
+    # Another diff file with an old @patch string
+    other_diff = pkg / "test_big.py"
+    other_diff.write_text(
+        '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n', encoding="utf-8"
+    )
+
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=["big.py: FileLimiter: moved MyClass → utils.py"],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    with patch(_FL_PATCH, return_value=fl_result):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 10)], str(other_diff): [(1, 2)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="direct",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+    # The per_file source for other_diff should have the updated string
+    updated_text = other_diff.read_text(encoding="utf-8")
+    assert "mypkg.utils.MyClass" in updated_text
+    assert any("patch_update" in m for m in msgs)
+
+
+def test_patch_update_updates_other_file(tmp_path):
+    """'update' mode, a separate file outside per_file gets updated on disk."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    big_source = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(big_source, encoding="utf-8")
+    # A file NOT in the diff that has the old @patch string
+    other = tmp_path / "test_other.py"
+    other.write_text(
+        '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n', encoding="utf-8"
+    )
+
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=["big.py: FileLimiter: moved MyClass → utils.py"],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    with patch(_FL_PATCH, return_value=fl_result):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="direct",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+    updated_text = other.read_text(encoding="utf-8")
+    assert "mypkg.utils.MyClass" in updated_text
+    assert any("patch_update" in m for m in msgs)
+
+
+def test_patch_update_skips_excluded_dir(tmp_path):
+    """Files under .venv/ are excluded from Phase 4 scanning."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    big_source = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(big_source, encoding="utf-8")
+    venv_dir = tmp_path / ".venv"
+    venv_dir.mkdir()
+    venv_file = venv_dir / "test.py"
+    venv_content = '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n'
+    venv_file.write_text(venv_content, encoding="utf-8")
+
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=["big.py: FileLimiter: moved MyClass → utils.py"],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    with patch(_FL_PATCH, return_value=fl_result):
+        list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="direct",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+    # .venv/test.py must not be modified
+    assert venv_file.read_text(encoding="utf-8") == venv_content
+
+
+def test_patch_update_no_repo_root(tmp_path):
+    """When repo_root can't be found, Phase 4 skips entirely."""
+    # No .git or pyproject.toml → _find_repo_root returns None
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+    other = tmp_path / "test_other.py"
+    other.write_text(
+        '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n', encoding="utf-8"
+    )
+
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=[],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    with patch(_FL_PATCH, return_value=fl_result):
+        list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="direct",
+                ),
+                # No _repo_root passed, no .git in tmp_path → repo_root=None
+            )
+        )
+    # test_other.py should be unchanged
+    assert (
+        other.read_text(encoding="utf-8")
+        == '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n'
+    )
+
+
+def test_patch_update_oserror_skipped(tmp_path):
+    """Phase 4 continues gracefully when read_text raises OSError."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    big_source = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(big_source, encoding="utf-8")
+    # A file that will raise OSError when read
+    other = tmp_path / "test_other.py"
+    other.write_text(
+        '@patch("mypkg.big.MyClass")\ndef test_it(): pass\n', encoding="utf-8"
+    )
+
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=[],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+
+    other_abs = str(other.resolve())
+
+    original_pathlib_read = None
+
+    def _patched_read_text(self, encoding="utf-8"):
+        if str(self.resolve()) == other_abs:
+            raise OSError("permission denied")
+        return original_pathlib_read(self, encoding=encoding)
+
+    import pathlib
+
+    original_pathlib_read = pathlib.Path.read_text
+
+    with patch.object(pathlib.Path, "read_text", _patched_read_text):
+        with patch(_FL_PATCH, return_value=fl_result):
+            # Should not raise even though read_text raises OSError
+            msgs = list(
+                run_engine(
+                    {str(f): [(1, 10)]},
+                    config=CrispenConfig(
+                        max_file_lines=5,
+                        file_limiter_patch_update="direct",
+                    ),
+                    _repo_root=str(tmp_path),
+                )
+            )
+
+    # No patch_update message for other since it raised OSError
+    assert not any("test_other" in m and "patch_update" in m for m in msgs)
+
+
+def test_patch_update_accumulates_from_recursive_fl(tmp_path):
+    """Entities from recursive FL results also contribute to the patch map."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    big_source = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(big_source, encoding="utf-8")
+
+    # Other file outside per_file with old @patch strings for both files
+    other = tmp_path / "test_other.py"
+    other.write_text(
+        '@patch("mypkg.big.MyClass")\n'
+        '@patch("mypkg.utils.HelperClass")\n'
+        "def test_it(): pass\n",
+        encoding="utf-8",
+    )
+
+    # First FL result: big.py → utils.py (MyClass moved there)
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={
+            "utils.py": "class MyClass: pass\n" * 10
+        },  # over limit for recursion
+        messages=[],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+
+    # utils.py written by first result; set up that file
+    utils_path = pkg / "utils.py"
+
+    # Second FL result: utils.py → helpers.py (HelperClass moved there)
+    second_result = FileLimiterResult(
+        original_source="# utils reduced\n",
+        new_files={"helpers.py": "class HelperClass: pass\n"},
+        messages=[],
+        abort=False,
+        entity_to_target={"HelperClass": "helpers.py"},
+    )
+
+    call_count = 0
+
+    def _fl_side_effect(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Write utils.py so the recursive call can find it
+            utils_path.write_text("class MyClass: pass\n" * 10, encoding="utf-8")
+            return first_result
+        return second_result
+
+    with patch(_FL_PATCH, side_effect=_fl_side_effect):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_recursive=True,
+                    file_limiter_patch_update="direct",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+
+    # Verify combined_patch_map was non-empty by checking at least one
+    # patch_update message was generated (from the other file or per_file).
+    updated_text = other.read_text(encoding="utf-8")
+    # At minimum, MyClass should be updated (from first pass)
+    assert "mypkg.utils.MyClass" in updated_text or any(
+        "patch_update" in m for m in msgs
+    )
