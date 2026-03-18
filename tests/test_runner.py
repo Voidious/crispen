@@ -288,6 +288,52 @@ def test_verify_async_def_entity_passes():
     assert vr.verified_lines == 2
 
 
+def test_verify_blank_line_collapse_after_pruning_passes():
+    # Regression: when multiple consecutive inline imports are all pruned to
+    # top-level, the resulting consecutive blank lines (3+ newlines before
+    # indented content) are collapsed by _normalize_blank_lines in code_gen.
+    # Verification must apply the same normalization to entity_no_imports so
+    # the substring match doesn't fail due to a blank-line count mismatch.
+    post_source = (
+        "def test_seq():\n"
+        '    """Docstring."""\n'
+        "    import libcst as cst\n"
+        "\n"
+        "    from libcst.metadata import MetadataWrapper\n"
+        "\n"
+        "    from foo import Bar\n"
+        "\n"
+        "    x = cst.parse_module('')\n"
+        "    w = MetadataWrapper(x)\n"
+        "    b = Bar()\n"
+    )
+    entity = _make_entity("test_seq", 1, 13)
+    # New file has all 3 inline imports hoisted to top-level and pruned from
+    # the function body; _normalize_blank_lines collapsed the 3+ consecutive
+    # blank lines down to 1.
+    new_file_src = (
+        "import libcst as cst\n"
+        "from libcst.metadata import MetadataWrapper\n"
+        "from foo import Bar\n"
+        "\n"
+        "def test_seq():\n"
+        '    """Docstring."""\n'
+        "\n"
+        "    x = cst.parse_module('')\n"
+        "    w = MetadataWrapper(x)\n"
+        "    b = Bar()\n"
+    )
+    split = SplitResult(
+        new_files={"test_collectors.py": new_file_src},
+        original_source="# original\n",
+        abort=False,
+    )
+    placements = [GroupPlacement(group=["test_seq"], target_file="test_collectors.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    assert vr.verified_functions == 1
+
+
 def test_verify_entity_with_name_rewrites_passes():
     # The original entity references SAFE_MODE; after splitting it becomes
     # conversion.SAFE_MODE in the new file.  Verification must apply the

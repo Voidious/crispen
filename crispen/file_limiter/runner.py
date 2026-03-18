@@ -16,7 +16,13 @@ from .advisor import (
     resolve_naming_conflicts,
 )
 from .classifier import classify_entities
-from .code_gen import SplitResult, _rewrite_module_var_names, generate_file_splits
+from .code_gen import (
+    SplitResult,
+    _EXCESS_BLANK_BODY_RE,
+    _EXCESS_BLANK_RE,
+    _rewrite_module_var_names,
+    generate_file_splits,
+)
 from .entity_parser import Entity, EntityKind
 
 
@@ -182,7 +188,13 @@ def _verify_preservation(
         entity_no_imports_orig = _strip_imports_by_line(entity_src)
         if entity_rewrites:
             entity_src = _rewrite_module_var_names(entity_src, entity_rewrites)
-        entity_no_imports = _strip_imports_by_line(entity_src)
+        entity_no_imports_stripped = _strip_imports_by_line(entity_src)
+        entity_no_imports_stripped = _EXCESS_BLANK_RE.sub(
+            "\n\n\n", entity_no_imports_stripped
+        )
+        entity_no_imports = _EXCESS_BLANK_BODY_RE.sub(
+            "\n\n", entity_no_imports_stripped
+        )
         if entity_no_imports not in combined_no_imports:
             preview_lines = entity_src.splitlines()[:3]
             preview = "\n    ".join(preview_lines)
