@@ -110,6 +110,29 @@ def _blocked_private_scopes(source: str, ranges: List[Tuple[int, int]]) -> Set[s
 _PROJECT_MARKERS = frozenset({"pyproject.toml", "setup.py", "setup.cfg", ".git"})
 
 
+def _collect_imported_names(source: str) -> Set[str]:
+    """Return names imported at the top level of *source*.
+
+    Handles ``import X``, ``import X as Y``, ``from X import Y``, and
+    ``from X import Y as Z``.  Star imports (``from X import *``) are skipped.
+    Returns an empty set when *source* cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name.split(".")[-1])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname if alias.asname else alias.name)
+    return names
+
+
 def _module_path_for_file(file_path: str) -> Optional[str]:
     """Return the dotted Python module path of *file_path*.
 
@@ -256,23 +279,58 @@ def _build_patch_map(
     filepath: str,
     fl_result: "FileLimiterResult",
     original_dir: Path,
+    pre_split_source: str = "",
 ) -> Dict[str, str]:
     """Build old_dotted_path.EntityName → new_dotted_path.EntityName map.
 
-    Returns an empty dict when the module path cannot be determined or
-    when no entities were moved.
+    Uses "basic" mode logic: for each entity, maps to the single new file that
+    imports it (the "caller") rather than its definition file.  If multiple new
+    files import the entity (forking), the entity is skipped.  Import aliases
+    present in *pre_split_source* that appear in exactly one new file are also
+    included.
+
+    Returns an empty dict when the module path cannot be determined or when no
+    entities were moved.
     """
     if not fl_result.entity_to_target:
         return {}
     old_module = _module_path_for_file(filepath)
     if old_module is None:
         return {}
+
+    # Build import index: name → list of new-file rel_paths that import it.
+    import_index: Dict[str, List[str]] = {}
+    for rel_path, src in fl_result.new_files.items():
+        if not src:
+            continue
+        for name in _collect_imported_names(src):
+            import_index.setdefault(name, []).append(rel_path)
+
     patch_map: Dict[str, str] = {}
-    for entity_name, rel_target in fl_result.entity_to_target.items():
-        new_module = _module_path_for_file(str(original_dir / rel_target))
+    for entity_name, def_rel_target in fl_result.entity_to_target.items():
+        # Callers = new files that import this entity, excluding its definer.
+        callers = [p for p in import_index.get(entity_name, []) if p != def_rel_target]
+        if len(callers) > 1:
+            continue  # forking: multiple callers, skip
+        target_rel = callers[0] if callers else def_rel_target
+        new_module = _module_path_for_file(str(original_dir / target_rel))
         if new_module is None:
             continue
         patch_map[f"{old_module}.{entity_name}"] = f"{new_module}.{entity_name}"
+
+    # Import aliases: names imported by the original file that appear in
+    # exactly one new sub-file (and are not already moved entities).
+    for alias_name in _collect_imported_names(pre_split_source):
+        if alias_name in fl_result.entity_to_target:
+            continue  # already handled above
+        importers = import_index.get(alias_name, [])
+        if len(importers) != 1:
+            continue  # zero or multiple: skip
+        new_module = _module_path_for_file(str(original_dir / importers[0]))
+        if new_module is None:
+            continue
+        patch_map[f"{old_module}.{alias_name}"] = f"{new_module}.{alias_name}"
+
     return patch_map
 
 
@@ -904,11 +962,14 @@ def run_engine(
                 ):
                     _fl_recursive.append((str(new_path), new_source))
 
+            pre_split_src = state["source"]
             state["source"] = fl_result.original_source
 
             if fl_result.entity_to_target:
                 combined_patch_map.update(
-                    _build_patch_map(filepath, fl_result, Path(filepath).parent)
+                    _build_patch_map(
+                        filepath, fl_result, Path(filepath).parent, pre_split_src
+                    )
                 )
 
             # For non-test whole-file subdir splits (without __main__), delete
@@ -983,7 +1044,7 @@ def run_engine(
 
             if r_result.entity_to_target and not r_result.abort:
                 combined_patch_map.update(
-                    _build_patch_map(r_path, r_result, Path(r_path).parent)
+                    _build_patch_map(r_path, r_result, Path(r_path).parent, r_source)
                 )
 
             # Subdir split of a recursively-processed file: delete the file
@@ -1029,11 +1090,7 @@ def run_engine(
     # ------------------------------------------------------------------ #
     # Phase 4 — Update @patch strings after FileLimiter entity moves     #
     # ------------------------------------------------------------------ #
-    if (
-        config.file_limiter_patch_update != "ignore"
-        and combined_patch_map
-        and repo_root
-    ):
+    if config.file_limiter_patch_update == "basic" and combined_patch_map and repo_root:
         # Update per_file sources still in memory (not yet written to disk).
         for filepath, state in per_file.items():
             new_src = apply_patch_strings(state["source"], combined_patch_map)

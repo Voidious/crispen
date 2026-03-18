@@ -16,6 +16,7 @@ from crispen.engine import (
     _build_alias_map,
     _build_patch_map,
     _categorize_into_stats,
+    _collect_imported_names,
     _compute_qname,
     _file_to_module,
     _find_outside_callers,
@@ -2425,6 +2426,30 @@ def test_file_limiter_recursive_llm_timing_recorded_in_stats(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _collect_imported_names
+# ---------------------------------------------------------------------------
+
+
+def test_collect_imported_names_various():
+    """Covers import, import-as, from-import, from-import-as, star (skip)."""
+    source = (
+        "import os\n"
+        "import os.path\n"
+        "import json as json_mod\n"
+        "from pathlib import Path\n"
+        "from typing import List as L\n"
+        "from os import *\n"
+    )
+    result = _collect_imported_names(source)
+    assert result == {"os", "path", "json_mod", "Path", "L"}
+
+
+def test_collect_imported_names_syntax_error():
+    """Invalid Python source → empty set."""
+    assert _collect_imported_names("def broken(:") == set()
+
+
+# ---------------------------------------------------------------------------
 # _build_patch_map
 # ---------------------------------------------------------------------------
 
@@ -2455,26 +2480,78 @@ def test_build_patch_map_no_old_module(tmp_path):
     assert result == {}
 
 
-def test_build_patch_map_success(tmp_path):
-    """Entities map to correct old → new dotted paths."""
+def test_build_patch_map_no_callers_uses_definer(tmp_path):
+    """Entity with no callers maps to its definition file."""
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
     f = pkg / "module.py"
-    (pkg / "utils.py").write_text("class MyClass: pass\n", encoding="utf-8")
     fl_result = FileLimiterResult(
         original_source="",
         new_files={"utils.py": "class MyClass: pass\n"},
         entity_to_target={"MyClass": "utils.py"},
     )
     result = _build_patch_map(str(f), fl_result, pkg)
-    assert result == {
-        "mypkg.module.MyClass": "mypkg.utils.MyClass",
-    }
+    assert result == {"mypkg.module.MyClass": "mypkg.utils.MyClass"}
+
+
+def test_build_patch_map_single_caller_uses_caller(tmp_path):
+    """Entity imported by exactly one new file → caller's module used."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "def MyFunc(): pass\n",
+            "caller.py": "from .sub import MyFunc\n",
+        },
+        entity_to_target={"MyFunc": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg)
+    assert result == {"mypkg.module.MyFunc": "mypkg.caller.MyFunc"}
+
+
+def test_build_patch_map_forking_entity_skipped(tmp_path):
+    """Entity imported by multiple new files (forking) → skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "def MyFunc(): pass\n",
+            "caller_a.py": "from .sub import MyFunc\n",
+            "caller_b.py": "from .sub import MyFunc\n",
+        },
+        entity_to_target={"MyFunc": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg)
+    assert result == {}
+
+
+def test_build_patch_map_empty_new_file_skipped(tmp_path):
+    """New file with empty source is skipped when building import index."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "class MyClass: pass\n",
+            "empty.py": "",
+        },
+        entity_to_target={"MyClass": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg)
+    assert result == {"mypkg.module.MyClass": "mypkg.sub.MyClass"}
 
 
 def test_build_patch_map_new_module_none(tmp_path):
-    """When new file's module path can't be resolved → entity is skipped."""
+    """When target file's module path can't be resolved → entity is skipped."""
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
     f = tmp_path / "module.py"
     fl_result = FileLimiterResult(
@@ -2487,6 +2564,93 @@ def test_build_patch_map_new_module_none(tmp_path):
     ):
         result = _build_patch_map(str(f), fl_result, tmp_path)
     assert result == {}
+
+
+def test_build_patch_map_import_alias_single_importer(tmp_path):
+    """Import alias from original appearing in exactly one new file → added."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    pre_split = "from external import Helper\ndef MyFunc(): pass\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "def MyFunc(): pass\n",
+            "utils.py": "from external import Helper\n",
+        },
+        entity_to_target={"MyFunc": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg, pre_split)
+    assert result["mypkg.module.Helper"] == "mypkg.utils.Helper"
+    assert result["mypkg.module.MyFunc"] == "mypkg.sub.MyFunc"
+
+
+def test_build_patch_map_import_alias_forking_skipped(tmp_path):
+    """Import alias in zero or multiple new files is skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    pre_split = (
+        "from external import Forked\nfrom external import Nowhere\ndef F(): pass\n"
+    )
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "from external import Forked\ndef F(): pass\n",
+            "utils.py": "from external import Forked\n",
+        },
+        entity_to_target={"F": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg, pre_split)
+    # Forked appears in 2 files → skipped; Nowhere appears in 0 files → skipped
+    assert "mypkg.module.Forked" not in result
+    assert "mypkg.module.Nowhere" not in result
+
+
+def test_build_patch_map_import_alias_skips_entity_names(tmp_path):
+    """Import alias that is also an entity name is not double-processed."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    # "Helper" appears both as entity_to_target key and in pre_split imports
+    pre_split = "from external import Helper\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={"utils.py": "from external import Helper\n"},
+        entity_to_target={"Helper": "utils.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg, pre_split)
+    # Entity loop handles Helper (definer=utils.py, no external callers → utils.py)
+    assert result == {"mypkg.module.Helper": "mypkg.utils.Helper"}
+
+
+def test_build_patch_map_import_alias_module_none(tmp_path):
+    """Import alias target module can't be resolved → alias is skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    pre_split = "from external import Helper\ndef MyFunc(): pass\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "def MyFunc(): pass\n",
+            "utils.py": "from external import Helper\n",
+        },
+        entity_to_target={"MyFunc": "sub.py"},
+    )
+    # Third call (for alias importer utils.py) returns None
+    with patch(
+        "crispen.engine._module_path_for_file",
+        side_effect=["mypkg.module", "mypkg.sub", None],
+    ):
+        result = _build_patch_map(str(f), fl_result, pkg, pre_split)
+    # MyFunc was added (second call succeeded); Helper was skipped (third → None)
+    assert result == {"mypkg.module.MyFunc": "mypkg.sub.MyFunc"}
+    assert "mypkg.module.Helper" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -2557,7 +2721,7 @@ def test_patch_update_no_combined_map(tmp_path):
                 {str(f): [(1, 10)]},
                 config=CrispenConfig(
                     max_file_lines=5,
-                    file_limiter_patch_update="direct",
+                    file_limiter_patch_update="basic",
                 ),
                 _repo_root=str(tmp_path),
             )
@@ -2596,7 +2760,7 @@ def test_patch_update_updates_per_file_source(tmp_path):
                 {str(f): [(1, 10)], str(other_diff): [(1, 2)]},
                 config=CrispenConfig(
                     max_file_lines=5,
-                    file_limiter_patch_update="direct",
+                    file_limiter_patch_update="basic",
                 ),
                 _repo_root=str(tmp_path),
             )
@@ -2635,7 +2799,7 @@ def test_patch_update_updates_other_file(tmp_path):
                 {str(f): [(1, 10)]},
                 config=CrispenConfig(
                     max_file_lines=5,
-                    file_limiter_patch_update="direct",
+                    file_limiter_patch_update="basic",
                 ),
                 _repo_root=str(tmp_path),
             )
@@ -2673,7 +2837,7 @@ def test_patch_update_skips_excluded_dir(tmp_path):
                 {str(f): [(1, 10)]},
                 config=CrispenConfig(
                     max_file_lines=5,
-                    file_limiter_patch_update="direct",
+                    file_limiter_patch_update="basic",
                 ),
                 _repo_root=str(tmp_path),
             )
@@ -2705,7 +2869,7 @@ def test_patch_update_no_repo_root(tmp_path):
                 {str(f): [(1, 10)]},
                 config=CrispenConfig(
                     max_file_lines=5,
-                    file_limiter_patch_update="direct",
+                    file_limiter_patch_update="basic",
                 ),
                 # No _repo_root passed, no .git in tmp_path → repo_root=None
             )
@@ -2761,7 +2925,7 @@ def test_patch_update_oserror_skipped(tmp_path):
                     {str(f): [(1, 10)]},
                     config=CrispenConfig(
                         max_file_lines=5,
-                        file_limiter_patch_update="direct",
+                        file_limiter_patch_update="basic",
                     ),
                     _repo_root=str(tmp_path),
                 )
@@ -2831,7 +2995,7 @@ def test_patch_update_accumulates_from_recursive_fl(tmp_path):
                 config=CrispenConfig(
                     max_file_lines=5,
                     file_limiter_recursive=True,
-                    file_limiter_patch_update="direct",
+                    file_limiter_patch_update="basic",
                 ),
                 _repo_root=str(tmp_path),
             )

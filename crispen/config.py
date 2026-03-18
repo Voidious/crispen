@@ -120,14 +120,15 @@ class CrispenConfig:
     # FileLimiter moves entities to new sub-modules.
     #
     # "ignore"  — Do nothing (default).  @patch strings are left as-is.
-    # "direct"  — Scan every *.py file in the repo and replace string
-    #             literals that reference a moved entity's old dotted path
-    #             (e.g. "pkg.old_module.MyClass") with the new canonical
-    #             path ("pkg.old_module.new_sub.MyClass").  Only strings
-    #             where the segment immediately after the old module path
-    #             is a moved entity name are updated; transitive
-    #             dependencies that ended up in multiple new files are
-    #             left unchanged.
+    # "basic"   — Scan every *.py file in the repo and replace string
+    #             literals referencing a moved entity's old dotted path
+    #             (e.g. "pkg.old_module.func") with the new path, but only
+    #             when the update is unambiguous (non-forking).  For each
+    #             entity, the patch target is the single new sub-module that
+    #             imports it (the "caller"); if multiple new files import
+    #             the entity (forking) it is skipped.  Import aliases from
+    #             the original file that appear in exactly one new file are
+    #             also updated.
     file_limiter_patch_update: str = "ignore"
 
     # Refactor allow-list: if non-empty, only the named refactors are run.
