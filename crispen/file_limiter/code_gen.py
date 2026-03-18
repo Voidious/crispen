@@ -1050,7 +1050,17 @@ def _add_re_exports(
                     or defined_name in external_loads
                 ):
                     to_import.append(defined_name)
-                    if defined_name not in still_loaded:
+                    # Add noqa when the name is not referenced in the remaining
+                    # source (pure re-export stub), OR when it is in external_loads
+                    # — in the latter case a non-migrated entity may currently use
+                    # the name, but if that entity is itself migrated in a later
+                    # recursive split the stub would become unreferenced and
+                    # _prune_unused_imports would silently drop it, breaking the
+                    # external caller.  The noqa marker protects against that.
+                    if (
+                        defined_name not in still_loaded
+                        or defined_name in external_loads
+                    ):
                         noqa_names.add(defined_name)
         if to_import:
             re_exports.setdefault(import_prefix, []).extend(to_import)

@@ -3349,13 +3349,28 @@ def test_add_re_exports_private_external_only_gets_noqa():
 
 
 def test_add_re_exports_private_in_still_loaded_no_noqa():
-    # Private name referenced in remaining source → re-export without noqa.
+    # Private name referenced in remaining source but NOT in external_loads
+    # → re-export without noqa (it is actively used; no future-pruning risk).
     source = "import os\n\n_helper()\n"
     entity = _make_entity("_helper", 3, 3)
     placement = GroupPlacement(group=["_helper"], target_file="utils.py")
     result = _add_re_exports(source, [placement], {"_helper": entity}, {})
     assert "from .utils import _helper\n" in result
     assert "# noqa" not in result
+
+
+def test_add_re_exports_private_in_still_loaded_and_external_loads_gets_noqa():
+    # Private name referenced in remaining source AND in external_loads → noqa
+    # marker is added even though it is currently "used", because the non-migrated
+    # entity that uses it may itself be migrated in a later recursive split, at
+    # which point _prune_unused_imports would silently drop an un-annotated stub.
+    source = "import os\n\n_helper()\n"
+    entity = _make_entity("_helper", 3, 3)
+    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"_helper": entity}, {}, external_loads={"_helper"}
+    )
+    assert "from .utils import _helper  # fmt: skip # noqa: F401, E501" in result
 
 
 def test_add_re_exports_public_not_in_still_loaded_gets_noqa():
@@ -3398,7 +3413,9 @@ def test_add_re_exports_multiple_noqa_each_on_own_line():
 
 def test_add_re_exports_mixed_splits_into_two_lines():
     # One entity defines two names: one in still_loaded, one purely re-exported.
-    # They must appear on separate lines so noqa doesn't suppress used-name warnings.
+    # Both are in external_loads, so both get # noqa: F401 to protect them from
+    # being pruned if the non-migrated entity that currently uses _used is itself
+    # migrated in a later recursive split.
     source = "import os\n\n_used()\n"
     entity = _make_entity("_block", 3, 4, ["_used", "_reexport"])
     placement = GroupPlacement(group=["_block"], target_file="utils.py")
@@ -3411,16 +3428,31 @@ def test_add_re_exports_mixed_splits_into_two_lines():
     )
     lines = result.splitlines()
     noqa_lines = [line for line in lines if "# fmt: skip # noqa: F401, E501" in line]
-    plain_lines = [
-        line
-        for line in lines
-        if "from .utils import" in line and "# fmt: skip" not in line
-    ]
+    assert len(noqa_lines) == 2
+    names = {line.split("import")[1].split("#")[0].strip() for line in noqa_lines}
+    assert names == {"_used", "_reexport"}
+
+
+def test_add_re_exports_mixed_only_still_loaded_in_external_loads_gets_noqa():
+    # When only the used name is in external_loads (not the purely re-exported one),
+    # verify external_loads membership drives noqa independently of still_loaded.
+    source = "import os\n\n_used()\n"
+    entity = _make_entity("_block", 3, 4, ["_used", "_reexport"])
+    placement = GroupPlacement(group=["_block"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"_block": entity},
+        {},
+        external_loads={"_used"},  # only _used is externally imported
+    )
+    lines = result.splitlines()
+    noqa_lines = [line for line in lines if "# fmt: skip # noqa: F401, E501" in line]
+    # _used is in still_loaded AND external_loads → gets noqa
     assert len(noqa_lines) == 1
-    assert "_reexport" in noqa_lines[0]
-    assert "_used" not in noqa_lines[0]
-    assert len(plain_lines) == 1
-    assert "_used" in plain_lines[0]
+    assert "_used" in noqa_lines[0]
+    # _reexport is not in still_loaded and not in external_loads → not re-exported
+    assert "_reexport" not in result
 
 
 def test_add_re_exports_is_test_file_adds_comment_before_first_noqa():
