@@ -2752,6 +2752,26 @@ def test_prune_unused_imports_relative_import_narrowed():
     assert "bar" not in result
 
 
+def test_prune_unused_imports_preserves_noqa_f401():
+    # Imports marked "# noqa: F401" are intentional re-export stubs and must
+    # never be pruned, even when the name is unused in the file body.
+    source = (
+        "from .utils import _helper  # fmt: skip # noqa: F401, E501\n"
+        "\n"
+        "def f():\n"
+        "    pass\n"
+    )
+    result = _prune_unused_imports(source)
+    assert "from .utils import _helper" in result
+
+
+def test_prune_unused_imports_prunes_unused_without_noqa():
+    # Without noqa, unused imports are still removed.
+    source = "from .utils import _helper\n\ndef f():\n    pass\n"
+    result = _prune_unused_imports(source)
+    assert "from .utils import _helper" not in result
+
+
 # ---------------------------------------------------------------------------
 # generate_file_splits — import pruning integration
 # ---------------------------------------------------------------------------
@@ -3001,6 +3021,44 @@ def test_collect_external_imported_names_deep_relative_import(tmp_path):
     sub.parent.mkdir(parents=True)
     sub.write_text("from ...utils import _helper\n")
     result = _collect_external_imported_names(str(mod))
+    assert "_helper" in result
+
+
+def test_collect_external_imported_names_init_py_at_root(tmp_path):
+    # A bare __init__.py at the project root has no package prefix, so no
+    # external caller can import from it by package path — returns empty set.
+    (tmp_path / "pyproject.toml").write_text("")
+    init_py = tmp_path / "__init__.py"
+    init_py.write_text("class Foo: pass\n")
+    result = _collect_external_imported_names(str(init_py))
+    assert result == set()
+
+
+def test_collect_external_imported_names_init_py(tmp_path):
+    # When original_path is an __init__.py, callers import from the package
+    # name (e.g. "mypkg.sub"), not "mypkg.sub.__init__".
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg" / "sub"
+    pkg.mkdir(parents=True)
+    init_py = pkg / "__init__.py"
+    init_py.write_text("class Foo: pass\n")
+    caller = tmp_path / "caller.py"
+    caller.write_text("from mypkg.sub import Foo\n")
+    result = _collect_external_imported_names(str(init_py))
+    assert "Foo" in result
+
+
+def test_collect_external_imported_names_init_py_relative_caller(tmp_path):
+    # Relative import from sibling module targeting a package __init__.py.
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    sub = pkg / "sub"
+    sub.mkdir()
+    (sub / "__init__.py").write_text("def _helper(): pass\n")
+    sibling = pkg / "other.py"
+    sibling.write_text("from .sub import _helper\n")
+    result = _collect_external_imported_names(str(sub / "__init__.py"))
     assert "_helper" in result
 
 

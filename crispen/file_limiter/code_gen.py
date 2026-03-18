@@ -896,6 +896,13 @@ def _collect_external_imported_names(original_path: str) -> Set[str]:
     # project_root is an ancestor of orig (derived by walking up from orig.parent),
     # so _module_path_from_file always returns a non-None string here.
     target_module = _module_path_from_file(project_root, orig)
+    # __init__.py defines the package itself; external callers import from the
+    # package path (e.g. "pkg.sub"), not "pkg.sub.__init__".
+    if orig.name == "__init__.py":
+        dot = target_module.rfind(".")
+        if dot == -1:
+            return set()  # bare __init__.py at project root; no external callers
+        target_module = target_module[:dot]
     result: Set[str] = set()
     for py_file in project_root.rglob("*.py"):
         if py_file.resolve() == orig:
@@ -1426,6 +1433,14 @@ def _prune_unused_imports(source: str) -> str:
 
         # Always preserve star imports.
         if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+            continue
+
+        # Preserve intentional re-export stubs added by _add_re_exports.
+        # These carry "# noqa: F401" and must not be pruned even when the
+        # name is no longer referenced in the file body — they exist solely
+        # to keep the module's public/private API intact for external callers.
+        import_lines = lines[node.lineno - 1 : node.end_lineno]
+        if any("noqa: F401" in line for line in import_lines):
             continue
 
         kept = [
