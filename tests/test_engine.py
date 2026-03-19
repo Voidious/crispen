@@ -16,6 +16,7 @@ from crispen.engine import (
     _build_alias_map,
     _build_patch_map,
     _categorize_into_stats,
+    _collect_code_referenced_names,
     _collect_imported_names,
     _compute_qname,
     _file_to_module,
@@ -2450,6 +2451,34 @@ def test_collect_imported_names_syntax_error():
 
 
 # ---------------------------------------------------------------------------
+# _collect_code_referenced_names
+# ---------------------------------------------------------------------------
+
+
+def test_collect_code_referenced_names_finds_load_uses():
+    """Names used in code expressions are returned."""
+    src = "from .sub import MyFunc\nresult = MyFunc()\n"
+    assert "MyFunc" in _collect_code_referenced_names(src)
+
+
+def test_collect_code_referenced_names_excludes_import_aliases():
+    """Import alias names are not ast.Name nodes → not returned."""
+    src = "from .sub import MyFunc\n"
+    assert "MyFunc" not in _collect_code_referenced_names(src)
+
+
+def test_collect_code_referenced_names_excludes_funcdef_name():
+    """Function definition names are not ast.Name Load nodes."""
+    src = "def MyFunc(): pass\n"
+    assert "MyFunc" not in _collect_code_referenced_names(src)
+
+
+def test_collect_code_referenced_names_syntax_error():
+    """Returns empty set on unparseable source."""
+    assert _collect_code_referenced_names("def (broken:") == set()
+
+
+# ---------------------------------------------------------------------------
 # _build_patch_map
 # ---------------------------------------------------------------------------
 
@@ -2496,7 +2525,7 @@ def test_build_patch_map_no_callers_uses_definer(tmp_path):
 
 
 def test_build_patch_map_single_caller_uses_caller(tmp_path):
-    """Entity imported by exactly one new file → caller's module used."""
+    """Entity imported and used by exactly one new file → caller's module used."""
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -2505,7 +2534,7 @@ def test_build_patch_map_single_caller_uses_caller(tmp_path):
         original_source="",
         new_files={
             "sub.py": "def MyFunc(): pass\n",
-            "caller.py": "from .sub import MyFunc\n",
+            "caller.py": "from .sub import MyFunc\nMyFunc()\n",
         },
         entity_to_target={"MyFunc": "sub.py"},
     )
@@ -2514,7 +2543,7 @@ def test_build_patch_map_single_caller_uses_caller(tmp_path):
 
 
 def test_build_patch_map_forking_entity_skipped(tmp_path):
-    """Entity imported by multiple new files (forking) → skipped."""
+    """Entity used by multiple new files (forking) → skipped."""
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -2523,8 +2552,8 @@ def test_build_patch_map_forking_entity_skipped(tmp_path):
         original_source="",
         new_files={
             "sub.py": "def MyFunc(): pass\n",
-            "caller_a.py": "from .sub import MyFunc\n",
-            "caller_b.py": "from .sub import MyFunc\n",
+            "caller_a.py": "from .sub import MyFunc\nMyFunc()\n",
+            "caller_b.py": "from .sub import MyFunc\nMyFunc()\n",
         },
         entity_to_target={"MyFunc": "sub.py"},
     )
@@ -2567,7 +2596,7 @@ def test_build_patch_map_new_module_none(tmp_path):
 
 
 def test_build_patch_map_import_alias_single_importer(tmp_path):
-    """Import alias from original appearing in exactly one new file → added."""
+    """Import alias from original used in exactly one new file → added."""
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -2577,7 +2606,7 @@ def test_build_patch_map_import_alias_single_importer(tmp_path):
         original_source="",
         new_files={
             "sub.py": "def MyFunc(): pass\n",
-            "utils.py": "from external import Helper\n",
+            "utils.py": "from external import Helper\nHelper()\n",
         },
         entity_to_target={"MyFunc": "sub.py"},
     )
@@ -2587,7 +2616,7 @@ def test_build_patch_map_import_alias_single_importer(tmp_path):
 
 
 def test_build_patch_map_import_alias_forking_skipped(tmp_path):
-    """Import alias in zero or multiple new files is skipped."""
+    """Import alias used in zero or multiple new files is skipped."""
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -2598,13 +2627,13 @@ def test_build_patch_map_import_alias_forking_skipped(tmp_path):
     fl_result = FileLimiterResult(
         original_source="",
         new_files={
-            "sub.py": "from external import Forked\ndef F(): pass\n",
-            "utils.py": "from external import Forked\n",
+            "sub.py": "from external import Forked\nForked()\ndef F(): pass\n",
+            "utils.py": "from external import Forked\nForked()\n",
         },
         entity_to_target={"F": "sub.py"},
     )
     result = _build_patch_map(str(f), fl_result, pkg, pre_split)
-    # Forked appears in 2 files → skipped; Nowhere appears in 0 files → skipped
+    # Forked used in 2 files → forking → skipped; Nowhere used in 0 files → skipped
     assert "mypkg.module.Forked" not in result
     assert "mypkg.module.Nowhere" not in result
 
@@ -2638,7 +2667,7 @@ def test_build_patch_map_import_alias_module_none(tmp_path):
         original_source="",
         new_files={
             "sub.py": "def MyFunc(): pass\n",
-            "utils.py": "from external import Helper\n",
+            "utils.py": "from external import Helper\nHelper()\n",
         },
         entity_to_target={"MyFunc": "sub.py"},
     )
@@ -2650,6 +2679,104 @@ def test_build_patch_map_import_alias_module_none(tmp_path):
         result = _build_patch_map(str(f), fl_result, pkg, pre_split)
     # MyFunc was added (second call succeeded); Helper was skipped (third → None)
     assert result == {"mypkg.module.MyFunc": "mypkg.sub.MyFunc"}
+    assert "mypkg.module.Helper" not in result
+
+
+def test_build_patch_map_import_only_caller_falls_back_to_definer(tmp_path):
+    """Entity imported but not used by any new file → falls back to definer."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "def MyFunc(): pass\n",
+            "__init__.py": "from .sub import MyFunc\n",
+        },
+        entity_to_target={"MyFunc": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg)
+    # __init__.py only re-exports (no Load usage) → 0 real callers → fall back to sub.py
+    assert result == {"mypkg.module.MyFunc": "mypkg.sub.MyFunc"}
+
+
+def test_build_patch_map_reexport_ignored_real_caller_wins(tmp_path):
+    """Re-export stub ignored; the one file that actually calls the entity is used."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "def MyFunc(): pass\n",
+            "caller.py": "from .sub import MyFunc\nMyFunc()\n",
+            "__init__.py": "from .sub import MyFunc\n",
+        },
+        entity_to_target={"MyFunc": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg)
+    # __init__.py has no Load usage; caller.py does → single real caller
+    assert result == {"mypkg.module.MyFunc": "mypkg.caller.MyFunc"}
+
+
+def test_build_patch_map_init_real_usage_counted_as_caller(tmp_path):
+    """__init__.py that actually calls an entity is counted as a real caller."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "def MyFunc(): pass\n",
+            "__init__.py": "from .sub import MyFunc\n_x = MyFunc()\n",
+        },
+        entity_to_target={"MyFunc": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg)
+    # __init__.py has a Load reference → it IS a real caller, not just a stub
+    assert result == {"mypkg.module.MyFunc": "mypkg.__init__.MyFunc"}
+
+
+def test_build_patch_map_init_real_usage_plus_other_caller_forks(tmp_path):
+    """__init__.py calling entity + another caller → forking → skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "def MyFunc(): pass\n",
+            "caller.py": "from .sub import MyFunc\nMyFunc()\n",
+            "__init__.py": "from .sub import MyFunc\nMyFunc()\n",
+        },
+        entity_to_target={"MyFunc": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg)
+    # 2 real callers (caller.py + __init__.py) → forking → skipped
+    assert "mypkg.module.MyFunc" not in result
+
+
+def test_build_patch_map_import_alias_reexport_stub_skipped(tmp_path):
+    """Import alias whose only importer is a re-export stub is skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    f = pkg / "module.py"
+    pre_split = "from external import Helper\ndef F(): pass\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "sub.py": "def F(): pass\n",
+            "__init__.py": "from external import Helper\n",
+        },
+        entity_to_target={"F": "sub.py"},
+    )
+    result = _build_patch_map(str(f), fl_result, pkg, pre_split)
+    # __init__.py imports Helper but has no Load usage → 0 real importers → skipped
     assert "mypkg.module.Helper" not in result
 
 

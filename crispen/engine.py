@@ -133,6 +133,26 @@ def _collect_imported_names(source: str) -> Set[str]:
     return names
 
 
+def _collect_code_referenced_names(source: str) -> Set[str]:
+    """Return names referenced in code as *Load* expressions.
+
+    Walks the AST looking for ``ast.Name`` nodes with ``Load`` context —
+    actual uses of a name in code (calls, attribute targets, right-hand-side
+    expressions).  Pure re-export stubs (``from .sub import X  # noqa: F401``)
+    produce no such nodes because the import alias itself is an ``ast.alias``,
+    not an ``ast.Name``.  Returns an empty set on parse failure.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+
+
 def _module_path_for_file(file_path: str) -> Optional[str]:
     """Return the dotted Python module path of *file_path*.
 
@@ -299,17 +319,28 @@ def _build_patch_map(
         return {}
 
     # Build import index: name → list of new-file rel_paths that import it.
+    # Build usage index: name → set of new-file rel_paths that reference it in
+    # code (ast.Name Load nodes — actual calls or expressions, not re-exports).
     import_index: Dict[str, List[str]] = {}
+    usage_index: Dict[str, Set[str]] = {}
     for rel_path, src in fl_result.new_files.items():
         if not src:
             continue
         for name in _collect_imported_names(src):
             import_index.setdefault(name, []).append(rel_path)
+        for name in _collect_code_referenced_names(src):
+            usage_index.setdefault(name, set()).add(rel_path)
 
     patch_map: Dict[str, str] = {}
     for entity_name, def_rel_target in fl_result.entity_to_target.items():
-        # Callers = new files that import this entity, excluding its definer.
-        callers = [p for p in import_index.get(entity_name, []) if p != def_rel_target]
+        # Callers = new files that both import this entity and reference it in
+        # code, excluding its definer.  Pure re-export stubs import the name
+        # but produce no ast.Name Load nodes, so they are naturally excluded.
+        callers = [
+            p
+            for p in import_index.get(entity_name, [])
+            if p != def_rel_target and p in usage_index.get(entity_name, set())
+        ]
         if len(callers) > 1:
             continue  # forking: multiple callers, skip
         target_rel = callers[0] if callers else def_rel_target
@@ -320,10 +351,15 @@ def _build_patch_map(
 
     # Import aliases: names imported by the original file that appear in
     # exactly one new sub-file (and are not already moved entities).
+    # Only count files that actually reference the alias in code, not stubs.
     for alias_name in _collect_imported_names(pre_split_source):
         if alias_name in fl_result.entity_to_target:
             continue  # already handled above
-        importers = import_index.get(alias_name, [])
+        importers = [
+            p
+            for p in import_index.get(alias_name, [])
+            if p in usage_index.get(alias_name, set())
+        ]
         if len(importers) != 1:
             continue  # zero or multiple: skip
         new_module = _module_path_for_file(str(original_dir / importers[0]))
