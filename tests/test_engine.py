@@ -2018,6 +2018,16 @@ def test_module_path_for_file_returns_dotted_path(tmp_path):
     assert _module_path_for_file(str(f)) == "tests.lua.test_foo"
 
 
+def test_module_path_for_file_init_strips_init_segment(tmp_path):
+    """__init__.py resolves to the package name, not package.__init__."""
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+    pkg = tmp_path / "mypkg" / "subpkg"
+    pkg.mkdir(parents=True)
+    f = pkg / "__init__.py"
+    f.write_text("", encoding="utf-8")
+    assert _module_path_for_file(str(f)) == "mypkg.subpkg"
+
+
 def test_module_path_for_file_no_markers_returns_none(tmp_path):
     f = tmp_path / "test_foo.py"
     f.write_text("", encoding="utf-8")
@@ -2722,7 +2732,11 @@ def test_build_patch_map_reexport_ignored_real_caller_wins(tmp_path):
 
 
 def test_build_patch_map_init_real_usage_counted_as_caller(tmp_path):
-    """__init__.py that actually calls an entity is counted as a real caller."""
+    """__init__.py that actually calls an entity is counted as a real caller.
+
+    The module path strips .__init__ so the patch target is the public
+    package namespace (mypkg.MyFunc, not mypkg.__init__.MyFunc).
+    """
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -2736,8 +2750,8 @@ def test_build_patch_map_init_real_usage_counted_as_caller(tmp_path):
         entity_to_target={"MyFunc": "sub.py"},
     )
     result = _build_patch_map(str(f), fl_result, pkg)
-    # __init__.py has a Load reference → it IS a real caller, not just a stub
-    assert result == {"mypkg.module.MyFunc": "mypkg.__init__.MyFunc"}
+    # __init__.py has a Load reference → real caller; .__init__ stripped from path
+    assert result == {"mypkg.module.MyFunc": "mypkg.MyFunc"}
 
 
 def test_build_patch_map_init_real_usage_plus_other_caller_forks(tmp_path):

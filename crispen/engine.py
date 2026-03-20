@@ -160,6 +160,10 @@ def _module_path_for_file(file_path: str) -> Optional[str]:
     ancestor containing pyproject.toml, setup.py, setup.cfg, or .git), then
     computes the dotted path relative to that root.
 
+    ``__init__.py`` files are mapped to their package name (e.g.
+    ``mypkg/__init__.py`` → ``mypkg``) so that patch paths always use the
+    public package namespace rather than the internal ``.__init__`` segment.
+
     Returns ``None`` when the project root cannot be determined or when the
     resolved path is not under the project root.
     """
@@ -168,7 +172,10 @@ def _module_path_for_file(file_path: str) -> Optional[str]:
     while True:
         if any((current / m).exists() for m in _PROJECT_MARKERS):
             rel = abs_path.relative_to(current)
-            return ".".join(rel.with_suffix("").parts)
+            module = ".".join(rel.with_suffix("").parts)
+            if module.endswith(".__init__"):
+                module = module[:-9]
+            return module
         parent = current.parent
         if parent == current:
             return None
