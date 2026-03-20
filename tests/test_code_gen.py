@@ -2178,6 +2178,86 @@ def test_generate_file_splits_type_checking_deduplication():
     assert placements_src.count("from .models import _LLMAccumulator") == 1
 
 
+def test_generate_file_splits_tc_dedup_drops_when_already_in_regular():
+    # Entity A uses _Acc at runtime (unquoted annotation → regular cross-file import).
+    # Entity B uses _Acc only in a quoted annotation → would normally get a TC import.
+    # Both go to workers.py.  The dedup step must remove the TC import entirely since
+    # _Acc is already covered by the regular import.
+    source = textwrap.dedent(
+        """\
+        from typing import Optional
+
+        class _Acc:
+            pass
+
+        def fn_runtime(x) -> None:
+            a: _Acc = x
+
+        def fn_quoted(x: Optional["_Acc"]) -> None:
+            pass
+        """
+    )
+    e_acc = Entity(EntityKind.CLASS, "_Acc", 3, 4, ["_Acc"])
+    e_rt = Entity(EntityKind.FUNCTION, "fn_runtime", 6, 7, ["fn_runtime"])
+    e_qt = Entity(EntityKind.FUNCTION, "fn_quoted", 9, 10, ["fn_quoted"])
+    c = _classified(entities=[e_acc, e_rt, e_qt])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_Acc"], target_file="models.py"),
+            GroupPlacement(group=["fn_runtime", "fn_quoted"], target_file="workers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "advisor.py")
+
+    workers_src = result.new_files["workers.py"]
+    # Regular import must be present, TYPE_CHECKING block must NOT be.
+    assert "from .models import _Acc" in workers_src
+    assert "if TYPE_CHECKING:" not in workers_src
+
+
+def test_generate_file_splits_tc_dedup_plain_import_branches():
+    # Covers the non-from-import branches in the dedup loop:
+    #   • "import sys" in needed → _FROM_IMPORT_RE does not match (2633->2631 branch)
+    #   • "import typing_extensions" in needed_tc (annotation-only) → TC import is a
+    #     plain import statement, not a from-import (2655 branch)
+    source = textwrap.dedent(
+        """\
+        import sys
+        import typing_extensions
+        from typing import Optional
+
+        class _Acc:
+            pass
+
+        def fn(x: Optional["_Acc"]) -> None:
+            sys.exit(0)
+
+        def fn2() -> "typing_extensions.Literal":
+            pass
+        """
+    )
+    e_acc = Entity(EntityKind.CLASS, "_Acc", 5, 6, ["_Acc"])
+    e_fn = Entity(EntityKind.FUNCTION, "fn", 8, 9, ["fn"])
+    e_fn2 = Entity(EntityKind.FUNCTION, "fn2", 11, 12, ["fn2"])
+    c = _classified(entities=[e_acc, e_fn, e_fn2])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_Acc"], target_file="models.py"),
+            GroupPlacement(group=["fn", "fn2"], target_file="workers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "advisor.py")
+
+    workers_src = result.new_files["workers.py"]
+    # TC import for _Acc (cross-file, quoted annotation) must still be present.
+    assert "if TYPE_CHECKING:" in workers_src
+    assert "_Acc" in workers_src
+    # Plain import for typing_extensions preserved in TC block.
+    assert "typing_extensions" in workers_src
+
+
 # ---------------------------------------------------------------------------
 # _extract_shared_helpers
 # ---------------------------------------------------------------------------

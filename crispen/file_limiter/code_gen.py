@@ -2622,6 +2622,35 @@ def generate_file_splits(
                         top_cross.append(imp)
             entity_srcs.append(_src)
         entity_srcs = [s for s in entity_srcs if s]
+        # Dedup: remove TC imports for names already covered by regular imports.
+        # This can happen when one entity uses a name at runtime (→ top_cross)
+        # while another entity in the same file only uses it in a quoted
+        # annotation (→ all_tc_imports), producing duplicate import statements.
+        if all_tc_imports and (needed or top_cross):
+            _regular_names: Set[str] = set()
+            for _imp in needed + top_cross:
+                _m = _FROM_IMPORT_RE.match(_imp)
+                if _m:
+                    _regular_names.update(
+                        n.strip() for n in _m.group(2).split(",") if n.strip()
+                    )
+            _deduped_tc: List[str] = []
+            for _tc in all_tc_imports:
+                _m = _FROM_IMPORT_RE.match(_tc)
+                if _m:
+                    _tc_names = {
+                        _n.strip() for _n in _m.group(2).split(",") if _n.strip()
+                    }
+                    _leftover = _tc_names - _regular_names
+                    if _leftover:
+                        _deduped_tc.append(
+                            _tc
+                            if _leftover == _tc_names
+                            else _narrow_import_source(_tc, _leftover)
+                        )
+                else:
+                    _deduped_tc.append(_tc)
+            all_tc_imports = _deduped_tc
         parts: List[str] = []
         imports_for_sort = list(needed + top_cross)
         if all_tc_imports:
