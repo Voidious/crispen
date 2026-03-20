@@ -31,6 +31,7 @@ from crispen.file_limiter.code_gen import (
     _find_main_direct_callees,
     _find_needed_imports,
     _find_type_checking_needed_imports,
+    _narrow_import_source,
     _find_project_root,
     _import_derived_names,
     _import_line_numbers,
@@ -585,7 +586,7 @@ def test_find_type_checking_needed_imports_deduplicates():
 
 def test_find_type_checking_needed_imports_import_names_no_match():
     # annotation_only has "MyType" but the ImportInfo names do not include it →
-    # the any() check on line 499 returns False → import is skipped.
+    # the tc_names check returns False → import is skipped.
     entity_src_map = {"foo": 'def foo(x: "MyType") -> None:\n    pass\n'}
     infos = [
         ImportInfo(
@@ -594,6 +595,69 @@ def test_find_type_checking_needed_imports_import_names_no_match():
     ]
     result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
     assert result == []
+
+
+def test_find_type_checking_needed_imports_partial_multi_name_import():
+    # From a multi-name import, only the annotation-only name should appear in
+    # the TYPE_CHECKING block; the other name (not referenced at all) must not.
+    entity_src_map = {
+        "foo": 'def foo(x: "MyResult") -> None:\n    pass\n',
+    }
+    infos = [
+        ImportInfo(
+            names=["MyResult", "run_thing"],
+            source="from mymod import MyResult, run_thing",
+            is_future=False,
+        )
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    assert len(result) == 1
+    assert "MyResult" in result[0]
+    assert "run_thing" not in result[0]
+
+
+def test_find_type_checking_needed_imports_narrowed_src_dedup():
+    # When two ImportInfo entries produce the same narrowed source after
+    # filtering, only one copy should appear in the result (line 535 branch).
+    entity_src_map = {"foo": 'def foo(x: "MyResult") -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["MyResult", "run_thing"],
+            source="from mymod import MyResult, run_thing",
+            is_future=False,
+        ),
+        # A second entry with the same source (e.g. two entities requested it).
+        ImportInfo(
+            names=["MyResult", "run_thing"],
+            source="from mymod import MyResult, run_thing",
+            is_future=False,
+        ),
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    assert result.count("from mymod import MyResult") == 1
+
+
+# ---------------------------------------------------------------------------
+# _narrow_import_source
+# ---------------------------------------------------------------------------
+
+
+def test_narrow_import_source_syntax_error():
+    # Invalid Python → original string returned unchanged.
+    bad = "from ??? import Foo"
+    assert _narrow_import_source(bad, {"Foo"}) == bad
+
+
+def test_narrow_import_source_plain_import():
+    # Non-ImportFrom statement (bare `import X`) → returned unchanged.
+    src = "import os"
+    assert _narrow_import_source(src, {"os"}) == src
+
+
+def test_narrow_import_source_empty_keep():
+    # keep_names matches nothing → alias_strs is empty → return original.
+    src = "from mymod import A, B"
+    assert _narrow_import_source(src, {"C"}) == src
 
 
 # ---------------------------------------------------------------------------

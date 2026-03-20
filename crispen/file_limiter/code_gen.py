@@ -463,6 +463,30 @@ def _find_needed_imports(
     return needed
 
 
+def _narrow_import_source(import_src: str, keep_names: Set[str]) -> str:
+    """Return a copy of *import_src* keeping only the exposed names in *keep_names*.
+
+    For ``from X import A, B, C`` with ``keep_names={A}``, returns
+    ``from X import A``.  Non-ImportFrom statements are returned unchanged.
+    """
+    try:
+        node = ast.parse(import_src).body[0]
+    except (SyntaxError, IndexError):
+        return import_src
+    if not isinstance(node, ast.ImportFrom):
+        return import_src
+    dots = "." * (node.level or 0)
+    mod = node.module or ""
+    alias_strs = [
+        f"{a.name} as {a.asname}" if a.asname else a.name
+        for a in node.names
+        if (a.asname or a.name) in keep_names
+    ]
+    if not alias_strs:
+        return import_src
+    return f"from {dots}{mod} import {', '.join(alias_strs)}"
+
+
 def _find_type_checking_needed_imports(
     entity_names: List[str],
     entity_source_map: Dict[str, str],
@@ -496,9 +520,21 @@ def _find_type_checking_needed_imports(
             continue
         if info.is_future:
             continue
-        if any(n in annotation_only for n in info.names):
-            needed.append(info.source)
-            seen.add(info.source)
+        tc_names = {n for n in info.names if n in annotation_only}
+        if not tc_names:
+            continue
+        # Narrow the import to only the names actually needed for type checking,
+        # avoiding unused-import warnings for names from multi-name imports that
+        # are not referenced in this file.
+        src = (
+            info.source
+            if len(tc_names) == len(info.names)
+            else _narrow_import_source(info.source, tc_names)
+        )
+        if src in seen:
+            continue
+        needed.append(src)
+        seen.add(src)
     return needed
 
 
