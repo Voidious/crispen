@@ -11,6 +11,7 @@ from crispen.config import CrispenConfig
 from crispen.engine import (
     _EXCLUDED_DIR_NAMES,
     _LLM_REFACTOR_KEYS,
+    _add_fl_context,
     _apply_tuple_dataclass,
     _blocked_private_scopes,
     _build_alias_map,
@@ -3149,3 +3150,198 @@ def test_patch_update_accumulates_from_recursive_fl(tmp_path):
     assert "mypkg.utils.MyClass" in updated_text or any(
         "patch_update" in m for m in msgs
     )
+
+
+# ---------------------------------------------------------------------------
+# _add_fl_context (engine helper for "rewrite" patch mode)
+# ---------------------------------------------------------------------------
+
+
+def test_add_fl_context_no_module_path():
+    """When module path cannot be determined, _add_fl_context does nothing."""
+    fl_list = []
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={},
+        abort=False,
+        entity_to_target={"X": "a.py"},
+    )
+    # A path with no ancestor containing pyproject.toml / .git → returns None.
+    _add_fl_context(fl_list, "/no/project/root/here/file.py", "", fl_result, {})
+    assert fl_list == []
+
+
+def test_add_fl_context_no_forking(tmp_path):
+    """When all entities are already in combined_patch_map, nothing is appended."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={},
+        abort=False,
+        entity_to_target={"X": "a.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    # Entity already covered by combined_patch_map → forking_old_paths is empty.
+    _add_fl_context(fl_list, filepath, "", fl_result, {"mypkg.big.X": "mypkg.a.X"})
+    assert fl_list == []
+
+
+def test_add_fl_context_normal(tmp_path):
+    """Forking entity not in combined_patch_map → appended to fl_all_contexts."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    fl_result = FileLimiterResult(
+        original_source="modified\n",
+        new_files={"utils.py": "class X: pass\n"},
+        abort=False,
+        entity_to_target={"X": "utils.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    _add_fl_context(fl_list, filepath, "original\n", fl_result, {})
+    assert len(fl_list) == 1
+    assert fl_list[0].forking_old_paths == {"mypkg.big.X"}
+    assert fl_list[0].old_module == "mypkg.big"
+    assert fl_list[0].original_source == "original\n"
+    assert fl_list[0].modified_source == "modified\n"
+
+
+# ---------------------------------------------------------------------------
+# "rewrite" patch mode in Phase 4
+# ---------------------------------------------------------------------------
+
+
+_REWRITE_PATCH = "crispen.engine.apply_patch_rewrite"
+
+
+def test_patch_update_rewrite_mode_calls_apply_patch_rewrite(tmp_path):
+    """'rewrite' mode with forking entities calls apply_patch_rewrite in Phase 4."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    # Entity appears as a caller in two new files → forking → skipped by basic.
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={
+            "utils.py": "class MyClass: pass\n",
+            "caller_a.py": "from .big import MyClass\nMyClass()\n",
+            "caller_b.py": "from .big import MyClass\nMyClass()\n",
+        },
+        messages=[],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    with (
+        patch(_FL_PATCH, return_value=fl_result),
+        patch(_REWRITE_PATCH, return_value=iter([])) as mock_rewrite,
+    ):
+        list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="rewrite",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+    mock_rewrite.assert_called_once()
+    contexts = mock_rewrite.call_args[0][0]
+    assert len(contexts) == 1
+    assert "mypkg.big.MyClass" in contexts[0].forking_old_paths
+
+
+def test_patch_update_rewrite_mode_no_fl_contexts_skips_apply(tmp_path):
+    """'rewrite' mode but no forking entities → apply_patch_rewrite not called."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    # Entity has only ONE caller → non-forking → goes into combined_patch_map.
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=[],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    with (
+        patch(_FL_PATCH, return_value=fl_result),
+        patch(_REWRITE_PATCH, return_value=iter([])) as mock_rewrite,
+    ):
+        list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="rewrite",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+    mock_rewrite.assert_not_called()
+
+
+def test_patch_update_rewrite_mode_recursive_fl_context_added(tmp_path):
+    """'rewrite' mode: forking entity from recursive FL pass is collected."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    # Main FL result: produces medium.py with 6 lines (> max_file_lines=5),
+    # which triggers the recursive pass.  No entity_to_target here so the
+    # main-loop rewrite branch is not entered.
+    medium_src = "".join(f"med_{i} = {i}\n" for i in range(6))
+    main_fl_result = FileLimiterResult(
+        original_source="# big_reduced\n",
+        new_files={"medium.py": medium_src},
+        messages=[],
+        abort=False,
+        entity_to_target={},
+    )
+
+    # Recursive FL result: MyClass appears in two callers → forking → skipped
+    # by _build_patch_map → not in combined_patch_map → triggers _add_fl_context.
+    recursive_fl_result = FileLimiterResult(
+        original_source="# medium_reduced\n",
+        new_files={
+            "small.py": "class MyClass: pass\n",
+            "caller_a.py": "from .medium import MyClass\nMyClass()\n",
+            "caller_b.py": "from .medium import MyClass\nMyClass()\n",
+        },
+        messages=[],
+        abort=False,
+        entity_to_target={"MyClass": "small.py"},
+    )
+
+    with (
+        patch(_FL_PATCH, side_effect=[main_fl_result, recursive_fl_result]),
+        patch(_REWRITE_PATCH, return_value=iter([])) as mock_rewrite,
+    ):
+        list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_recursive=True,
+                    file_limiter_patch_update="rewrite",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+
+    mock_rewrite.assert_called_once()
+    contexts = mock_rewrite.call_args[0][0]
+    assert any("mypkg.medium.MyClass" in ctx.forking_old_paths for ctx in contexts)

@@ -129,7 +129,20 @@ class CrispenConfig:
     #             the entity (forking) it is skipped.  Import aliases from
     #             the original file that appear in exactly one new file are
     #             also updated.
+    # "rewrite" — Performs "basic" updates first, then uses an LLM to
+    #             resolve the remaining cases that basic mode skipped
+    #             (entities that forked into multiple callers).  The LLM
+    #             receives the original file, the diff, all new sub-files,
+    #             and a chunk of test functions and proposes updated @patch
+    #             strings.  A second LLM verify step checks each proposal;
+    #             failed chunks are retried up to patch_update_retries
+    #             additional times before being skipped.
     file_limiter_patch_update: str = "ignore"
+
+    # Number of additional LLM verify+retry attempts for each function chunk
+    # in "rewrite" mode.  0 means no retry: a chunk rejected by the verify
+    # LLM is skipped.  Default 2 = three total attempts (initial + two retries).
+    patch_update_retries: int = 2
 
     # Refactor allow-list: if non-empty, only the named refactors are run.
     # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",

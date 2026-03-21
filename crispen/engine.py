@@ -16,6 +16,7 @@ from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvi
 from .config import CrispenConfig, format_header, load_config
 from .errors import CrispenAPIError
 from .file_limiter.runner import FileLimiterResult, run_file_limiter
+from .patch_rewriter import _FLContext, apply_patch_rewrite
 from .patch_updater import apply_patch_strings
 from .refactors.caller_updater import CallerUpdater
 from .refactors.duplicate_extractor import DuplicateExtractor
@@ -375,6 +376,49 @@ def _build_patch_map(
         patch_map[f"{old_module}.{alias_name}"] = f"{new_module}.{alias_name}"
 
     return patch_map
+
+
+def _add_fl_context(
+    fl_all_contexts: List["_FLContext"],
+    filepath: str,
+    pre_split_src: str,
+    fl_result: "FileLimiterResult",
+    combined_patch_map: Dict[str, str],
+) -> None:
+    """Append an _FLContext to *fl_all_contexts* for "rewrite" patch mode.
+
+    Computes the forking old paths (entities in entity_to_target that basic
+    mode skipped because they appeared in multiple callers) and builds the
+    new module path map for all sub-files.  Does nothing when no forking
+    entities exist or when the module path cannot be determined.
+    """
+    old_mod = _module_path_for_file(filepath)
+    if old_mod is None:
+        return
+    forking_old_paths = {
+        f"{old_mod}.{name}"
+        for name in fl_result.entity_to_target
+        if f"{old_mod}.{name}" not in combined_patch_map
+    }
+    if not forking_old_paths:
+        return
+    orig_dir = Path(filepath).parent
+    new_mod_paths = {
+        rel: _module_path_for_file(str(orig_dir / rel)) or rel
+        for rel in fl_result.new_files
+    }
+    fl_all_contexts.append(
+        _FLContext(
+            filepath=filepath,
+            old_module=old_mod,
+            original_source=pre_split_src,
+            modified_source=fl_result.original_source or "",
+            new_files=dict(fl_result.new_files),
+            new_module_paths=new_mod_paths,
+            entity_to_target=dict(fl_result.entity_to_target),
+            forking_old_paths=forking_old_paths,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +981,7 @@ def run_engine(
     # Phase 3 — FileLimiter: split files exceeding max_file_lines        #
     # ------------------------------------------------------------------ #
     combined_patch_map: Dict[str, str] = {}
+    _fl_all_contexts: List[_FLContext] = []
     if config.max_file_lines > 0 and _should_run("file_limiter", config):
         # Pending queue for recursive FileLimiter processing: (filepath, source)
         # pairs for newly-created files that are still over the limit.
@@ -1014,6 +1059,14 @@ def run_engine(
                         filepath, fl_result, Path(filepath).parent, pre_split_src
                     )
                 )
+                if config.file_limiter_patch_update == "rewrite":
+                    _add_fl_context(
+                        _fl_all_contexts,
+                        filepath,
+                        pre_split_src,
+                        fl_result,
+                        combined_patch_map,
+                    )
 
             # For non-test whole-file subdir splits (without __main__), delete
             # the original file now that service/__init__.py takes its place as
@@ -1089,6 +1142,14 @@ def run_engine(
                 combined_patch_map.update(
                     _build_patch_map(r_path, r_result, Path(r_path).parent, r_source)
                 )
+                if config.file_limiter_patch_update == "rewrite":
+                    _add_fl_context(
+                        _fl_all_contexts,
+                        r_path,
+                        r_source,
+                        r_result,
+                        combined_patch_map,
+                    )
 
             # Subdir split of a recursively-processed file: delete the file
             # that was replaced by a package __init__.py.  Handle before the
@@ -1133,7 +1194,11 @@ def run_engine(
     # ------------------------------------------------------------------ #
     # Phase 4 — Update @patch strings after FileLimiter entity moves     #
     # ------------------------------------------------------------------ #
-    if config.file_limiter_patch_update == "basic" and combined_patch_map and repo_root:
+    if (
+        config.file_limiter_patch_update in ("basic", "rewrite")
+        and combined_patch_map
+        and repo_root
+    ):
         # Update per_file sources still in memory (not yet written to disk).
         for filepath, state in per_file.items():
             new_src = apply_patch_strings(state["source"], combined_patch_map)
@@ -1161,6 +1226,14 @@ def run_engine(
             if new_src != src:
                 py_file.write_text(new_src, encoding="utf-8")
                 yield f"{py_file}: patch_update: updated @patch strings"
+
+    if config.file_limiter_patch_update == "rewrite" and _fl_all_contexts:
+        yield from apply_patch_rewrite(
+            _fl_all_contexts,
+            per_file,
+            repo_root,
+            config,
+        )
 
     # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #
