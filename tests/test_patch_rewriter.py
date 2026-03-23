@@ -11,6 +11,7 @@ from crispen.llm_client import LLMCallResult
 from crispen.patch_rewriter import (
     _FLContext,
     _TestFunctionInfo,
+    RewriteAccumulator,
     _apply_cross_file_const_updates,
     _apply_function_updates,
     _build_attr_const_map,
@@ -622,6 +623,175 @@ def test_rewrite_no_py_files_in_repo(mock_key, mock_client, mock_call, tmp_path)
     msgs = list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG))
     assert msgs == []
     mock_call.assert_not_called()
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+@mock_patch(_PATCH_MAKE_CLIENT, return_value=MagicMock())
+@mock_patch(_PATCH_GET_KEY, return_value="fake_key")
+def test_rewrite_acc_tracks_calls_and_files(mock_key, mock_client, mock_call, tmp_path):
+    """RewriteAccumulator is populated with call counts and files_updated."""
+    test_file = tmp_path / "test_big.py"
+    src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
+    test_file.write_text(src, encoding="utf-8")
+    new_code = '@patch("pkg.sub_a.A")\ndef test_f(mock_a):\n    pass'
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input={
+                "updates": [{"function_name": "test_f", "updated_code": new_code}]
+            },
+            elapsed=1.5,
+            input_tokens=100,
+            output_tokens=50,
+        ),
+        LLMCallResult(
+            tool_input={"correct": True, "issues": []},
+            elapsed=0.5,
+            input_tokens=80,
+            output_tokens=10,
+        ),
+    ]
+    acc = RewriteAccumulator()
+    list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG, _acc=acc))
+    assert acc.calls == 2
+    assert acc.elapsed == 2.0
+    assert acc.input_tokens == 180
+    assert acc.output_tokens == 60
+    assert acc.files_updated == 1
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+@mock_patch(_PATCH_MAKE_CLIENT, return_value=MagicMock())
+@mock_patch(_PATCH_GET_KEY, return_value="fake_key")
+def test_rewrite_acc_per_file_files_updated(mock_key, mock_client, mock_call):
+    """files_updated is incremented for in-memory per_file changes."""
+    src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
+    per_file = {"/repo/tests/test_big.py": {"source": src, "msgs": []}}
+    new_code = '@patch("pkg.sub_a.A")\ndef test_f(mock_a):\n    pass'
+    mock_call.side_effect = [
+        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
+        _ok({"correct": True, "issues": []}),
+    ]
+    acc = RewriteAccumulator()
+    list(apply_patch_rewrite([_make_fl_ctx()], per_file, None, _CFG, _acc=acc))
+    assert acc.files_updated == 1
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_acc_accumulates(mock_call):
+    """_process_file_source accumulates calls, elapsed, and tokens into _acc."""
+    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input={
+                "updates": [{"function_name": "test_f", "updated_code": new_code}]
+            },
+            elapsed=1.2,
+            input_tokens=200,
+            output_tokens=40,
+        ),
+        LLMCallResult(
+            tool_input={"correct": True, "issues": []},
+            elapsed=0.3,
+            input_tokens=150,
+            output_tokens=5,
+        ),
+    ]
+    acc = RewriteAccumulator()
+    _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1, _acc=acc
+    )
+    assert acc.calls == 2
+    assert abs(acc.elapsed - 1.5) < 1e-9
+    assert acc.input_tokens == 350
+    assert acc.output_tokens == 45
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_prints_to_stderr(mock_call, capsys):
+    """verbose=True emits per-call messages to stderr."""
+    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+    mock_call.side_effect = [
+        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
+        _ok({"correct": True, "issues": []}),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "patch_rewriter" in err
+    assert "rewriting" in err
+    assert "verifying" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_detailed_timing(mock_call, capsys):
+    """timing='detailed' appends elapsed/token info after each call."""
+    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input={
+                "updates": [{"function_name": "test_f", "updated_code": new_code}]
+            },
+            elapsed=1.23,
+            input_tokens=100,
+            output_tokens=20,
+        ),
+        LLMCallResult(
+            tool_input={"correct": True, "issues": []},
+            elapsed=0.45,
+            input_tokens=80,
+            output_tokens=5,
+        ),
+    ]
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=1, timing="detailed")
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        cfg,
+        1,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "→ done" in err
+    assert "1.23s" in err
+    assert "0.45s" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_retry_label(mock_call, capsys):
+    """Retry attempts include '(retry)' in the verbose message."""
+    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+    mock_call.side_effect = [
+        # First attempt: syntax error in updated code.
+        _ok({"updates": [{"function_name": "test_f", "updated_code": "def f(:\n"}]}),
+        # Second attempt: correct code.
+        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
+        _ok({"correct": True, "issues": []}),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        2,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "(retry)" in err
 
 
 # ---------------------------------------------------------------------------
@@ -1575,4 +1745,57 @@ def test_rewrite_cross_file_const_disk(mock_key, mock_client, mock_call, tmp_pat
     ]
     list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG))
     # The constant definition on disk should be updated.
+    assert '"pkg.sub_a.A"' in helpers.read_text(encoding="utf-8")
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+@mock_patch(_PATCH_MAKE_CLIENT, return_value=MagicMock())
+@mock_patch(_PATCH_GET_KEY, return_value="fake_key")
+def test_rewrite_cross_file_const_per_file_acc(
+    mock_key, mock_client, mock_call, tmp_path
+):
+    """_acc.files_updated is incremented when a cross-file const in per_file changes."""
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+    helpers = tmp_path / "helpers.py"
+    helpers.write_text('TARGET = "pkg.big.A"\n', encoding="utf-8")
+    test_src = (
+        "from .helpers import TARGET\n\n@patch(TARGET)\ndef test_f(m):\n    pass\n"
+    )
+    helpers_state = {"source": 'TARGET = "pkg.big.A"\n', "msgs": []}
+    per_file = {
+        str(tmp_path / "test_foo.py"): {"source": test_src, "msgs": []},
+        str(helpers): helpers_state,
+    }
+    new_code = '@patch("pkg.sub_a.A")\ndef test_f(m):\n    pass'
+    mock_call.side_effect = [
+        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
+        _ok({"correct": True, "issues": []}),
+    ]
+    acc = RewriteAccumulator()
+    list(apply_patch_rewrite([_make_fl_ctx()], per_file, None, _CFG, _acc=acc))
+    # One file_updated for the test_foo.py source change, one for helpers const.
+    assert acc.files_updated >= 1
+    assert '"pkg.sub_a.A"' in helpers_state["source"]
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+@mock_patch(_PATCH_MAKE_CLIENT, return_value=MagicMock())
+@mock_patch(_PATCH_GET_KEY, return_value="fake_key")
+def test_rewrite_cross_file_const_disk_acc(mock_key, mock_client, mock_call, tmp_path):
+    """_acc.files_updated is incremented when a cross-file const on disk changes."""
+    helpers = tmp_path / "helpers.py"
+    helpers.write_text('TARGET = "pkg.big.A"\n', encoding="utf-8")
+    test_src = (
+        "from .helpers import TARGET\n\n@patch(TARGET)\ndef test_f(m):\n    pass\n"
+    )
+    test_file = tmp_path / "test_foo.py"
+    test_file.write_text(test_src, encoding="utf-8")
+    new_code = '@patch("pkg.sub_a.A")\ndef test_f(m):\n    pass'
+    mock_call.side_effect = [
+        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
+        _ok({"correct": True, "issues": []}),
+    ]
+    acc = RewriteAccumulator()
+    list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG, _acc=acc))
+    assert acc.files_updated >= 1
     assert '"pkg.sub_a.A"' in helpers.read_text(encoding="utf-8")

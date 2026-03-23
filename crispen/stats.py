@@ -16,6 +16,7 @@ class RunStats:
     duplicate_matched: int = 0
     function_split: int = 0
     file_limiter_edits: int = 0  # new files written by FileLimiter
+    patch_update_edits: int = 0  # files updated by @patch string updates
 
     # Rejection counts
     algorithmic_rejected: int = 0
@@ -26,6 +27,7 @@ class RunStats:
     llm_edit_calls: int = 0
     llm_verify_calls: int = 0
     file_limiter_llm_calls: int = 0
+    patch_rewrite_llm_calls: int = 0  # LLM calls for rewrite-mode patch updates
 
     # File and line tracking
     files_edited: List[str] = field(default_factory=list)
@@ -111,12 +113,14 @@ class RunStats:
         self.duplicate_matched += other.duplicate_matched
         self.function_split += other.function_split
         self.file_limiter_edits += other.file_limiter_edits
+        self.patch_update_edits += other.patch_update_edits
         self.algorithmic_rejected += other.algorithmic_rejected
         self.llm_rejected += other.llm_rejected
         self.llm_veto_calls += other.llm_veto_calls
         self.llm_edit_calls += other.llm_edit_calls
         self.llm_verify_calls += other.llm_verify_calls
         self.file_limiter_llm_calls += other.file_limiter_llm_calls
+        self.patch_rewrite_llm_calls += other.patch_rewrite_llm_calls
         self.lines_added += other.lines_added
         self.lines_deleted += other.lines_deleted
         self.file_limiter_functions_verified += other.file_limiter_functions_verified
@@ -171,6 +175,7 @@ class RunStats:
             + self.duplicate_matched
             + self.function_split
             + self.file_limiter_edits
+            + self.patch_update_edits
         )
 
     @property
@@ -184,6 +189,7 @@ class RunStats:
             + self.llm_edit_calls
             + self.llm_verify_calls
             + self.file_limiter_llm_calls
+            + self.patch_rewrite_llm_calls
         )
 
     def count_lines_changed(self, original: str, new: str) -> None:
@@ -207,6 +213,7 @@ class RunStats:
         lines.append(f"  match existing:      {self.duplicate_matched}")
         lines.append(f"  function split:      {self.function_split}")
         lines.append(f"  file limiter:        {self.file_limiter_edits}")
+        lines.append(f"  patch update:        {self.patch_update_edits}")
         lines.append(f"  total:               {self.total_edits}")
         lines.append("rejected:")
         lines.append(f"  algorithmic:         {self.algorithmic_rejected}")
@@ -217,6 +224,7 @@ class RunStats:
         lines.append(f"  edit:                {self.llm_edit_calls}")
         lines.append(f"  verify:              {self.llm_verify_calls}")
         lines.append(f"  file limiter:        {self.file_limiter_llm_calls}")
+        lines.append(f"  patch rewrite:       {self.patch_rewrite_llm_calls}")
         lines.append(f"  total:               {self.total_llm_calls}")
         if self.files_edited:
             flist = ", ".join(self.files_edited)

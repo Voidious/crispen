@@ -3257,6 +3257,61 @@ def test_patch_update_rewrite_mode_calls_apply_patch_rewrite(tmp_path):
     assert "mypkg.big.MyClass" in contexts[0].forking_old_paths
 
 
+def test_patch_update_rewrite_mode_records_llm_stats(tmp_path):
+    """Rewrite accumulator with non-zero elapsed/tokens triggers record_llm_call."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={
+            "utils.py": "class MyClass: pass\n",
+            "caller_a.py": "from .big import MyClass\nMyClass()\n",
+            "caller_b.py": "from .big import MyClass\nMyClass()\n",
+        },
+        messages=[],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+
+    def _rewrite_with_acc(
+        fl_contexts, per_file, repo_root, config, verbose=False, _acc=None
+    ):
+        if _acc is not None:
+            _acc.calls = 2
+            _acc.elapsed = 1.5
+            _acc.input_tokens = 100
+            _acc.output_tokens = 20
+            _acc.files_updated = 1
+        return iter([])
+
+    stats = RunStats()
+    with (
+        patch(_FL_PATCH, return_value=fl_result),
+        patch(_REWRITE_PATCH, side_effect=_rewrite_with_acc),
+    ):
+        list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="rewrite",
+                ),
+                _repo_root=str(tmp_path),
+                stats=stats,
+            )
+        )
+    assert stats.patch_rewrite_llm_calls == 2
+    assert stats.patch_update_edits == 1
+    assert stats.llm_elapsed == 1.5
+    assert stats.llm_input_tokens == 100
+    assert "patch_rewriter" in stats.llm_elapsed_by_refactor
+
+
 def test_patch_update_rewrite_mode_no_fl_contexts_skips_apply(tmp_path):
     """'rewrite' mode but no forking entities → apply_patch_rewrite not called."""
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")

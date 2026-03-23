@@ -11,12 +11,14 @@ def _filled() -> RunStats:
     s.duplicate_matched = 1
     s.function_split = 4
     s.file_limiter_edits = 2
+    s.patch_update_edits = 1
     s.algorithmic_rejected = 0
     s.llm_rejected = 1
     s.llm_veto_calls = 4
     s.llm_edit_calls = 7
     s.llm_verify_calls = 3
     s.file_limiter_llm_calls = 5
+    s.patch_rewrite_llm_calls = 2
     s.files_edited = ["foo.py", "bar.py"]
     s.lines_added = 30
     s.lines_deleted = 15
@@ -112,6 +114,38 @@ def test_merge_adds_file_limiter_fields():
     assert a.lines_deleted == 7
 
 
+def test_merge_adds_patch_update_fields():
+    a = RunStats(patch_update_edits=2, patch_rewrite_llm_calls=3)
+    b = RunStats(patch_update_edits=4, patch_rewrite_llm_calls=1)
+    a.merge(b)
+    assert a.patch_update_edits == 6
+    assert a.patch_rewrite_llm_calls == 4
+
+
+def test_total_edits_includes_patch_update():
+    s = RunStats(
+        if_not_else=1,
+        tuple_to_dataclass=1,
+        duplicate_extracted=1,
+        duplicate_matched=1,
+        function_split=1,
+        file_limiter_edits=1,
+        patch_update_edits=3,
+    )
+    assert s.total_edits == 9
+
+
+def test_total_llm_calls_includes_patch_rewrite():
+    s = RunStats(
+        llm_veto_calls=1,
+        llm_edit_calls=1,
+        llm_verify_calls=1,
+        file_limiter_llm_calls=1,
+        patch_rewrite_llm_calls=5,
+    )
+    assert s.total_llm_calls == 9
+
+
 # ---------------------------------------------------------------------------
 # property totals
 # ---------------------------------------------------------------------------
@@ -186,14 +220,16 @@ def test_format_summary_with_files():
     assert "match existing:" in text
     assert "function split:" in text
     assert "file limiter:        2" in text
-    assert "total:               13" in text
+    assert "patch update:        1" in text
+    assert "total:               14" in text
     assert "algorithmic:" in text
     assert "LLM:" in text
     assert "veto:" in text
     assert "edit:" in text
     assert "verify:" in text
     assert "file limiter:        5" in text
-    assert "total:               19" in text
+    assert "patch rewrite:       2" in text
+    assert "total:               21" in text
     assert "files edited (2): foo.py, bar.py" in text
     assert "lines added:           30" in text
     assert "lines deleted:         15" in text

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import difflib
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
@@ -65,6 +66,17 @@ class _TestFunctionInfo:
     start_line: int  # 1-indexed, inclusive (includes decorators)
     end_line: int  # 1-indexed, inclusive
     const_refs: List[_ConstRef] = field(default_factory=list)
+
+
+@dataclass
+class RewriteAccumulator:
+    """Mutable accumulator for timing and edit counts during patch rewrite."""
+
+    calls: int = 0
+    elapsed: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    files_updated: int = 0
 
 
 _PATCH_REWRITE_TOOL: dict = {
@@ -697,6 +709,8 @@ def _process_file_source(
     max_attempts: int,
     scan_file: str = "",
     repo_root: Optional[str] = None,
+    verbose: bool = False,
+    _acc: Optional[RewriteAccumulator] = None,
 ) -> Tuple[str, bool, Dict[str, Dict[str, str]]]:
     """Scan *source* for @patch functions matching *all_forking_paths* and update.
 
@@ -712,6 +726,7 @@ def _process_file_source(
         return source, False, {}
 
     all_updates: Dict[str, str] = {}
+    file_desc = f"'{scan_file}'" if scan_file else "file"
 
     for i in range(0, len(functions), _CHUNK_SIZE):
         chunk = functions[i : i + _CHUNK_SIZE]
@@ -722,6 +737,16 @@ def _process_file_source(
             attempts_left -= 1
 
             rewrite_prompt = _build_rewrite_prompt(context_msg, chunk, prev_issues)
+            n_funcs = len(chunk)
+            if verbose:
+                retry_label = " (retry)" if prev_issues is not None else ""
+                print(
+                    f"crispen: patch_rewriter: rewriting @patch strings in"
+                    f" {file_desc} ({n_funcs}"
+                    f" function{'s' if n_funcs != 1 else ''}){retry_label}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             r = call_with_tool(
                 client,
                 config.provider,
@@ -733,6 +758,18 @@ def _process_file_source(
                 caller="patch_rewriter",
                 tool_choice_override=config.tool_choice,
             )
+            if _acc is not None:
+                _acc.calls += 1
+                _acc.elapsed += r.elapsed
+                _acc.input_tokens += r.input_tokens
+                _acc.output_tokens += r.output_tokens
+            if verbose and config.timing == "detailed":
+                print(
+                    f"crispen: patch_rewriter:   → done [{r.elapsed:.2f}s,"
+                    f" {r.input_tokens:,} in / {r.output_tokens:,} out]",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if r.tool_input is None:
                 break  # LLM did not invoke the tool; skip chunk
 
@@ -753,6 +790,12 @@ def _process_file_source(
                 continue  # retry
 
             # LLM verify step.
+            if verbose:
+                print(
+                    f"crispen: patch_rewriter: verifying @patch updates in {file_desc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             v = call_with_tool(
                 client,
                 config.provider,
@@ -769,6 +812,18 @@ def _process_file_source(
                 caller="patch_rewriter",
                 tool_choice_override=config.tool_choice,
             )
+            if _acc is not None:
+                _acc.calls += 1
+                _acc.elapsed += v.elapsed
+                _acc.input_tokens += v.input_tokens
+                _acc.output_tokens += v.output_tokens
+            if verbose and config.timing == "detailed":
+                print(
+                    f"crispen: patch_rewriter:   → done [{v.elapsed:.2f}s,"
+                    f" {v.input_tokens:,} in / {v.output_tokens:,} out]",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if v.tool_input is None:
                 # Verify call failed; accept proposed updates as-is.
                 all_updates.update(proposed)
@@ -839,6 +894,7 @@ def _process_file_source(
 def _apply_cross_file_const_updates(
     cross_file_proposals: Dict[str, Dict[str, Set[str]]],
     per_file: Dict[str, Any],
+    _acc: Optional[RewriteAccumulator] = None,
 ) -> Iterator[str]:
     """Apply agreed-upon cross-file constant definition updates.
 
@@ -873,6 +929,8 @@ def _apply_cross_file_const_updates(
                 per_file_entry["msgs"].append(
                     "patch_update: updated @patch constant definition (rewrite)"
                 )
+                if _acc is not None:
+                    _acc.files_updated += 1
             continue
 
         # Disk file.
@@ -883,6 +941,8 @@ def _apply_cross_file_const_updates(
         new_src = apply_patch_strings(old_src, resolved)
         if new_src != old_src:
             Path(abs_file).write_text(new_src, encoding="utf-8")
+            if _acc is not None:
+                _acc.files_updated += 1
             yield (
                 f"{abs_file}: patch_update: "
                 "updated @patch constant definition (rewrite)"
@@ -899,6 +959,8 @@ def apply_patch_rewrite(
     per_file: Dict[str, Any],
     repo_root: Optional[str],
     config: "CrispenConfig",
+    verbose: bool = False,
+    _acc: Optional[RewriteAccumulator] = None,
 ) -> Iterator[str]:
     """Update @patch strings for forking entities using LLM.
 
@@ -942,12 +1004,16 @@ def apply_patch_rewrite(
             max_attempts,
             scan_file=filepath,
             repo_root=repo_root,
+            verbose=verbose,
+            _acc=_acc,
         )
         if changed:
             state["source"] = new_src
             state["msgs"].append(
                 f"{filepath}: patch_update: updated @patch strings (rewrite)"
             )
+            if _acc is not None:
+                _acc.files_updated += 1
         for abs_file, patch_map in cross.items():
             for old_val, new_val in patch_map.items():
                 cross_file_proposals.setdefault(abs_file, {}).setdefault(
@@ -955,7 +1021,9 @@ def apply_patch_rewrite(
                 ).add(new_val)
 
     if repo_root is None:
-        yield from _apply_cross_file_const_updates(cross_file_proposals, per_file)
+        yield from _apply_cross_file_const_updates(
+            cross_file_proposals, per_file, _acc=_acc
+        )
         return
 
     # Scan every other .py file in the repo.
@@ -981,9 +1049,13 @@ def apply_patch_rewrite(
             max_attempts,
             scan_file=str(py_file),
             repo_root=repo_root,
+            verbose=verbose,
+            _acc=_acc,
         )
         if changed:
             py_file.write_text(new_src, encoding="utf-8")
+            if _acc is not None:
+                _acc.files_updated += 1
             yield f"{py_file}: patch_update: updated @patch strings (rewrite)"
         for abs_file, patch_map in cross.items():
             for old_val, new_val in patch_map.items():
@@ -991,4 +1063,6 @@ def apply_patch_rewrite(
                     old_val, set()
                 ).add(new_val)
 
-    yield from _apply_cross_file_const_updates(cross_file_proposals, per_file)
+    yield from _apply_cross_file_const_updates(
+        cross_file_proposals, per_file, _acc=_acc
+    )

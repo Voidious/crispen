@@ -16,7 +16,7 @@ from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvi
 from .config import CrispenConfig, format_header, load_config
 from .errors import CrispenAPIError
 from .file_limiter.runner import FileLimiterResult, run_file_limiter
-from .patch_rewriter import _FLContext, apply_patch_rewrite
+from .patch_rewriter import _FLContext, RewriteAccumulator, apply_patch_rewrite
 from .patch_updater import apply_patch_strings
 from .refactors.caller_updater import CallerUpdater
 from .refactors.duplicate_extractor import DuplicateExtractor
@@ -1207,6 +1207,7 @@ def run_engine(
                 state["msgs"].append(
                     f"{filepath}: patch_update: updated @patch strings"
                 )
+                _stats.patch_update_edits += 1
         # Scan every other *.py file in the repo and update on disk.
         per_file_abs = {str(Path(f).resolve()) for f in per_file}
         repo_root_path = Path(repo_root)
@@ -1225,15 +1226,30 @@ def run_engine(
             new_src = apply_patch_strings(src, combined_patch_map)
             if new_src != src:
                 py_file.write_text(new_src, encoding="utf-8")
+                _stats.patch_update_edits += 1
                 yield f"{py_file}: patch_update: updated @patch strings"
 
     if config.file_limiter_patch_update == "rewrite" and _fl_all_contexts:
+        _rewrite_acc = RewriteAccumulator()
         yield from apply_patch_rewrite(
             _fl_all_contexts,
             per_file,
             repo_root,
             config,
+            verbose=verbose,
+            _acc=_rewrite_acc,
         )
+        _stats.patch_rewrite_llm_calls += _rewrite_acc.calls
+        if _rewrite_acc.elapsed > 0 or _rewrite_acc.input_tokens > 0:
+            _stats.record_llm_call(
+                _rewrite_acc.elapsed,
+                _rewrite_acc.input_tokens,
+                _rewrite_acc.output_tokens,
+                "file_limiter",
+                "patch_rewriter",
+                "",
+            )
+        _stats.patch_update_edits += _rewrite_acc.files_updated
 
     # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #
