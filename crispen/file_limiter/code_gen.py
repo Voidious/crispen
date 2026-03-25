@@ -27,6 +27,7 @@ class ImportInfo:
     names: List[str]  # names made available by this import
     source: str  # the import statement text (no trailing newline)
     is_future: bool  # True if `from __future__ import ...`
+    is_type_checking: bool = False  # True if inside `if TYPE_CHECKING:` block
 
 
 @dataclass
@@ -397,7 +398,13 @@ def _test_names_in_decorators(source: str, names: Set[str]) -> Set[str]:
 
 
 def _extract_import_info(source: str) -> List[ImportInfo]:
-    """Return :class:`ImportInfo` for each top-level import in *source*."""
+    """Return :class:`ImportInfo` for each top-level import in *source*.
+
+    Also includes imports found inside module-level ``if TYPE_CHECKING:``
+    blocks, marked with ``is_type_checking=True``.  These are used by
+    :func:`_find_type_checking_needed_imports` to distribute forward-reference
+    imports to the correct sub-files after a split.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -430,6 +437,48 @@ def _extract_import_info(source: str) -> List[ImportInfo]:
             src = f"from {dots}{mod} import {', '.join(alias_strs)}"
             is_future = node.module == "__future__"
             result.append(ImportInfo(names=names, source=src, is_future=is_future))
+        elif (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
+            for child in node.body:
+                if isinstance(child, ast.Import):
+                    tc_names = [
+                        alias.asname if alias.asname else alias.name.split(".")[0]
+                        for alias in child.names
+                    ]
+                    tc_src = "".join(
+                        lines[child.lineno - 1 : child.end_lineno]
+                    ).rstrip()
+                    result.append(
+                        ImportInfo(
+                            names=tc_names,
+                            source=tc_src,
+                            is_future=False,
+                            is_type_checking=True,
+                        )
+                    )
+                elif isinstance(child, ast.ImportFrom):
+                    tc_names = [
+                        alias.asname if alias.asname else alias.name
+                        for alias in child.names
+                    ]
+                    tc_dots = "." * (child.level or 0)
+                    tc_mod = child.module or ""
+                    tc_alias_strs = [
+                        f"{a.name} as {a.asname}" if a.asname else a.name
+                        for a in child.names
+                    ]
+                    tc_src = f"from {tc_dots}{tc_mod} import {', '.join(tc_alias_strs)}"
+                    result.append(
+                        ImportInfo(
+                            names=tc_names,
+                            source=tc_src,
+                            is_future=False,
+                            is_type_checking=True,
+                        )
+                    )
 
     return result
 
@@ -456,6 +505,8 @@ def _find_needed_imports(
     for info in import_infos:
         if info.source in seen:
             continue
+        if info.is_type_checking:
+            continue  # handled by _find_type_checking_needed_imports
         if info.is_future or any(n in referenced for n in info.names):
             needed.append(info.source)
             seen.add(info.source)
@@ -1531,6 +1582,11 @@ def _prune_unused_imports(source: str) -> str:
 def _strip_top_level_import_lines(src: str) -> str:
     """Return *src* with all top-level import statements removed.
 
+    Also removes module-level ``if TYPE_CHECKING:`` blocks, since their
+    imports are now redistributed to each sub-file via the import-info
+    system and emitting the block verbatim would produce the wrong relative
+    import path and/or an unused import in the wrong sub-file.
+
     Uses AST to locate the exact line range of each import node, correctly
     handling multi-line imports.  Returns *src* unchanged when it cannot be
     parsed as Python.
@@ -1542,6 +1598,13 @@ def _strip_top_level_import_lines(src: str) -> str:
     remove: Set[int] = set()
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for ln in range(node.lineno, node.end_lineno + 1):
+                remove.add(ln)
+        elif (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
             for ln in range(node.lineno, node.end_lineno + 1):
                 remove.add(ln)
     if not remove:

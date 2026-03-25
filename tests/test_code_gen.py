@@ -453,6 +453,49 @@ def test_extract_import_info_multiline_parens_normalized():
     assert "PurePath" in infos[0].names
 
 
+def test_extract_import_info_type_checking_from_import():
+    # Imports inside `if TYPE_CHECKING:` are extracted with is_type_checking=True.
+    source = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .config import MyConfig\n"
+    )
+    infos = _extract_import_info(source)
+    tc = [i for i in infos if i.is_type_checking]
+    assert len(tc) == 1
+    assert "MyConfig" in tc[0].names
+    assert tc[0].source == "from .config import MyConfig"
+    assert tc[0].is_future is False
+
+
+def test_extract_import_info_type_checking_plain_import():
+    # Plain `import` inside `if TYPE_CHECKING:` is also captured.
+    source = "if TYPE_CHECKING:\n    import sys\n"
+    infos = _extract_import_info(source)
+    tc = [i for i in infos if i.is_type_checking]
+    assert len(tc) == 1
+    assert "sys" in tc[0].names
+    assert tc[0].is_type_checking is True
+
+
+def test_extract_import_info_type_checking_not_is_future():
+    # TYPE_CHECKING block imports must not be marked as is_future.
+    source = "if TYPE_CHECKING:\n    from .foo import Bar\n"
+    infos = _extract_import_info(source)
+    tc = [i for i in infos if i.is_type_checking]
+    assert all(not i.is_future for i in tc)
+
+
+def test_extract_import_info_type_checking_skips_non_import_children():
+    # Non-import statements inside a TYPE_CHECKING block (rare but valid)
+    # must not cause errors and must be silently skipped.
+    source = "if TYPE_CHECKING:\n    from .foo import Bar\n    x = 1\n"
+    infos = _extract_import_info(source)
+    tc = [i for i in infos if i.is_type_checking]
+    assert len(tc) == 1
+    assert "Bar" in tc[0].names
+
+
 # ---------------------------------------------------------------------------
 # _find_needed_imports
 # ---------------------------------------------------------------------------
@@ -503,6 +546,21 @@ def test_find_needed_imports_entity_not_in_map():
     # Entity name not in entity_source_map → treated as empty source.
     infos = [ImportInfo(names=["os"], source="import os", is_future=False)]
     result = _find_needed_imports(["ghost"], {}, infos, set())
+    assert result == []
+
+
+def test_find_needed_imports_skips_type_checking():
+    # is_type_checking imports must not appear as regular imports.
+    entity_src_map = {"foo": 'def foo(x: "MyConfig") -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["MyConfig"],
+            source="from .config import MyConfig",
+            is_future=False,
+            is_type_checking=True,
+        )
+    ]
+    result = _find_needed_imports(["foo"], entity_src_map, infos, {"foo"})
     assert result == []
 
 
@@ -635,6 +693,23 @@ def test_find_type_checking_needed_imports_narrowed_src_dedup():
     ]
     result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
     assert result.count("from mymod import MyResult") == 1
+
+
+def test_find_type_checking_needed_imports_uses_is_type_checking_infos():
+    # is_type_checking=True ImportInfo entries are used for TC distribution;
+    # the function should return them for entities that use the name in a
+    # quoted annotation.
+    entity_src_map = {"foo": 'def foo(config: "MyConfig") -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["MyConfig"],
+            source="from .config import MyConfig",
+            is_future=False,
+            is_type_checking=True,
+        )
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    assert "from .config import MyConfig" in result
 
 
 # ---------------------------------------------------------------------------
@@ -4331,6 +4406,16 @@ def test_strip_top_level_import_lines_no_imports():
 def test_strip_top_level_import_lines_syntax_error():
     src = "def (\n"
     assert _strip_top_level_import_lines(src) == src
+
+
+def test_strip_top_level_import_lines_strips_type_checking_block():
+    # `if TYPE_CHECKING:` blocks must be stripped so that their imports are
+    # not emitted verbatim in sub-files (wrong path, wrong file).
+    src = "if TYPE_CHECKING:\n" "    from .config import MyConfig\n" "\n" "_CONST = 1\n"
+    result = _strip_top_level_import_lines(src)
+    assert "TYPE_CHECKING" not in result
+    assert "MyConfig" not in result
+    assert "_CONST = 1" in result
 
 
 # ---------------------------------------------------------------------------
