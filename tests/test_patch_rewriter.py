@@ -513,6 +513,19 @@ def test_build_rewrite_prompt_with_issues():
     assert "wrong path" in prompt
 
 
+def test_build_rewrite_prompt_with_issues_and_prev_proposed():
+    funcs = [
+        _TestFunctionInfo("test_f", "@patch('old')\ndef test_f(): pass", ["old"], 1, 2)
+    ]
+    issues = [{"function_name": "test_f", "issue": "wrong path"}]
+    prev_proposed = {"test_f": '@patch("bad.path")\ndef test_f(): pass'}
+    prompt = _build_rewrite_prompt(_ctx_msg(), funcs, issues, prev_proposed)
+    assert "Previous attempt" in prompt
+    assert "wrong path" in prompt
+    assert "bad.path" in prompt
+    assert "incorrect" in prompt
+
+
 # ---------------------------------------------------------------------------
 # _build_verify_prompt
 # ---------------------------------------------------------------------------
@@ -958,6 +971,59 @@ def test_process_verbose_retry_label(mock_call, capsys):
     )
     err = capsys.readouterr().err
     assert "(retry)" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_verify_accepted(mock_call, capsys):
+    """verbose=True prints 'ACCEPTED' when verify succeeds."""
+    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+    mock_call.side_effect = [
+        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
+        _ok({"correct": True, "issues": []}),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "ACCEPTED" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_verify_rejected_prints_issues(mock_call, capsys):
+    """verbose=True prints 'REJECTED' and each issue when verify rejects."""
+    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+    mock_call.side_effect = [
+        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
+        _ok(
+            {
+                "correct": False,
+                "issues": [{"function_name": "test_f", "issue": "wrong module path"}],
+            }
+        ),
+        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
+        _ok({"correct": True, "issues": []}),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        2,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "REJECTED" in err
+    assert "wrong module path" in err
+    assert "ACCEPTED" in err
 
 
 # ---------------------------------------------------------------------------

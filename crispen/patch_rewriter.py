@@ -711,13 +711,18 @@ def _build_rewrite_prompt(
     context_msg: str,
     functions: List[_TestFunctionInfo],
     prev_issues: Optional[List[dict]] = None,
+    prev_proposed: Optional[Dict[str, str]] = None,
 ) -> str:
     """Build the user message for the rewrite LLM call."""
     parts = [context_msg]
     if prev_issues:
-        parts.append("\n## Previous attempt had these issues — please fix them:\n")
+        parts.append("\n## Previous attempt was rejected — please fix these issues:\n")
         for issue in prev_issues:
             parts.append(f"- **{issue['function_name']}**: {issue['issue']}\n")
+        if prev_proposed:
+            parts.append("\n### What the previous attempt proposed (incorrect):\n")
+            for func_name, proposed_code in prev_proposed.items():
+                parts.append(f"```python\n{proposed_code}\n```\n")
     parts.append("\n## Test functions to update:\n")
     for func in functions:
         parts.append(f"```python\n{func.full_text}\n```\n")
@@ -818,12 +823,15 @@ def _process_file_source(
     for i in range(0, len(functions), _CHUNK_SIZE):
         chunk = functions[i : i + _CHUNK_SIZE]
         prev_issues: Optional[List[dict]] = None
+        prev_proposed: Optional[Dict[str, str]] = None
         attempts_left = max_attempts
 
         while attempts_left > 0:
             attempts_left -= 1
 
-            rewrite_prompt = _build_rewrite_prompt(context_msg, chunk, prev_issues)
+            rewrite_prompt = _build_rewrite_prompt(
+                context_msg, chunk, prev_issues, prev_proposed
+            )
             n_funcs = len(chunk)
             if verbose:
                 retry_label = " (retry)" if prev_issues is not None else ""
@@ -917,13 +925,31 @@ def _process_file_source(
                 all_updates.update(proposed)
                 break
 
-            if v.tool_input.get("correct", False):
+            verify_correct = v.tool_input.get("correct", False)
+            issues = v.tool_input.get("issues", [])
+            if verbose:
+                v_status = "ACCEPTED" if verify_correct else "REJECTED"
+                print(
+                    f"crispen: patch_rewriter: verify {v_status}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if not verify_correct:
+                    for issue in issues:
+                        print(
+                            f"crispen: patch_rewriter:   issue:"
+                            f" {issue.get('function_name', '?')}:"
+                            f" {issue.get('issue', '')}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+            if verify_correct:
                 all_updates.update(proposed)
                 break
             else:
-                issues = v.tool_input.get("issues", [])
                 if attempts_left > 0:
                     prev_issues = issues
+                    prev_proposed = proposed
                 # else: retries exhausted — skip this chunk
 
     # Post-process: find constant definitions to update in addition to inlining.
