@@ -7,7 +7,7 @@ import difflib
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING, Union
 
 import libcst as cst
 from libcst.metadata import MetadataWrapper, PositionProvider
@@ -82,8 +82,9 @@ class RewriteAccumulator:
 _PATCH_REWRITE_TOOL: dict = {
     "name": "update_patch_strings",
     "description": (
-        "Update @patch decorator strings in the provided test functions so they "
-        "point to the correct new module paths after a source file was split."
+        "Update patch() call strings in the provided test functions so they "
+        "point to the correct new module paths after a source file was split. "
+        "Handles both @patch(...) decorators and with patch(...) context managers."
     ),
     "input_schema": {
         "type": "object",
@@ -101,7 +102,9 @@ _PATCH_REWRITE_TOOL: dict = {
                             "type": "string",
                             "description": (
                                 "Complete updated function code including all "
-                                "decorators and body, with corrected @patch strings."
+                                "decorators and body, with corrected patch() "
+                                "strings in both @patch decorators and "
+                                "with patch(...) context managers."
                             ),
                         },
                     },
@@ -378,6 +381,80 @@ def _substitute_consts_in_func_text(
 
 
 # ---------------------------------------------------------------------------
+# Body scan: collect patch() paths from ``with patch(...)`` context managers
+# ---------------------------------------------------------------------------
+
+
+def _find_with_patch_paths_in_body(
+    func_text: str,
+    old_paths: Set[str],
+    const_map: Dict[str, Tuple[str, str]],
+    attr_const_map: Dict[str, Dict[str, Tuple[str, str]]],
+) -> List[str]:
+    """Return patch() string args from ``with patch(...)`` statements in *func_text*.
+
+    Walks the function body but does not recurse into nested function definitions.
+    Handles plain string literals, module-level named constants, and
+    ``module.CONSTANT`` attribute forms for both ``patch(...)`` and ``*.patch(...)``.
+    Also covers ``async with patch(...)`` context managers.
+    """
+    try:
+        tree = ast.parse(func_text)
+    except SyntaxError:
+        return []
+    func_node: Optional[Union[ast.FunctionDef, ast.AsyncFunctionDef]] = None
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_node = stmt
+            break
+    if func_node is None:
+        return []
+
+    # Collect IDs of all descendants of nested FunctionDef/AsyncFunctionDef nodes so
+    # that ``with`` statements inside closures are excluded from results.
+    excluded: Set[int] = set()
+    for node in ast.walk(func_node):
+        if node is func_node:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.walk(node):
+                excluded.add(id(child))
+
+    results: List[str] = []
+    for node in ast.walk(func_node):
+        if id(node) in excluded:
+            continue
+        if not isinstance(node, (ast.With, ast.AsyncWith)):
+            continue
+        for item in node.items:
+            call = item.context_expr
+            if not isinstance(call, ast.Call):
+                continue
+            func = call.func
+            is_patch = (isinstance(func, ast.Name) and func.id == "patch") or (
+                isinstance(func, ast.Attribute) and func.attr == "patch"
+            )
+            if not is_patch or not call.args:
+                continue
+            arg0 = call.args[0]
+            if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str):
+                if _matches_any(arg0.value, old_paths):
+                    results.append(arg0.value)
+            elif isinstance(arg0, ast.Name) and arg0.id in const_map:
+                val, _ = const_map[arg0.id]
+                if _matches_any(val, old_paths):
+                    results.append(val)
+            elif isinstance(arg0, ast.Attribute) and isinstance(arg0.value, ast.Name):
+                alias = arg0.value.id
+                attr_name = arg0.attr
+                if alias in attr_const_map and attr_name in attr_const_map[alias]:
+                    val, _ = attr_const_map[alias][attr_name]
+                    if _matches_any(val, old_paths):
+                        results.append(val)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Extraction helper (read new values back from LLM output)
 # ---------------------------------------------------------------------------
 
@@ -490,19 +567,27 @@ class _PatchFunctionCollector(cst.CSTVisitor):
                             )
             patch_dec_idx += 1
 
-        if not old_patch_paths:
-            return
-
+        # Compute line range and extract full text before the early-return check so
+        # the body scan (below) can run even when there are no matching decorators.
         func_pos = self.get_metadata(PositionProvider, node)
         if node.decorators:
             # FunctionDef position starts at "def", not the first decorator.
             dec_pos = self.get_metadata(PositionProvider, node.decorators[0])
             start_line = dec_pos.start.line
-        else:  # pragma: no cover
+        else:
             start_line = func_pos.start.line
         end_line = func_pos.end.line
 
         original_full_text = "\n".join(self._lines[start_line - 1 : end_line])
+
+        # Also scan the function body for ``with patch(...)`` context managers.
+        body_paths = _find_with_patch_paths_in_body(
+            original_full_text, self._old_paths, self._const_map, self._attr_const_map
+        )
+        old_patch_paths.extend(body_paths)
+
+        if not old_patch_paths:
+            return
 
         # Build the full_text sent to the LLM: substitute constant names with
         # their string values so the LLM always sees plain string literals.
@@ -562,7 +647,7 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
     """Build the shared LLM prompt context describing all split files."""
     parts: List[str] = [
         "A Python source file was split into multiple sub-modules by an automated "
-        "refactoring tool.  Update the @patch decorator strings in the provided "
+        "refactoring tool.  Update the patch() call strings in the provided "
         "test functions so they reference the correct new module paths.\n"
     ]
 
@@ -606,15 +691,17 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
             parts.append(f"- `{entity_name}` → `{target_rel}` (module: `{new_mod}`)\n")
 
     parts.append(
-        "\n## Rules for updating @patch strings:\n"
+        "\n## Rules for updating patch() strings:\n"
         "1. If the modified original file still re-exports an entity "
         '(e.g. `from .newfile import Entity`), then `@patch("old_module.Entity")` '
         "is **still valid** — leave it unchanged.\n"
         "2. If the entity is no longer accessible from the original module, update "
-        "the @patch path to point to the new sub-module.\n"
+        "the patch() path to point to the new sub-module.\n"
         "3. For entities split across multiple new files, use what the test function "
         "calls or imports to determine which new module is the correct patch target.\n"
-        "4. Only modify @patch string literals — do not change any other code.\n"
+        "4. Only modify the string argument of ``patch()`` calls — in ``@patch(...)`` "
+        "decorators and in ``with patch(...) as ...:`` context managers — do not "
+        "change any other code.\n"
         "5. Return every function in the input, even those left unchanged.\n"
     )
     return "".join(parts)
@@ -656,7 +743,7 @@ def _build_verify_prompt(
             parts.append("*(no update proposed)*\n")
     parts.append(
         "\nVerify each proposed update:\n"
-        "- Are the new @patch paths correct for where each entity now resides?\n"
+        "- Are the new patch() paths correct for where each entity now resides?\n"
         "- Were any patches incorrectly changed that should remain unchanged?\n"
         "- Were any patches left unchanged that should have been updated?\n"
         "Set `correct` to True only if ALL updates are correct.\n"
@@ -741,7 +828,7 @@ def _process_file_source(
             if verbose:
                 retry_label = " (retry)" if prev_issues is not None else ""
                 print(
-                    f"crispen: patch_rewriter: rewriting @patch strings in"
+                    f"crispen: patch_rewriter: rewriting patch() strings in"
                     f" {file_desc} ({n_funcs}"
                     f" function{'s' if n_funcs != 1 else ''}){retry_label}",
                     file=sys.stderr,
@@ -792,7 +879,8 @@ def _process_file_source(
             # LLM verify step.
             if verbose:
                 print(
-                    f"crispen: patch_rewriter: verifying @patch updates in {file_desc}",
+                    f"crispen: patch_rewriter: verifying patch() updates"
+                    f" in {file_desc}",
                     file=sys.stderr,
                     flush=True,
                 )

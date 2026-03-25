@@ -23,6 +23,7 @@ from crispen.patch_rewriter import (
     _compiles,
     _extract_patch_args_from_code,
     _find_test_functions_to_update,
+    _find_with_patch_paths_in_body,
     _is_patch_call,
     _matches_any,
     _process_file_source,
@@ -220,6 +221,171 @@ def test_find_start_end_lines():
     result = _find_test_functions_to_update(src, {"old.mod.X"})
     assert result[0].start_line == 2  # @patch line (first decorator)
     assert result[0].end_line == 4  # last line of body
+
+
+def test_find_body_with_patch_no_decorator():
+    # Function has no @patch decorator but uses ``with patch(...)`` in the body.
+    src = "def test_f():\n" '    with patch("old.mod.X") as m:\n' "        pass\n"
+    result = _find_test_functions_to_update(src, {"old.mod.X"})
+    assert len(result) == 1
+    assert result[0].function_name == "test_f"
+    assert "old.mod.X" in result[0].old_patch_paths
+    # start_line should be the ``def`` line (no decorators).
+    assert result[0].start_line == 1
+
+
+def test_find_body_with_patch_combined_with_decorator():
+    # Function has both an @patch decorator and a body-level with patch(...).
+    src = (
+        '@patch("old.mod.Y")\n'
+        "def test_f(mock_y):\n"
+        '    with patch("old.mod.X") as m:\n'
+        "        pass\n"
+    )
+    result = _find_test_functions_to_update(src, {"old.mod.X", "old.mod.Y"})
+    assert len(result) == 1
+    paths = result[0].old_patch_paths
+    assert "old.mod.X" in paths
+    assert "old.mod.Y" in paths
+
+
+# ---------------------------------------------------------------------------
+# _find_with_patch_paths_in_body
+# ---------------------------------------------------------------------------
+
+
+def test_body_scan_syntax_error():
+    assert _find_with_patch_paths_in_body("def f(:\n", {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_no_funcdef():
+    # Parsed text has no FunctionDef at the top level.
+    assert _find_with_patch_paths_in_body("x = 1\n", {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_simple_match():
+    src = 'def test_f():\n    with patch("old.X") as m:\n        pass\n'
+    result = _find_with_patch_paths_in_body(src, {"old.X"}, {}, {})
+    assert result == ["old.X"]
+
+
+def test_body_scan_no_match():
+    src = 'def test_f():\n    with patch("other.Y") as m:\n        pass\n'
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_attribute_patch():
+    # ``with mock.patch(...)`` form.
+    src = 'def test_f():\n    with mock.patch("old.X") as m:\n        pass\n'
+    result = _find_with_patch_paths_in_body(src, {"old.X"}, {}, {})
+    assert result == ["old.X"]
+
+
+def test_body_scan_not_patch_call():
+    src = 'def test_f():\n    with other("old.X") as m:\n        pass\n'
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_no_args():
+    src = "def test_f():\n    with patch() as m:\n        pass\n"
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_non_call_context_manager():
+    # Context manager is a plain Name, not a Call.
+    src = "def test_f():\n    with ctx as m:\n        pass\n"
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_non_string_arg():
+    # First arg is a Call expression (not string/Name/Attribute).
+    src = "def test_f():\n    with patch(get_target()) as m:\n        pass\n"
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_name_const_match():
+    const_map = {"MY_TARGET": ("old.X", "/file.py")}
+    src = "def test_f():\n    with patch(MY_TARGET) as m:\n        pass\n"
+    result = _find_with_patch_paths_in_body(src, {"old.X"}, const_map, {})
+    assert result == ["old.X"]
+
+
+def test_body_scan_name_const_no_match():
+    # Constant value doesn't match old_paths.
+    const_map = {"MY_TARGET": ("other.Y", "/file.py")}
+    src = "def test_f():\n    with patch(MY_TARGET) as m:\n        pass\n"
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, const_map, {}) == []
+
+
+def test_body_scan_name_not_in_const_map():
+    src = "def test_f():\n    with patch(unknown_var) as m:\n        pass\n"
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_attr_const_match():
+    attr_const_map = {"consts": {"TARGET": ("old.X", "/consts.py")}}
+    src = "def test_f():\n    with patch(consts.TARGET) as m:\n        pass\n"
+    result = _find_with_patch_paths_in_body(src, {"old.X"}, {}, attr_const_map)
+    assert result == ["old.X"]
+
+
+def test_body_scan_attr_const_module_not_in_map():
+    src = "def test_f():\n    with patch(unknown_mod.X) as m:\n        pass\n"
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_attr_const_attr_not_in_map():
+    attr_const_map = {"consts": {"OTHER": ("old.X", "/consts.py")}}
+    src = "def test_f():\n    with patch(consts.MISSING) as m:\n        pass\n"
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, attr_const_map) == []
+
+
+def test_body_scan_attr_const_no_match():
+    # Attribute constant value doesn't match old_paths.
+    attr_const_map = {"consts": {"TARGET": ("other.Y", "/consts.py")}}
+    src = "def test_f():\n    with patch(consts.TARGET) as m:\n        pass\n"
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, attr_const_map) == []
+
+
+def test_body_scan_nested_funcdef_excluded():
+    # ``with patch(...)`` inside a nested function should NOT trigger inclusion of
+    # the outer function — the nested function is its own unit.
+    src = (
+        "def test_outer():\n"
+        "    def inner():\n"
+        '        with patch("old.X") as m:\n'
+        "            pass\n"
+    )
+    assert _find_with_patch_paths_in_body(src, {"old.X"}, {}, {}) == []
+
+
+def test_body_scan_multiple_with_items():
+    # ``with patch("a") as m, patch("b") as n:`` — both items should be found.
+    src = (
+        "def test_f():\n"
+        '    with patch("old.X") as m, patch("old.Y") as n:\n'
+        "        pass\n"
+    )
+    result = _find_with_patch_paths_in_body(src, {"old.X", "old.Y"}, {}, {})
+    assert set(result) == {"old.X", "old.Y"}
+
+
+def test_body_scan_async_with():
+    src = 'async def test_f():\n    async with patch("old.X") as m:\n        pass\n'
+    result = _find_with_patch_paths_in_body(src, {"old.X"}, {}, {})
+    assert result == ["old.X"]
+
+
+def test_body_scan_nested_in_if():
+    # ``with patch(...)`` inside an ``if`` block should still be found.
+    src = (
+        "def test_f():\n"
+        "    if True:\n"
+        '        with patch("old.X") as m:\n'
+        "            pass\n"
+    )
+    result = _find_with_patch_paths_in_body(src, {"old.X"}, {}, {})
+    assert result == ["old.X"]
 
 
 # ---------------------------------------------------------------------------
