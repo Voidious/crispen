@@ -18,6 +18,7 @@ from crispen.file_limiter.code_gen import (
     _collect_quoted_annotation_names,
     _collect_name_stores,
     _inject_module_level_imports,
+    _inject_type_checking_imports,
     _test_names_in_decorators,
     _extract_import_info,
     _extract_module_docstring,
@@ -359,6 +360,84 @@ def test_inject_module_level_imports_syntax_error_prepends():
     src = "def (broken:\n"
     result = _inject_module_level_imports(src, ["import os"])
     assert result.startswith("import os\n")
+
+
+# ---------------------------------------------------------------------------
+# _inject_type_checking_imports
+# ---------------------------------------------------------------------------
+
+
+def test_inject_type_checking_imports_empty_list():
+    src = "import os\n"
+    assert _inject_type_checking_imports(src, []) == src
+
+
+def test_inject_type_checking_imports_syntax_error():
+    src = "def (broken:\n"
+    assert _inject_type_checking_imports(src, ["from .config import Cfg"]) == src
+
+
+def test_inject_type_checking_imports_all_already_present():
+    # If every requested import is already in an existing TC block, no change.
+    src = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .config import Cfg\n"
+        "\n"
+        "x = 1\n"
+    )
+    result = _inject_type_checking_imports(src, ["from .config import Cfg"])
+    assert result == src
+
+
+def test_inject_type_checking_imports_appends_to_existing_block():
+    # New import should be appended inside the existing TYPE_CHECKING block.
+    src = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .config import Cfg\n"
+        "\n"
+        "x = 1\n"
+    )
+    result = _inject_type_checking_imports(src, ["from .models import MyModel"])
+    assert "from .models import MyModel" in result
+    tc_start = result.index("if TYPE_CHECKING:")
+    assert result.index("from .models import MyModel") > tc_start
+    assert "x = 1" in result
+
+
+def test_inject_type_checking_imports_creates_block_with_typing_import():
+    # No existing TC block and TYPE_CHECKING not imported → add both.
+    src = "from typing import List\n\ndef foo(x: 'Cfg') -> None:\n    pass\n"
+    result = _inject_type_checking_imports(src, ["from .config import Cfg"])
+    assert "from typing import TYPE_CHECKING" in result
+    assert "if TYPE_CHECKING:" in result
+    assert "    from .config import Cfg" in result
+
+
+def test_inject_type_checking_imports_creates_block_type_checking_already_imported():
+    # TYPE_CHECKING already in typing import → don't add it again.
+    src = (
+        "from typing import List, TYPE_CHECKING\n"
+        "\n"
+        "def foo(x: 'Cfg') -> None:\n"
+        "    pass\n"
+    )
+    result = _inject_type_checking_imports(src, ["from .config import Cfg"])
+    assert result.count("TYPE_CHECKING") == 2  # one in import, one in if-block
+    assert "if TYPE_CHECKING:" in result
+    assert "    from .config import Cfg" in result
+
+
+def test_inject_type_checking_imports_block_after_last_import():
+    # The new block should appear after the last import, before other code.
+    src = "import os\nimport sys\n\nx = 1\n"
+    result = _inject_type_checking_imports(src, ["from .config import Cfg"])
+    lines = result.splitlines()
+    sys_line = next(i for i, l in enumerate(lines) if "import sys" in l)
+    if_line = next(i for i, l in enumerate(lines) if "if TYPE_CHECKING" in l)
+    x_line = next(i for i, l in enumerate(lines) if "x = 1" in l)
+    assert sys_line < if_line < x_line
 
 
 # ---------------------------------------------------------------------------
@@ -4383,6 +4462,44 @@ def test_generate_file_splits_subdir_bumps_two_levels_deep():
     assert "from .... import llm_client" in core_src
     assert "from .. import llm_client" not in core_src
     assert "from ... import llm_client" not in core_src
+
+
+def test_generate_file_splits_subdir_injects_tc_import_for_nonmigrated_entity():
+    # When a _block_N TOP_LEVEL entity that holds the `if TYPE_CHECKING:` block
+    # is migrated to a sub-file, any non-migrated entity that references the
+    # guarded name in a quoted annotation must receive the TYPE_CHECKING import
+    # in the updated original (__init__.py).
+    #
+    # The original file has three entities:
+    #   _block_1 — the TYPE_CHECKING block (migrated to sub.py)
+    #   helper   — migrated to sub.py
+    #   entry    — stays in __init__.py, references "MyConfig" in annotation
+    source = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .config import MyConfig\n"
+        "\n"
+        "def helper():\n"
+        "    pass\n"
+        "\n"
+        "def entry(cfg: 'MyConfig') -> None:\n"
+        "    helper()\n"
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, [])
+    e_helper = _make_entity("helper", 5, 6)
+    e_entry = _make_entity("entry", 8, 9)
+    c = _classified(entities=[e_block, e_helper, e_entry])
+    plan = _plan(
+        [GroupPlacement(group=["_block_1", "helper"], target_file="pkg/sub.py")]
+    )
+
+    result = generate_file_splits(c, plan, source, "pkg.py", subdir_name="pkg")
+
+    assert not result.abort
+    init_src = result.original_source
+    # The TYPE_CHECKING import must be injected and bumped for the new depth.
+    assert "if TYPE_CHECKING:" in init_src
+    assert "from ..config import MyConfig" in init_src
 
 
 # ---------------------------------------------------------------------------

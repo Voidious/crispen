@@ -370,6 +370,63 @@ def _inject_module_level_imports(source: str, imports: List[str]) -> str:
     return "".join(lines[:insert_after] + import_lines + lines[insert_after:])
 
 
+def _inject_type_checking_imports(source: str, imports: List[str]) -> str:
+    """Add *imports* under a module-level ``if TYPE_CHECKING:`` guard in *source*.
+
+    If a TYPE_CHECKING block already exists, new imports are appended to it
+    (skipping any already present).  Otherwise a new block is inserted after
+    the last top-level import statement, along with ``from typing import
+    TYPE_CHECKING`` when that name is not already imported.
+    """
+    if not imports:
+        return source
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    # Determine which imports are not already in an existing TC block.
+    existing_tc = {i.source for i in _extract_import_info(source) if i.is_type_checking}
+    new_imports = [imp for imp in imports if imp not in existing_tc]
+    if not new_imports:
+        return source
+
+    lines = source.splitlines(keepends=True)
+
+    # Append to an existing TYPE_CHECKING block if one is present.
+    for node in tree.body:
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
+            insert_line = node.end_lineno
+            new_lines = ["    " + imp + "\n" for imp in sorted(new_imports)]
+            return "".join(lines[:insert_line] + new_lines + lines[insert_line:])
+
+    # No existing block: insert one after the last top-level import.
+    last_import_line = 0
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            last_import_line = max(last_import_line, node.end_lineno)
+    insert_after = last_import_line
+
+    tc_already_imported = any(
+        isinstance(n, ast.ImportFrom)
+        and n.module == "typing"
+        and any((a.asname or a.name) == "TYPE_CHECKING" for a in n.names)
+        for n in tree.body
+    )
+    new_lines = []
+    if not tc_already_imported:
+        new_lines.append("from typing import TYPE_CHECKING\n")
+    new_lines.append("if TYPE_CHECKING:\n")
+    for imp in sorted(new_imports):
+        new_lines.append("    " + imp + "\n")
+    new_lines.append("\n")
+    return "".join(lines[:insert_after] + new_lines + lines[insert_after:])
+
+
 def _test_names_in_decorators(source: str, names: Set[str]) -> Set[str]:
     """Return the subset of *names* that appear as Name loads inside a decorator.
 
@@ -2751,6 +2808,23 @@ def generate_file_splits(
         post_source, migrated_names - copy_not_migrate, entity_map, entity_source_map
     )
     updated = _prune_unused_imports(updated)
+    # Compute TYPE_CHECKING imports needed by non-migrated entities that had
+    # their import guard block removed as part of a migrated TOP_LEVEL entity.
+    # Injection happens AFTER the relative-import bump below so that bumped
+    # import strings are passed to _inject_type_checking_imports rather than
+    # relying on the bump (which only matches unindented ``from .`` lines and
+    # therefore misses indented imports inside an ``if TYPE_CHECKING:`` block).
+    _non_migrated_names = [
+        e.name for e in classified.entities if e.name not in migrated_names
+    ]
+    _tc_to_inject: List[str] = []
+    if _non_migrated_names:
+        _regular_in_updated = {
+            i.source for i in _extract_import_info(updated) if not i.is_type_checking
+        }
+        _tc_to_inject = _find_type_checking_needed_imports(
+            _non_migrated_names, entity_source_map, import_infos, _regular_in_updated
+        )
     # For non-test subdir splits, re-exports from the __init__.py use relative
     # import prefixes computed from inside the package (e.g. ".utils" not
     # ".service.utils").  For test files the original keeps existing abs_pkg
@@ -2763,6 +2837,9 @@ def generate_file_splits(
     # are already computed from the __init__.py's perspective and are correct.
     if subdir_name is not None and not is_test_file and not has_main:
         updated = _bump_relative_imports(updated)
+        _tc_to_inject = [_bump_relative_imports(imp) for imp in _tc_to_inject]
+    if _tc_to_inject:
+        updated = _inject_type_checking_imports(updated, _tc_to_inject)
     if subdir_name is not None:
         # If the original file had a module docstring and it was migrated away,
         # place it in subdir/__init__.py in both cases: for non-test splits
