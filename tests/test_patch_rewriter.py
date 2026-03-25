@@ -10,18 +10,15 @@ from crispen.config import CrispenConfig
 from crispen.llm_client import LLMCallResult
 from crispen.patch_rewriter import (
     _FLContext,
-    _TestFunctionInfo,
     RewriteAccumulator,
     _apply_cross_file_const_updates,
-    _apply_function_updates,
     _build_attr_const_map,
     _build_const_map,
     _build_context_message,
     _build_local_const_map,
-    _build_rewrite_prompt,
-    _build_verify_prompt,
+    _build_single_patch_prompt,
+    _build_single_verify_prompt,
     _compiles,
-    _extract_patch_args_from_code,
     _find_test_functions_to_update,
     _find_with_patch_paths_in_body,
     _is_patch_call,
@@ -389,63 +386,6 @@ def test_body_scan_nested_in_if():
 
 
 # ---------------------------------------------------------------------------
-# _apply_function_updates
-# ---------------------------------------------------------------------------
-
-
-def test_apply_empty_updates():
-    src = "@patch('x')\ndef test_f(): pass\n"
-    info = _TestFunctionInfo("test_f", "@patch('x')\ndef test_f(): pass", ["x"], 1, 2)
-    assert _apply_function_updates(src, [info], {}) == src
-
-
-def test_apply_with_updates():
-    src = "@patch('old.X')\ndef test_f(): pass\n"
-    info = _TestFunctionInfo(
-        "test_f", "@patch('old.X')\ndef test_f(): pass", ["old.X"], 1, 2
-    )
-    new_code = "@patch('new.X')\ndef test_f(): pass"
-    result = _apply_function_updates(src, [info], {"test_f": new_code})
-    assert "@patch('new.X')" in result
-    assert "@patch('old.X')" not in result
-
-
-def test_apply_unmatched_name_in_updates():
-    # updates has a key not matching any function → no replacement; loop body skipped.
-    src = "@patch('old.X')\ndef test_f(): pass\n"
-    info = _TestFunctionInfo(
-        "test_f", "@patch('old.X')\ndef test_f(): pass", ["old.X"], 1, 2
-    )
-    result = _apply_function_updates(
-        src, [info], {"OTHER": "@patch('new.X')\ndef OTHER(): pass"}
-    )
-    assert result == src
-
-
-def test_apply_new_code_already_has_trailing_newline():
-    # Covers the False branch of `if not new_code.endswith("\n")`.
-    src = "@patch('old.X')\ndef test_f(): pass\n"
-    info = _TestFunctionInfo(
-        "test_f", "@patch('old.X')\ndef test_f(): pass", ["old.X"], 1, 2
-    )
-    new_code = "@patch('new.X')\ndef test_f(): pass\n"  # already has trailing \n
-    result = _apply_function_updates(src, [info], {"test_f": new_code})
-    assert "@patch('new.X')" in result
-
-
-def test_apply_multiple_functions():
-    src = "@patch('old.A')\ndef test_a(): pass\n\n@patch('old.B')\ndef test_b(): pass\n"
-    funcs = _find_test_functions_to_update(src, {"old.A", "old.B"})
-    updates = {
-        f.function_name: f.full_text.replace("old.A", "new.A").replace("old.B", "new.B")
-        for f in funcs
-    }
-    result = _apply_function_updates(src, funcs, updates)
-    assert "new.A" in result
-    assert "new.B" in result
-
-
-# ---------------------------------------------------------------------------
 # _build_context_message
 # ---------------------------------------------------------------------------
 
@@ -486,70 +426,6 @@ def test_build_context_multiple_contexts():
 
 
 # ---------------------------------------------------------------------------
-# _build_rewrite_prompt
-# ---------------------------------------------------------------------------
-
-
-def _ctx_msg() -> str:
-    return _build_context_message([_make_fl_ctx()])
-
-
-def test_build_rewrite_prompt_no_issues():
-    funcs = [
-        _TestFunctionInfo("test_f", "@patch('old')\ndef test_f(): pass", ["old"], 1, 2)
-    ]
-    prompt = _build_rewrite_prompt(_ctx_msg(), funcs, None)
-    assert "Previous attempt" not in prompt
-    assert "test_f" in prompt
-
-
-def test_build_rewrite_prompt_with_issues():
-    funcs = [
-        _TestFunctionInfo("test_f", "@patch('old')\ndef test_f(): pass", ["old"], 1, 2)
-    ]
-    issues = [{"function_name": "test_f", "issue": "wrong path"}]
-    prompt = _build_rewrite_prompt(_ctx_msg(), funcs, issues)
-    assert "Previous attempt" in prompt
-    assert "wrong path" in prompt
-
-
-def test_build_rewrite_prompt_with_issues_and_prev_proposed():
-    funcs = [
-        _TestFunctionInfo("test_f", "@patch('old')\ndef test_f(): pass", ["old"], 1, 2)
-    ]
-    issues = [{"function_name": "test_f", "issue": "wrong path"}]
-    prev_proposed = {"test_f": '@patch("bad.path")\ndef test_f(): pass'}
-    prompt = _build_rewrite_prompt(_ctx_msg(), funcs, issues, prev_proposed)
-    assert "Previous attempt" in prompt
-    assert "wrong path" in prompt
-    assert "bad.path" in prompt
-    assert "incorrect" in prompt
-
-
-# ---------------------------------------------------------------------------
-# _build_verify_prompt
-# ---------------------------------------------------------------------------
-
-
-def test_build_verify_prompt_with_update():
-    funcs = [
-        _TestFunctionInfo("test_f", "@patch('old')\ndef test_f(): pass", ["old"], 1, 2)
-    ]
-    prompt = _build_verify_prompt(
-        _ctx_msg(), funcs, {"test_f": "@patch('new')\ndef test_f(): pass"}
-    )
-    assert "Proposed update" in prompt
-
-
-def test_build_verify_prompt_no_update():
-    funcs = [
-        _TestFunctionInfo("test_f", "@patch('old')\ndef test_f(): pass", ["old"], 1, 2)
-    ]
-    prompt = _build_verify_prompt(_ctx_msg(), funcs, {})
-    assert "no update proposed" in prompt
-
-
-# ---------------------------------------------------------------------------
 # _process_file_source
 # ---------------------------------------------------------------------------
 
@@ -567,7 +443,7 @@ def test_process_no_functions(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL, return_value=_ok(None))
 def test_process_llm_no_tool_input(mock_call):
-    # LLM returns tool_input=None → break, no updates.
+    # LLM returns tool_input=None → break, no update.
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
@@ -575,16 +451,34 @@ def test_process_llm_no_tool_input(mock_call):
     assert changed is False
 
 
+@mock_patch(_PATCH_CALL_TOOL, return_value=_ok({"new_patch_string": ""}))
+def test_process_llm_new_path_empty(mock_call):
+    # LLM returns empty string → treated as invalid, break.
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL, return_value=_ok({"new_patch_string": "old.mod.X"}))
+def test_process_no_change_needed(mock_call):
+    # LLM returns same string as original → no verify call, no update.
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 1  # no verify call
+
+
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_syntax_error_then_success(mock_call):
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+def test_process_patch_changed_verify_accepts(mock_call):
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": "def f(:\n"}]}),
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     result, changed, cross = _process_file_source(
-        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert changed is True
     assert "new.mod.X" in result
@@ -592,11 +486,10 @@ def test_process_syntax_error_then_success(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verify_none_accept(mock_call):
-    # Verify call returns tool_input=None → accept proposed updates.
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+    # Verify call returns tool_input=None → accept proposed update.
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok(None),  # verify returns no tool_input
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok(None),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
@@ -606,33 +499,13 @@ def test_process_verify_none_accept(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_verify_correct(mock_call):
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
-    mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
-    ]
-    result, changed, cross = _process_file_source(
-        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
-    )
-    assert changed is True
-    assert "new.mod.X" in result
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_verify_fail_then_success(mock_call):
+def test_process_verify_rejected_then_accept(mock_call):
     # First verify rejects; second attempt is accepted.
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok(
-            {
-                "correct": False,
-                "issues": [{"function_name": "test_f", "issue": "wrong"}],
-            }
-        ),
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": False, "issue": "wrong path"}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
@@ -641,33 +514,16 @@ def test_process_verify_fail_then_success(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_verify_fail_exhausted(mock_call):
-    # Verify rejects and max_attempts=1 → chunk is skipped.
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+def test_process_verify_rejected_exhausted(mock_call):
+    # Verify rejects and max_attempts=1 → patch string skipped.
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok(
-            {"correct": False, "issues": [{"function_name": "test_f", "issue": "bad"}]}
-        ),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": False, "issue": "bad"}),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert result == _SRC_WITH_PATCH
-    assert changed is False
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_no_actual_change(mock_call):
-    # LLM returns same code as original → updated == source → changed is False.
-    same_code = '@patch("old.mod.X")\ndef test_f(mock_x):\n    pass'
-    mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": same_code}]}),
-        _ok({"correct": True, "issues": []}),
-    ]
-    result, changed, cross = _process_file_source(
-        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
-    )
     assert changed is False
 
 
@@ -691,10 +547,9 @@ def test_rewrite_no_forking_paths():
 @mock_patch(_PATCH_MAKE_CLIENT, return_value=MagicMock())
 @mock_patch(_PATCH_GET_KEY, return_value="fake_key")
 def test_rewrite_per_file_update(mock_key, mock_client, mock_call):
-    new_code = '@patch("pkg.sub_a.A")\ndef test_f(mock_a):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "pkg.sub_a.A"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
     per_file = {"/repo/tests/test_big.py": {"source": src, "msgs": []}}
@@ -723,10 +578,9 @@ def test_rewrite_disk_file_update(mock_key, mock_client, mock_call, tmp_path):
     test_file = tmp_path / "test_big.py"
     src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
     test_file.write_text(src, encoding="utf-8")
-    new_code = '@patch("pkg.sub_a.A")\ndef test_f(mock_a):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "pkg.sub_a.A"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     msgs = list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG))
     assert "pkg.sub_a.A" in test_file.read_text(encoding="utf-8")
@@ -812,18 +666,15 @@ def test_rewrite_acc_tracks_calls_and_files(mock_key, mock_client, mock_call, tm
     test_file = tmp_path / "test_big.py"
     src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
     test_file.write_text(src, encoding="utf-8")
-    new_code = '@patch("pkg.sub_a.A")\ndef test_f(mock_a):\n    pass'
     mock_call.side_effect = [
         LLMCallResult(
-            tool_input={
-                "updates": [{"function_name": "test_f", "updated_code": new_code}]
-            },
+            tool_input={"new_patch_string": "pkg.sub_a.A"},
             elapsed=1.5,
             input_tokens=100,
             output_tokens=50,
         ),
         LLMCallResult(
-            tool_input={"correct": True, "issues": []},
+            tool_input={"correct": True, "issue": ""},
             elapsed=0.5,
             input_tokens=80,
             output_tokens=10,
@@ -845,10 +696,9 @@ def test_rewrite_acc_per_file_files_updated(mock_key, mock_client, mock_call):
     """files_updated is incremented for in-memory per_file changes."""
     src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
     per_file = {"/repo/tests/test_big.py": {"source": src, "msgs": []}}
-    new_code = '@patch("pkg.sub_a.A")\ndef test_f(mock_a):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "pkg.sub_a.A"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     acc = RewriteAccumulator()
     list(apply_patch_rewrite([_make_fl_ctx()], per_file, None, _CFG, _acc=acc))
@@ -858,18 +708,15 @@ def test_rewrite_acc_per_file_files_updated(mock_key, mock_client, mock_call):
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_acc_accumulates(mock_call):
     """_process_file_source accumulates calls, elapsed, and tokens into _acc."""
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
     mock_call.side_effect = [
         LLMCallResult(
-            tool_input={
-                "updates": [{"function_name": "test_f", "updated_code": new_code}]
-            },
+            tool_input={"new_patch_string": "new.mod.X"},
             elapsed=1.2,
             input_tokens=200,
             output_tokens=40,
         ),
         LLMCallResult(
-            tool_input={"correct": True, "issues": []},
+            tool_input={"correct": True, "issue": ""},
             elapsed=0.3,
             input_tokens=150,
             output_tokens=5,
@@ -888,10 +735,9 @@ def test_process_acc_accumulates(mock_call):
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verbose_prints_to_stderr(mock_call, capsys):
     """verbose=True emits per-call messages to stderr."""
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     _process_file_source(
         _SRC_WITH_PATCH,
@@ -905,25 +751,22 @@ def test_process_verbose_prints_to_stderr(mock_call, capsys):
     )
     err = capsys.readouterr().err
     assert "patch_rewriter" in err
-    assert "rewriting" in err
+    assert "evaluating" in err
     assert "verifying" in err
 
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verbose_detailed_timing(mock_call, capsys):
     """timing='detailed' appends elapsed/token info after each call."""
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
     mock_call.side_effect = [
         LLMCallResult(
-            tool_input={
-                "updates": [{"function_name": "test_f", "updated_code": new_code}]
-            },
+            tool_input={"new_patch_string": "new.mod.X"},
             elapsed=1.23,
             input_tokens=100,
             output_tokens=20,
         ),
         LLMCallResult(
-            tool_input={"correct": True, "issues": []},
+            tool_input={"correct": True, "issue": ""},
             elapsed=0.45,
             input_tokens=80,
             output_tokens=5,
@@ -951,13 +794,13 @@ def test_process_verbose_detailed_timing(mock_call, capsys):
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verbose_retry_label(mock_call, capsys):
     """Retry attempts include '(retry)' in the verbose message."""
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
     mock_call.side_effect = [
-        # First attempt: syntax error in updated code.
-        _ok({"updates": [{"function_name": "test_f", "updated_code": "def f(:\n"}]}),
-        # Second attempt: correct code.
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        # First attempt: verify rejects.
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": False, "issue": "bad target"}),
+        # Second attempt: accepted.
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     _process_file_source(
         _SRC_WITH_PATCH,
@@ -976,10 +819,9 @@ def test_process_verbose_retry_label(mock_call, capsys):
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verbose_verify_accepted(mock_call, capsys):
     """verbose=True prints 'ACCEPTED' when verify succeeds."""
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     _process_file_source(
         _SRC_WITH_PATCH,
@@ -996,19 +838,13 @@ def test_process_verbose_verify_accepted(mock_call, capsys):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_verbose_verify_rejected_prints_issues(mock_call, capsys):
-    """verbose=True prints 'REJECTED' and each issue when verify rejects."""
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
+def test_process_verbose_verify_rejected_prints_issue(mock_call, capsys):
+    """verbose=True prints 'REJECTED' and the issue when verify rejects."""
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok(
-            {
-                "correct": False,
-                "issues": [{"function_name": "test_f", "issue": "wrong module path"}],
-            }
-        ),
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": False, "issue": "wrong module path"}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     _process_file_source(
         _SRC_WITH_PATCH,
@@ -1024,6 +860,48 @@ def test_process_verbose_verify_rejected_prints_issues(mock_call, capsys):
     assert "REJECTED" in err
     assert "wrong module path" in err
     assert "ACCEPTED" in err
+
+
+# ---------------------------------------------------------------------------
+# _build_single_patch_prompt
+# ---------------------------------------------------------------------------
+
+
+def _ctx_msg() -> str:
+    return _build_context_message([_make_fl_ctx()])
+
+
+def test_build_single_patch_prompt_no_prev():
+    prompt = _build_single_patch_prompt(_ctx_msg(), "def test_f(): pass", "old.mod.X")
+    assert "old.mod.X" in prompt
+    assert "Previous attempt" not in prompt
+
+
+def test_build_single_patch_prompt_with_prev():
+    prompt = _build_single_patch_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        "old.mod.X",
+        prev_issue="wrong module",
+        prev_proposed="bad.mod.X",
+    )
+    assert "Previous attempt" in prompt
+    assert "wrong module" in prompt
+    assert "bad.mod.X" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _build_single_verify_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_build_single_verify_prompt_basic():
+    prompt = _build_single_verify_prompt(
+        _ctx_msg(), "def test_f(): pass", "old.mod.X", "new.mod.X"
+    )
+    assert "old.mod.X" in prompt
+    assert "new.mod.X" in prompt
+    assert "correct" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1364,62 +1242,6 @@ def test_substitute_attr_non_name_base():
 
 
 # ---------------------------------------------------------------------------
-# _extract_patch_args_from_code
-# ---------------------------------------------------------------------------
-
-
-def test_extract_multiple_patch_decorators():
-    code = '@patch("a.b.C")\n@patch("d.e.F")\ndef test_f(m1, m2): pass\n'
-    result = _extract_patch_args_from_code(code)
-    assert result == ["a.b.C", "d.e.F"]
-
-
-def test_extract_non_patch_not_counted():
-    code = '@other("x")\n@patch("a.b.C")\ndef test_f(m): pass\n'
-    result = _extract_patch_args_from_code(code)
-    assert result == ["a.b.C"]
-
-
-def test_extract_non_call_decorator_skipped():
-    # @staticmethod is a Name, not a Call → continue (line 351).
-    code = "@staticmethod\n@patch('a.b.C')\ndef test_f(m): pass\n"
-    result = _extract_patch_args_from_code(code)
-    assert result == ["a.b.C"]
-
-
-def test_extract_non_simple_string_returns_none():
-    code = "@patch(some_var)\ndef test_f(m): pass\n"
-    result = _extract_patch_args_from_code(code)
-    assert result == [None]
-
-
-def test_extract_no_args_returns_none():
-    code = "@patch()\ndef test_f(m): pass\n"
-    result = _extract_patch_args_from_code(code)
-    assert result == [None]
-
-
-def test_extract_prefixed_string_returns_none():
-    code = '@patch(b"a.b.C")\ndef test_f(m): pass\n'
-    result = _extract_patch_args_from_code(code)
-    assert result == [None]
-
-
-def test_extract_triple_quoted_returns_none():
-    code = '@patch("""a.b.C""")\ndef test_f(m): pass\n'
-    result = _extract_patch_args_from_code(code)
-    assert result == [None]
-
-
-def test_extract_parse_error_returns_empty():
-    assert _extract_patch_args_from_code("def f(:\n") == []
-
-
-def test_extract_no_function_def_returns_empty():
-    assert _extract_patch_args_from_code("x = 1\n") == []
-
-
-# ---------------------------------------------------------------------------
 # _find_test_functions_to_update — constant reference handling
 # ---------------------------------------------------------------------------
 
@@ -1573,18 +1395,15 @@ def test_find_attr_multi_level_not_handled(tmp_path):
 _SRC_WITH_CONST = (
     'TARGET = "old.mod.X"\n\n' "@patch(TARGET)\n" "def test_f(mock_x):\n" "    pass\n"
 )
-_NEW_CODE_CONST = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
 
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_const_same_file_update(mock_call, tmp_path):
-    """Const ref where all agree → const definition updated in same-file source."""
+    """Const ref → apply_patch_strings updates const definition and patch literal."""
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
-        _ok(
-            {"updates": [{"function_name": "test_f", "updated_code": _NEW_CODE_CONST}]}
-        ),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_CONST,
@@ -1596,27 +1415,28 @@ def test_process_const_same_file_update(mock_call, tmp_path):
         scan_file=scan,
     )
     assert changed is True
-    # Function is inlined with new path.
-    assert '"new.mod.X"' in result
-    # Constant definition is also updated.
+    # apply_patch_strings updates all occurrences of "old.mod.X" → "new.mod.X".
     assert '"new.mod.X"' in result
     assert '"old.mod.X"' not in result
-    # No cross-file updates.
+    # No cross-file updates for same-file const.
     assert cross == {}
 
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_const_cross_file_update(mock_call, tmp_path):
-    """Const ref from imported file → cross_file_patch_maps returned."""
+    """Const ref from imported file → cross_file_patch_maps returned.
+
+    The scan file itself has no string literal for 'old.mod.X' (only a NAME
+    reference via @patch(TARGET)), so changed may be False while cross still
+    records the update needed in helpers.py.
+    """
     helpers = tmp_path / "helpers.py"
     helpers.write_text('TARGET = "old.mod.X"\n', encoding="utf-8")
     src = "from .helpers import TARGET\n\n@patch(TARGET)\ndef test_f(mock):\n    pass\n"
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
-        _ok(
-            {"updates": [{"function_name": "test_f", "updated_code": _NEW_CODE_CONST}]}
-        ),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     result, changed, cross = _process_file_source(
         src,
@@ -1628,93 +1448,15 @@ def test_process_const_cross_file_update(mock_call, tmp_path):
         scan_file=scan,
         repo_root=str(tmp_path),
     )
-    assert changed is True
     helpers_abs = str(helpers.resolve())
     assert helpers_abs in cross
     assert cross[helpers_abs] == {"old.mod.X": "new.mod.X"}
 
 
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_const_diverge_no_const_update(mock_call, tmp_path):
-    """Two functions with same const but different new values → const not updated."""
-    src = (
-        'TARGET = "old.mod.X"\n\n'
-        "@patch(TARGET)\ndef test_a(m):\n    pass\n\n"
-        "@patch(TARGET)\ndef test_b(m):\n    pass\n"
-    )
+@mock_patch(_PATCH_CALL_TOOL, return_value=_ok({"new_patch_string": "old.mod.X"}))
+def test_process_const_no_change_no_cross(mock_call, tmp_path):
+    """LLM returns same path → no change, cross is empty."""
     scan = str(tmp_path / "test_foo.py")
-    code_a = '@patch("new.mod.A")\ndef test_a(m):\n    pass'
-    code_b = '@patch("new.mod.B")\ndef test_b(m):\n    pass'
-    mock_call.side_effect = [
-        _ok(
-            {
-                "updates": [
-                    {"function_name": "test_a", "updated_code": code_a},
-                    {"function_name": "test_b", "updated_code": code_b},
-                ]
-            }
-        ),
-        _ok({"correct": True, "issues": []}),
-    ]
-    result, changed, cross = _process_file_source(
-        src,
-        {"old.mod.X"},
-        "ctx",
-        MagicMock(),
-        _CFG,
-        1,
-        scan_file=scan,
-    )
-    assert changed is True
-    # Both functions inlined with their individual new values.
-    assert '"new.mod.A"' in result
-    assert '"new.mod.B"' in result
-    # Constant definition NOT updated (still old value) because proposals diverged.
-    assert '"old.mod.X"' in result
-    assert cross == {}
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_const_ref_not_in_all_updates(mock_call, tmp_path):
-    """LLM updates a literal-patch func but not the const-ref func → line 756."""
-    # test_a has @patch(TARGET) (const_ref); test_b has @patch("old.mod.X") (literal).
-    # LLM only returns an update for test_b → test_a is in functions but not
-    # in all_updates → the `if updated_code is None: continue` branch is hit.
-    src = (
-        'TARGET = "old.mod.X"\n\n'
-        "@patch(TARGET)\ndef test_a(m):\n    pass\n\n"
-        '@patch("old.mod.X")\ndef test_b(m):\n    pass\n'
-    )
-    scan = str(tmp_path / "test_foo.py")
-    code_b = '@patch("new.mod.X")\ndef test_b(m):\n    pass'
-    mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_b", "updated_code": code_b}]}),
-        _ok({"correct": True, "issues": []}),
-    ]
-    result, changed, cross = _process_file_source(
-        src,
-        {"old.mod.X"},
-        "ctx",
-        MagicMock(),
-        _CFG,
-        1,
-        scan_file=scan,
-    )
-    # test_b updated; test_a not in all_updates → const def not changed.
-    assert '"new.mod.X"' in result
-    assert cross == {}
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_const_no_llm_update_for_func(mock_call, tmp_path):
-    """LLM doesn't update the function with a const ref → no const update."""
-    scan = str(tmp_path / "test_foo.py")
-    mock_call.side_effect = [
-        _ok({"updates": []}),  # LLM returns no updates
-        # No verify call since proposed is empty → LLM invokes tool with empty updates
-        # Actually with no updates, proposed={} → no invalid → verify is called
-        _ok({"correct": True, "issues": []}),
-    ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_CONST,
         {"old.mod.X"},
@@ -1729,71 +1471,66 @@ def test_process_const_no_llm_update_for_func(mock_call, tmp_path):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_const_new_equals_old_no_update(mock_call, tmp_path):
-    """LLM returns same path as old → no_change detected, const not updated."""
-    scan = str(tmp_path / "test_foo.py")
-    same_code = '@patch("old.mod.X")\ndef test_f(mock_x):\n    pass'
+def test_process_duplicate_old_path_uses_first_func(mock_call):
+    """Two functions share the same old_patch_path → only one LLM call is made.
+
+    Covers the 'False' branch of `if old_path not in unique_patches`.
+    """
+    src = (
+        '@patch("old.mod.X")\ndef test_a(m):\n    pass\n\n'
+        '@patch("old.mod.X")\ndef test_b(m):\n    pass\n'
+    )
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": same_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     result, changed, cross = _process_file_source(
-        _SRC_WITH_CONST,
-        {"old.mod.X"},
-        "ctx",
-        MagicMock(),
-        _CFG,
-        1,
-        scan_file=scan,
+        src, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
-    # All updates still applied (function still gets the "same" replacement),
-    # but since new_val == old_val the const definition update is skipped.
-    assert cross == {}
+    assert changed is True
+    assert "new.mod.X" in result
+    # Only 2 LLM calls for a single unique patch string (rewrite + verify).
+    assert mock_call.call_count == 2
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_const_patch_dec_idx_out_of_range(mock_call, tmp_path):
-    """LLM drops a decorator → patch_dec_idx out of range → const ref skipped."""
+def test_process_cross_file_const_ref_not_in_patch_map(mock_call, tmp_path):
+    """Cross-file const whose patch path is not in patch_map → line 857 continue.
+
+    Scenario: function has two @patch decorators with different old paths. One
+    is a cross-file const ref (path A) and the other is a literal (path B).
+    LLM changes path B but leaves path A unchanged (no entry in patch_map for A).
+    The const ref for A should be skipped (line 857).
+    """
+    helpers = tmp_path / "helpers.py"
+    helpers.write_text('TARGET_A = "old.mod.A"\n', encoding="utf-8")
+    src = (
+        "from .helpers import TARGET_A\n\n"
+        '@patch(TARGET_A)\n@patch("old.mod.B")\n'
+        "def test_f(m1, m2):\n    pass\n"
+    )
     scan = str(tmp_path / "test_foo.py")
-    # The const is at patch_dec_idx=0; LLM returns code with NO patch decorators.
-    no_dec_code = "def test_f(mock_x):\n    pass"
+    # LLM: old.mod.A → no change (returns same), old.mod.B → new.mod.B.
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": no_dec_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "old.mod.A"}),  # no change for A
+        _ok({"new_patch_string": "new.mod.B"}),  # change for B
+        _ok({"correct": True, "issue": ""}),  # verify for B
     ]
     result, changed, cross = _process_file_source(
-        _SRC_WITH_CONST,
-        {"old.mod.X"},
+        src,
+        {"old.mod.A", "old.mod.B"},
         "ctx",
         MagicMock(),
         _CFG,
         1,
         scan_file=scan,
+        repo_root=str(tmp_path),
     )
-    # Function update applied (no decorator code), const def not updated.
-    assert cross == {}
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_const_arg_none_skipped(mock_call, tmp_path):
-    """LLM returns a non-literal (None from _extract) → const ref skipped."""
-    scan = str(tmp_path / "test_foo.py")
-    # LLM returns @patch(some_var) — still a Name, not SimpleString.
-    name_arg_code = "@patch(some_var)\ndef test_f(mock_x):\n    pass"
-    mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": name_arg_code}]}),
-        _ok({"correct": True, "issues": []}),
-    ]
-    result, changed, cross = _process_file_source(
-        _SRC_WITH_CONST,
-        {"old.mod.X"},
-        "ctx",
-        MagicMock(),
-        _CFG,
-        1,
-        scan_file=scan,
-    )
-    assert cross == {}
+    assert changed is True
+    assert "new.mod.B" in result
+    # old.mod.A is not in patch_map → no cross-file update for helpers.py.
+    helpers_abs = str(helpers.resolve())
+    assert helpers_abs not in cross
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -1812,8 +1549,8 @@ def test_process_no_scan_file_no_const_processing(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_attr_const_same_file_update(mock_call, tmp_path):
-    """@patch(constants.TARGET) resolved via import → inlined, cross-file proposal."""
+def test_process_attr_const_cross_file_update(mock_call, tmp_path):
+    """@patch(constants.TARGET) resolved via import → cross-file proposal returned."""
     constants_file = tmp_path / "constants.py"
     constants_file.write_text('TARGET = "old.mod.X"\n', encoding="utf-8")
     src = (
@@ -1823,10 +1560,9 @@ def test_process_attr_const_same_file_update(mock_call, tmp_path):
         "    pass\n"
     )
     scan = str(tmp_path / "test_foo.py")
-    new_code = '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "new.mod.X"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     result, changed, cross = _process_file_source(
         src,
@@ -1838,8 +1574,6 @@ def test_process_attr_const_same_file_update(mock_call, tmp_path):
         scan_file=scan,
         repo_root=str(tmp_path),
     )
-    assert changed is True
-    assert '"new.mod.X"' in result
     # Cross-file proposal recorded for constants.py.
     constants_abs = str(constants_file.resolve())
     assert constants_abs in cross
@@ -1948,10 +1682,9 @@ def test_rewrite_cross_file_const_per_file(mock_key, mock_client, mock_call, tmp
         str(tmp_path / "test_foo.py"): {"source": test_src, "msgs": []},
         str(helpers): helpers_state,
     }
-    new_code = '@patch("pkg.sub_a.A")\ndef test_f(m):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "pkg.sub_a.A"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     list(apply_patch_rewrite([_make_fl_ctx()], per_file, None, _CFG))
     # The constant definition in helpers.py (per_file entry) should be updated.
@@ -1970,10 +1703,9 @@ def test_rewrite_cross_file_const_disk(mock_key, mock_client, mock_call, tmp_pat
     )
     test_file = tmp_path / "test_foo.py"
     test_file.write_text(test_src, encoding="utf-8")
-    new_code = '@patch("pkg.sub_a.A")\ndef test_f(m):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "pkg.sub_a.A"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG))
     # The constant definition on disk should be updated.
@@ -1998,10 +1730,9 @@ def test_rewrite_cross_file_const_per_file_acc(
         str(tmp_path / "test_foo.py"): {"source": test_src, "msgs": []},
         str(helpers): helpers_state,
     }
-    new_code = '@patch("pkg.sub_a.A")\ndef test_f(m):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "pkg.sub_a.A"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     acc = RewriteAccumulator()
     list(apply_patch_rewrite([_make_fl_ctx()], per_file, None, _CFG, _acc=acc))
@@ -2022,10 +1753,9 @@ def test_rewrite_cross_file_const_disk_acc(mock_key, mock_client, mock_call, tmp
     )
     test_file = tmp_path / "test_foo.py"
     test_file.write_text(test_src, encoding="utf-8")
-    new_code = '@patch("pkg.sub_a.A")\ndef test_f(m):\n    pass'
     mock_call.side_effect = [
-        _ok({"updates": [{"function_name": "test_f", "updated_code": new_code}]}),
-        _ok({"correct": True, "issues": []}),
+        _ok({"new_patch_string": "pkg.sub_a.A"}),
+        _ok({"correct": True, "issue": ""}),
     ]
     acc = RewriteAccumulator()
     list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG, _acc=acc))
