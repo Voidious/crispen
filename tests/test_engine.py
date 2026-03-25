@@ -19,6 +19,7 @@ from crispen.engine import (
     _categorize_into_stats,
     _collect_code_referenced_names,
     _collect_imported_names,
+    _collect_top_level_names,
     _compute_qname,
     _file_to_module,
     _find_outside_callers,
@@ -2438,6 +2439,52 @@ def test_file_limiter_recursive_llm_timing_recorded_in_stats(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _collect_top_level_names
+# ---------------------------------------------------------------------------
+
+
+def test_collect_top_level_names_various():
+    """Covers functions, classes, assignments, aug/ann assigns, imports, from-imports,
+    non-Name aug-assign targets, and unrecognised statement types."""
+    source = (
+        "import os\n"
+        "import libcst as cst\n"
+        "from pathlib import Path\n"
+        "from typing import List as L\n"
+        "from os import *\n"  # star import skipped
+        "_CONST = 42\n"
+        "x: int = 1\n"
+        "counter += 1\n"
+        "a, b = 1, 2\n"  # tuple target → ast.Tuple, not ast.Name
+        "some_obj.attr += 1\n"  # AugAssign with Attribute target → skipped
+        "if True: pass\n"  # ast.If → matches no elif, skipped
+        "def my_func(): pass\n"
+        "class MyClass: pass\n"
+        "async def async_func(): pass\n"
+    )
+    result = _collect_top_level_names(source)
+    assert "os" in result
+    assert "cst" in result
+    assert "Path" in result
+    assert "L" in result
+    assert "_CONST" in result
+    assert "x" in result
+    assert "counter" in result
+    assert "my_func" in result
+    assert "MyClass" in result
+    assert "async_func" in result
+    # Tuple-unpacking targets (a, b = …) are ast.Tuple, not ast.Name → skipped
+    assert "a" not in result
+    assert "b" not in result
+    # Attribute aug-assign (some_obj.attr += 1) → target is Attribute, skipped
+    assert "some_obj" not in result
+
+
+def test_collect_top_level_names_syntax_error():
+    """Invalid Python source → empty set."""
+    assert _collect_top_level_names("def broken(:") == set()
+
+
 # _collect_imported_names
 # ---------------------------------------------------------------------------
 
@@ -3184,8 +3231,84 @@ def test_add_fl_context_no_forking(tmp_path):
     )
     filepath = str(tmp_path / "mypkg" / "big.py")
     # Entity already covered by combined_patch_map → forking_old_paths is empty.
+    # No _block_N entities → nothing appended.
     _add_fl_context(fl_list, filepath, "", fl_result, {"mypkg.big.X": "mypkg.a.X"})
     assert fl_list == []
+
+
+def test_add_fl_context_block_entity_uses_specific_names(tmp_path):
+    """When a _block_N entity was moved and all named entities are mapped,
+    the block-internal names (vars, imports) from the target file are used as
+    specific scan keys — NOT the broad module path — so already-updated strings
+    like ``old_module.sub.run_engine`` are not re-sent to the LLM."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    fl_result = FileLimiterResult(
+        original_source="modified\n",
+        new_files={
+            "core.py": "_REFACTORS = []\nimport libcst as cst\n\ndef X(): pass\n"
+        },
+        abort=False,
+        entity_to_target={"_block_1": "core.py", "X": "core.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    # Both entities are in the patch map → forking_old_paths would be empty.
+    # _block_1 is a TOP_LEVEL block → scan core.py for block-internal names.
+    # X is in entity_to_target so it's excluded; _REFACTORS and cst are not.
+    combined = {
+        "mypkg.big._block_1": "mypkg.core._block_1",
+        "mypkg.big.X": "mypkg.core.X",
+    }
+    _add_fl_context(fl_list, filepath, "original\n", fl_result, combined)
+    assert len(fl_list) == 1
+    # Only _REFACTORS and cst are block-internal; X is excluded (named entity).
+    assert fl_list[0].forking_old_paths == {"mypkg.big._REFACTORS", "mypkg.big.cst"}
+    assert fl_list[0].old_module == "mypkg.big"
+
+
+def test_add_fl_context_block_entity_no_new_names(tmp_path):
+    """When a _block_N entity was moved but the target file contains no names
+    beyond those already in entity_to_target, nothing is appended."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    fl_result = FileLimiterResult(
+        original_source="modified\n",
+        # core.py only defines X, which is already in entity_to_target.
+        new_files={"core.py": "def X(): pass\n"},
+        abort=False,
+        entity_to_target={"_block_1": "core.py", "X": "core.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    combined = {
+        "mypkg.big._block_1": "mypkg.core._block_1",
+        "mypkg.big.X": "mypkg.core.X",
+    }
+    _add_fl_context(fl_list, filepath, "original\n", fl_result, combined)
+    assert fl_list == []
+
+
+def test_add_fl_context_forking_and_block_combined(tmp_path):
+    """Forking entities AND block-internal names are both added to forking_old_paths."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    fl_result = FileLimiterResult(
+        original_source="modified\n",
+        new_files={"core.py": "_TIMEOUT = 30\ndef Y(): pass\n"},
+        abort=False,
+        # Y is forking (not in combined_patch_map); _block_1 moved with _TIMEOUT inside.
+        entity_to_target={"_block_1": "core.py", "Y": "core.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    # Only _block_1 is in combined_patch_map; Y is not (forking).
+    combined = {"mypkg.big._block_1": "mypkg.core._block_1"}
+    _add_fl_context(fl_list, filepath, "original\n", fl_result, combined)
+    assert len(fl_list) == 1
+    # Y is a forking entity; _TIMEOUT is block-internal; Y in new file is excluded
+    # (it's in all_entity_names).
+    assert fl_list[0].forking_old_paths == {"mypkg.big.Y", "mypkg.big._TIMEOUT"}
 
 
 def test_add_fl_context_normal(tmp_path):

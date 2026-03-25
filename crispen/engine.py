@@ -111,6 +111,37 @@ def _blocked_private_scopes(source: str, ranges: List[Tuple[int, int]]) -> Set[s
 _PROJECT_MARKERS = frozenset({"pyproject.toml", "setup.py", "setup.cfg", ".git"})
 
 
+def _collect_top_level_names(source: str) -> Set[str]:
+    """Return all names defined or imported at the module top level of *source*.
+
+    Covers functions, classes, module-level variable assignments, and all
+    import styles.  Returns an empty set when *source* cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name.split(".")[-1])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname if alias.asname else alias.name)
+    return names
+
+
 def _collect_imported_names(source: str) -> Set[str]:
     """Return names imported at the top level of *source*.
 
@@ -391,6 +422,14 @@ def _add_fl_context(
     mode skipped because they appeared in multiple callers) and builds the
     new module path map for all sub-files.  Does nothing when no forking
     entities exist or when the module path cannot be determined.
+
+    When no forking entities exist but TOP_LEVEL blocks (_block_N) were
+    moved, also scans the new target files to find names that came from
+    those blocks (module-level vars, constants, imported aliases) but are
+    not individually tracked in entity_to_target.  Each such name is added
+    as a specific old path (``old_module.name``) so the LLM can find any
+    ``with patch(old_module.name)`` calls without matching already-updated
+    paths like ``old_module.sub.name`` that basic mode already rewrote.
     """
     old_mod = _module_path_for_file(filepath)
     if old_mod is None:
@@ -400,6 +439,19 @@ def _add_fl_context(
         for name in fl_result.entity_to_target
         if f"{old_mod}.{name}" not in combined_patch_map
     }
+    # Also collect names from moved _block_N entities that are NOT individually
+    # tracked (i.e., not in entity_to_target).  These are block-internal names
+    # (vars, constants, imported aliases) that basic mode never maps, regardless
+    # of whether forking entities were also found above.
+    all_entity_names = set(fl_result.entity_to_target)
+    for entity_name, target_rel in fl_result.entity_to_target.items():
+        if not entity_name.startswith("_block_"):
+            continue
+        new_src = fl_result.new_files.get(target_rel, "")
+        for name in _collect_top_level_names(new_src):
+            old_path = f"{old_mod}.{name}"
+            if name not in all_entity_names and old_path not in combined_patch_map:
+                forking_old_paths.add(old_path)
     if not forking_old_paths:
         return
     orig_dir = Path(filepath).parent
