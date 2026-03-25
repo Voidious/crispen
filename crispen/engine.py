@@ -142,6 +142,29 @@ def _collect_top_level_names(source: str) -> Set[str]:
     return names
 
 
+def _collect_assignment_names(source: str) -> Set[str]:
+    """Return names from top-level variable assignments in *source*.
+
+    Covers ``X = …``, ``X: T = …``, and ``X += …`` where the target is a
+    plain ``ast.Name``.  Functions, classes, and imports are excluded (they
+    are handled elsewhere).  Returns an empty set on parse failure.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+    return names
+
+
 def _collect_imported_names(source: str) -> Set[str]:
     """Return names imported at the top level of *source*.
 
@@ -351,8 +374,6 @@ def _build_patch_map(
     Returns an empty dict when the module path cannot be determined or when no
     entities were moved.
     """
-    if not fl_result.entity_to_target:
-        return {}
     old_module = _module_path_for_file(filepath)
     if old_module is None:
         return {}
@@ -405,6 +426,42 @@ def _build_patch_map(
         if new_module is None:
             continue
         patch_map[f"{old_module}.{alias_name}"] = f"{new_module}.{alias_name}"
+
+    # Variable assignments: names assigned at the module level that were present
+    # in the original file and are not already tracked as entities or import
+    # aliases.  Uses the same caller logic as named entities: 0 callers → only
+    # used in its defining file; 1 caller → migrated and consumed by exactly one
+    # other file; 2+ → forking.  Only names from the original file are considered
+    # to avoid spurious entries for helper variables introduced by code generation.
+    # Names defined in multiple new files are skipped (ambiguous origin).
+    orig_assignments = _collect_assignment_names(pre_split_source)
+    def_index: Dict[str, List[str]] = {}
+    for rel_path, src in fl_result.new_files.items():
+        if not src:
+            continue
+        for name in _collect_assignment_names(src):
+            if name in orig_assignments and name not in fl_result.entity_to_target:
+                def_index.setdefault(name, []).append(rel_path)
+
+    for assign_name, def_rel_targets in def_index.items():
+        if len(def_rel_targets) != 1:
+            continue  # defined in multiple files → ambiguous
+        old_path = f"{old_module}.{assign_name}"
+        if old_path in patch_map:
+            continue  # already handled by entity or import-alias section
+        def_rel_target = def_rel_targets[0]
+        callers = [
+            p
+            for p in import_index.get(assign_name, [])
+            if p != def_rel_target and p in usage_index.get(assign_name, set())
+        ]
+        if len(callers) > 1:
+            continue  # forking: multiple consumers, skip
+        target_rel = callers[0] if callers else def_rel_target
+        new_module = _module_path_for_file(str(original_dir / target_rel))
+        if new_module is None:
+            continue
+        patch_map[old_path] = f"{new_module}.{assign_name}"
 
     return patch_map
 

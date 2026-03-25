@@ -17,6 +17,7 @@ from crispen.engine import (
     _build_alias_map,
     _build_patch_map,
     _categorize_into_stats,
+    _collect_assignment_names,
     _collect_code_referenced_names,
     _collect_imported_names,
     _collect_top_level_names,
@@ -2509,6 +2510,31 @@ def test_collect_imported_names_syntax_error():
 
 
 # ---------------------------------------------------------------------------
+# _collect_assignment_names
+# ---------------------------------------------------------------------------
+
+
+def test_collect_assignment_names_basic():
+    """Covers plain assignment, annotated assignment, augmented assignment."""
+    source = (
+        "_CONST = 42\n"
+        "x: int = 1\n"
+        "counter += 1\n"
+        "a, b = 1, 2\n"  # tuple target → skipped
+        "obj.attr += 1\n"  # attribute aug-assign → skipped
+        "def my_func(): pass\n"  # function → skipped
+        "import os\n"  # import → skipped
+    )
+    result = _collect_assignment_names(source)
+    assert result == {"_CONST", "x", "counter"}
+
+
+def test_collect_assignment_names_syntax_error():
+    """Invalid Python source → empty set."""
+    assert _collect_assignment_names("def broken(:") == set()
+
+
+# ---------------------------------------------------------------------------
 # _collect_code_referenced_names
 # ---------------------------------------------------------------------------
 
@@ -2840,6 +2866,147 @@ def test_build_patch_map_import_alias_reexport_stub_skipped(tmp_path):
     result = _build_patch_map(str(f), fl_result, pkg, pre_split)
     # __init__.py imports Helper but has no Load usage → 0 real importers → skipped
     assert "mypkg.module.Helper" not in result
+
+
+# ---------------------------------------------------------------------------
+# _build_patch_map — variable assignment section
+# ---------------------------------------------------------------------------
+
+
+def test_build_patch_map_assignment_no_callers(tmp_path):
+    """Module-level variable in original file, only used in its defining new file."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    pre_split = "_TIMEOUT = 30\ndef run(): pass\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "core.py": "_TIMEOUT = 30\ndef run(): pass\n",
+        },
+        abort=False,
+        entity_to_target={"run": "core.py"},
+    )
+    result = _build_patch_map(str(pkg / "big.py"), fl_result, pkg, pre_split)
+    # 0 callers → _TIMEOUT stays in its definer core.py
+    assert result["mypkg.big._TIMEOUT"] == "mypkg.core._TIMEOUT"
+
+
+def test_build_patch_map_assignment_single_caller(tmp_path):
+    """Variable defined in one new file, imported and used by exactly one other."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    pre_split = "_TIMEOUT = 30\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "core.py": "_TIMEOUT = 30\n",
+            "runner.py": "from .core import _TIMEOUT\nif _TIMEOUT > 0: pass\n",
+        },
+        abort=False,
+        entity_to_target={},
+    )
+    result = _build_patch_map(str(pkg / "big.py"), fl_result, pkg, pre_split)
+    # runner.py imports and uses _TIMEOUT → single caller
+    assert result["mypkg.big._TIMEOUT"] == "mypkg.runner._TIMEOUT"
+
+
+def test_build_patch_map_assignment_forking_skipped(tmp_path):
+    """Variable imported and used by two new files → forking → skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    pre_split = "_TIMEOUT = 30\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "core.py": "_TIMEOUT = 30\n",
+            "a.py": "from .core import _TIMEOUT\nif _TIMEOUT: pass\n",
+            "b.py": "from .core import _TIMEOUT\nif _TIMEOUT: pass\n",
+        },
+        abort=False,
+        entity_to_target={},
+    )
+    result = _build_patch_map(str(pkg / "big.py"), fl_result, pkg, pre_split)
+    assert "mypkg.big._TIMEOUT" not in result
+
+
+def test_build_patch_map_assignment_defined_in_multiple_files_skipped(tmp_path):
+    """Variable appearing in two new files' assignments → ambiguous → skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    pre_split = "_TIMEOUT = 30\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={
+            "core.py": "_TIMEOUT = 30\n",
+            "utils.py": "_TIMEOUT = 60\n",
+        },
+        abort=False,
+        entity_to_target={},
+    )
+    result = _build_patch_map(str(pkg / "big.py"), fl_result, pkg, pre_split)
+    assert "mypkg.big._TIMEOUT" not in result
+
+
+def test_build_patch_map_assignment_not_in_original_skipped(tmp_path):
+    """Variable introduced by code generation (not in pre_split_source) → skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    pre_split = "def run(): pass\n"  # _TIMEOUT not in original
+    fl_result = FileLimiterResult(
+        original_source="",
+        new_files={"core.py": "_TIMEOUT = 30\ndef run(): pass\n"},
+        abort=False,
+        entity_to_target={"run": "core.py"},
+    )
+    result = _build_patch_map(str(pkg / "big.py"), fl_result, pkg, pre_split)
+    assert "mypkg.big._TIMEOUT" not in result
+
+
+def test_build_patch_map_assignment_already_in_patch_map_skipped(tmp_path):
+    """Variable in patch_map from import-alias section → assignment section skips it."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    # pre_split both imports and assigns _TIMEOUT → import-alias section maps it first.
+    pre_split = "from ext import _TIMEOUT\n_TIMEOUT = 30\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        # core.py imports, assigns, and uses _TIMEOUT: alias + assignment.
+        new_files={
+            "core.py": (
+                "from ext import _TIMEOUT\n_TIMEOUT = 30\nif _TIMEOUT > 0: pass\n"
+            )
+        },
+        abort=False,
+        entity_to_target={},
+    )
+    result = _build_patch_map(str(pkg / "big.py"), fl_result, pkg, pre_split)
+    # Import-alias section mapped it; assignment section hits old_path in patch_map.
+    assert result["mypkg.big._TIMEOUT"] == "mypkg.core._TIMEOUT"
+    # Verify mapped exactly once (assignment section did NOT add a duplicate).
+    assert list(result.values()).count("mypkg.core._TIMEOUT") == 1
+
+
+def test_build_patch_map_assignment_new_module_none_skipped(tmp_path):
+    """When _module_path_for_file returns None for the target, entry is skipped."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    pre_split = "_TIMEOUT = 30\n"
+    fl_result = FileLimiterResult(
+        original_source="",
+        # Target path cannot be resolved to a module (no pyproject.toml ancestor).
+        new_files={"/unresolvable/abs/path.py": "_TIMEOUT = 30\n"},
+        abort=False,
+        entity_to_target={},
+    )
+    result = _build_patch_map(str(pkg / "big.py"), fl_result, pkg, pre_split)
+    assert "mypkg.big._TIMEOUT" not in result
 
 
 # ---------------------------------------------------------------------------
