@@ -19,6 +19,7 @@ from crispen.patch_rewriter import (
     _build_func_verify_prompt,
     _build_local_const_map,
     _build_rewrite_func_prompt,
+    _build_rewrite_verify_prompt,
     _compiles,
     _find_test_functions_to_update,
     _find_with_patch_paths_in_body,
@@ -72,6 +73,8 @@ _CLASSIFY_NO_CHANGE = {"needs_rewrite": False, "patch_renames": {}}
 _CLASSIFY_REWRITE = {"needs_rewrite": True}
 _VERIFY_OK = {"correct": True, "issue": ""}
 _VERIFY_REJECT = {"correct": False, "issue": "wrong path"}
+_REWRITE_VERIFY_OK = {"correct": True, "issue": ""}
+_REWRITE_VERIFY_REJECT = {"correct": False, "issue": "wrong mock setup"}
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +564,23 @@ def test_build_rewrite_func_prompt_with_error():
 
 
 # ---------------------------------------------------------------------------
+# _build_rewrite_verify_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_build_rewrite_verify_prompt_basic():
+    prompt = _build_rewrite_verify_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass\n',
+    )
+    assert "Original test function" in prompt
+    assert "Rewritten test function" in prompt
+    assert "new.mod.X" in prompt
+    assert "correct" in prompt
+
+
+# ---------------------------------------------------------------------------
 # _process_file_source — basic flow
 # ---------------------------------------------------------------------------
 
@@ -726,6 +746,7 @@ def test_process_needs_rewrite_success(mock_call):
     mock_call.side_effect = [
         _ok(_CLASSIFY_REWRITE),
         _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
@@ -782,6 +803,7 @@ def test_process_needs_rewrite_compile_error_retry(mock_call):
         _ok(_CLASSIFY_REWRITE),
         _ok({"rewritten_function": "def f(:\n    pass\n"}),  # invalid
         _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
@@ -801,6 +823,52 @@ def test_process_needs_rewrite_compile_error_exhausted(mock_call):
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
     )
+    assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_verify_none_accept(mock_call):
+    # Verify returns tool_input=None → accept the rewrite.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(None),  # verify returns None → accept
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is True
+    assert "new.mod.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_verify_rejected_then_accept(mock_call):
+    # Verify rejects first rewrite; second rewrite+verify is accepted.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_REJECT),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_verify_rejected_exhausted(mock_call):
+    # Verify rejects and max_attempts=1 → no update.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_REJECT),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert result == _SRC_WITH_PATCH
     assert changed is False
 
 
@@ -892,7 +960,7 @@ def test_process_acc_accumulates(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_acc_rewrite_accumulates(mock_call):
-    """Full rewrite path accumulates both classify and rewrite calls."""
+    """Full rewrite path accumulates classify, rewrite, and verify calls."""
     mock_call.side_effect = [
         LLMCallResult(
             tool_input=_CLASSIFY_REWRITE,
@@ -906,13 +974,19 @@ def test_process_acc_rewrite_accumulates(mock_call):
             input_tokens=300,
             output_tokens=60,
         ),
+        LLMCallResult(
+            tool_input=_REWRITE_VERIFY_OK,
+            elapsed=0.2,
+            input_tokens=80,
+            output_tokens=5,
+        ),
     ]
     acc = RewriteAccumulator()
     _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1, _acc=acc
     )
-    assert acc.calls == 2
-    assert abs(acc.elapsed - 2.0) < 1e-9
+    assert acc.calls == 3
+    assert abs(acc.elapsed - 2.2) < 1e-9
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -1045,10 +1119,11 @@ def test_process_verbose_verify_rejected_prints_issue(mock_call, capsys):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verbose_rewrite_path(mock_call, capsys):
-    """verbose=True prints 'rewriting' and 'rewrote' for full rewrite path."""
+    """verbose=True prints 'rewriting', 'verifying rewrite', and 'rewrote'."""
     mock_call.side_effect = [
         _ok(_CLASSIFY_REWRITE),
         _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
     ]
     _process_file_source(
         _SRC_WITH_PATCH,
@@ -1062,7 +1137,34 @@ def test_process_verbose_rewrite_path(mock_call, capsys):
     )
     err = capsys.readouterr().err
     assert "rewriting" in err
+    assert "verifying rewrite" in err
     assert "rewrote" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_rewrite_verify_rejected(mock_call, capsys):
+    """verbose=True prints 'REJECTED' and issue when rewrite verify fails."""
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_REJECT),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        2,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "REJECTED" in err
+    assert "wrong mock setup" in err
+    assert "ACCEPTED" in err
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -1072,6 +1174,7 @@ def test_process_verbose_rewrite_compile_retry(mock_call, capsys):
         _ok(_CLASSIFY_REWRITE),
         _ok({"rewritten_function": "def f(:\n    pass\n"}),  # invalid
         _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
     ]
     cfg = CrispenConfig(patch_update_retries=1, timing="detailed")
     _process_file_source(

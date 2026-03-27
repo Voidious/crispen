@@ -169,6 +169,35 @@ _PATCH_REWRITE_FUNC_TOOL: dict = {
     },
 }
 
+_PATCH_REWRITE_VERIFY_TOOL: dict = {
+    "name": "verify_rewrite",
+    "description": (
+        "Verify whether a rewritten test function is correct after a source "
+        "file was split into sub-modules."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "correct": {
+                "type": "boolean",
+                "description": (
+                    "True if the rewritten function correctly updates all @patch "
+                    "strings, the mock parameters match their decorators, and all "
+                    "original test logic is preserved without hallucinated code."
+                ),
+            },
+            "issue": {
+                "type": "string",
+                "description": (
+                    "What is wrong with the rewritten function. "
+                    "Empty string when correct."
+                ),
+            },
+        },
+        "required": ["correct", "issue"],
+    },
+}
+
 _PATCH_SINGLE_VERIFY_TOOL: dict = {
     "name": "verify_patch_update",
     "description": (
@@ -768,6 +797,28 @@ def _build_rewrite_func_prompt(
     return "".join(parts)
 
 
+def _build_rewrite_verify_prompt(
+    context_msg: str,
+    original_function_text: str,
+    rewritten_function_text: str,
+) -> str:
+    """Build the user prompt for a full-rewrite verify LLM call."""
+    parts = [
+        context_msg,
+        _PATCH_RULES,
+        f"\n## Original test function:\n```python\n{original_function_text}\n```\n\n"
+        f"## Rewritten test function:\n```python\n{rewritten_function_text}\n```\n\n"
+        "Verify that the rewrite is correct:\n"
+        "- All @patch strings point to where the name is looked up after the split.\n"
+        "- All mock parameters correspond correctly to their @patch decorators "
+        "(order, count, and names).\n"
+        "- All original test logic is preserved — no hallucinated code, no "
+        "missing assertions or setup.\n"
+        "Set `correct` to True only if all of the above are satisfied.\n",
+    ]
+    return "".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Function splice helper
 # ---------------------------------------------------------------------------
@@ -927,14 +978,74 @@ def _process_file_source(
                     if not _compiles(new_func_text):
                         prev_error = "Rewritten function is not valid Python."
                         continue
-                    func_splices.append((func.start_line, func.end_line, new_func_text))
+                    # LLM verify step.
+                    rewrite_verify_prompt = _build_rewrite_verify_prompt(
+                        context_msg, func.full_text, new_func_text
+                    )
                     if verbose:
                         print(
-                            f"crispen: patch_rewriter: rewrote '{func.function_name}'",
+                            f"crispen: patch_rewriter: verifying rewrite for"
+                            f" '{func.function_name}' in {file_desc}",
                             file=sys.stderr,
                             flush=True,
                         )
-                    break
+                    rv = call_with_tool(
+                        client,
+                        config.provider,
+                        config.model,
+                        256,
+                        _PATCH_REWRITE_VERIFY_TOOL,
+                        "verify_rewrite",
+                        [{"role": "user", "content": rewrite_verify_prompt}],
+                        caller="patch_rewriter",
+                        tool_choice_override=config.tool_choice,
+                    )
+                    if _acc is not None:
+                        _acc.calls += 1
+                        _acc.elapsed += rv.elapsed
+                        _acc.input_tokens += rv.input_tokens
+                        _acc.output_tokens += rv.output_tokens
+                    if verbose and config.timing == "detailed":
+                        print(
+                            f"crispen: patch_rewriter:   → done [{rv.elapsed:.2f}s,"
+                            f" {rv.input_tokens:,} in / {rv.output_tokens:,} out]",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    rv_correct = rv.tool_input is None or rv.tool_input.get(
+                        "correct", False
+                    )
+                    if verbose and rv.tool_input is not None:
+                        rv_status = "ACCEPTED" if rv_correct else "REJECTED"
+                        print(
+                            f"crispen: patch_rewriter: rewrite verify {rv_status}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        if not rv_correct and rv.tool_input.get("issue"):
+                            print(
+                                f"crispen: patch_rewriter:   issue:"
+                                f" {rv.tool_input.get('issue')}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                    if rv_correct:
+                        func_splices.append(
+                            (func.start_line, func.end_line, new_func_text)
+                        )
+                        if verbose:
+                            print(
+                                f"crispen: patch_rewriter: rewrote"
+                                f" '{func.function_name}'",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        break
+                    prev_error = (
+                        rv.tool_input.get("issue", "")
+                        or "LLM verify rejected the rewrite."
+                    )
+                    continue
                 break  # done with this function (rewrite handled above)
 
             # String-swap: validate and filter renames.
