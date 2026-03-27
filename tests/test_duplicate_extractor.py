@@ -2233,7 +2233,7 @@ def _make_invalid_assembled_extractor(monkeypatch, verbose=True):
     with (
         patch("crispen.llm_client.anthropic") as mock_anthropic,
         patch(
-            "crispen.refactors.duplicate_extractor._apply_edits",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._apply_edits",
             return_value="def f(:\n    pass\n",  # invalid Python
         ),
     ):
@@ -2289,7 +2289,7 @@ def _make_pyflakes_check_extractor(monkeypatch, verbose=True):
     with (
         patch("crispen.llm_client.anthropic") as mock_anthropic,
         patch(
-            "crispen.refactors.duplicate_extractor._pyflakes_new_undefined_names",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._pyflakes_new_undefined_names",
             return_value={"mock_client"},
         ),
     ):
@@ -2346,7 +2346,7 @@ def _make_missing_free_vars_extractor(monkeypatch, verbose=True):
     with (
         patch("crispen.llm_client.anthropic") as mock_anthropic,
         patch(
-            "crispen.refactors.duplicate_extractor._missing_free_vars",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._missing_free_vars",
             return_value={"new_source"},
         ),
     ):
@@ -2662,7 +2662,7 @@ def _make_uncalled_in_combined_extractor(monkeypatch, verbose=True):
     with (
         patch("crispen.llm_client.anthropic") as mock_anthropic,
         patch(
-            "crispen.refactors.duplicate_extractor._has_call_to",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._has_call_to",
             side_effect=[True, False],
         ),
     ):
@@ -2716,7 +2716,7 @@ def _make_undefined_in_combined_extractor(monkeypatch, verbose=True):
     with (
         patch("crispen.llm_client.anthropic") as mock_anthropic,
         patch(
-            "crispen.refactors.duplicate_extractor._has_funcdef",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._has_funcdef",
             side_effect=[False],
         ),
     ):
@@ -2762,7 +2762,7 @@ def test_undefined_helper_in_combined_two_groups_one_dropped(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic") as mock_anthropic,
         patch(
-            "crispen.refactors.duplicate_extractor._has_funcdef",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._has_funcdef",
             side_effect=[False, True],
         ),
     ):
@@ -2861,7 +2861,7 @@ def _make_two_group_drop_extractor(monkeypatch, verbose=True):
     with (
         patch("crispen.llm_client.anthropic") as mock_anthropic,
         patch(
-            "crispen.refactors.duplicate_extractor._has_call_to",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._has_call_to",
             side_effect=[True, True, True, False],
         ),
     ):
@@ -3765,7 +3765,9 @@ def test_engine_propagates_api_error(tmp_path, monkeypatch):
     monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.setattr("crispen.engine.load_config", lambda: CrispenConfig())
+    monkeypatch.setattr(
+        "crispen.engine.engine_core.load_config", lambda: CrispenConfig()
+    )
 
     with pytest.raises(CrispenAPIError):
         list(run_engine({str(f): _DUP_RANGES}))
@@ -3786,7 +3788,9 @@ def test_cli_exits_on_api_error(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setattr("crispen.cli.load_config", lambda: CrispenConfig())
-    monkeypatch.setattr("crispen.engine.load_config", lambda: CrispenConfig())
+    monkeypatch.setattr(
+        "crispen.engine.engine_core.load_config", lambda: CrispenConfig()
+    )
 
     # Write file so engine can read it
     f = tmp_path / "dup.py"
@@ -3836,7 +3840,7 @@ def test_veto_timeout_skips_group(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_ApiTimeout("veto timed out"),
         ),
     ):
@@ -3864,7 +3868,7 @@ def test_extract_timeout_skips_group(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_mock_run,
         ),
     ):
@@ -4174,7 +4178,7 @@ def test_func_match_no_arg_replaces_body(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             return_value=(True, "same operation", ""),
         ),
     ):
@@ -4191,7 +4195,7 @@ def test_func_match_verbose_false(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             return_value=(True, "same operation", ""),
         ),
     ):
@@ -4207,7 +4211,7 @@ def test_func_match_veto_rejects(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             return_value=(False, "different", ""),
         ),
     ):
@@ -4223,7 +4227,7 @@ def test_func_match_veto_timeout(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_ApiTimeout("timed out"),
         ),
     ):
@@ -4246,11 +4250,11 @@ def test_func_match_verify_fails(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_mock_run,
         ),
         patch(
-            "crispen.refactors.duplicate_extractor._verify_extraction",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._verify_extraction",
             return_value=False,
         ),
     ):
@@ -4271,7 +4275,7 @@ def test_func_match_param_call_gen_success(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_mock_run,
         ),
     ):
@@ -4304,7 +4308,7 @@ def test_func_match_param_call_gen_timeout(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_mock_run,
         ),
     ):
@@ -4342,7 +4346,7 @@ def test_func_match_then_dup_extract(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_mock_run,
         ),
     ):
@@ -4376,7 +4380,7 @@ def test_match_functions_false_skips_func_match_pass(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_mock_run_with_timeout,
         ),
     ):
@@ -5829,7 +5833,7 @@ def test_llm_verify_timeout_verbose(monkeypatch, capsys):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_mock_run,
         ),
     ):
@@ -5977,7 +5981,7 @@ def test_llm_verify_timeout_silent(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.duplicate_extractor_core._run_with_timeout",
             side_effect=_mock_run,
         ),
     ):

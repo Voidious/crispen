@@ -60,9 +60,9 @@ _CFG = CrispenConfig(patch_update_retries=1)
 _FORKING_PATHS = {"old.mod.X"}
 _SRC_WITH_PATCH = '@patch("old.mod.X")\ndef test_f(mock_x):\n    pass\n'
 
-_PATCH_GET_KEY = "crispen.patch_rewriter.get_api_key"
-_PATCH_MAKE_CLIENT = "crispen.patch_rewriter.make_client"
-_PATCH_CALL_TOOL = "crispen.patch_rewriter.call_with_tool"
+_PATCH_GET_KEY = "crispen.patch_rewriter.llm_and_patch_processing.get_api_key"
+_PATCH_MAKE_CLIENT = "crispen.patch_rewriter.llm_and_patch_processing.make_client"
+_PATCH_CALL_TOOL = "crispen.patch_rewriter.llm_and_patch_processing.call_with_tool"
 
 
 # ---------------------------------------------------------------------------

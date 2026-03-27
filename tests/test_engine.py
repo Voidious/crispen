@@ -135,7 +135,7 @@ def test_rewritten_source_used_when_available(tmp_path):
 
     f = tmp_path / "code.py"
     f.write_text("x = 1\n", encoding="utf-8")
-    with patch("crispen.engine._REFACTORS", [_RewritingRefactor]):
+    with patch("crispen.engine.engine_core._REFACTORS", [_RewritingRefactor]):
         msgs = _run({str(f): [(1, 1)]})
     assert any("Rewriter" in m for m in msgs)
     assert f.read_text(encoding="utf-8") == rewritten
@@ -172,7 +172,7 @@ class _RaisingTransformer(Refactor):
 def test_skip_transform_error(tmp_path):
     f = tmp_path / "code.py"
     f.write_text("x = 1\n", encoding="utf-8")
-    with patch("crispen.engine._REFACTORS", [_RaisingTransformer]):
+    with patch("crispen.engine.engine_core._REFACTORS", [_RaisingTransformer]):
         msgs = _run({str(f): [(1, 1)]})
     assert any("transform error" in m for m in msgs)
 
@@ -194,7 +194,7 @@ class _CrispenApiErrorRefactor(Refactor):
 def test_crispen_api_error_propagates(tmp_path):
     f = tmp_path / "code.py"
     f.write_text("x = 1\n", encoding="utf-8")
-    with patch("crispen.engine._REFACTORS", [_CrispenApiErrorRefactor]):
+    with patch("crispen.engine.engine_core._REFACTORS", [_CrispenApiErrorRefactor]):
         with pytest.raises(CrispenAPIError):
             list(run_engine({str(f): [(1, 1)]}))
 
@@ -212,7 +212,7 @@ def test_tuple_dataclass_transform_error_handled(tmp_path):
         def __init__(self, *a, **kw):
             raise RuntimeError("simulated TupleDataclass failure")
 
-    with patch("crispen.engine.TupleDataclass", _FailingTD):
+    with patch("crispen.engine.engine_core.TupleDataclass", _FailingTD):
         msgs = _run({str(f): [(1, 1)]})
     assert any("TupleDataclass" in m and "transform error" in m for m in msgs)
 
@@ -488,7 +488,9 @@ def test_find_outside_callers_call_qname_not_target(tmp_path):
 
 def test_find_outside_callers_manager_build_fails(tmp_path):
     (tmp_path / "other.py").write_text("x = 1\n")
-    with patch("crispen.engine.FullRepoManager", side_effect=RuntimeError("fail")):
+    with patch(
+        "crispen.engine.repo_analysis.FullRepoManager", side_effect=RuntimeError("fail")
+    ):
         result = _find_outside_callers(str(tmp_path), {"some.func"}, set())
     # Conservative: all target qnames are blocked.
     assert result == {"some.func"}
@@ -501,7 +503,7 @@ def test_find_outside_callers_manager_build_fails(tmp_path):
 
 def test_find_outside_callers_wrapper_fails(tmp_path):
     (tmp_path / "other.py").write_text("x = 1\n")
-    with patch("crispen.engine.FullRepoManager") as MockFRM:
+    with patch("crispen.engine.repo_analysis.FullRepoManager") as MockFRM:
         MockFRM.return_value.get_metadata_wrapper_for_path.side_effect = RuntimeError(
             "fail"
         )
@@ -530,7 +532,7 @@ def test_apply_tuple_dataclass_parse_error():
 
 
 def test_apply_tuple_dataclass_crispen_api_error():
-    with patch("crispen.engine.MetadataWrapper") as MockWrapper:
+    with patch("crispen.engine.engine_core.MetadataWrapper") as MockWrapper:
         MockWrapper.return_value.visit.side_effect = CrispenAPIError("test api error")
         with pytest.raises(CrispenAPIError):
             _apply_tuple_dataclass("f.py", [(1, 1)], "x = 1\n", False, set())
@@ -655,7 +657,7 @@ def test_cross_file_caller_updater_parse_error(tmp_path):
             )
         return original_parse(source)
 
-    with patch("crispen.engine.cst.parse_module", patched_parse):
+    with patch("crispen.engine.engine_core.cst.parse_module", patched_parse):
         # Should not crash; CallerUpdater pass silently continues.
         list(
             run_engine(
@@ -679,7 +681,9 @@ def test_cross_file_caller_updater_raises(tmp_path):
 
     changed = {str(service): [(1, 2)]}
 
-    with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
+    with patch(
+        "crispen.engine.engine_core.CallerUpdater", side_effect=RuntimeError("fail")
+    ):
         # Should not crash; the exception is caught.
         list(
             run_engine(
@@ -755,7 +759,7 @@ def test_visit_with_timeout_fires():
 def test_find_outside_callers_scope_analysis_timeout(tmp_path):
     """When _visit_with_timeout times out, all target qnames are blocked."""
     (tmp_path / "other.py").write_text("x = 1\n")
-    with patch("crispen.engine._visit_with_timeout", return_value=False):
+    with patch("crispen.engine.repo_analysis._visit_with_timeout", return_value=False):
         result = _find_outside_callers(str(tmp_path), {"some.func"}, set())
     assert result == {"some.func"}
 
@@ -764,7 +768,7 @@ def test_find_outside_callers_deadline_expired(tmp_path):
     """Total budget already exhausted before any file is visited: all blocked."""
     (tmp_path / "other.py").write_text("x = 1\n")
     # A negative timeout makes the deadline fall in the past immediately.
-    with patch("crispen.engine._SCOPE_ANALYSIS_TIMEOUT", -1):
+    with patch("crispen.engine.repo_analysis._SCOPE_ANALYSIS_TIMEOUT", -1):
         result = _find_outside_callers(str(tmp_path), {"some.func"}, set())
     assert result == {"some.func"}
 
@@ -842,7 +846,9 @@ def test_phase1_private_caller_updater_exception_ignored(tmp_path):
     )
     f = tmp_path / "code.py"
     f.write_text(source, encoding="utf-8")
-    with patch("crispen.engine.CallerUpdater", side_effect=RuntimeError("fail")):
+    with patch(
+        "crispen.engine.engine_core.CallerUpdater", side_effect=RuntimeError("fail")
+    ):
         msgs = _run({str(f): [(1, 100)]})
     # TupleDataclass still ran successfully
     assert any("TupleDataclass" in m for m in msgs)
@@ -1131,7 +1137,7 @@ def test_phase2_apply_tuple_dataclass_td_none(tmp_path):
             filepath, ranges, source, verbose, approved_public_funcs, **kw
         )
 
-    with patch("crispen.engine._apply_tuple_dataclass", patched_apply):
+    with patch("crispen.engine.engine_core._apply_tuple_dataclass", patched_apply):
         msgs = list(
             run_engine(
                 {str(service): [(1, 2)]},
@@ -1147,7 +1153,7 @@ def test_phase2_apply_tuple_dataclass_td_none(tmp_path):
 # FileLimiter (Phase 3 of engine)
 # ---------------------------------------------------------------------------
 
-_FL_PATCH = "crispen.engine.run_file_limiter"
+_FL_PATCH = "crispen.engine.engine_core.run_file_limiter"
 
 
 def test_file_limiter_disabled_by_max_file_lines_zero(tmp_path):
@@ -1770,8 +1776,8 @@ def test_engine_enabled_refactors_runs_only_listed(tmp_path):
             called.append("Spy")
             return []
 
-    with patch("crispen.engine._REFACTORS", [_Spy]):
-        with patch("crispen.engine._REFACTOR_KEY", {_Spy: "spy"}):
+    with patch("crispen.engine.engine_core._REFACTORS", [_Spy]):
+        with patch("crispen.engine.engine_core._REFACTOR_KEY", {_Spy: "spy"}):
             list(
                 run_engine(
                     {str(f): [(1, 4)]},
@@ -1821,7 +1827,9 @@ def test_engine_match_function_disabled_passes_flag_to_duplicate_extractor(tmp_p
         constructed_with.update(kwargs)
         original_init(self, *args, **kwargs)
 
-    with patch("crispen.engine.DuplicateExtractor.__init__", side_effect=_spy_init):
+    with patch(
+        "crispen.engine.engine_core.DuplicateExtractor.__init__", side_effect=_spy_init
+    ):
         list(
             run_engine(
                 {str(f): [(1, 1)]},
@@ -1847,7 +1855,9 @@ def test_engine_match_function_enabled_by_default(tmp_path):
         constructed_with.update(kwargs)
         original_init(self, *args, **kwargs)
 
-    with patch("crispen.engine.DuplicateExtractor.__init__", side_effect=_spy_init):
+    with patch(
+        "crispen.engine.engine_core.DuplicateExtractor.__init__", side_effect=_spy_init
+    ):
         list(
             run_engine(
                 {str(f): [(1, 1)]},
@@ -2673,7 +2683,8 @@ def test_build_patch_map_new_module_none(tmp_path):
         entity_to_target={"MyClass": "utils.py"},
     )
     with patch(
-        "crispen.engine._module_path_for_file", side_effect=["mypkg.module", None]
+        "crispen.engine.inline_imports._module_path_for_file",
+        side_effect=["mypkg.module", None],
     ):
         result = _build_patch_map(str(f), fl_result, tmp_path)
     assert result == {}
@@ -2757,7 +2768,7 @@ def test_build_patch_map_import_alias_module_none(tmp_path):
     )
     # Third call (for alias importer utils.py) returns None
     with patch(
-        "crispen.engine._module_path_for_file",
+        "crispen.engine.inline_imports._module_path_for_file",
         side_effect=["mypkg.module", "mypkg.sub", None],
     ):
         result = _build_patch_map(str(f), fl_result, pkg, pre_split)
@@ -3503,7 +3514,7 @@ def test_add_fl_context_normal(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-_REWRITE_PATCH = "crispen.engine.apply_patch_rewrite"
+_REWRITE_PATCH = "crispen.engine.engine_core.apply_patch_rewrite"
 
 
 def test_patch_update_rewrite_mode_calls_apply_patch_rewrite(tmp_path):
