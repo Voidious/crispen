@@ -60,6 +60,7 @@ def _make_fl_ctx(**kwargs) -> _FLContext:
 
 
 _CFG = CrispenConfig(patch_update_retries=1)
+_CFG_NO_LLM_VERIFY = CrispenConfig(patch_update_retries=1, llm_verify_retries=0)
 _FORKING_PATHS = {"old.mod.X"}
 _SRC_WITH_PATCH = '@patch("old.mod.X")\ndef test_f(mock_x):\n    pass\n'
 
@@ -717,13 +718,13 @@ def test_process_verify_rejected_then_accept(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verify_rejected_exhausted(mock_call):
-    # Verify rejects and max_attempts=1 → function skipped.
+    # Verify rejects with llm_verify_retries=0 → function skipped.
     mock_call.side_effect = [
         _ok(_CLASSIFY_RENAME),
         _ok(_VERIFY_REJECT),
     ]
     result, changed, cross = _process_file_source(
-        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG_NO_LLM_VERIFY, 1
     )
     assert result == _SRC_WITH_PATCH
     assert changed is False
@@ -859,14 +860,14 @@ def test_process_needs_rewrite_verify_rejected_then_accept(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_needs_rewrite_verify_rejected_exhausted(mock_call):
-    # Verify rejects and max_attempts=1 → no update.
+    # Verify rejects with llm_verify_retries=0 → no update.
     mock_call.side_effect = [
         _ok(_CLASSIFY_REWRITE),
         _ok({"rewritten_function": _VALID_REWRITE}),
         _ok(_REWRITE_VERIFY_REJECT),
     ]
     result, changed, cross = _process_file_source(
-        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG_NO_LLM_VERIFY, 1
     )
     assert result == _SRC_WITH_PATCH
     assert changed is False

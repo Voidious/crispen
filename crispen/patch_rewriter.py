@@ -879,6 +879,7 @@ def _process_file_source(
         prev_issue: Optional[str] = None
         prev_proposed: Optional[str] = None
         attempts_left = max_attempts
+        rename_verify_retries_left = config.llm_verify_retries
 
         while attempts_left > 0:
             attempts_left -= 1
@@ -930,6 +931,7 @@ def _process_file_source(
             if needs_rewrite:
                 # Stage 2: Full function rewrite.
                 rewrite_attempts = max_attempts
+                rewrite_verify_retries_left = config.llm_verify_retries
                 prev_error: Optional[str] = None
                 while rewrite_attempts > 0:
                     rewrite_attempts -= 1
@@ -1041,11 +1043,13 @@ def _process_file_source(
                                 flush=True,
                             )
                         break
-                    prev_error = (
-                        rv.tool_input.get("issue", "")
-                        or "LLM verify rejected the rewrite."
-                    )
-                    continue
+                    rv_issue = rv.tool_input.get("issue", "") if rv.tool_input else ""
+                    if rewrite_verify_retries_left > 0:
+                        rewrite_verify_retries_left -= 1
+                        prev_error = rv_issue or "LLM verify rejected the rewrite."
+                        rewrite_attempts += 1  # don't burn compile retry budget
+                        continue
+                    # verify retries exhausted — skip this function
                 break  # done with this function (rewrite handled above)
 
             # String-swap: validate and filter renames.
@@ -1132,9 +1136,11 @@ def _process_file_source(
                 string_swap_results.append((func, patch_renames))
                 break
             else:
-                if attempts_left > 0:
+                if rename_verify_retries_left > 0:
+                    rename_verify_retries_left -= 1
                     prev_issue = issue
                     prev_proposed = str(patch_renames)
+                    attempts_left += 1  # don't burn classify retry budget
                 # else: retries exhausted — skip this function
 
     # Collect cross-file and same-file constant definition updates.
