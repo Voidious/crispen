@@ -212,7 +212,7 @@ def test_tuple_dataclass_transform_error_handled(tmp_path):
         def __init__(self, *a, **kw):
             raise RuntimeError("simulated TupleDataclass failure")
 
-    with patch("crispen.engine.TupleDataclass", _FailingTD):
+    with patch("crispen.engine.repo_analysis_and_stats.TupleDataclass", _FailingTD):
         msgs = _run({str(f): [(1, 1)]})
     assert any("TupleDataclass" in m and "transform error" in m for m in msgs)
 
@@ -488,7 +488,10 @@ def test_find_outside_callers_call_qname_not_target(tmp_path):
 
 def test_find_outside_callers_manager_build_fails(tmp_path):
     (tmp_path / "other.py").write_text("x = 1\n")
-    with patch("crispen.engine.FullRepoManager", side_effect=RuntimeError("fail")):
+    with patch(
+        "crispen.engine.repo_analysis_and_stats.FullRepoManager",
+        side_effect=RuntimeError("fail"),
+    ):
         result = _find_outside_callers(str(tmp_path), {"some.func"}, set())
     # Conservative: all target qnames are blocked.
     assert result == {"some.func"}
@@ -501,7 +504,7 @@ def test_find_outside_callers_manager_build_fails(tmp_path):
 
 def test_find_outside_callers_wrapper_fails(tmp_path):
     (tmp_path / "other.py").write_text("x = 1\n")
-    with patch("crispen.engine.FullRepoManager") as MockFRM:
+    with patch("crispen.engine.repo_analysis_and_stats.FullRepoManager") as MockFRM:
         MockFRM.return_value.get_metadata_wrapper_for_path.side_effect = RuntimeError(
             "fail"
         )
@@ -530,7 +533,7 @@ def test_apply_tuple_dataclass_parse_error():
 
 
 def test_apply_tuple_dataclass_crispen_api_error():
-    with patch("crispen.engine.MetadataWrapper") as MockWrapper:
+    with patch("crispen.engine.repo_analysis_and_stats.MetadataWrapper") as MockWrapper:
         MockWrapper.return_value.visit.side_effect = CrispenAPIError("test api error")
         with pytest.raises(CrispenAPIError):
             _apply_tuple_dataclass("f.py", [(1, 1)], "x = 1\n", False, set())
@@ -755,7 +758,9 @@ def test_visit_with_timeout_fires():
 def test_find_outside_callers_scope_analysis_timeout(tmp_path):
     """When _visit_with_timeout times out, all target qnames are blocked."""
     (tmp_path / "other.py").write_text("x = 1\n")
-    with patch("crispen.engine._visit_with_timeout", return_value=False):
+    with patch(
+        "crispen.engine.repo_analysis_and_stats._visit_with_timeout", return_value=False
+    ):
         result = _find_outside_callers(str(tmp_path), {"some.func"}, set())
     assert result == {"some.func"}
 
@@ -764,7 +769,7 @@ def test_find_outside_callers_deadline_expired(tmp_path):
     """Total budget already exhausted before any file is visited: all blocked."""
     (tmp_path / "other.py").write_text("x = 1\n")
     # A negative timeout makes the deadline fall in the past immediately.
-    with patch("crispen.engine._SCOPE_ANALYSIS_TIMEOUT", -1):
+    with patch("crispen.engine.repo_analysis_and_stats._SCOPE_ANALYSIS_TIMEOUT", -1):
         result = _find_outside_callers(str(tmp_path), {"some.func"}, set())
     assert result == {"some.func"}
 
@@ -2673,7 +2678,8 @@ def test_build_patch_map_new_module_none(tmp_path):
         entity_to_target={"MyClass": "utils.py"},
     )
     with patch(
-        "crispen.engine._module_path_for_file", side_effect=["mypkg.module", None]
+        "crispen.engine.filelimiter_inline_imports._module_path_for_file",
+        side_effect=["mypkg.module", None],
     ):
         result = _build_patch_map(str(f), fl_result, tmp_path)
     assert result == {}
@@ -2757,7 +2763,7 @@ def test_build_patch_map_import_alias_module_none(tmp_path):
     )
     # Third call (for alias importer utils.py) returns None
     with patch(
-        "crispen.engine._module_path_for_file",
+        "crispen.engine.filelimiter_inline_imports._module_path_for_file",
         side_effect=["mypkg.module", "mypkg.sub", None],
     ):
         result = _build_patch_map(str(f), fl_result, pkg, pre_split)
