@@ -113,32 +113,67 @@ _PATCH_RULES = (
     "```\n"
 )
 
-_PATCH_SINGLE_REWRITE_TOOL: dict = {
-    "name": "update_patch_string",
+_PATCH_CLASSIFY_TOOL: dict = {
+    "name": "classify_patch_updates",
     "description": (
-        "Decide whether a single patch() string needs updating after a source "
-        "file was split into sub-modules. Return the new string, or the original "
-        "if no change is needed."
+        "Classify whether a test function's @patch decorators need simple string "
+        "path renames after a source file was split into sub-modules, or whether "
+        "the function requires a full rewrite (e.g. new @patch decorators, new "
+        "mock parameters, or body changes)."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "new_patch_string": {
+            "needs_rewrite": {
+                "type": "boolean",
+                "description": (
+                    "True if the function requires a full rewrite — for example "
+                    "because new @patch decorators and/or new mock parameters or "
+                    "setup code are needed. False if only patch string paths need "
+                    "renaming (or no change is needed)."
+                ),
+            },
+            "patch_renames": {
+                "type": "object",
+                "description": (
+                    "When needs_rewrite is False: a map of old patch string → new "
+                    "patch string for each @patch that needs updating. Omit or "
+                    "leave empty if no patches need changing."
+                ),
+                "additionalProperties": {"type": "string"},
+            },
+        },
+        "required": ["needs_rewrite"],
+    },
+}
+
+_PATCH_REWRITE_FUNC_TOOL: dict = {
+    "name": "rewrite_test_function",
+    "description": (
+        "Produce a complete rewritten test function after a source file was split "
+        "into sub-modules. The rewrite may add new @patch decorators, new mock "
+        "parameters, and setup code as needed."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "rewritten_function": {
                 "type": "string",
                 "description": (
-                    "The updated patch string. Return the ORIGINAL string unchanged "
-                    "if the existing patch is still correct."
+                    "The complete rewritten test function including all decorators, "
+                    "the def signature, and the full body. Must be valid Python and "
+                    "preserve all original test logic."
                 ),
             }
         },
-        "required": ["new_patch_string"],
+        "required": ["rewritten_function"],
     },
 }
 
 _PATCH_SINGLE_VERIFY_TOOL: dict = {
     "name": "verify_patch_update",
     "description": (
-        "Verify whether a proposed patch() string update is correct after a "
+        "Verify whether proposed patch() string updates are correct after a "
         "source file was split into sub-modules."
     ),
     "input_schema": {
@@ -146,12 +181,12 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
         "properties": {
             "correct": {
                 "type": "boolean",
-                "description": "True if the proposed update is correct.",
+                "description": "True if all proposed updates are correct.",
             },
             "issue": {
                 "type": "string",
                 "description": (
-                    "What is wrong with the proposed update. "
+                    "What is wrong with the proposed updates. "
                     "Empty string when correct."
                 ),
             },
@@ -664,49 +699,90 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
     return "".join(parts)
 
 
-def _build_single_patch_prompt(
+def _build_classify_prompt(
     context_msg: str,
     function_text: str,
-    old_patch_string: str,
+    old_patch_paths: List[str],
     prev_issue: Optional[str] = None,
     prev_proposed: Optional[str] = None,
 ) -> str:
-    """Build the user prompt for a single-patch rewrite LLM call."""
+    """Build the user prompt for the per-function classify LLM call."""
+    paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
     parts = [context_msg, _PATCH_RULES]
     if prev_issue:
         parts.append(
             f"\n## Previous attempt was rejected:\n"
-            f"- Proposed: `{prev_proposed}`\n"
+            f"- Proposed renames: {prev_proposed}\n"
             f"- Issue: {prev_issue}\n"
         )
     parts.append(
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
-        f"## Patch string to evaluate:\n`{old_patch_string}`\n\n"
-        f"Should this patch string change after the split? "
-        f"Return the new string, or the original `{old_patch_string}` "
-        f"if no change is needed.\n"
+        f"## Patch strings to evaluate:\n{paths_list}\n\n"
+        "Decide whether this function needs a **full rewrite** (new @patch "
+        "decorators, new mock parameters, or body changes) or just **patch "
+        "string renames**. If renames only, provide the updated strings.\n"
     )
     return "".join(parts)
 
 
-def _build_single_verify_prompt(
+def _build_func_verify_prompt(
     context_msg: str,
     function_text: str,
-    old_patch_string: str,
-    new_patch_string: str,
+    patch_renames: Dict[str, str],
 ) -> str:
-    """Build the user prompt for a single-patch verify LLM call."""
+    """Build the user prompt for a per-function rename verify LLM call."""
+    rename_lines = "\n".join(
+        f"- `{old}` → `{new}`" for old, new in patch_renames.items()
+    )
     parts = [
         context_msg,
         _PATCH_RULES,
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
-        f"## Proposed patch() string update:\n"
-        f"- Original: `{old_patch_string}`\n"
-        f"- Proposed: `{new_patch_string}`\n\n"
-        f"Is this update correct? Set `correct` to True only if the proposed "
-        f"patch string points to where the name is looked up after the split.\n",
+        f"## Proposed patch() string updates:\n{rename_lines}\n\n"
+        "Are all these updates correct? Set `correct` to True only if every "
+        "proposed patch string points to where the name is looked up after "
+        "the split.\n",
     ]
     return "".join(parts)
+
+
+def _build_rewrite_func_prompt(
+    context_msg: str,
+    function_text: str,
+    old_patch_paths: List[str],
+    prev_error: Optional[str] = None,
+) -> str:
+    """Build the user prompt for the full function rewrite LLM call."""
+    paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
+    parts = [context_msg, _PATCH_RULES]
+    if prev_error:
+        parts.append(f"\n## Previous rewrite was invalid:\n" f"- Error: {prev_error}\n")
+    parts.append(
+        f"\n## Test function to rewrite:\n```python\n{function_text}\n```\n\n"
+        f"## Patch strings that need updating:\n{paths_list}\n\n"
+        "Rewrite the complete function. You may add new @patch decorators with "
+        "corresponding mock parameters and setup code. Preserve all original "
+        "test logic. Return the complete function including all decorators and "
+        "body.\n"
+    )
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Function splice helper
+# ---------------------------------------------------------------------------
+
+
+def _splice_function(
+    source: str, start_line: int, end_line: int, new_func_text: str
+) -> str:
+    """Replace lines start_line..end_line (1-indexed, inclusive) with new_func_text."""
+    lines = source.splitlines(True)
+    if new_func_text and not new_func_text.endswith("\n"):
+        new_func_text += "\n"
+    new_lines = new_func_text.splitlines(True)
+    lines[start_line - 1 : end_line] = new_lines
+    return "".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -728,10 +804,9 @@ def _process_file_source(
 ) -> Tuple[str, bool, Dict[str, Dict[str, str]]]:
     """Scan *source* for @patch functions matching *all_forking_paths* and update.
 
-    Processes one patch string at a time.  Returns
-    ``(updated_source, was_changed, cross_file_patch_maps)`` where
-    *cross_file_patch_maps* maps absolute file path → {old_string: new_string}
-    for constant definitions in other files.
+    Processes one function at a time using a two-stage approach: first classify
+    whether the function needs a full rewrite or simple string renames, then act
+    accordingly.  Returns ``(updated_source, was_changed, cross_file_patch_maps)``.
     """
     functions = _find_test_functions_to_update(
         source, all_forking_paths, scan_file, repo_root
@@ -739,17 +814,17 @@ def _process_file_source(
     if not functions:
         return source, False, {}
 
-    # Build {old_path: representative_function} for each unique patch string.
     file_desc = f"'{scan_file}'" if scan_file else "file"
-    unique_patches: Dict[str, _TestFunctionInfo] = {}
+    source_lines = source.splitlines()
+
+    # (start_line, end_line, new_text) splices for both string-swap and full rewrites.
+    func_splices: List[Tuple[int, int, str]] = []
+    # Track string-swap funcs and their accepted renames for cross-file const handling.
+    string_swap_results: List[Tuple[_TestFunctionInfo, Dict[str, str]]] = []
+    # Same-file const definition updates (applied after all splices).
+    same_file_const_map: Dict[str, str] = {}
+
     for func in functions:
-        for old_path in func.old_patch_paths:
-            if old_path not in unique_patches:
-                unique_patches[old_path] = func
-
-    patch_map: Dict[str, str] = {}  # old_path → new_path
-
-    for old_path, rep_func in unique_patches.items():
         prev_issue: Optional[str] = None
         prev_proposed: Optional[str] = None
         attempts_left = max_attempts
@@ -757,13 +832,18 @@ def _process_file_source(
         while attempts_left > 0:
             attempts_left -= 1
 
-            prompt = _build_single_patch_prompt(
-                context_msg, rep_func.full_text, old_path, prev_issue, prev_proposed
+            # Stage 1: Classify (and get renames if string-swap).
+            classify_prompt = _build_classify_prompt(
+                context_msg,
+                func.full_text,
+                func.old_patch_paths,
+                prev_issue,
+                prev_proposed,
             )
             retry_label = " (retry)" if prev_issue is not None else ""
             if verbose:
                 print(
-                    f"crispen: patch_rewriter: evaluating '{old_path}'"
+                    f"crispen: patch_rewriter: classifying '{func.function_name}'"
                     f" in {file_desc}{retry_label}",
                     file=sys.stderr,
                     flush=True,
@@ -772,10 +852,10 @@ def _process_file_source(
                 client,
                 config.provider,
                 config.model,
-                256,
-                _PATCH_SINGLE_REWRITE_TOOL,
-                "update_patch_string",
-                [{"role": "user", "content": prompt}],
+                512,
+                _PATCH_CLASSIFY_TOOL,
+                "classify_patch_updates",
+                [{"role": "user", "content": classify_prompt}],
                 caller="patch_rewriter",
                 tool_choice_override=config.tool_choice,
             )
@@ -794,20 +874,95 @@ def _process_file_source(
             if r.tool_input is None:
                 break
 
-            new_path = r.tool_input.get("new_patch_string", old_path)
-            if not isinstance(new_path, str) or not new_path:
-                break
-            if new_path == old_path:
-                break  # no change needed
+            needs_rewrite = r.tool_input.get("needs_rewrite", False)
 
-            # Verify.
-            verify_prompt = _build_single_verify_prompt(
-                context_msg, rep_func.full_text, old_path, new_path
+            if needs_rewrite:
+                # Stage 2: Full function rewrite.
+                rewrite_attempts = max_attempts
+                prev_error: Optional[str] = None
+                while rewrite_attempts > 0:
+                    rewrite_attempts -= 1
+                    rewrite_prompt = _build_rewrite_func_prompt(
+                        context_msg,
+                        func.full_text,
+                        func.old_patch_paths,
+                        prev_error,
+                    )
+                    if verbose:
+                        retry_rw = " (retry)" if prev_error is not None else ""
+                        print(
+                            f"crispen: patch_rewriter: rewriting"
+                            f" '{func.function_name}' in {file_desc}{retry_rw}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    rw = call_with_tool(
+                        client,
+                        config.provider,
+                        config.model,
+                        2048,
+                        _PATCH_REWRITE_FUNC_TOOL,
+                        "rewrite_test_function",
+                        [{"role": "user", "content": rewrite_prompt}],
+                        caller="patch_rewriter",
+                        tool_choice_override=config.tool_choice,
+                    )
+                    if _acc is not None:
+                        _acc.calls += 1
+                        _acc.elapsed += rw.elapsed
+                        _acc.input_tokens += rw.input_tokens
+                        _acc.output_tokens += rw.output_tokens
+                    if verbose and config.timing == "detailed":
+                        print(
+                            f"crispen: patch_rewriter:   → done [{rw.elapsed:.2f}s,"
+                            f" {rw.input_tokens:,} in / {rw.output_tokens:,} out]",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    if rw.tool_input is None:
+                        break
+                    new_func_text = rw.tool_input.get("rewritten_function", "")
+                    if not isinstance(new_func_text, str) or not new_func_text.strip():
+                        break
+                    if not _compiles(new_func_text):
+                        prev_error = "Rewritten function is not valid Python."
+                        continue
+                    func_splices.append((func.start_line, func.end_line, new_func_text))
+                    if verbose:
+                        print(
+                            f"crispen: patch_rewriter: rewrote '{func.function_name}'",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    break
+                break  # done with this function (rewrite handled above)
+
+            # String-swap: validate and filter renames.
+            raw_renames = r.tool_input.get("patch_renames") or {}
+            if not isinstance(raw_renames, dict):
+                raw_renames = {}
+            patch_renames: Dict[str, str] = {
+                old: new
+                for old, new in raw_renames.items()
+                if (
+                    isinstance(old, str)
+                    and isinstance(new, str)
+                    and old != new
+                    and old in func.old_patch_paths
+                )
+            }
+
+            if not patch_renames:
+                break  # no changes needed
+
+            # Verify the renames.
+            verify_prompt = _build_func_verify_prompt(
+                context_msg, func.full_text, patch_renames
             )
             if verbose:
                 print(
-                    f"crispen: patch_rewriter: verifying '{old_path}'"
-                    f" → '{new_path}'",
+                    f"crispen: patch_rewriter: verifying renames for"
+                    f" '{func.function_name}' in {file_desc}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -835,8 +990,12 @@ def _process_file_source(
                     flush=True,
                 )
             if v.tool_input is None:
-                # Verify call failed; accept proposed update.
-                patch_map[old_path] = new_path
+                # Verify failed; accept renames.
+                orig_text = "\n".join(source_lines[func.start_line - 1 : func.end_line])
+                new_text = apply_patch_strings(orig_text, patch_renames)
+                if new_text != orig_text:
+                    func_splices.append((func.start_line, func.end_line, new_text))
+                string_swap_results.append((func, patch_renames))
                 break
 
             verify_correct = v.tool_input.get("correct", False)
@@ -855,36 +1014,47 @@ def _process_file_source(
                         flush=True,
                     )
             if verify_correct:
-                patch_map[old_path] = new_path
+                orig_text = "\n".join(source_lines[func.start_line - 1 : func.end_line])
+                new_text = apply_patch_strings(orig_text, patch_renames)
+                if new_text != orig_text:
+                    func_splices.append((func.start_line, func.end_line, new_text))
+                string_swap_results.append((func, patch_renames))
                 break
             else:
                 if attempts_left > 0:
                     prev_issue = issue
-                    prev_proposed = new_path
-                # else: retries exhausted — skip this patch string
+                    prev_proposed = str(patch_renames)
+                # else: retries exhausted — skip this function
 
-    # Collect cross-file constant definition updates.
-    # Same-file constants are automatically updated by apply_patch_strings below,
-    # since it replaces all string literals matching the old path.
+    # Collect cross-file and same-file constant definition updates.
     cross_file_patch_maps: Dict[str, Dict[str, str]] = {}
-    if patch_map and scan_file:
+    if string_swap_results and scan_file:
         scan_file_abs = str(Path(scan_file).resolve())
-        for func in functions:
+        for func, accepted in string_swap_results:
             for ref in func.const_refs:
-                if ref.source_file == scan_file_abs:
-                    continue  # handled by apply_patch_strings
-                new_val = patch_map.get(ref.resolved_value)
+                new_val = accepted.get(ref.resolved_value)
                 if new_val is None or new_val == ref.resolved_value:
                     continue
-                cross_file_patch_maps.setdefault(ref.source_file, {})[
-                    ref.resolved_value
-                ] = new_val
+                if ref.source_file == scan_file_abs:
+                    same_file_const_map[ref.resolved_value] = new_val
+                else:
+                    cross_file_patch_maps.setdefault(ref.source_file, {})[
+                        ref.resolved_value
+                    ] = new_val
 
-    if not patch_map:
+    if not func_splices and not same_file_const_map:
         return source, False, cross_file_patch_maps
 
-    updated = apply_patch_strings(source, patch_map)
-    return updated, updated != source, cross_file_patch_maps
+    # Apply splices (bottom to top to preserve line indices).
+    result_source = source
+    for start_line, end_line, new_text in sorted(func_splices, key=lambda x: -x[0]):
+        result_source = _splice_function(result_source, start_line, end_line, new_text)
+
+    # Apply same-file constant definition updates.
+    if same_file_const_map:
+        result_source = apply_patch_strings(result_source, same_file_const_map)
+
+    return result_source, result_source != source, cross_file_patch_maps
 
 
 # ---------------------------------------------------------------------------

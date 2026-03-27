@@ -13,11 +13,12 @@ from crispen.patch_rewriter import (
     RewriteAccumulator,
     _apply_cross_file_const_updates,
     _build_attr_const_map,
+    _build_classify_prompt,
     _build_const_map,
     _build_context_message,
+    _build_func_verify_prompt,
     _build_local_const_map,
-    _build_single_patch_prompt,
-    _build_single_verify_prompt,
+    _build_rewrite_func_prompt,
     _compiles,
     _find_test_functions_to_update,
     _find_with_patch_paths_in_body,
@@ -25,6 +26,7 @@ from crispen.patch_rewriter import (
     _matches_any,
     _process_file_source,
     _resolve_import_to_file,
+    _splice_function,
     _substitute_consts_in_func_text,
     apply_patch_rewrite,
 )
@@ -63,6 +65,13 @@ _SRC_WITH_PATCH = '@patch("old.mod.X")\ndef test_f(mock_x):\n    pass\n'
 _PATCH_GET_KEY = "crispen.patch_rewriter.get_api_key"
 _PATCH_MAKE_CLIENT = "crispen.patch_rewriter.make_client"
 _PATCH_CALL_TOOL = "crispen.patch_rewriter.call_with_tool"
+
+# Shorthand classify tool_inputs.
+_CLASSIFY_RENAME = {"needs_rewrite": False, "patch_renames": {"old.mod.X": "new.mod.X"}}
+_CLASSIFY_NO_CHANGE = {"needs_rewrite": False, "patch_renames": {}}
+_CLASSIFY_REWRITE = {"needs_rewrite": True}
+_VERIFY_OK = {"correct": True, "issue": ""}
+_VERIFY_REJECT = {"correct": False, "issue": "wrong path"}
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +435,133 @@ def test_build_context_multiple_contexts():
 
 
 # ---------------------------------------------------------------------------
-# _process_file_source
+# _splice_function
+# ---------------------------------------------------------------------------
+
+
+def test_splice_function_basic():
+    source = "line1\nline2\nline3\nline4\n"
+    result = _splice_function(source, 2, 3, "new2\nnew3\n")
+    assert result == "line1\nnew2\nnew3\nline4\n"
+
+
+def test_splice_function_single_line():
+    source = "line1\nline2\nline3\n"
+    result = _splice_function(source, 2, 2, "replacement\n")
+    assert result == "line1\nreplacement\nline3\n"
+
+
+def test_splice_function_size_change():
+    # Replace 1 line with 3 lines.
+    source = "a\nb\nc\n"
+    result = _splice_function(source, 2, 2, "x\ny\nz\n")
+    assert result == "a\nx\ny\nz\nc\n"
+
+
+def test_splice_function_no_trailing_newline():
+    # new_func_text without trailing newline gets one added.
+    source = "a\nb\nc\n"
+    result = _splice_function(source, 2, 2, "replacement")
+    assert result == "a\nreplacement\nc\n"
+
+
+def test_splice_function_empty_new_text():
+    # Empty string: no trailing newline added (falsy check), splitlines gives [].
+    source = "a\nb\nc\n"
+    result = _splice_function(source, 2, 2, "")
+    assert result == "a\nc\n"
+
+
+# ---------------------------------------------------------------------------
+# _build_classify_prompt
+# ---------------------------------------------------------------------------
+
+
+def _ctx_msg() -> str:
+    return _build_context_message([_make_fl_ctx()])
+
+
+def test_build_classify_prompt_no_prev():
+    prompt = _build_classify_prompt(_ctx_msg(), "def test_f(): pass", ["old.mod.X"])
+    assert "old.mod.X" in prompt
+    assert "Previous attempt" not in prompt
+    assert "full rewrite" in prompt
+
+
+def test_build_classify_prompt_with_prev():
+    prompt = _build_classify_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        ["old.mod.X"],
+        prev_issue="wrong module",
+        prev_proposed="{'old.mod.X': 'bad.mod.X'}",
+    )
+    assert "Previous attempt" in prompt
+    assert "wrong module" in prompt
+    assert "bad.mod.X" in prompt
+
+
+def test_build_classify_prompt_multiple_paths():
+    prompt = _build_classify_prompt(
+        _ctx_msg(), "def test_f(): pass", ["old.mod.X", "old.mod.Y"]
+    )
+    assert "old.mod.X" in prompt
+    assert "old.mod.Y" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _build_func_verify_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_build_func_verify_prompt_basic():
+    prompt = _build_func_verify_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        {"old.mod.X": "new.mod.X"},
+    )
+    assert "old.mod.X" in prompt
+    assert "new.mod.X" in prompt
+    assert "correct" in prompt
+
+
+def test_build_func_verify_prompt_multiple_renames():
+    prompt = _build_func_verify_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        {"old.mod.X": "new.mod.X", "old.mod.Y": "new.mod.Y"},
+    )
+    assert "old.mod.X" in prompt
+    assert "old.mod.Y" in prompt
+    assert "new.mod.X" in prompt
+    assert "new.mod.Y" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _build_rewrite_func_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_build_rewrite_func_prompt_no_error():
+    prompt = _build_rewrite_func_prompt(_ctx_msg(), "def test_f(): pass", ["old.mod.X"])
+    assert "old.mod.X" in prompt
+    assert "Previous rewrite" not in prompt
+    assert "Rewrite the complete function" in prompt
+
+
+def test_build_rewrite_func_prompt_with_error():
+    prompt = _build_rewrite_func_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        ["old.mod.X"],
+        prev_error="SyntaxError on line 3",
+    )
+    assert "Previous rewrite was invalid" in prompt
+    assert "SyntaxError on line 3" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _process_file_source — basic flow
 # ---------------------------------------------------------------------------
 
 
@@ -442,8 +577,8 @@ def test_process_no_functions(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL, return_value=_ok(None))
-def test_process_llm_no_tool_input(mock_call):
-    # LLM returns tool_input=None → break, no update.
+def test_process_classify_tool_none(mock_call):
+    # Classify returns tool_input=None → break, no update.
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
@@ -451,18 +586,9 @@ def test_process_llm_no_tool_input(mock_call):
     assert changed is False
 
 
-@mock_patch(_PATCH_CALL_TOOL, return_value=_ok({"new_patch_string": ""}))
-def test_process_llm_new_path_empty(mock_call):
-    # LLM returns empty string → treated as invalid, break.
-    result, changed, cross = _process_file_source(
-        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
-    )
-    assert changed is False
-
-
-@mock_patch(_PATCH_CALL_TOOL, return_value=_ok({"new_patch_string": "old.mod.X"}))
+@mock_patch(_PATCH_CALL_TOOL, return_value=_ok(_CLASSIFY_NO_CHANGE))
 def test_process_no_change_needed(mock_call):
-    # LLM returns same string as original → no verify call, no update.
+    # Classify returns empty renames → no verify call, no update.
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
@@ -471,11 +597,50 @@ def test_process_no_change_needed(mock_call):
     assert mock_call.call_count == 1  # no verify call
 
 
+@mock_patch(
+    _PATCH_CALL_TOOL,
+    return_value=_ok(
+        {"needs_rewrite": False, "patch_renames": {"old.mod.X": "old.mod.X"}}
+    ),
+)
+def test_process_same_path_filtered_out(mock_call):
+    # Rename where old == new → filtered, treated as no change.
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is False
+    assert mock_call.call_count == 1
+
+
+@mock_patch(
+    _PATCH_CALL_TOOL,
+    return_value=_ok({"needs_rewrite": False, "patch_renames": "not-a-dict"}),
+)
+def test_process_patch_renames_not_dict(mock_call):
+    # patch_renames is not a dict → treated as empty, no change.
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is False
+
+
+@mock_patch(
+    _PATCH_CALL_TOOL,
+    return_value=_ok({"needs_rewrite": False, "patch_renames": {42: "new.mod.X"}}),
+)
+def test_process_patch_renames_non_string_key(mock_call):
+    # Non-string key in patch_renames → filtered out.
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is False
+
+
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_patch_changed_verify_accepts(mock_call):
+def test_process_string_swap_verify_accepts(mock_call):
     mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
@@ -486,9 +651,9 @@ def test_process_patch_changed_verify_accepts(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verify_none_accept(mock_call):
-    # Verify call returns tool_input=None → accept proposed update.
+    # Verify call returns tool_input=None → accept proposed renames.
     mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
+        _ok(_CLASSIFY_RENAME),
         _ok(None),
     ]
     result, changed, cross = _process_file_source(
@@ -499,13 +664,30 @@ def test_process_verify_none_accept(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_verify_rejected_then_accept(mock_call):
-    # First verify rejects; second attempt is accepted.
+def test_process_verify_none_accept_no_splice(mock_call, tmp_path):
+    # Verify returns None; function uses const ref → new_text == orig_text → no splice.
+    src = 'TARGET = "old.mod.X"\n\n@patch(TARGET)\ndef test_f(mock_x):\n    pass\n'
+    scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": False, "issue": "wrong path"}),
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok(_CLASSIFY_RENAME),
+        _ok(None),
+    ]
+    result, changed, cross = _process_file_source(
+        src, {"old.mod.X"}, "ctx", MagicMock(), _CFG, 1, scan_file=scan
+    )
+    # No splice but const should be updated via same_file_const_map.
+    assert changed is True
+    assert "new.mod.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verify_rejected_then_accept(mock_call):
+    # First verify rejects; second classify+verify is accepted.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_REJECT),
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
@@ -515,16 +697,396 @@ def test_process_verify_rejected_then_accept(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verify_rejected_exhausted(mock_call):
-    # Verify rejects and max_attempts=1 → patch string skipped.
+    # Verify rejects and max_attempts=1 → function skipped.
     mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": False, "issue": "bad"}),
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_REJECT),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert result == _SRC_WITH_PATCH
     assert changed is False
+
+
+# ---------------------------------------------------------------------------
+# _process_file_source — full rewrite path
+# ---------------------------------------------------------------------------
+
+_VALID_REWRITE = (
+    '@patch("new.mod.X")\n'
+    '@patch("new.mod.Y")\n'
+    "def test_f(mock_x, mock_y):\n"
+    "    pass\n"
+)
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_success(mock_call):
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is True
+    assert "new.mod.X" in result
+    assert "new.mod.Y" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_tool_none(mock_call):
+    # Rewrite call returns tool_input=None → no update.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok(None),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_empty_text(mock_call):
+    # Rewrite returns empty string → no update.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": ""}),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_non_string(mock_call):
+    # Rewrite returns non-string value → no update.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": 42}),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_compile_error_retry(mock_call):
+    # First rewrite has syntax error; second is valid.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": "def f(:\n    pass\n"}),  # invalid
+        _ok({"rewritten_function": _VALID_REWRITE}),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "new.mod.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_compile_error_exhausted(mock_call):
+    # Both rewrite attempts fail to compile → no update.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": "def f(:\n    pass\n"}),  # invalid
+        _ok({"rewritten_function": "def f(:\n    pass\n"}),  # still invalid
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is False
+
+
+# ---------------------------------------------------------------------------
+# _process_file_source — per-function processing (forking case)
+# ---------------------------------------------------------------------------
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_per_function_different_renames(mock_call):
+    """Two functions with the same @patch string can receive different renames.
+
+    This is the forking case: test_a tests an entity that moved to mod1,
+    test_b tests an entity that moved to mod2.  Each gets classified and
+    renamed independently.
+    """
+    src = (
+        '@patch("old.mod.X")\ndef test_a(m):\n    call_a()\n\n'
+        '@patch("old.mod.X")\ndef test_b(m):\n    call_b()\n'
+    )
+    mock_call.side_effect = [
+        # test_a: classify → rename to mod1
+        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "mod1.X"}}),
+        _ok(_VERIFY_OK),
+        # test_b: classify → rename to mod2
+        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "mod2.X"}}),
+        _ok(_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        src, {"old.mod.X"}, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is True
+    assert "mod1.X" in result
+    assert "mod2.X" in result
+    assert mock_call.call_count == 4
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_per_function_both_updated(mock_call):
+    """Two functions with the same @patch string both get the same rename."""
+    src = (
+        '@patch("old.mod.X")\ndef test_a(m):\n    pass\n\n'
+        '@patch("old.mod.X")\ndef test_b(m):\n    pass\n'
+    )
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        src, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is True
+    assert result.count("new.mod.X") == 2
+
+
+# ---------------------------------------------------------------------------
+# _process_file_source — accumulator and verbose
+# ---------------------------------------------------------------------------
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_acc_accumulates(mock_call):
+    """_process_file_source accumulates calls, elapsed, and tokens into _acc."""
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input=_CLASSIFY_RENAME,
+            elapsed=1.2,
+            input_tokens=200,
+            output_tokens=40,
+        ),
+        LLMCallResult(
+            tool_input=_VERIFY_OK,
+            elapsed=0.3,
+            input_tokens=150,
+            output_tokens=5,
+        ),
+    ]
+    acc = RewriteAccumulator()
+    _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1, _acc=acc
+    )
+    assert acc.calls == 2
+    assert abs(acc.elapsed - 1.5) < 1e-9
+    assert acc.input_tokens == 350
+    assert acc.output_tokens == 45
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_acc_rewrite_accumulates(mock_call):
+    """Full rewrite path accumulates both classify and rewrite calls."""
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input=_CLASSIFY_REWRITE,
+            elapsed=0.5,
+            input_tokens=100,
+            output_tokens=10,
+        ),
+        LLMCallResult(
+            tool_input={"rewritten_function": _VALID_REWRITE},
+            elapsed=1.5,
+            input_tokens=300,
+            output_tokens=60,
+        ),
+    ]
+    acc = RewriteAccumulator()
+    _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1, _acc=acc
+    )
+    assert acc.calls == 2
+    assert abs(acc.elapsed - 2.0) < 1e-9
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_prints_to_stderr(mock_call, capsys):
+    """verbose=True emits per-call messages to stderr."""
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "patch_rewriter" in err
+    assert "classifying" in err
+    assert "verifying renames" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_detailed_timing(mock_call, capsys):
+    """timing='detailed' appends elapsed/token info after each call."""
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input=_CLASSIFY_RENAME,
+            elapsed=1.23,
+            input_tokens=100,
+            output_tokens=20,
+        ),
+        LLMCallResult(
+            tool_input=_VERIFY_OK,
+            elapsed=0.45,
+            input_tokens=80,
+            output_tokens=5,
+        ),
+    ]
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=1, timing="detailed")
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        cfg,
+        1,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "→ done" in err
+    assert "1.23s" in err
+    assert "0.45s" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_retry_label(mock_call, capsys):
+    """Retry attempts include '(retry)' in the verbose message."""
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_REJECT),
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        2,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "(retry)" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_verify_accepted(mock_call, capsys):
+    """verbose=True prints 'ACCEPTED' when verify succeeds."""
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "ACCEPTED" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_verify_rejected_prints_issue(mock_call, capsys):
+    """verbose=True prints 'REJECTED' and the issue when verify rejects."""
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_RENAME),
+        _ok({"correct": False, "issue": "wrong module path"}),
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        2,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "REJECTED" in err
+    assert "wrong module path" in err
+    assert "ACCEPTED" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_rewrite_path(mock_call, capsys):
+    """verbose=True prints 'rewriting' and 'rewrote' for full rewrite path."""
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "rewriting" in err
+    assert "rewrote" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verbose_rewrite_compile_retry(mock_call, capsys):
+    """verbose=True prints '(retry)' when rewrite compile fails."""
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": "def f(:\n    pass\n"}),  # invalid
+        _ok({"rewritten_function": _VALID_REWRITE}),
+    ]
+    cfg = CrispenConfig(patch_update_retries=1, timing="detailed")
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        cfg,
+        2,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "rewriting" in err
+    assert "(retry)" in err
 
 
 # ---------------------------------------------------------------------------
@@ -548,8 +1110,8 @@ def test_rewrite_no_forking_paths():
 @mock_patch(_PATCH_GET_KEY, return_value="fake_key")
 def test_rewrite_per_file_update(mock_key, mock_client, mock_call):
     mock_call.side_effect = [
-        _ok({"new_patch_string": "pkg.sub_a.A"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"pkg.big.A": "pkg.sub_a.A"}}),
+        _ok(_VERIFY_OK),
     ]
     src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
     per_file = {"/repo/tests/test_big.py": {"source": src, "msgs": []}}
@@ -579,8 +1141,8 @@ def test_rewrite_disk_file_update(mock_key, mock_client, mock_call, tmp_path):
     src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
     test_file.write_text(src, encoding="utf-8")
     mock_call.side_effect = [
-        _ok({"new_patch_string": "pkg.sub_a.A"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"pkg.big.A": "pkg.sub_a.A"}}),
+        _ok(_VERIFY_OK),
     ]
     msgs = list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG))
     assert "pkg.sub_a.A" in test_file.read_text(encoding="utf-8")
@@ -668,13 +1230,16 @@ def test_rewrite_acc_tracks_calls_and_files(mock_key, mock_client, mock_call, tm
     test_file.write_text(src, encoding="utf-8")
     mock_call.side_effect = [
         LLMCallResult(
-            tool_input={"new_patch_string": "pkg.sub_a.A"},
+            tool_input={
+                "needs_rewrite": False,
+                "patch_renames": {"pkg.big.A": "pkg.sub_a.A"},
+            },
             elapsed=1.5,
             input_tokens=100,
             output_tokens=50,
         ),
         LLMCallResult(
-            tool_input={"correct": True, "issue": ""},
+            tool_input=_VERIFY_OK,
             elapsed=0.5,
             input_tokens=80,
             output_tokens=10,
@@ -697,211 +1262,12 @@ def test_rewrite_acc_per_file_files_updated(mock_key, mock_client, mock_call):
     src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
     per_file = {"/repo/tests/test_big.py": {"source": src, "msgs": []}}
     mock_call.side_effect = [
-        _ok({"new_patch_string": "pkg.sub_a.A"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"pkg.big.A": "pkg.sub_a.A"}}),
+        _ok(_VERIFY_OK),
     ]
     acc = RewriteAccumulator()
     list(apply_patch_rewrite([_make_fl_ctx()], per_file, None, _CFG, _acc=acc))
     assert acc.files_updated == 1
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_acc_accumulates(mock_call):
-    """_process_file_source accumulates calls, elapsed, and tokens into _acc."""
-    mock_call.side_effect = [
-        LLMCallResult(
-            tool_input={"new_patch_string": "new.mod.X"},
-            elapsed=1.2,
-            input_tokens=200,
-            output_tokens=40,
-        ),
-        LLMCallResult(
-            tool_input={"correct": True, "issue": ""},
-            elapsed=0.3,
-            input_tokens=150,
-            output_tokens=5,
-        ),
-    ]
-    acc = RewriteAccumulator()
-    _process_file_source(
-        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1, _acc=acc
-    )
-    assert acc.calls == 2
-    assert abs(acc.elapsed - 1.5) < 1e-9
-    assert acc.input_tokens == 350
-    assert acc.output_tokens == 45
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_verbose_prints_to_stderr(mock_call, capsys):
-    """verbose=True emits per-call messages to stderr."""
-    mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
-    ]
-    _process_file_source(
-        _SRC_WITH_PATCH,
-        _FORKING_PATHS,
-        "ctx",
-        MagicMock(),
-        _CFG,
-        1,
-        scan_file="tests/test_foo.py",
-        verbose=True,
-    )
-    err = capsys.readouterr().err
-    assert "patch_rewriter" in err
-    assert "evaluating" in err
-    assert "verifying" in err
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_verbose_detailed_timing(mock_call, capsys):
-    """timing='detailed' appends elapsed/token info after each call."""
-    mock_call.side_effect = [
-        LLMCallResult(
-            tool_input={"new_patch_string": "new.mod.X"},
-            elapsed=1.23,
-            input_tokens=100,
-            output_tokens=20,
-        ),
-        LLMCallResult(
-            tool_input={"correct": True, "issue": ""},
-            elapsed=0.45,
-            input_tokens=80,
-            output_tokens=5,
-        ),
-    ]
-    from crispen.config import CrispenConfig
-
-    cfg = CrispenConfig(patch_update_retries=1, timing="detailed")
-    _process_file_source(
-        _SRC_WITH_PATCH,
-        _FORKING_PATHS,
-        "ctx",
-        MagicMock(),
-        cfg,
-        1,
-        scan_file="tests/test_foo.py",
-        verbose=True,
-    )
-    err = capsys.readouterr().err
-    assert "→ done" in err
-    assert "1.23s" in err
-    assert "0.45s" in err
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_verbose_retry_label(mock_call, capsys):
-    """Retry attempts include '(retry)' in the verbose message."""
-    mock_call.side_effect = [
-        # First attempt: verify rejects.
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": False, "issue": "bad target"}),
-        # Second attempt: accepted.
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
-    ]
-    _process_file_source(
-        _SRC_WITH_PATCH,
-        _FORKING_PATHS,
-        "ctx",
-        MagicMock(),
-        _CFG,
-        2,
-        scan_file="tests/test_foo.py",
-        verbose=True,
-    )
-    err = capsys.readouterr().err
-    assert "(retry)" in err
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_verbose_verify_accepted(mock_call, capsys):
-    """verbose=True prints 'ACCEPTED' when verify succeeds."""
-    mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
-    ]
-    _process_file_source(
-        _SRC_WITH_PATCH,
-        _FORKING_PATHS,
-        "ctx",
-        MagicMock(),
-        _CFG,
-        1,
-        scan_file="tests/test_foo.py",
-        verbose=True,
-    )
-    err = capsys.readouterr().err
-    assert "ACCEPTED" in err
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_verbose_verify_rejected_prints_issue(mock_call, capsys):
-    """verbose=True prints 'REJECTED' and the issue when verify rejects."""
-    mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": False, "issue": "wrong module path"}),
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
-    ]
-    _process_file_source(
-        _SRC_WITH_PATCH,
-        _FORKING_PATHS,
-        "ctx",
-        MagicMock(),
-        _CFG,
-        2,
-        scan_file="tests/test_foo.py",
-        verbose=True,
-    )
-    err = capsys.readouterr().err
-    assert "REJECTED" in err
-    assert "wrong module path" in err
-    assert "ACCEPTED" in err
-
-
-# ---------------------------------------------------------------------------
-# _build_single_patch_prompt
-# ---------------------------------------------------------------------------
-
-
-def _ctx_msg() -> str:
-    return _build_context_message([_make_fl_ctx()])
-
-
-def test_build_single_patch_prompt_no_prev():
-    prompt = _build_single_patch_prompt(_ctx_msg(), "def test_f(): pass", "old.mod.X")
-    assert "old.mod.X" in prompt
-    assert "Previous attempt" not in prompt
-
-
-def test_build_single_patch_prompt_with_prev():
-    prompt = _build_single_patch_prompt(
-        _ctx_msg(),
-        "def test_f(): pass",
-        "old.mod.X",
-        prev_issue="wrong module",
-        prev_proposed="bad.mod.X",
-    )
-    assert "Previous attempt" in prompt
-    assert "wrong module" in prompt
-    assert "bad.mod.X" in prompt
-
-
-# ---------------------------------------------------------------------------
-# _build_single_verify_prompt
-# ---------------------------------------------------------------------------
-
-
-def test_build_single_verify_prompt_basic():
-    prompt = _build_single_verify_prompt(
-        _ctx_msg(), "def test_f(): pass", "old.mod.X", "new.mod.X"
-    )
-    assert "old.mod.X" in prompt
-    assert "new.mod.X" in prompt
-    assert "correct" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1399,11 +1765,11 @@ _SRC_WITH_CONST = (
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_const_same_file_update(mock_call, tmp_path):
-    """Const ref → apply_patch_strings updates const definition and patch literal."""
+    """Same-file const ref → same_file_const_map updates the const definition."""
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "new.mod.X"}}),
+        _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_CONST,
@@ -1415,7 +1781,7 @@ def test_process_const_same_file_update(mock_call, tmp_path):
         scan_file=scan,
     )
     assert changed is True
-    # apply_patch_strings updates all occurrences of "old.mod.X" → "new.mod.X".
+    # apply_patch_strings updates the const definition.
     assert '"new.mod.X"' in result
     assert '"old.mod.X"' not in result
     # No cross-file updates for same-file const.
@@ -1424,19 +1790,14 @@ def test_process_const_same_file_update(mock_call, tmp_path):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_const_cross_file_update(mock_call, tmp_path):
-    """Const ref from imported file → cross_file_patch_maps returned.
-
-    The scan file itself has no string literal for 'old.mod.X' (only a NAME
-    reference via @patch(TARGET)), so changed may be False while cross still
-    records the update needed in helpers.py.
-    """
+    """Const ref from imported file → cross_file_patch_maps returned."""
     helpers = tmp_path / "helpers.py"
     helpers.write_text('TARGET = "old.mod.X"\n', encoding="utf-8")
     src = "from .helpers import TARGET\n\n@patch(TARGET)\ndef test_f(mock):\n    pass\n"
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "new.mod.X"}}),
+        _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         src,
@@ -1453,9 +1814,11 @@ def test_process_const_cross_file_update(mock_call, tmp_path):
     assert cross[helpers_abs] == {"old.mod.X": "new.mod.X"}
 
 
-@mock_patch(_PATCH_CALL_TOOL, return_value=_ok({"new_patch_string": "old.mod.X"}))
+@mock_patch(
+    _PATCH_CALL_TOOL, return_value=_ok({"needs_rewrite": False, "patch_renames": {}})
+)
 def test_process_const_no_change_no_cross(mock_call, tmp_path):
-    """LLM returns same path → no change, cross is empty."""
+    """LLM returns no renames → no change, cross is empty."""
     scan = str(tmp_path / "test_foo.py")
     result, changed, cross = _process_file_source(
         _SRC_WITH_CONST,
@@ -1471,36 +1834,13 @@ def test_process_const_no_change_no_cross(mock_call, tmp_path):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_duplicate_old_path_uses_first_func(mock_call):
-    """Two functions share the same old_patch_path → only one LLM call is made.
-
-    Covers the 'False' branch of `if old_path not in unique_patches`.
-    """
-    src = (
-        '@patch("old.mod.X")\ndef test_a(m):\n    pass\n\n'
-        '@patch("old.mod.X")\ndef test_b(m):\n    pass\n'
-    )
-    mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
-    ]
-    result, changed, cross = _process_file_source(
-        src, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
-    )
-    assert changed is True
-    assert "new.mod.X" in result
-    # Only 2 LLM calls for a single unique patch string (rewrite + verify).
-    assert mock_call.call_count == 2
-
-
-@mock_patch(_PATCH_CALL_TOOL)
-def test_process_cross_file_const_ref_not_in_patch_map(mock_call, tmp_path):
-    """Cross-file const whose patch path is not in patch_map → line 857 continue.
+def test_process_cross_file_const_ref_not_in_renames(mock_call, tmp_path):
+    """Cross-file const whose patch path is not in accepted renames → skipped.
 
     Scenario: function has two @patch decorators with different old paths. One
     is a cross-file const ref (path A) and the other is a literal (path B).
-    LLM changes path B but leaves path A unchanged (no entry in patch_map for A).
-    The const ref for A should be skipped (line 857).
+    Classify returns rename only for B; A is not in accepted renames.
+    The const ref for A should be skipped.
     """
     helpers = tmp_path / "helpers.py"
     helpers.write_text('TARGET_A = "old.mod.A"\n', encoding="utf-8")
@@ -1510,11 +1850,10 @@ def test_process_cross_file_const_ref_not_in_patch_map(mock_call, tmp_path):
         "def test_f(m1, m2):\n    pass\n"
     )
     scan = str(tmp_path / "test_foo.py")
-    # LLM: old.mod.A → no change (returns same), old.mod.B → new.mod.B.
+    # Classify: only rename old.mod.B → new.mod.B; old.mod.A unchanged.
     mock_call.side_effect = [
-        _ok({"new_patch_string": "old.mod.A"}),  # no change for A
-        _ok({"new_patch_string": "new.mod.B"}),  # change for B
-        _ok({"correct": True, "issue": ""}),  # verify for B
+        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.B": "new.mod.B"}}),
+        _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         src,
@@ -1528,7 +1867,7 @@ def test_process_cross_file_const_ref_not_in_patch_map(mock_call, tmp_path):
     )
     assert changed is True
     assert "new.mod.B" in result
-    # old.mod.A is not in patch_map → no cross-file update for helpers.py.
+    # old.mod.A not in accepted renames → no cross-file update for helpers.py.
     helpers_abs = str(helpers.resolve())
     assert helpers_abs not in cross
 
@@ -1561,8 +1900,8 @@ def test_process_attr_const_cross_file_update(mock_call, tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
-        _ok({"new_patch_string": "new.mod.X"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "new.mod.X"}}),
+        _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         src,
@@ -1683,8 +2022,8 @@ def test_rewrite_cross_file_const_per_file(mock_key, mock_client, mock_call, tmp
         str(helpers): helpers_state,
     }
     mock_call.side_effect = [
-        _ok({"new_patch_string": "pkg.sub_a.A"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"pkg.big.A": "pkg.sub_a.A"}}),
+        _ok(_VERIFY_OK),
     ]
     list(apply_patch_rewrite([_make_fl_ctx()], per_file, None, _CFG))
     # The constant definition in helpers.py (per_file entry) should be updated.
@@ -1704,8 +2043,8 @@ def test_rewrite_cross_file_const_disk(mock_key, mock_client, mock_call, tmp_pat
     test_file = tmp_path / "test_foo.py"
     test_file.write_text(test_src, encoding="utf-8")
     mock_call.side_effect = [
-        _ok({"new_patch_string": "pkg.sub_a.A"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"pkg.big.A": "pkg.sub_a.A"}}),
+        _ok(_VERIFY_OK),
     ]
     list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG))
     # The constant definition on disk should be updated.
@@ -1731,8 +2070,8 @@ def test_rewrite_cross_file_const_per_file_acc(
         str(helpers): helpers_state,
     }
     mock_call.side_effect = [
-        _ok({"new_patch_string": "pkg.sub_a.A"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"pkg.big.A": "pkg.sub_a.A"}}),
+        _ok(_VERIFY_OK),
     ]
     acc = RewriteAccumulator()
     list(apply_patch_rewrite([_make_fl_ctx()], per_file, None, _CFG, _acc=acc))
@@ -1754,8 +2093,8 @@ def test_rewrite_cross_file_const_disk_acc(mock_key, mock_client, mock_call, tmp
     test_file = tmp_path / "test_foo.py"
     test_file.write_text(test_src, encoding="utf-8")
     mock_call.side_effect = [
-        _ok({"new_patch_string": "pkg.sub_a.A"}),
-        _ok({"correct": True, "issue": ""}),
+        _ok({"needs_rewrite": False, "patch_renames": {"pkg.big.A": "pkg.sub_a.A"}}),
+        _ok(_VERIFY_OK),
     ]
     acc = RewriteAccumulator()
     list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG, _acc=acc))
