@@ -485,7 +485,7 @@ def test_build_classify_prompt_no_prev():
     prompt = _build_classify_prompt(_ctx_msg(), "def test_f(): pass", ["old.mod.X"])
     assert "old.mod.X" in prompt
     assert "Previous attempt" not in prompt
-    assert "full rewrite" in prompt
+    assert "patch_renames" in prompt
 
 
 def test_build_classify_prompt_with_prev():

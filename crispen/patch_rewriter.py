@@ -116,34 +116,33 @@ _PATCH_RULES = (
 _PATCH_CLASSIFY_TOOL: dict = {
     "name": "classify_patch_updates",
     "description": (
-        "Classify whether a test function's @patch decorators need simple string "
-        "path renames after a source file was split into sub-modules, or whether "
-        "the function requires a full rewrite (e.g. new @patch decorators, new "
-        "mock parameters, or body changes)."
+        "For each @patch string listed, provide its correct new value after the "
+        "source file was split. Also flag if the test function needs structural "
+        "changes beyond path renames (new @patch decorators, new mock parameters, "
+        "or body changes)."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "needs_rewrite": {
-                "type": "boolean",
-                "description": (
-                    "True if the function requires a full rewrite — for example "
-                    "because new @patch decorators and/or new mock parameters or "
-                    "setup code are needed. False if only patch string paths need "
-                    "renaming (or no change is needed)."
-                ),
-            },
             "patch_renames": {
                 "type": "object",
                 "description": (
-                    "When needs_rewrite is False: a map of old patch string → new "
-                    "patch string for each @patch that needs updating. Omit or "
-                    "leave empty if no patches need changing."
+                    "Map of old patch string → new patch string. Provide an entry "
+                    "for every patch path that was evaluated. Use the SAME string "
+                    "as the value if no rename is needed for that path."
                 ),
                 "additionalProperties": {"type": "string"},
             },
+            "needs_rewrite": {
+                "type": "boolean",
+                "description": (
+                    "True if the function additionally requires structural changes "
+                    "— new @patch decorators, new mock parameters, or body edits. "
+                    "False if only path renames (or no change) are needed."
+                ),
+            },
         },
-        "required": ["needs_rewrite"],
+        "required": ["patch_renames", "needs_rewrite"],
     },
 }
 
@@ -718,9 +717,10 @@ def _build_classify_prompt(
     parts.append(
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
         f"## Patch strings to evaluate:\n{paths_list}\n\n"
-        "Decide whether this function needs a **full rewrite** (new @patch "
-        "decorators, new mock parameters, or body changes) or just **patch "
-        "string renames**. If renames only, provide the updated strings.\n"
+        "For **each** patch string listed above, apply the step-by-step algorithm "
+        "and provide its correct new value in `patch_renames` (use the **same** "
+        "string if no rename is needed). Also set `needs_rewrite` to True if "
+        "the function requires structural changes beyond path renames.\n"
     )
     return "".join(parts)
 
