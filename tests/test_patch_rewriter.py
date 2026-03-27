@@ -607,15 +607,162 @@ def test_process_classify_tool_none(mock_call):
     assert changed is False
 
 
-@mock_patch(_PATCH_CALL_TOOL, return_value=_ok(_CLASSIFY_NO_CHANGE))
+@mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_needed(mock_call):
-    # Classify returns empty renames → no verify call, no update.
+    # Classify returns empty renames → verify confirms no-change → no update.
+    mock_call.side_effect = [_ok(_CLASSIFY_NO_CHANGE), _ok(_VERIFY_OK)]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert result == _SRC_WITH_PATCH
     assert changed is False
-    assert mock_call.call_count == 1  # no verify call
+    assert mock_call.call_count == 2  # classify + verify
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_verify_none_accept(mock_call):
+    # Classify says no change; verify returns None → accept no-change.
+    mock_call.side_effect = [_ok(_CLASSIFY_NO_CHANGE), _ok(None)]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is False
+    assert mock_call.call_count == 2
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_verify_rejects_then_accepts(mock_call):
+    # No-change verify rejects first; classify+verify accepted on retry.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_REJECT),
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "new.mod.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_verify_retries_exhausted(mock_call):
+    # No-change verify rejects with llm_verify_retries=0 → accept no-change.
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=1, llm_verify_retries=0)
+    mock_call.side_effect = [_ok(_CLASSIFY_NO_CHANGE), _ok(_VERIFY_REJECT)]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), cfg, 1
+    )
+    assert changed is False
+    assert mock_call.call_count == 2
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_verify_verbose(mock_call, capsys):
+    # verbose=True prints 'verifying no-change' and 'ACCEPTED'.
+    mock_call.side_effect = [_ok(_CLASSIFY_NO_CHANGE), _ok(_VERIFY_OK)]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "verifying no-change" in err
+    assert "ACCEPTED" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_verify_verbose_reject(mock_call, capsys):
+    # verbose=True prints 'REJECTED' and the issue when no-change verify rejects.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok({"correct": False, "issue": "patch still points to old module"}),
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        2,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "REJECTED" in err
+    assert "patch still points to old module" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_verify_timing_detailed(mock_call, capsys):
+    # timing='detailed' appends elapsed/token info after the no-change verify call.
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=1, timing="detailed")
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input=_CLASSIFY_NO_CHANGE,
+            elapsed=0.5,
+            input_tokens=100,
+            output_tokens=10,
+        ),
+        LLMCallResult(
+            tool_input=_VERIFY_OK,
+            elapsed=0.3,
+            input_tokens=80,
+            output_tokens=5,
+        ),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        cfg,
+        1,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "→ done" in err
+    assert "0.30s" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_acc_accumulates(mock_call):
+    # _acc accumulates calls from both classify and no-change verify.
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input=_CLASSIFY_NO_CHANGE,
+            elapsed=0.5,
+            input_tokens=100,
+            output_tokens=10,
+        ),
+        LLMCallResult(
+            tool_input=_VERIFY_OK,
+            elapsed=0.3,
+            input_tokens=80,
+            output_tokens=5,
+        ),
+    ]
+    acc = RewriteAccumulator()
+    _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1, _acc=acc
+    )
+    assert acc.calls == 2
+    assert abs(acc.elapsed - 0.8) < 1e-9
+    assert acc.input_tokens == 180
+    assert acc.output_tokens == 15
 
 
 @mock_patch(
@@ -625,12 +772,13 @@ def test_process_no_change_needed(mock_call):
     ),
 )
 def test_process_same_path_filtered_out(mock_call):
-    # Rename where old == new → filtered, treated as no change.
+    # Rename where old == new → filtered to empty → triggers no-change verify.
+    # return_value repeats for both calls; verify gets wrong type → rejects; retries
+    # exhaust → accept no-change.
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert changed is False
-    assert mock_call.call_count == 1
 
 
 @mock_patch(

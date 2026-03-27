@@ -775,6 +775,22 @@ def _build_func_verify_prompt(
     return "".join(parts)
 
 
+def _build_no_change_verify_prompt(
+    context_msg: str,
+    function_text: str,
+) -> str:
+    """Build the user prompt for a no-change verify LLM call."""
+    parts = [
+        context_msg,
+        _PATCH_RULES,
+        f"\n## Test function:\n```python\n{function_text}\n```\n\n"
+        "The proposed update is: **no patch strings need changing**.\n\n"
+        "Is this correct? Set `correct` to True only if all @patch strings in "
+        "this function still point to the correct location after the split.\n",
+    ]
+    return "".join(parts)
+
+
 def _build_rewrite_func_prompt(
     context_msg: str,
     function_text: str,
@@ -1068,7 +1084,66 @@ def _process_file_source(
             }
 
             if not patch_renames:
-                break  # no changes needed
+                # Verify the "no change needed" conclusion.
+                no_change_verify_prompt = _build_no_change_verify_prompt(
+                    context_msg, func.full_text
+                )
+                if verbose:
+                    print(
+                        f"crispen: patch_rewriter: verifying no-change for"
+                        f" '{func.function_name}' in {file_desc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                v = call_with_tool(
+                    client,
+                    config.provider,
+                    config.model,
+                    256,
+                    _PATCH_SINGLE_VERIFY_TOOL,
+                    "verify_patch_update",
+                    [{"role": "user", "content": no_change_verify_prompt}],
+                    caller="patch_rewriter",
+                    tool_choice_override=config.tool_choice,
+                )
+                if _acc is not None:
+                    _acc.calls += 1
+                    _acc.elapsed += v.elapsed
+                    _acc.input_tokens += v.input_tokens
+                    _acc.output_tokens += v.output_tokens
+                if verbose and config.timing == "detailed":
+                    print(
+                        f"crispen: patch_rewriter:   → done [{v.elapsed:.2f}s,"
+                        f" {v.input_tokens:,} in / {v.output_tokens:,} out]",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                if v.tool_input is None:
+                    break  # verify call failed; accept no-change
+                verify_correct = v.tool_input.get("correct", False)
+                issue = v.tool_input.get("issue", "")
+                if verbose:
+                    v_status = "ACCEPTED" if verify_correct else "REJECTED"
+                    print(
+                        f"crispen: patch_rewriter: no-change verify {v_status}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if not verify_correct and issue:
+                        print(
+                            f"crispen: patch_rewriter:   issue: {issue}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                if verify_correct:
+                    break  # confirmed: no change needed
+                if rename_verify_retries_left > 0:
+                    rename_verify_retries_left -= 1
+                    prev_issue = issue
+                    prev_proposed = "no change needed"
+                    attempts_left += 1  # don't burn classify retry budget
+                    continue
+                break  # retries exhausted — accept no-change
 
             # Verify the renames.
             verify_prompt = _build_func_verify_prompt(
