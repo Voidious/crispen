@@ -202,7 +202,8 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
     "name": "verify_patch_update",
     "description": (
         "Verify whether proposed patch() string updates are correct after a "
-        "source file was split into sub-modules."
+        "source file was split into sub-modules. When rejecting, populate "
+        "corrections with {current_path: corrected_path} for each rename needed."
     ),
     "input_schema": {
         "type": "object",
@@ -214,19 +215,22 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
             "corrections": {
                 "type": "object",
                 "description": (
-                    "When correct=false because a module path changed, map each "
-                    "current patch string to its corrected value — for example, "
-                    '{"pkg.mod.Name": "pkg.mod.sub.Name"}. '
-                    "Set to empty dict only when the fix requires adding a new "
-                    "@patch decorator or mock parameter (not a path rename)."
+                    "When correct=false and the fix is a module path rename: "
+                    "required mapping of {current_path: corrected_path} for "
+                    "each string that needs renaming. For example: "
+                    '{"crispen.engine.MetadataWrapper": '
+                    '"crispen.engine.helpers.MetadataWrapper"}. '
+                    "Leave empty only if the fix requires adding an entirely "
+                    "new @patch decorator (not renaming an existing one)."
                 ),
                 "additionalProperties": {"type": "string"},
             },
             "issue": {
                 "type": "string",
                 "description": (
-                    "What is wrong with the proposed updates. "
-                    "Empty string when correct."
+                    "Explain why the patch string is wrong (module that moved, "
+                    "etc.). Do not include the corrected path here — "
+                    "put that in corrections."
                 ),
             },
         },
@@ -832,20 +836,25 @@ def _build_func_verify_prompt(
 def _build_no_change_verify_prompt(
     context_msg: str,
     function_text: str,
+    old_patch_paths: List[str],
 ) -> str:
     """Build the user prompt for a no-change verify LLM call."""
+    paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
     parts = [
         context_msg,
         _PATCH_RULES,
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
+        f"## Patch strings in this test (no update proposed):\n{paths_list}\n\n"
         "The proposed update is: **no patch strings need changing**.\n\n"
-        "Is this correct? Set `correct` to True only if all @patch strings in "
-        "this function still point to the correct location after the split.\n"
-        "If not correct, set `corrections` to map each @patch string that needs "
-        "updating to its corrected path (e.g., "
-        '{"crispen.engine.X": "crispen.engine.sub.X"}). '
-        "Only leave `corrections` empty when the fix requires adding a new "
-        "@patch decorator or mock parameter, not just updating an existing path.\n",
+        "Is this correct? Set `correct` to True only if all @patch strings "
+        "in this function still point to the correct location after the split.\n"
+        "When you reject (correct=false): populate `corrections` with "
+        "{current_path: corrected_path} for each string listed above that "
+        "needs renaming — use the exact strings from the list as keys. "
+        "The `issue` field is for explaining why the current path is wrong, "
+        "not for describing the fix. "
+        "Only leave `corrections` empty if the fix requires an entirely new "
+        "@patch decorator.\n",
     ]
     return "".join(parts)
 
@@ -1164,7 +1173,7 @@ def _process_file_source(
             if not patch_renames:
                 # Verify the "no change needed" conclusion.
                 no_change_verify_prompt = _build_no_change_verify_prompt(
-                    context_msg, func.full_text
+                    context_msg, func.full_text, func.old_patch_paths
                 )
                 if verbose:
                     print(
