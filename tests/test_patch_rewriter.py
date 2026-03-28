@@ -75,6 +75,11 @@ _CLASSIFY_NO_CHANGE = {"needs_rewrite": False, "patch_renames": {}}
 _CLASSIFY_REWRITE = {"needs_rewrite": True}
 _VERIFY_OK = {"correct": True, "issue": ""}
 _VERIFY_REJECT = {"correct": False, "issue": "wrong path"}
+_VERIFY_REJECT_WITH_CORRECTIONS = {
+    "correct": False,
+    "issue": "wrong path",
+    "corrections": {"old.mod.X": "new.mod.X"},
+}
 _REWRITE_VERIFY_OK = {"correct": True, "issue": ""}
 _REWRITE_VERIFY_REJECT = {"correct": False, "issue": "wrong mock setup"}
 
@@ -750,6 +755,201 @@ def test_process_no_change_exhausted_escalate_verbose(mock_call, capsys):
     )
     err = capsys.readouterr().err
     assert "escalating to rewrite" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_applied(mock_call):
+    # No-change verify returns corrections → corrections-verify accepts → apply.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),
+        _ok(_VERIFY_OK),  # corrections-verify accepts
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "new.mod.X" in result
+    assert mock_call.call_count == 3
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_verify_none_accept(mock_call):
+    # Corrections-verify returns tool_input=None → accept.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),
+        _ok(None),  # corrections-verify returns None → accept
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "new.mod.X" in result
+    assert mock_call.call_count == 3
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_verify_fails_retry(mock_call):
+    # Corrections-verify rejects → retries left → retry classify which succeeds.
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),  # classify → no change
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),  # verify → reject + corrections
+        _ok(_VERIFY_REJECT),  # corrections-verify → rejected
+        _ok(_CLASSIFY_RENAME),  # classify (retry) → rename
+        _ok(_VERIFY_OK),  # rename verify → accept
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), cfg, 3
+    )
+    assert changed is True
+    assert "new.mod.X" in result
+    assert mock_call.call_count == 5
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_verbose(mock_call, capsys):
+    # verbose=True prints 'verifying corrections for' and 'ACCEPTED'.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),
+        _ok(_VERIFY_OK),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        _CFG,
+        2,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "verifying corrections for" in err
+    assert "ACCEPTED" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_verbose_reject(mock_call, capsys):
+    # verbose=True prints 'REJECTED' and issue when corrections-verify rejects.
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),
+        _ok({"correct": False, "issue": "correction still wrong", "corrections": {}}),
+        _ok(_CLASSIFY_RENAME),
+        _ok(_VERIFY_OK),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        cfg,
+        3,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "corrections verify REJECTED" in err
+    assert "correction still wrong" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_timing_detailed(mock_call, capsys):
+    # timing='detailed' prints elapsed/token info after corrections-verify call.
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=2, timing="detailed")
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input=_CLASSIFY_NO_CHANGE,
+            elapsed=0.5,
+            input_tokens=100,
+            output_tokens=10,
+        ),
+        LLMCallResult(
+            tool_input=_VERIFY_REJECT_WITH_CORRECTIONS,
+            elapsed=0.4,
+            input_tokens=90,
+            output_tokens=20,
+        ),
+        LLMCallResult(
+            tool_input=_VERIFY_OK,
+            elapsed=0.3,
+            input_tokens=80,
+            output_tokens=5,
+        ),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        cfg,
+        2,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "0.30s" in err
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_acc(mock_call):
+    # _acc accumulates calls from classify, no-change verify, and corrections-verify.
+    mock_call.side_effect = [
+        LLMCallResult(
+            tool_input=_CLASSIFY_NO_CHANGE,
+            elapsed=0.5,
+            input_tokens=100,
+            output_tokens=10,
+        ),
+        LLMCallResult(
+            tool_input=_VERIFY_REJECT_WITH_CORRECTIONS,
+            elapsed=0.4,
+            input_tokens=90,
+            output_tokens=20,
+        ),
+        LLMCallResult(
+            tool_input=_VERIFY_OK,
+            elapsed=0.3,
+            input_tokens=80,
+            output_tokens=5,
+        ),
+    ]
+    acc = RewriteAccumulator()
+    _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2, _acc=acc
+    )
+    assert acc.calls == 3
+    assert abs(acc.elapsed - 1.2) < 1e-9
+    assert acc.input_tokens == 270
+    assert acc.output_tokens == 35
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_no_splice(mock_call, tmp_path):
+    # Corrections-verify accepts; function uses const ref → no splice; const updated.
+    src = 'TARGET = "old.mod.X"\n\n@patch(TARGET)\ndef test_f(mock_x):\n    pass\n'
+    scan = str(tmp_path / "test_foo.py")
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),
+        _ok(_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        src, {"old.mod.X"}, "ctx", MagicMock(), _CFG, 2, scan_file=scan
+    )
+    assert changed is True
+    assert "new.mod.X" in result
+    assert mock_call.call_count == 3
 
 
 @mock_patch(_PATCH_CALL_TOOL)

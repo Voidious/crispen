@@ -218,8 +218,18 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
                     "Empty string when correct."
                 ),
             },
+            "corrections": {
+                "type": "object",
+                "description": (
+                    "When correct=false and the fix is simple string renames, "
+                    "the corrected patch strings as {old_path: new_path}. "
+                    "Empty dict when correct=true or the fix requires "
+                    "structural changes beyond simple string replacement."
+                ),
+                "additionalProperties": {"type": "string"},
+            },
         },
-        "required": ["correct", "issue"],
+        "required": ["correct", "issue", "corrections"],
     },
 }
 
@@ -829,7 +839,11 @@ def _build_no_change_verify_prompt(
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
         "The proposed update is: **no patch strings need changing**.\n\n"
         "Is this correct? Set `correct` to True only if all @patch strings in "
-        "this function still point to the correct location after the split.\n",
+        "this function still point to the correct location after the split.\n"
+        "If not correct, also populate `corrections` with the corrected string "
+        "substitutions ({old_patch_path: new_patch_path}) for any paths that "
+        "need renaming. Use an empty dict if the fix requires structural "
+        "changes beyond simple string replacement.\n",
     ]
     return "".join(parts)
 
@@ -1161,7 +1175,7 @@ def _process_file_source(
                     client,
                     config.provider,
                     config.model,
-                    256,
+                    512,
                     _PATCH_SINGLE_VERIFY_TOOL,
                     "verify_patch_update",
                     [{"role": "user", "content": no_change_verify_prompt}],
@@ -1199,11 +1213,92 @@ def _process_file_source(
                         )
                 if verify_correct:
                     break  # confirmed: no change needed
+                # Check if verifier provided corrections for a direct apply.
+                corrections = v.tool_input.get("corrections") or {}
+                corrections_renames: Dict[str, str] = {
+                    old: new
+                    for old, new in corrections.items()
+                    if (
+                        isinstance(old, str)
+                        and isinstance(new, str)
+                        and old != new
+                        and old in func.old_patch_paths
+                    )
+                }
+                if corrections_renames:
+                    # Verifier provided corrections — verify before applying.
+                    vc_prompt = _build_func_verify_prompt(
+                        context_msg, func.full_text, corrections_renames
+                    )
+                    if verbose:
+                        print(
+                            f"crispen: patch_rewriter: verifying corrections for"
+                            f" '{func.function_name}' in {file_desc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    vc = call_with_tool(
+                        client,
+                        config.provider,
+                        config.model,
+                        256,
+                        _PATCH_SINGLE_VERIFY_TOOL,
+                        "verify_patch_update",
+                        [{"role": "user", "content": vc_prompt}],
+                        caller="patch_rewriter",
+                        tool_choice_override=config.tool_choice,
+                    )
+                    if _acc is not None:
+                        _acc.calls += 1
+                        _acc.elapsed += vc.elapsed
+                        _acc.input_tokens += vc.input_tokens
+                        _acc.output_tokens += vc.output_tokens
+                    if verbose and config.timing == "detailed":
+                        print(
+                            f"crispen: patch_rewriter:   → done [{vc.elapsed:.2f}s,"
+                            f" {vc.input_tokens:,} in / {vc.output_tokens:,} out]",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    vc_correct = vc.tool_input is None or vc.tool_input.get(
+                        "correct", False
+                    )
+                    if verbose and vc.tool_input is not None:
+                        vc_status = "ACCEPTED" if vc_correct else "REJECTED"
+                        print(
+                            f"crispen: patch_rewriter: corrections verify {vc_status}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        if not vc_correct and vc.tool_input.get("issue"):
+                            print(
+                                f"crispen: patch_rewriter:   issue:"
+                                f" {vc.tool_input.get('issue')}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                    if vc_correct:
+                        orig_text = "\n".join(
+                            source_lines[func.start_line - 1 : func.end_line]
+                        )
+                        new_text = apply_patch_strings(orig_text, corrections_renames)
+                        if new_text != orig_text:
+                            func_splices.append(
+                                (func.start_line, func.end_line, new_text)
+                            )
+                        string_swap_results.append((func, corrections_renames))
+                        break
+                    # Corrections verify rejected; update issue for retry/escalation.
+                    issue = vc.tool_input.get("issue", "") or issue
                 if rename_verify_retries_left > 0:
                     rename_verify_retries_left -= 1
                     prev_issue = issue
                     no_change_paths = ", ".join(f"`{p}`" for p in func.old_patch_paths)
-                    prev_proposed = f"no change (kept {no_change_paths} unchanged)"
+                    prev_proposed = (
+                        str(corrections_renames)
+                        if corrections_renames
+                        else f"no change (kept {no_change_paths} unchanged)"
+                    )
                     attempts_left += 1  # don't burn classify retry budget
                     continue
                 # Retries exhausted.  When verify_retries were enabled the
