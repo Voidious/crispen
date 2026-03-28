@@ -737,12 +737,6 @@ def _build_classify_prompt(
     """Build the user prompt for the per-function classify LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
     parts = [context_msg, _PATCH_RULES]
-    if prev_issue:
-        parts.append(
-            f"\n## Previous attempt was rejected:\n"
-            f"- Proposed renames: {prev_proposed}\n"
-            f"- Issue: {prev_issue}\n"
-        )
     parts.append(
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
         f"## Patch strings to evaluate:\n{paths_list}\n\n"
@@ -751,6 +745,13 @@ def _build_classify_prompt(
         "string if no rename is needed). Also set `needs_rewrite` to True if "
         "the function requires structural changes beyond path renames.\n"
     )
+    if prev_issue:
+        parts.append(
+            f"\n## CORRECTION REQUIRED — previous attempt was rejected:\n"
+            f"- You previously proposed: {prev_proposed}\n"
+            f"- Why it was wrong: {prev_issue}\n"
+            f"- You MUST output a corrected classification that fixes this issue.\n"
+        )
     return "".join(parts)
 
 
@@ -1140,7 +1141,8 @@ def _process_file_source(
                 if rename_verify_retries_left > 0:
                     rename_verify_retries_left -= 1
                     prev_issue = issue
-                    prev_proposed = "no change needed"
+                    no_change_paths = ", ".join(f"`{p}`" for p in func.old_patch_paths)
+                    prev_proposed = f"no change (kept {no_change_paths} unchanged)"
                     attempts_left += 1  # don't burn classify retry budget
                     continue
                 break  # retries exhausted — accept no-change

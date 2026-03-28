@@ -500,7 +500,7 @@ def test_build_classify_prompt_with_prev():
         prev_issue="wrong module",
         prev_proposed="{'old.mod.X': 'bad.mod.X'}",
     )
-    assert "Previous attempt" in prompt
+    assert "CORRECTION REQUIRED" in prompt
     assert "wrong module" in prompt
     assert "bad.mod.X" in prompt
 
