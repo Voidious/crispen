@@ -21,6 +21,7 @@ from crispen.patch_rewriter import (
     _build_rewrite_func_prompt,
     _build_rewrite_verify_prompt,
     _compiles,
+    _extract_migration_reminder,
     _find_test_functions_to_update,
     _find_with_patch_paths_in_body,
     _is_patch_call,
@@ -477,6 +478,46 @@ def test_splice_function_empty_new_text():
 
 
 # ---------------------------------------------------------------------------
+# _extract_migration_reminder
+# ---------------------------------------------------------------------------
+
+
+def test_extract_migration_reminder_basic():
+    ctx_msg = _build_context_message([_make_fl_ctx()])
+    reminder = _extract_migration_reminder(ctx_msg)
+    assert "Entity migration (quick reference)" in reminder
+    assert "pkg.sub_a" in reminder
+    assert "pkg.sub_b" in reminder
+
+
+def test_extract_migration_reminder_empty_context():
+    reminder = _extract_migration_reminder("no migration here")
+    assert reminder == ""
+
+
+def test_extract_migration_reminder_no_entities():
+    ctx = _make_fl_ctx(entity_to_target={}, new_module_paths={})
+    ctx_msg = _build_context_message([ctx])
+    # Empty entity_to_target → no bullets → reminder is empty string
+    reminder = _extract_migration_reminder(ctx_msg)
+    assert reminder == ""
+
+
+def test_extract_migration_reminder_heading_stops_capture():
+    # When a second fl_context follows the first, a new ## heading appears after
+    # the entity migration section — the extractor must stop capturing there.
+    ctx1 = _make_fl_ctx(old_module="pkg.big", filepath="/p/pkg/big.py")
+    ctx2 = _make_fl_ctx(old_module="pkg.large", filepath="/p/pkg/large.py")
+    ctx_msg = _build_context_message([ctx1, ctx2])
+    reminder = _extract_migration_reminder(ctx_msg)
+    # The reminder should contain migration bullets from both contexts but
+    # not any heading markers.
+    assert "### Entity migration:" not in reminder
+    assert "## Split module:" not in reminder
+    assert "pkg.sub_a" in reminder
+
+
+# ---------------------------------------------------------------------------
 # _build_classify_prompt
 # ---------------------------------------------------------------------------
 
@@ -488,8 +529,9 @@ def _ctx_msg() -> str:
 def test_build_classify_prompt_no_prev():
     prompt = _build_classify_prompt(_ctx_msg(), "def test_f(): pass", ["old.mod.X"])
     assert "old.mod.X" in prompt
-    assert "Previous attempt" not in prompt
+    assert "CORRECTION REQUIRED" not in prompt
     assert "patch_renames" in prompt
+    assert "Entity migration (quick reference)" in prompt
 
 
 def test_build_classify_prompt_with_prev():
@@ -648,7 +690,7 @@ def test_process_no_change_verify_rejects_then_accepts(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_verify_retries_exhausted(mock_call):
-    # No-change verify rejects with llm_verify_retries=0 → accept no-change.
+    # llm_verify_retries=0: no escalation, accept no-change immediately.
     from crispen.config import CrispenConfig
 
     cfg = CrispenConfig(patch_update_retries=1, llm_verify_retries=0)
@@ -658,6 +700,56 @@ def test_process_no_change_verify_retries_exhausted(mock_call):
     )
     assert changed is False
     assert mock_call.call_count == 2
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_exhausted_escalates_to_rewrite(mock_call):
+    # When llm_verify_retries>0 and no-change retries are exhausted, escalate
+    # to the full rewrite path seeded with the verifier's explanation.
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),  # classify → no change
+        _ok(_VERIFY_REJECT),  # verify → reject
+        _ok(_CLASSIFY_NO_CHANGE),  # classify (retry) → no change again
+        _ok(_VERIFY_REJECT),  # verify → reject (retries exhausted → escalate)
+        _ok({"rewritten_function": _VALID_REWRITE}),  # rewrite (escalated)
+        _ok(_REWRITE_VERIFY_OK),  # verify rewrite → accept
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), cfg, 3
+    )
+    assert changed is True
+    assert mock_call.call_count == 6
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_exhausted_escalate_verbose(mock_call, capsys):
+    # verbose=True prints 'escalating to rewrite' when escalation is triggered.
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_REJECT),
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_REJECT),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
+    ]
+    _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        "ctx",
+        MagicMock(),
+        cfg,
+        3,
+        scan_file="tests/test_foo.py",
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "escalating to rewrite" in err
 
 
 @mock_patch(_PATCH_CALL_TOOL)

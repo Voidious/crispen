@@ -677,6 +677,31 @@ def _find_test_functions_to_update(
 # ---------------------------------------------------------------------------
 
 
+def _extract_migration_reminder(context_msg: str) -> str:
+    """Pull entity migration bullets from context_msg for re-inclusion near instruction.
+
+    The entity migration table appears near the top of the context message, which
+    may be tens of thousands of tokens away from where the model generates its
+    response.  Repeating a compact version at the end of the prompt keeps the
+    relevant lookup table in the model's immediate attention window.
+    """
+    lines: List[str] = []
+    capturing = False
+    for line in context_msg.splitlines():
+        stripped = line.rstrip()
+        if stripped == "### Entity migration:":
+            capturing = True
+            continue
+        if capturing:
+            if stripped.startswith("#"):
+                capturing = False
+            elif stripped.startswith("- "):
+                lines.append(stripped)
+    if not lines:
+        return ""
+    return "## Entity migration (quick reference):\n" + "\n".join(lines) + "\n\n"
+
+
 def _build_context_message(fl_contexts: List[_FLContext]) -> str:
     """Build the shared LLM prompt context describing all split files."""
     parts: List[str] = [
@@ -736,14 +761,31 @@ def _build_classify_prompt(
 ) -> str:
     """Build the user prompt for the per-function classify LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
+    migration_reminder = _extract_migration_reminder(context_msg)
     parts = [context_msg, _PATCH_RULES]
     parts.append(
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
         f"## Patch strings to evaluate:\n{paths_list}\n\n"
-        "For **each** patch string listed above, apply the step-by-step algorithm "
-        "and provide its correct new value in `patch_renames` (use the **same** "
-        "string if no rename is needed). Also set `needs_rewrite` to True if "
-        "the function requires structural changes beyond path renames.\n"
+    )
+    if migration_reminder:
+        parts.append(migration_reminder)
+    parts.append(
+        "For **each** patch string, work through these steps:\n"
+        "1. Identify the production function F this test exercises "
+        "(look at what the test calls or patches).\n"
+        "2. Look up F in the Entity migration quick reference above.\n"
+        "   - If F was **not migrated**: the patch string is unchanged — "
+        "include it in `patch_renames` with the **same** value.\n"
+        "   - If F was **migrated to new module M**: go to step 3.\n"
+        "3. Find the patched name (last component, e.g. `MetadataWrapper` in "
+        "`crispen.engine.MetadataWrapper`). Search module M's source in the "
+        "context above for an import of that name "
+        "(e.g. `from libcst.metadata import MetadataWrapper`).\n"
+        "   - If M imports the name: update the patch string to `M.Name`.\n"
+        "   - If M does **not** import it: the patch string is unchanged.\n"
+        "Include **every** evaluated path in `patch_renames`. "
+        "Set `needs_rewrite` to True only for structural changes "
+        "(new decorators, new mock parameters, or body edits).\n"
     )
     if prev_issue:
         parts.append(
@@ -897,59 +939,78 @@ def _process_file_source(
         prev_proposed: Optional[str] = None
         attempts_left = max_attempts
         rename_verify_retries_left = config.llm_verify_retries
+        # When the no-change verify path exhausts retries we escalate: skip
+        # the next classify call and go directly to the full rewrite path,
+        # seeding it with the verifier's explanation as the initial prev_error.
+        _rewrite_escalation_error: Optional[str] = None
+        r = None  # may be skipped when escalating
 
         while attempts_left > 0:
             attempts_left -= 1
 
-            # Stage 1: Classify (and get renames if string-swap).
-            classify_prompt = _build_classify_prompt(
-                context_msg,
-                func.full_text,
-                func.old_patch_paths,
-                prev_issue,
-                prev_proposed,
-            )
-            retry_label = " (retry)" if prev_issue is not None else ""
-            if verbose:
-                print(
-                    f"crispen: patch_rewriter: classifying '{func.function_name}'"
-                    f" in {file_desc}{retry_label}",
-                    file=sys.stderr,
-                    flush=True,
+            if _rewrite_escalation_error is not None:
+                # Bypass classify; the no-change verify already identified the
+                # problem — hand the explanation straight to the rewrite path.
+                needs_rewrite = True
+                if verbose:
+                    print(
+                        f"crispen: patch_rewriter: escalating to rewrite for"
+                        f" '{func.function_name}' in {file_desc}"
+                        f" (no-change verify retries exhausted)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
+                # Stage 1: Classify (and get renames if string-swap).
+                classify_prompt = _build_classify_prompt(
+                    context_msg,
+                    func.full_text,
+                    func.old_patch_paths,
+                    prev_issue,
+                    prev_proposed,
                 )
-            r = call_with_tool(
-                client,
-                config.provider,
-                config.model,
-                512,
-                _PATCH_CLASSIFY_TOOL,
-                "classify_patch_updates",
-                [{"role": "user", "content": classify_prompt}],
-                caller="patch_rewriter",
-                tool_choice_override=config.tool_choice,
-            )
-            if _acc is not None:
-                _acc.calls += 1
-                _acc.elapsed += r.elapsed
-                _acc.input_tokens += r.input_tokens
-                _acc.output_tokens += r.output_tokens
-            if verbose and config.timing == "detailed":
-                print(
-                    f"crispen: patch_rewriter:   → done [{r.elapsed:.2f}s,"
-                    f" {r.input_tokens:,} in / {r.output_tokens:,} out]",
-                    file=sys.stderr,
-                    flush=True,
+                retry_label = " (retry)" if prev_issue is not None else ""
+                if verbose:
+                    print(
+                        f"crispen: patch_rewriter: classifying '{func.function_name}'"
+                        f" in {file_desc}{retry_label}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                r = call_with_tool(
+                    client,
+                    config.provider,
+                    config.model,
+                    512,
+                    _PATCH_CLASSIFY_TOOL,
+                    "classify_patch_updates",
+                    [{"role": "user", "content": classify_prompt}],
+                    caller="patch_rewriter",
+                    tool_choice_override=config.tool_choice,
                 )
-            if r.tool_input is None:
-                break
+                if _acc is not None:
+                    _acc.calls += 1
+                    _acc.elapsed += r.elapsed
+                    _acc.input_tokens += r.input_tokens
+                    _acc.output_tokens += r.output_tokens
+                if verbose and config.timing == "detailed":
+                    print(
+                        f"crispen: patch_rewriter:   → done [{r.elapsed:.2f}s,"
+                        f" {r.input_tokens:,} in / {r.output_tokens:,} out]",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                if r.tool_input is None:
+                    break
 
-            needs_rewrite = r.tool_input.get("needs_rewrite", False)
+                needs_rewrite = r.tool_input.get("needs_rewrite", False)
 
             if needs_rewrite:
                 # Stage 2: Full function rewrite.
                 rewrite_attempts = max_attempts
                 rewrite_verify_retries_left = config.llm_verify_retries
-                prev_error: Optional[str] = None
+                prev_error: Optional[str] = _rewrite_escalation_error
+                _rewrite_escalation_error = None
                 while rewrite_attempts > 0:
                     rewrite_attempts -= 1
                     rewrite_prompt = _build_rewrite_func_prompt(
@@ -1145,7 +1206,15 @@ def _process_file_source(
                     prev_proposed = f"no change (kept {no_change_paths} unchanged)"
                     attempts_left += 1  # don't burn classify retry budget
                     continue
-                break  # retries exhausted — accept no-change
+                # Retries exhausted.  When verify_retries were enabled the
+                # verify step consistently identified a required change that
+                # the classify path could not produce — escalate to the full
+                # rewrite path, seeding it with the verifier's explanation.
+                if config.llm_verify_retries > 0:
+                    _rewrite_escalation_error = issue
+                    attempts_left += 1  # allow one more outer iteration
+                    continue
+                break  # llm_verify_retries=0 → accept no-change
 
             # Verify the renames.
             verify_prompt = _build_func_verify_prompt(
