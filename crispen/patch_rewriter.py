@@ -1287,7 +1287,10 @@ def _process_file_source(
                     prev_issue = issue
                     prev_proposed = str(patch_renames)
                     attempts_left += 1  # don't burn classify retry budget
-                # else: retries exhausted — skip this function
+                elif config.llm_verify_retries > 0:
+                    _rewrite_escalation_error = issue
+                    attempts_left += 1  # allow one more outer iteration
+                # else (llm_verify_retries=0): retries exhausted — skip
 
     # Collect cross-file and same-file constant definition updates.
     cross_file_patch_maps: Dict[str, Dict[str, str]] = {}

@@ -970,6 +970,28 @@ def test_process_verify_rejected_exhausted(mock_call):
     assert changed is False
 
 
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_verify_rejected_exhausted_escalates_to_rewrite(mock_call):
+    # When llm_verify_retries>0 and rename verify retries are exhausted,
+    # escalate to the full rewrite path seeded with the verifier's explanation.
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_RENAME),  # classify → rename
+        _ok(_VERIFY_REJECT),  # verify → reject
+        _ok(_CLASSIFY_RENAME),  # classify (retry) → rename again
+        _ok(_VERIFY_REJECT),  # verify → reject (retries exhausted → escalate)
+        _ok({"rewritten_function": _VALID_REWRITE}),  # rewrite (escalated)
+        _ok(_REWRITE_VERIFY_OK),  # verify rewrite → accept
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), cfg, 3
+    )
+    assert changed is True
+    assert mock_call.call_count == 6
+
+
 # ---------------------------------------------------------------------------
 # _process_file_source — full rewrite path
 # ---------------------------------------------------------------------------
