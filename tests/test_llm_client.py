@@ -182,6 +182,30 @@ def test_call_with_tool_anthropic_success():
     assert isinstance(result.input_tokens, int)
 
 
+def test_call_with_tool_anthropic_no_matching_block_returns_none():
+    """When no block matches tool_name, tool_input is None."""
+    client = MagicMock()
+    text_block = MagicMock()
+    text_block.type = "text"
+    text_block.name = "other"
+    resp = MagicMock()
+    resp.content = [text_block]
+    resp.usage = MagicMock()
+    resp.usage.input_tokens = 10
+    resp.usage.output_tokens = 5
+    client.messages.create.return_value = resp
+    result = call_with_tool(
+        client,
+        "anthropic",
+        "claude-sonnet-4-6",
+        256,
+        _TOOL,
+        "evaluate_duplicate",
+        _MESSAGES,
+    )
+    assert result.tool_input is None
+
+
 def test_call_with_tool_anthropic_skips_non_matching_blocks():
     client = MagicMock()
     # First block is a text block (non-matching), second is the tool_use match.
@@ -295,6 +319,7 @@ def test_call_with_tool_moonshot_success():
 
 def test_call_with_tool_moonshot_api_error():
     with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = Exception
         mock_oai.APIError = Exception
         client = MagicMock()
         client.chat.completions.create.side_effect = Exception("rate limit")
@@ -387,9 +412,64 @@ def test_call_with_tool_openai_returns_timing_and_tokens():
 
 def test_call_with_tool_openai_api_error():
     with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = Exception
         mock_oai.APIError = Exception
         client = MagicMock()
         client.chat.completions.create.side_effect = Exception("rate limit")
+        with pytest.raises(CrispenAPIError, match="openai API error"):
+            call_with_tool(
+                client,
+                "openai",
+                "gpt-4o",
+                256,
+                _TOOL,
+                "evaluate_duplicate",
+                _MESSAGES,
+                caller="Test",
+            )
+
+
+def test_call_with_tool_openai_invalid_prompt_returns_none(capsys):
+    """invalid_prompt 400 returns tool_input=None and prints to stderr."""
+
+    class _InvalidPromptError(Exception):
+        code = "invalid_prompt"
+
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _InvalidPromptError
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _InvalidPromptError("policy flag")
+        result = call_with_tool(
+            client,
+            "openai",
+            "gpt-5.1",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+            caller="Test",
+        )
+    assert result.tool_input is None
+    err = capsys.readouterr().err
+    assert "openai API error" in err
+    assert "policy flag" in err
+
+
+def test_call_with_tool_openai_non_bad_request_api_error_raises():
+    """Non-BadRequestError openai.APIError is re-raised as CrispenAPIError."""
+
+    class _BadRequest(Exception):
+        code = "invalid_prompt"
+
+    class _OtherAPIError(Exception):
+        pass
+
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _BadRequest
+        mock_oai.APIError = _OtherAPIError
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _OtherAPIError("rate limit")
         with pytest.raises(CrispenAPIError, match="openai API error"):
             call_with_tool(
                 client,

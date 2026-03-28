@@ -78,7 +78,7 @@ class RewriteAccumulator:
 
 _PATCH_RULES = (
     "\n## Rules for updating patch() strings:\n"
-    "**Core principle:** `@patch('A.B.Name')` intercepts the `Name` attribute in "
+    "**Core principle:** `@patch('A.B.Name')` replaces the `Name` attribute in "
     "module `A.B`'s namespace. Python resolves `Name` in the **defining** module "
     "of the function that uses it — NOT in any module that merely re-exports it.\n\n"
     "**Step-by-step algorithm:**\n"
@@ -98,7 +98,7 @@ _PATCH_RULES = (
     "5. **Re-exports are irrelevant.** If `old_module/__init__.py` still imports "
     "`Name` independently (e.g. `from libcst.metadata import Name`) or re-exports "
     "F (e.g. `from .M import F`), those are SEPARATE bindings in a SEPARATE "
-    "namespace. Patching `old_module.Name` does NOT intercept F's lookup of `Name` "
+    "namespace. Patching `old_module.Name` does NOT affect F's lookup of `Name` "
     "in M.\n\n"
     "**Example:**\n"
     "```python\n"
@@ -211,13 +211,6 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
                 "type": "boolean",
                 "description": "True if all proposed updates are correct.",
             },
-            "issue": {
-                "type": "string",
-                "description": (
-                    "What is wrong with the proposed updates. "
-                    "Empty string when correct."
-                ),
-            },
             "corrections": {
                 "type": "object",
                 "description": (
@@ -229,8 +222,15 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
                 ),
                 "additionalProperties": {"type": "string"},
             },
+            "issue": {
+                "type": "string",
+                "description": (
+                    "What is wrong with the proposed updates. "
+                    "Empty string when correct."
+                ),
+            },
         },
-        "required": ["correct", "issue", "corrections"],
+        "required": ["correct", "corrections", "issue"],
     },
 }
 
@@ -800,10 +800,10 @@ def _build_classify_prompt(
     )
     if prev_issue:
         parts.append(
-            f"\n## CORRECTION REQUIRED — previous attempt was rejected:\n"
+            f"\n## Previous attempt was rejected:\n"
             f"- You previously proposed: {prev_proposed}\n"
             f"- Why it was wrong: {prev_issue}\n"
-            f"- You MUST output a corrected classification that fixes this issue.\n"
+            f"- Output a corrected classification that fixes this issue.\n"
         )
     return "".join(parts)
 

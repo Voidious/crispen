@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -157,6 +158,25 @@ def call_with_tool(
             create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         try:
             response = client.chat.completions.create(**create_kwargs)
+        except openai.BadRequestError as exc:
+            if getattr(exc, "code", None) == "invalid_prompt":
+                # Content policy flag — print warning and return None gracefully
+                # so callers skip the function rather than crashing the pipeline.
+                print(
+                    f"crispen: {caller}: {provider} API error: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return LLMCallResult(
+                    tool_input=None,
+                    elapsed=time.perf_counter() - t0,
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+            raise CrispenAPIError(
+                f"{caller}: {provider} API error: {exc}\n"
+                "Commit blocked. To skip all hooks: git commit --no-verify"
+            ) from exc
         except openai.APIError as exc:
             raise CrispenAPIError(
                 f"{caller}: {provider} API error: {exc}\n"
