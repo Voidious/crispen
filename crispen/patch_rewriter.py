@@ -221,10 +221,11 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
             "corrections": {
                 "type": "object",
                 "description": (
-                    "When correct=false and the fix is simple string renames, "
-                    "the corrected patch strings as {old_path: new_path}. "
-                    "Empty dict when correct=true or the fix requires "
-                    "structural changes beyond simple string replacement."
+                    "When correct=false because a module path changed, map each "
+                    "current patch string to its corrected value — for example, "
+                    '{"pkg.mod.Name": "pkg.mod.sub.Name"}. '
+                    "Set to empty dict only when the fix requires adding a new "
+                    "@patch decorator or mock parameter (not a path rename)."
                 ),
                 "additionalProperties": {"type": "string"},
             },
@@ -840,10 +841,11 @@ def _build_no_change_verify_prompt(
         "The proposed update is: **no patch strings need changing**.\n\n"
         "Is this correct? Set `correct` to True only if all @patch strings in "
         "this function still point to the correct location after the split.\n"
-        "If not correct, also populate `corrections` with the corrected string "
-        "substitutions ({old_patch_path: new_patch_path}) for any paths that "
-        "need renaming. Use an empty dict if the fix requires structural "
-        "changes beyond simple string replacement.\n",
+        "If not correct, set `corrections` to map each @patch string that needs "
+        "updating to its corrected path (e.g., "
+        '{"crispen.engine.X": "crispen.engine.sub.X"}). '
+        "Only leave `corrections` empty when the fix requires adding a new "
+        "@patch decorator or mock parameter, not just updating an existing path.\n",
     ]
     return "".join(parts)
 
