@@ -656,23 +656,21 @@ def test_find_type_checking_needed_imports_quoted_only():
             names=["MyType"], source="from models import MyType", is_future=False
         )
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert "from models import MyType" in result
 
 
 def test_find_type_checking_needed_imports_runtime_excluded():
     # When the name is used at runtime (not just in a quoted annotation),
     # it should NOT appear in the TYPE_CHECKING-only list.
+    # annotation_only = quoted - runtime excludes runtime names directly.
     entity_src_map = {"foo": "def foo():\n    return MyType()\n"}
     infos = [
         ImportInfo(
             names=["MyType"], source="from models import MyType", is_future=False
         )
     ]
-    # Pass the import as already in regular_needed_sources.
-    result = _find_type_checking_needed_imports(
-        ["foo"], entity_src_map, infos, {"from models import MyType"}
-    )
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert result == []
 
 
@@ -684,7 +682,7 @@ def test_find_type_checking_needed_imports_no_annotations():
             names=["MyType"], source="from models import MyType", is_future=False
         )
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert result == []
 
 
@@ -701,7 +699,7 @@ def test_find_type_checking_needed_imports_future_excluded():
             names=["MyType"], source="from models import MyType", is_future=False
         ),
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert "from __future__ import annotations" not in result
     assert "from models import MyType" in result
 
@@ -717,7 +715,7 @@ def test_find_type_checking_needed_imports_deduplicates():
             names=["MyType"], source="from models import MyType", is_future=False
         ),
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert result.count("from models import MyType") == 1
 
 
@@ -730,7 +728,7 @@ def test_find_type_checking_needed_imports_import_names_no_match():
             names=["OtherType"], source="from models import OtherType", is_future=False
         )
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert result == []
 
 
@@ -747,7 +745,7 @@ def test_find_type_checking_needed_imports_partial_multi_name_import():
             is_future=False,
         )
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert len(result) == 1
     assert "MyResult" in result[0]
     assert "run_thing" not in result[0]
@@ -770,8 +768,33 @@ def test_find_type_checking_needed_imports_narrowed_src_dedup():
             is_future=False,
         ),
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert result.count("from mymod import MyResult") == 1
+
+
+def test_find_type_checking_needed_imports_shared_import_with_runtime_peer():
+    # Regression: when an import line covers both a runtime name and an
+    # annotation-only name, the annotation-only name must still get a
+    # TYPE_CHECKING import even though the import source appears in the
+    # regular imports (where _prune_unused_imports will later drop it).
+    entity_src_map = {
+        "foo": (
+            'def foo(_acc: Optional["_LLMAccumulator"] = None) -> None:\n'
+            "    call_with_tool(_PLACEMENT_TOOL)\n"
+        )
+    }
+    infos = [
+        ImportInfo(
+            names=["_LLMAccumulator", "_PLACEMENT_TOOL"],
+            source="from .llm_schemas import _LLMAccumulator, _PLACEMENT_TOOL",
+            is_future=False,
+        )
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
+    # _LLMAccumulator is only in a quoted annotation → must be in TC block
+    assert any("_LLMAccumulator" in r for r in result)
+    # _PLACEMENT_TOOL is a runtime reference → must NOT be in TC block
+    assert not any("_PLACEMENT_TOOL" in r for r in result)
 
 
 def test_find_type_checking_needed_imports_uses_is_type_checking_infos():
@@ -787,7 +810,7 @@ def test_find_type_checking_needed_imports_uses_is_type_checking_infos():
             is_type_checking=True,
         )
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert "from .config import MyConfig" in result
 
 

@@ -599,14 +599,15 @@ def _find_type_checking_needed_imports(
     entity_names: List[str],
     entity_source_map: Dict[str, str],
     import_infos: List[ImportInfo],
-    regular_needed_sources: Set[str],
 ) -> List[str]:
     """Return import statements needed only for quoted type annotations.
 
     These should be placed under ``if TYPE_CHECKING:`` because the names are
     only referenced inside string-valued annotations (forward references) and
-    are not needed at runtime.  *regular_needed_sources* is the set of import
-    source strings already emitted as regular imports (to avoid duplicates).
+    are not needed at runtime.  Names that appear in regular (non-annotation)
+    loads are excluded via ``annotation_only = quoted - runtime``, which
+    guarantees that any name emitted here will be pruned from regular imports
+    by ``_prune_unused_imports`` — so no duplicate imports can arise.
     ``__future__`` imports are always excluded since they are handled by
     ``_find_needed_imports``.
     """
@@ -624,7 +625,7 @@ def _find_type_checking_needed_imports(
     needed: List[str] = []
     seen: Set[str] = set()
     for info in import_infos:
-        if info.source in regular_needed_sources or info.source in seen:
+        if info.source in seen:
             continue
         if info.is_future:
             continue
@@ -2641,7 +2642,7 @@ def generate_file_splits(
             ent_names, entity_source_map, import_infos, all_entity_names
         )
         needed_tc = _find_type_checking_needed_imports(
-            ent_names, entity_source_map, import_infos, set(needed)
+            ent_names, entity_source_map, import_infos
         )
         if subdir_name is not None:
             depth = len(Path(target_file).parts) - 1
@@ -2819,11 +2820,8 @@ def generate_file_splits(
     ]
     _tc_to_inject: List[str] = []
     if _non_migrated_names:
-        _regular_in_updated = {
-            i.source for i in _extract_import_info(updated) if not i.is_type_checking
-        }
         _tc_to_inject = _find_type_checking_needed_imports(
-            _non_migrated_names, entity_source_map, import_infos, _regular_in_updated
+            _non_migrated_names, entity_source_map, import_infos
         )
     # For non-test subdir splits, re-exports from the __init__.py use relative
     # import prefixes computed from inside the package (e.g. ".utils" not
