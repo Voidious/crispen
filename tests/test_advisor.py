@@ -669,7 +669,7 @@ def test_plan_chunked_placement_makes_multiple_calls(mock_key, mock_client, mock
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_chunked_placement_second_chunk_fails_aborts(
-    mock_key, mock_client, mock_call
+    mock_key, mock_client, mock_call, capsys
 ):
     """Second chunk exhausts all per-chunk retries → placement returns None → abort."""
     mock_key.return_value = "key"
@@ -698,11 +698,12 @@ def test_plan_chunked_placement_second_chunk_fails_aborts(
     ]
 
     c = _classified(entities=entities, set_2_groups=groups)
-    plan = advise_file_limiter(c, "src/big.py", cfg)
+    plan = advise_file_limiter(c, "src/big.py", cfg, verbose=True)
 
     assert plan.abort is True
     assert "LLM failed to assign file placements" in plan.abort_reason
     assert mock_call.call_count == 4  # propose + chunk1 + 2 failed chunk2 attempts
+    assert "failed to assign file placements" in capsys.readouterr().err
 
 
 @patch(_PATCH_CALL)

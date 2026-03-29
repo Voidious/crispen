@@ -606,7 +606,7 @@ def _assign_placements_chunk(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 20 + n_groups * 20)
+    max_tokens = max(512, 100 + n_groups * 40)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to assign file placements"
@@ -851,7 +851,7 @@ def _rename_conflicting_chunk(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 20 + n_groups * 20)
+    max_tokens = max(512, 100 + n_groups * 40)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to resolve naming conflicts"
@@ -974,6 +974,7 @@ def _assign_placements(
     for chunk_start in range(0, len(groups_to_place), _PLACEMENT_CHUNK_SIZE):
         chunk = groups_to_place[chunk_start : chunk_start + _PLACEMENT_CHUNK_SIZE]
         chunk_placements: Optional[List[GroupPlacement]] = None
+        chunk_prev_failure = prev_failure
         for _ in range(1 + config.file_limiter_retries):
             chunk_placements = _assign_placements_chunk(
                 chunk,
@@ -982,7 +983,7 @@ def _assign_placements(
                 existing_files,
                 client,
                 config,
-                prev_failure,
+                chunk_prev_failure,
                 min_files=2,
                 verbose=verbose,
                 timing=timing,
@@ -992,7 +993,19 @@ def _assign_placements(
             )
             if chunk_placements is not None:
                 break
+            chunk_prev_failure = (
+                f"Your previous response did not include placements for all "
+                f"{len(chunk)} group(s). You MUST return a target_file for "
+                f"every group_id from 0 to {len(chunk) - 1}."
+            )
         if chunk_placements is None:
+            if verbose:
+                print(
+                    f"crispen: FileLimiter: failed to assign file placements"
+                    f" after {1 + config.file_limiter_retries} attempt(s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
             return None
         all_placements.extend(chunk_placements)
 
