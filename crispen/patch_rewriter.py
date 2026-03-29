@@ -100,6 +100,16 @@ _PATCH_RULES = (
     "F (e.g. `from .M import F`), those are SEPARATE bindings in a SEPARATE "
     "namespace. Patching `old_module.Name` does NOT affect F's lookup of `Name` "
     "in M.\n\n"
+    "**from-import pitfall:** When M does "
+    "`from libcst.metadata import MetadataWrapper`,"
+    " it creates an INDEPENDENT local binding in M's namespace. Patching "
+    "`libcst.metadata.MetadataWrapper` does NOT affect that local binding — only "
+    "`M.MetadataWrapper` intercepts calls made inside M. "
+    "The source of the import is irrelevant to the patch target.\n\n"
+    "**Package constraint:** A file split only moves entities within the same project "
+    "package. The top-level package (first path component) NEVER changes in a rename. "
+    "e.g. `crispen.engine.X` always renames to another `crispen.*` path — "
+    "a rename to `libcst.metadata.X` is ALWAYS wrong.\n\n"
     "**Example:**\n"
     "```python\n"
     "# Before split: _apply_foo() defined in crispen.engine, imports MetadataWrapper\n"
@@ -110,6 +120,8 @@ _PATCH_RULES = (
     "# that is a separate binding — patching it does NOT affect "
     "helpers.MetadataWrapper\n"
     "@patch('crispen.engine.helpers.MetadataWrapper')  # correct after split\n"
+    "# WRONG: @patch('libcst.metadata.MetadataWrapper')  "
+    "-- patches libcst's namespace, not helpers's local binding\n"
     "```\n"
 )
 
@@ -821,15 +833,21 @@ def _build_func_verify_prompt(
     rename_lines = "\n".join(
         f"- `{old}` → `{new}`" for old, new in patch_renames.items()
     )
+    migration_reminder = _extract_migration_reminder(context_msg)
     parts = [
         context_msg,
         _PATCH_RULES,
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
-        f"## Proposed patch() string updates:\n{rename_lines}\n\n"
+        f"## Proposed patch() string updates:\n{rename_lines}\n\n",
+    ]
+    if migration_reminder:
+        parts.append(migration_reminder)
+    parts.append(
         "Are all these updates correct? Set `correct` to True only if every "
         "proposed patch string points to where the name is looked up after "
-        "the split.\n",
-    ]
+        "the split. Remember: renames must stay within the same top-level package "
+        "(the first path component never changes).\n"
+    )
     return "".join(parts)
 
 
@@ -840,11 +858,16 @@ def _build_no_change_verify_prompt(
 ) -> str:
     """Build the user prompt for a no-change verify LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
+    migration_reminder = _extract_migration_reminder(context_msg)
     parts = [
         context_msg,
         _PATCH_RULES,
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
-        f"## Patch strings in this test (no update proposed):\n{paths_list}\n\n"
+        f"## Patch strings in this test (no update proposed):\n{paths_list}\n\n",
+    ]
+    if migration_reminder:
+        parts.append(migration_reminder)
+    parts.append(
         "The proposed update is: **no patch strings need changing**.\n\n"
         "Is this correct? Set `correct` to True only if all @patch strings "
         "in this function still point to the correct location after the split.\n"
@@ -854,8 +877,8 @@ def _build_no_change_verify_prompt(
         "The `issue` field is for explaining why the current path is wrong, "
         "not for describing the fix. "
         "Only leave `corrections` empty if the fix requires an entirely new "
-        "@patch decorator.\n",
-    ]
+        "@patch decorator.\n"
+    )
     return "".join(parts)
 
 
@@ -1167,6 +1190,10 @@ def _process_file_source(
                     and isinstance(new, str)
                     and old != new
                     and old in func.old_patch_paths
+                    # A file split never moves entities across top-level packages.
+                    # Renames like crispen.engine.X → libcst.metadata.X are always
+                    # wrong (confusing import source with patch target).
+                    and new.split(".")[0] == old.split(".")[0]
                 )
             }
 
@@ -1234,6 +1261,7 @@ def _process_file_source(
                         and isinstance(new, str)
                         and old != new
                         and old in func.old_patch_paths
+                        and new.split(".")[0] == old.split(".")[0]
                     )
                 }
                 if corrections_renames:

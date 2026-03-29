@@ -18,6 +18,7 @@ from crispen.patch_rewriter import (
     _build_context_message,
     _build_func_verify_prompt,
     _build_local_const_map,
+    _build_no_change_verify_prompt,
     _build_rewrite_func_prompt,
     _build_rewrite_verify_prompt,
     _compiles,
@@ -62,15 +63,18 @@ def _make_fl_ctx(**kwargs) -> _FLContext:
 
 _CFG = CrispenConfig(patch_update_retries=1)
 _CFG_NO_LLM_VERIFY = CrispenConfig(patch_update_retries=1, llm_verify_retries=0)
-_FORKING_PATHS = {"old.mod.X"}
-_SRC_WITH_PATCH = '@patch("old.mod.X")\ndef test_f(mock_x):\n    pass\n'
+_FORKING_PATHS = {"crispen.before.X"}
+_SRC_WITH_PATCH = '@patch("crispen.before.X")\ndef test_f(mock_x):\n    pass\n'
 
 _PATCH_GET_KEY = "crispen.patch_rewriter.get_api_key"
 _PATCH_MAKE_CLIENT = "crispen.patch_rewriter.make_client"
 _PATCH_CALL_TOOL = "crispen.patch_rewriter.call_with_tool"
 
 # Shorthand classify tool_inputs.
-_CLASSIFY_RENAME = {"needs_rewrite": False, "patch_renames": {"old.mod.X": "new.mod.X"}}
+_CLASSIFY_RENAME = {
+    "needs_rewrite": False,
+    "patch_renames": {"crispen.before.X": "crispen.after.X"},
+}
 _CLASSIFY_NO_CHANGE = {"needs_rewrite": False, "patch_renames": {}}
 _CLASSIFY_REWRITE = {"needs_rewrite": True}
 _VERIFY_OK = {"correct": True, "issue": ""}
@@ -78,7 +82,7 @@ _VERIFY_REJECT = {"correct": False, "issue": "wrong path"}
 _VERIFY_REJECT_WITH_CORRECTIONS = {
     "correct": False,
     "issue": "wrong path",
-    "corrections": {"old.mod.X": "new.mod.X"},
+    "corrections": {"crispen.before.X": "crispen.after.X"},
 }
 _REWRITE_VERIFY_OK = {"correct": True, "issue": ""}
 _REWRITE_VERIFY_REJECT = {"correct": False, "issue": "wrong mock setup"}
@@ -145,107 +149,111 @@ def test_compiles_invalid():
 
 
 def test_find_empty_old_paths():
-    src = '@patch("old.mod.X")\ndef test_f(): pass\n'
+    src = '@patch("crispen.before.X")\ndef test_f(): pass\n'
     assert _find_test_functions_to_update(src, set()) == []
 
 
 def test_find_parse_error():
-    assert _find_test_functions_to_update("def f(:\n", {"old.mod.X"}) == []
+    assert _find_test_functions_to_update("def f(:\n", {"crispen.before.X"}) == []
 
 
 def test_find_no_match():
     src = '@patch("other.mod.Y")\ndef test_f(): pass\n'
-    assert _find_test_functions_to_update(src, {"old.mod.X"}) == []
+    assert _find_test_functions_to_update(src, {"crispen.before.X"}) == []
 
 
 def test_find_match_exact():
-    src = '@patch("old.mod.X")\ndef test_f(): pass\n'
-    result = _find_test_functions_to_update(src, {"old.mod.X"})
+    src = '@patch("crispen.before.X")\ndef test_f(): pass\n'
+    result = _find_test_functions_to_update(src, {"crispen.before.X"})
     assert len(result) == 1
     assert result[0].function_name == "test_f"
-    assert "old.mod.X" in result[0].old_patch_paths
+    assert "crispen.before.X" in result[0].old_patch_paths
 
 
 def test_find_match_prefix():
-    src = '@patch("old.mod.X.method")\ndef test_f(): pass\n'
-    result = _find_test_functions_to_update(src, {"old.mod.X"})
+    src = '@patch("crispen.before.X.method")\ndef test_f(): pass\n'
+    result = _find_test_functions_to_update(src, {"crispen.before.X"})
     assert len(result) == 1
-    assert "old.mod.X.method" in result[0].old_patch_paths
+    assert "crispen.before.X.method" in result[0].old_patch_paths
 
 
 def test_find_not_a_call_decorator():
     # @patch used as a bare name (no parentheses), not a Call node.
     src = "@patch\ndef test_f(): pass\n"
-    assert _find_test_functions_to_update(src, {"old.mod.X"}) == []
+    assert _find_test_functions_to_update(src, {"crispen.before.X"}) == []
 
 
 def test_find_no_args():
     src = "@patch()\ndef test_f(): pass\n"
-    assert _find_test_functions_to_update(src, {"old.mod.X"}) == []
+    assert _find_test_functions_to_update(src, {"crispen.before.X"}) == []
 
 
 def test_find_arg_not_simple_string():
     # @patch(some_variable) — first arg is a Name, not a SimpleString.
     src = "@patch(some_var)\ndef test_f(): pass\n"
-    assert _find_test_functions_to_update(src, {"old.mod.X"}) == []
+    assert _find_test_functions_to_update(src, {"crispen.before.X"}) == []
 
 
 def test_find_prefixed_string():
     # b"..." — raw[0] is 'b', not a quote character.
-    src = '@patch(b"old.mod.X")\ndef test_f(): pass\n'
-    assert _find_test_functions_to_update(src, {"old.mod.X"}) == []
+    src = '@patch(b"crispen.before.X")\ndef test_f(): pass\n'
+    assert _find_test_functions_to_update(src, {"crispen.before.X"}) == []
 
 
 def test_find_triple_quoted():
-    src = '@patch("""old.mod.X""")\ndef test_f(): pass\n'
-    assert _find_test_functions_to_update(src, {"old.mod.X"}) == []
+    src = '@patch("""crispen.before.X""")\ndef test_f(): pass\n'
+    assert _find_test_functions_to_update(src, {"crispen.before.X"}) == []
 
 
 def test_find_not_patch_name():
-    # @decorate("old.mod.X") — attribute name is not "patch".
-    src = '@decorate("old.mod.X")\ndef test_f(): pass\n'
-    assert _find_test_functions_to_update(src, {"old.mod.X"}) == []
+    # @decorate("crispen.before.X") — attribute name is not "patch".
+    src = '@decorate("crispen.before.X")\ndef test_f(): pass\n'
+    assert _find_test_functions_to_update(src, {"crispen.before.X"}) == []
 
 
 def test_find_attribute_patch():
-    # @mock.patch("old.mod.X") — Attribute form.
-    src = '@mock.patch("old.mod.X")\ndef test_f(): pass\n'
-    result = _find_test_functions_to_update(src, {"old.mod.X"})
+    # @mock.patch("crispen.before.X") — Attribute form.
+    src = '@mock.patch("crispen.before.X")\ndef test_f(): pass\n'
+    result = _find_test_functions_to_update(src, {"crispen.before.X"})
     assert len(result) == 1
     assert result[0].function_name == "test_f"
 
 
 def test_find_multiple_functions():
     src = (
-        '@patch("old.mod.X")\ndef test_a(): pass\n\n'
-        '@patch("old.mod.Y")\ndef test_b(): pass\n'
+        '@patch("crispen.before.X")\ndef test_a(): pass\n\n'
+        '@patch("crispen.before.Y")\ndef test_b(): pass\n'
     )
-    result = _find_test_functions_to_update(src, {"old.mod.X", "old.mod.Y"})
+    result = _find_test_functions_to_update(
+        src, {"crispen.before.X", "crispen.before.Y"}
+    )
     assert {f.function_name for f in result} == {"test_a", "test_b"}
 
 
 def test_find_full_text_includes_decorator():
-    src = '@patch("old.mod.X")\ndef test_f():\n    pass\n'
-    result = _find_test_functions_to_update(src, {"old.mod.X"})
-    assert '@patch("old.mod.X")' in result[0].full_text
+    src = '@patch("crispen.before.X")\ndef test_f():\n    pass\n'
+    result = _find_test_functions_to_update(src, {"crispen.before.X"})
+    assert '@patch("crispen.before.X")' in result[0].full_text
     assert "def test_f" in result[0].full_text
 
 
 def test_find_start_end_lines():
     # line 1: # header, line 2: @patch..., line 3: def test_f, line 4: pass
-    src = "# header\n" '@patch("old.mod.X")\n' "def test_f():\n" "    pass\n"
-    result = _find_test_functions_to_update(src, {"old.mod.X"})
+    src = "# header\n" '@patch("crispen.before.X")\n' "def test_f():\n" "    pass\n"
+    result = _find_test_functions_to_update(src, {"crispen.before.X"})
     assert result[0].start_line == 2  # @patch line (first decorator)
     assert result[0].end_line == 4  # last line of body
 
 
 def test_find_body_with_patch_no_decorator():
     # Function has no @patch decorator but uses ``with patch(...)`` in the body.
-    src = "def test_f():\n" '    with patch("old.mod.X") as m:\n' "        pass\n"
-    result = _find_test_functions_to_update(src, {"old.mod.X"})
+    src = (
+        "def test_f():\n" '    with patch("crispen.before.X") as m:\n' "        pass\n"
+    )
+    result = _find_test_functions_to_update(src, {"crispen.before.X"})
     assert len(result) == 1
     assert result[0].function_name == "test_f"
-    assert "old.mod.X" in result[0].old_patch_paths
+    assert "crispen.before.X" in result[0].old_patch_paths
     # start_line should be the ``def`` line (no decorators).
     assert result[0].start_line == 1
 
@@ -253,16 +261,18 @@ def test_find_body_with_patch_no_decorator():
 def test_find_body_with_patch_combined_with_decorator():
     # Function has both an @patch decorator and a body-level with patch(...).
     src = (
-        '@patch("old.mod.Y")\n'
+        '@patch("crispen.before.Y")\n'
         "def test_f(mock_y):\n"
-        '    with patch("old.mod.X") as m:\n'
+        '    with patch("crispen.before.X") as m:\n'
         "        pass\n"
     )
-    result = _find_test_functions_to_update(src, {"old.mod.X", "old.mod.Y"})
+    result = _find_test_functions_to_update(
+        src, {"crispen.before.X", "crispen.before.Y"}
+    )
     assert len(result) == 1
     paths = result[0].old_patch_paths
-    assert "old.mod.X" in paths
-    assert "old.mod.Y" in paths
+    assert "crispen.before.X" in paths
+    assert "crispen.before.Y" in paths
 
 
 # ---------------------------------------------------------------------------
@@ -532,8 +542,10 @@ def _ctx_msg() -> str:
 
 
 def test_build_classify_prompt_no_prev():
-    prompt = _build_classify_prompt(_ctx_msg(), "def test_f(): pass", ["old.mod.X"])
-    assert "old.mod.X" in prompt
+    prompt = _build_classify_prompt(
+        _ctx_msg(), "def test_f(): pass", ["crispen.before.X"]
+    )
+    assert "crispen.before.X" in prompt
     assert "Previous attempt was rejected" not in prompt
     assert "patch_renames" in prompt
     assert "Entity migration (quick reference)" in prompt
@@ -543,9 +555,9 @@ def test_build_classify_prompt_with_prev():
     prompt = _build_classify_prompt(
         _ctx_msg(),
         "def test_f(): pass",
-        ["old.mod.X"],
+        ["crispen.before.X"],
         prev_issue="wrong module",
-        prev_proposed="{'old.mod.X': 'bad.mod.X'}",
+        prev_proposed="{'crispen.before.X': 'bad.mod.X'}",
     )
     assert "Previous attempt was rejected" in prompt
     assert "wrong module" in prompt
@@ -554,10 +566,10 @@ def test_build_classify_prompt_with_prev():
 
 def test_build_classify_prompt_multiple_paths():
     prompt = _build_classify_prompt(
-        _ctx_msg(), "def test_f(): pass", ["old.mod.X", "old.mod.Y"]
+        _ctx_msg(), "def test_f(): pass", ["crispen.before.X", "crispen.before.Y"]
     )
-    assert "old.mod.X" in prompt
-    assert "old.mod.Y" in prompt
+    assert "crispen.before.X" in prompt
+    assert "crispen.before.Y" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -569,10 +581,10 @@ def test_build_func_verify_prompt_basic():
     prompt = _build_func_verify_prompt(
         _ctx_msg(),
         "def test_f(): pass",
-        {"old.mod.X": "new.mod.X"},
+        {"crispen.before.X": "crispen.after.X"},
     )
-    assert "old.mod.X" in prompt
-    assert "new.mod.X" in prompt
+    assert "crispen.before.X" in prompt
+    assert "crispen.after.X" in prompt
     assert "correct" in prompt
 
 
@@ -580,12 +592,29 @@ def test_build_func_verify_prompt_multiple_renames():
     prompt = _build_func_verify_prompt(
         _ctx_msg(),
         "def test_f(): pass",
-        {"old.mod.X": "new.mod.X", "old.mod.Y": "new.mod.Y"},
+        {"crispen.before.X": "crispen.after.X", "crispen.before.Y": "crispen.after.Y"},
     )
-    assert "old.mod.X" in prompt
-    assert "old.mod.Y" in prompt
-    assert "new.mod.X" in prompt
-    assert "new.mod.Y" in prompt
+    assert "crispen.before.X" in prompt
+    assert "crispen.before.Y" in prompt
+    assert "crispen.after.X" in prompt
+    assert "crispen.after.Y" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _build_no_change_verify_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_build_no_change_verify_prompt_includes_migration_reminder():
+    # Prompt built with a context that has migration entries should include
+    # the migration quick-reference block near the instructions.
+    prompt = _build_no_change_verify_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        ["crispen.before.X"],
+    )
+    assert "crispen.before.X" in prompt
+    assert "Entity migration" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -594,8 +623,10 @@ def test_build_func_verify_prompt_multiple_renames():
 
 
 def test_build_rewrite_func_prompt_no_error():
-    prompt = _build_rewrite_func_prompt(_ctx_msg(), "def test_f(): pass", ["old.mod.X"])
-    assert "old.mod.X" in prompt
+    prompt = _build_rewrite_func_prompt(
+        _ctx_msg(), "def test_f(): pass", ["crispen.before.X"]
+    )
+    assert "crispen.before.X" in prompt
     assert "Previous rewrite" not in prompt
     assert "Rewrite the complete function" in prompt
 
@@ -604,7 +635,7 @@ def test_build_rewrite_func_prompt_with_error():
     prompt = _build_rewrite_func_prompt(
         _ctx_msg(),
         "def test_f(): pass",
-        ["old.mod.X"],
+        ["crispen.before.X"],
         prev_error="SyntaxError on line 3",
     )
     assert "Previous rewrite was invalid" in prompt
@@ -620,11 +651,11 @@ def test_build_rewrite_verify_prompt_basic():
     prompt = _build_rewrite_verify_prompt(
         _ctx_msg(),
         "def test_f(): pass",
-        '@patch("new.mod.X")\ndef test_f(mock_x):\n    pass\n',
+        '@patch("crispen.after.X")\ndef test_f(mock_x):\n    pass\n',
     )
     assert "Original test function" in prompt
     assert "Rewritten test function" in prompt
-    assert "new.mod.X" in prompt
+    assert "crispen.after.X" in prompt
     assert "correct" in prompt
 
 
@@ -690,7 +721,7 @@ def test_process_no_change_verify_rejects_then_accepts(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
     )
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -769,7 +800,7 @@ def test_process_no_change_corrections_applied(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
     )
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
     assert mock_call.call_count == 3
 
 
@@ -785,7 +816,7 @@ def test_process_no_change_corrections_verify_none_accept(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
     )
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
     assert mock_call.call_count == 3
 
 
@@ -806,7 +837,7 @@ def test_process_no_change_corrections_verify_fails_retry(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), cfg, 3
     )
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
     assert mock_call.call_count == 5
 
 
@@ -937,7 +968,9 @@ def test_process_no_change_corrections_acc(mock_call):
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_corrections_no_splice(mock_call, tmp_path):
     # Corrections-verify accepts; function uses const ref → no splice; const updated.
-    src = 'TARGET = "old.mod.X"\n\n@patch(TARGET)\ndef test_f(mock_x):\n    pass\n'
+    src = (
+        'TARGET = "crispen.before.X"\n\n@patch(TARGET)\ndef test_f(mock_x):\n    pass\n'
+    )
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
         _ok(_CLASSIFY_NO_CHANGE),
@@ -945,10 +978,10 @@ def test_process_no_change_corrections_no_splice(mock_call, tmp_path):
         _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
-        src, {"old.mod.X"}, "ctx", MagicMock(), _CFG, 2, scan_file=scan
+        src, {"crispen.before.X"}, "ctx", MagicMock(), _CFG, 2, scan_file=scan
     )
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
     assert mock_call.call_count == 3
 
 
@@ -1060,7 +1093,10 @@ def test_process_no_change_acc_accumulates(mock_call):
 @mock_patch(
     _PATCH_CALL_TOOL,
     return_value=_ok(
-        {"needs_rewrite": False, "patch_renames": {"old.mod.X": "old.mod.X"}}
+        {
+            "needs_rewrite": False,
+            "patch_renames": {"crispen.before.X": "crispen.before.X"},
+        }
     ),
 )
 def test_process_same_path_filtered_out(mock_call):
@@ -1087,7 +1123,9 @@ def test_process_patch_renames_not_dict(mock_call):
 
 @mock_patch(
     _PATCH_CALL_TOOL,
-    return_value=_ok({"needs_rewrite": False, "patch_renames": {42: "new.mod.X"}}),
+    return_value=_ok(
+        {"needs_rewrite": False, "patch_renames": {42: "crispen.after.X"}}
+    ),
 )
 def test_process_patch_renames_non_string_key(mock_call):
     # Non-string key in patch_renames → filtered out.
@@ -1107,7 +1145,7 @@ def test_process_string_swap_verify_accepts(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -1121,24 +1159,26 @@ def test_process_verify_none_accept(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
 
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_verify_none_accept_no_splice(mock_call, tmp_path):
     # Verify returns None; function uses const ref → new_text == orig_text → no splice.
-    src = 'TARGET = "old.mod.X"\n\n@patch(TARGET)\ndef test_f(mock_x):\n    pass\n'
+    src = (
+        'TARGET = "crispen.before.X"\n\n@patch(TARGET)\ndef test_f(mock_x):\n    pass\n'
+    )
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
         _ok(_CLASSIFY_RENAME),
         _ok(None),
     ]
     result, changed, cross = _process_file_source(
-        src, {"old.mod.X"}, "ctx", MagicMock(), _CFG, 1, scan_file=scan
+        src, {"crispen.before.X"}, "ctx", MagicMock(), _CFG, 1, scan_file=scan
     )
     # No splice but const should be updated via same_file_const_map.
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -1197,8 +1237,8 @@ def test_process_verify_rejected_exhausted_escalates_to_rewrite(mock_call):
 # ---------------------------------------------------------------------------
 
 _VALID_REWRITE = (
-    '@patch("new.mod.X")\n'
-    '@patch("new.mod.Y")\n'
+    '@patch("crispen.after.X")\n'
+    '@patch("crispen.after.Y")\n'
     "def test_f(mock_x, mock_y):\n"
     "    pass\n"
 )
@@ -1215,8 +1255,8 @@ def test_process_needs_rewrite_success(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert changed is True
-    assert "new.mod.X" in result
-    assert "new.mod.Y" in result
+    assert "crispen.after.X" in result
+    assert "crispen.after.Y" in result
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -1272,7 +1312,7 @@ def test_process_needs_rewrite_compile_error_retry(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
     )
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -1301,7 +1341,7 @@ def test_process_needs_rewrite_verify_none_accept(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert changed is True
-    assert "new.mod.X" in result
+    assert "crispen.after.X" in result
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -1349,23 +1389,33 @@ def test_process_per_function_different_renames(mock_call):
     renamed independently.
     """
     src = (
-        '@patch("old.mod.X")\ndef test_a(m):\n    call_a()\n\n'
-        '@patch("old.mod.X")\ndef test_b(m):\n    call_b()\n'
+        '@patch("crispen.before.X")\ndef test_a(m):\n    call_a()\n\n'
+        '@patch("crispen.before.X")\ndef test_b(m):\n    call_b()\n'
     )
     mock_call.side_effect = [
         # test_a: classify → rename to mod1
-        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "mod1.X"}}),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.mod1.X"},
+            }
+        ),
         _ok(_VERIFY_OK),
         # test_b: classify → rename to mod2
-        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "mod2.X"}}),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.mod2.X"},
+            }
+        ),
         _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
-        src, {"old.mod.X"}, "ctx", MagicMock(), _CFG, 1
+        src, {"crispen.before.X"}, "ctx", MagicMock(), _CFG, 1
     )
     assert changed is True
-    assert "mod1.X" in result
-    assert "mod2.X" in result
+    assert "crispen.mod1.X" in result
+    assert "crispen.mod2.X" in result
     assert mock_call.call_count == 4
 
 
@@ -1373,8 +1423,8 @@ def test_process_per_function_different_renames(mock_call):
 def test_process_per_function_both_updated(mock_call):
     """Two functions with the same @patch string both get the same rename."""
     src = (
-        '@patch("old.mod.X")\ndef test_a(m):\n    pass\n\n'
-        '@patch("old.mod.X")\ndef test_b(m):\n    pass\n'
+        '@patch("crispen.before.X")\ndef test_a(m):\n    pass\n\n'
+        '@patch("crispen.before.X")\ndef test_b(m):\n    pass\n'
     )
     mock_call.side_effect = [
         _ok(_CLASSIFY_RENAME),
@@ -1386,7 +1436,7 @@ def test_process_per_function_both_updated(mock_call):
         src, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert changed is True
-    assert result.count("new.mod.X") == 2
+    assert result.count("crispen.after.X") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2180,18 +2230,20 @@ def test_substitute_attr_non_name_base():
 
 def test_find_const_ref_same_file(tmp_path):
     """@patch(CONST) where CONST is in the same file → collected, substituted."""
-    src = 'TARGET = "old.mod.X"\n\n@patch(TARGET)\ndef test_f(mock_x):\n    pass\n'
+    src = (
+        'TARGET = "crispen.before.X"\n\n@patch(TARGET)\ndef test_f(mock_x):\n    pass\n'
+    )
     scan = str(tmp_path / "test_foo.py")
-    result = _find_test_functions_to_update(src, {"old.mod.X"}, scan_file=scan)
+    result = _find_test_functions_to_update(src, {"crispen.before.X"}, scan_file=scan)
     assert len(result) == 1
     assert result[0].function_name == "test_f"
     # full_text sent to LLM has the value inlined
-    assert '"old.mod.X"' in result[0].full_text
+    assert '"crispen.before.X"' in result[0].full_text
     assert "TARGET" not in result[0].full_text
     # const_ref recorded
     assert len(result[0].const_refs) == 1
     assert result[0].const_refs[0].const_name == "TARGET"
-    assert result[0].const_refs[0].resolved_value == "old.mod.X"
+    assert result[0].const_refs[0].resolved_value == "crispen.before.X"
     assert result[0].const_refs[0].patch_dec_idx == 0
 
 
@@ -2199,7 +2251,7 @@ def test_find_const_ref_not_in_map_not_collected(tmp_path):
     """@patch(UNRESOLVED) where name not in const_map → not collected."""
     src = "@patch(UNRESOLVED)\ndef test_f(mock): pass\n"
     scan = str(tmp_path / "test_foo.py")
-    result = _find_test_functions_to_update(src, {"old.mod.X"}, scan_file=scan)
+    result = _find_test_functions_to_update(src, {"crispen.before.X"}, scan_file=scan)
     assert result == []
 
 
@@ -2207,20 +2259,20 @@ def test_find_const_ref_value_no_match(tmp_path):
     """@patch(CONST) where const value doesn't match old_paths → not collected."""
     src = 'TARGET = "other.mod.Y"\n\n@patch(TARGET)\ndef test_f(mock): pass\n'
     scan = str(tmp_path / "test_foo.py")
-    result = _find_test_functions_to_update(src, {"old.mod.X"}, scan_file=scan)
+    result = _find_test_functions_to_update(src, {"crispen.before.X"}, scan_file=scan)
     assert result == []
 
 
 def test_find_mix_literal_and_const(tmp_path):
     """Function with both a literal @patch and a const @patch → both collected."""
     src = (
-        'TARGET = "old.mod.X"\n\n'
-        '@patch("old.mod.X")\n'
+        'TARGET = "crispen.before.X"\n\n'
+        '@patch("crispen.before.X")\n'
         "@patch(TARGET)\n"
         "def test_f(m1, m2):\n    pass\n"
     )
     scan = str(tmp_path / "test_foo.py")
-    result = _find_test_functions_to_update(src, {"old.mod.X"}, scan_file=scan)
+    result = _find_test_functions_to_update(src, {"crispen.before.X"}, scan_file=scan)
     assert len(result) == 1
     assert len(result[0].old_patch_paths) == 2
     assert len(result[0].const_refs) == 1
@@ -2231,13 +2283,13 @@ def test_find_mix_literal_and_const(tmp_path):
 def test_find_patch_no_args_increments_idx(tmp_path):
     """@patch() with no args increments patch_dec_idx before the const @patch."""
     src = (
-        'TARGET = "old.mod.X"\n\n'
+        'TARGET = "crispen.before.X"\n\n'
         "@patch()\n"
         "@patch(TARGET)\n"
         "def test_f(m):\n    pass\n"
     )
     scan = str(tmp_path / "test_foo.py")
-    result = _find_test_functions_to_update(src, {"old.mod.X"}, scan_file=scan)
+    result = _find_test_functions_to_update(src, {"crispen.before.X"}, scan_file=scan)
     assert len(result) == 1
     assert result[0].const_refs[0].patch_dec_idx == 1
 
@@ -2245,11 +2297,11 @@ def test_find_patch_no_args_increments_idx(tmp_path):
 def test_find_cross_file_const(tmp_path):
     """@patch(CONST) where CONST comes from a relative import → collected."""
     helpers = tmp_path / "helpers.py"
-    helpers.write_text('TARGET = "old.mod.X"\n', encoding="utf-8")
+    helpers.write_text('TARGET = "crispen.before.X"\n', encoding="utf-8")
     src = "from .helpers import TARGET\n\n@patch(TARGET)\ndef test_f(mock):\n    pass\n"
     scan = str(tmp_path / "test_foo.py")
     result = _find_test_functions_to_update(
-        src, {"old.mod.X"}, scan_file=scan, repo_root=str(tmp_path)
+        src, {"crispen.before.X"}, scan_file=scan, repo_root=str(tmp_path)
     )
     assert len(result) == 1
     assert result[0].const_refs[0].source_file == str(helpers.resolve())
@@ -2258,20 +2310,20 @@ def test_find_cross_file_const(tmp_path):
 def test_find_attr_const_ref_collected(tmp_path):
     """@patch(constants.TARGET) where ``import constants`` resolves → collected."""
     constants_file = tmp_path / "constants.py"
-    constants_file.write_text('TARGET = "old.mod.X"\n', encoding="utf-8")
+    constants_file.write_text('TARGET = "crispen.before.X"\n', encoding="utf-8")
     src = "import constants\n\n@patch(constants.TARGET)\ndef test_f(mock):\n    pass\n"
     scan = str(tmp_path / "test_foo.py")
     result = _find_test_functions_to_update(
-        src, {"old.mod.X"}, scan_file=scan, repo_root=str(tmp_path)
+        src, {"crispen.before.X"}, scan_file=scan, repo_root=str(tmp_path)
     )
     assert len(result) == 1
     assert result[0].function_name == "test_f"
     assert result[0].const_refs[0].const_name == "constants.TARGET"
-    assert result[0].const_refs[0].resolved_value == "old.mod.X"
+    assert result[0].const_refs[0].resolved_value == "crispen.before.X"
     assert result[0].const_refs[0].patch_dec_idx == 0
     assert result[0].const_refs[0].source_file == str(constants_file.resolve())
     # LLM sees inlined value, not the attribute access form.
-    assert '"old.mod.X"' in result[0].full_text
+    assert '"crispen.before.X"' in result[0].full_text
     assert "constants.TARGET" not in result[0].full_text
 
 
@@ -2281,7 +2333,7 @@ def test_find_attr_const_module_not_in_map(tmp_path):
     scan = str(tmp_path / "test_foo.py")
     # No ``import unknown`` in source → attr_const_map empty → no match.
     result = _find_test_functions_to_update(
-        src, {"old.mod.X"}, scan_file=scan, repo_root=str(tmp_path)
+        src, {"crispen.before.X"}, scan_file=scan, repo_root=str(tmp_path)
     )
     assert result == []
 
@@ -2289,11 +2341,11 @@ def test_find_attr_const_module_not_in_map(tmp_path):
 def test_find_attr_const_attr_not_in_module(tmp_path):
     """@patch(constants.UNKNOWN) where attr not in module constants → not collected."""
     constants_file = tmp_path / "constants.py"
-    constants_file.write_text('TARGET = "old.mod.X"\n', encoding="utf-8")
+    constants_file.write_text('TARGET = "crispen.before.X"\n', encoding="utf-8")
     src = "import constants\n\n@patch(constants.UNKNOWN)\ndef test_f(mock):\n    pass\n"
     scan = str(tmp_path / "test_foo.py")
     result = _find_test_functions_to_update(
-        src, {"old.mod.X"}, scan_file=scan, repo_root=str(tmp_path)
+        src, {"crispen.before.X"}, scan_file=scan, repo_root=str(tmp_path)
     )
     assert result == []
 
@@ -2305,7 +2357,7 @@ def test_find_attr_const_value_no_match(tmp_path):
     src = "import constants\n\n@patch(constants.OTHER)\ndef test_f(mock):\n    pass\n"
     scan = str(tmp_path / "test_foo.py")
     result = _find_test_functions_to_update(
-        src, {"old.mod.X"}, scan_file=scan, repo_root=str(tmp_path)
+        src, {"crispen.before.X"}, scan_file=scan, repo_root=str(tmp_path)
     )
     assert result == []
 
@@ -2325,7 +2377,10 @@ def test_find_attr_multi_level_not_handled(tmp_path):
 # ---------------------------------------------------------------------------
 
 _SRC_WITH_CONST = (
-    'TARGET = "old.mod.X"\n\n' "@patch(TARGET)\n" "def test_f(mock_x):\n" "    pass\n"
+    'TARGET = "crispen.before.X"\n\n'
+    "@patch(TARGET)\n"
+    "def test_f(mock_x):\n"
+    "    pass\n"
 )
 
 
@@ -2334,12 +2389,17 @@ def test_process_const_same_file_update(mock_call, tmp_path):
     """Same-file const ref → same_file_const_map updates the const definition."""
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
-        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "new.mod.X"}}),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.after.X"},
+            }
+        ),
         _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_CONST,
-        {"old.mod.X"},
+        {"crispen.before.X"},
         "ctx",
         MagicMock(),
         _CFG,
@@ -2348,8 +2408,8 @@ def test_process_const_same_file_update(mock_call, tmp_path):
     )
     assert changed is True
     # apply_patch_strings updates the const definition.
-    assert '"new.mod.X"' in result
-    assert '"old.mod.X"' not in result
+    assert '"crispen.after.X"' in result
+    assert '"crispen.before.X"' not in result
     # No cross-file updates for same-file const.
     assert cross == {}
 
@@ -2358,16 +2418,21 @@ def test_process_const_same_file_update(mock_call, tmp_path):
 def test_process_const_cross_file_update(mock_call, tmp_path):
     """Const ref from imported file → cross_file_patch_maps returned."""
     helpers = tmp_path / "helpers.py"
-    helpers.write_text('TARGET = "old.mod.X"\n', encoding="utf-8")
+    helpers.write_text('TARGET = "crispen.before.X"\n', encoding="utf-8")
     src = "from .helpers import TARGET\n\n@patch(TARGET)\ndef test_f(mock):\n    pass\n"
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
-        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "new.mod.X"}}),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.after.X"},
+            }
+        ),
         _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         src,
-        {"old.mod.X"},
+        {"crispen.before.X"},
         "ctx",
         MagicMock(),
         _CFG,
@@ -2377,7 +2442,7 @@ def test_process_const_cross_file_update(mock_call, tmp_path):
     )
     helpers_abs = str(helpers.resolve())
     assert helpers_abs in cross
-    assert cross[helpers_abs] == {"old.mod.X": "new.mod.X"}
+    assert cross[helpers_abs] == {"crispen.before.X": "crispen.after.X"}
 
 
 @mock_patch(
@@ -2388,7 +2453,7 @@ def test_process_const_no_change_no_cross(mock_call, tmp_path):
     scan = str(tmp_path / "test_foo.py")
     result, changed, cross = _process_file_source(
         _SRC_WITH_CONST,
-        {"old.mod.X"},
+        {"crispen.before.X"},
         "ctx",
         MagicMock(),
         _CFG,
@@ -2409,21 +2474,27 @@ def test_process_cross_file_const_ref_not_in_renames(mock_call, tmp_path):
     The const ref for A should be skipped.
     """
     helpers = tmp_path / "helpers.py"
-    helpers.write_text('TARGET_A = "old.mod.A"\n', encoding="utf-8")
+    helpers.write_text('TARGET_A = "crispen.before.A"\n', encoding="utf-8")
     src = (
         "from .helpers import TARGET_A\n\n"
-        '@patch(TARGET_A)\n@patch("old.mod.B")\n'
+        '@patch(TARGET_A)\n@patch("crispen.before.B")\n'
         "def test_f(m1, m2):\n    pass\n"
     )
     scan = str(tmp_path / "test_foo.py")
-    # Classify: only rename old.mod.B → new.mod.B; old.mod.A unchanged.
+    # Classify: only rename crispen.before.B → crispen.after.B;
+    # crispen.before.A unchanged.
     mock_call.side_effect = [
-        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.B": "new.mod.B"}}),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.B": "crispen.after.B"},
+            }
+        ),
         _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         src,
-        {"old.mod.A", "old.mod.B"},
+        {"crispen.before.A", "crispen.before.B"},
         "ctx",
         MagicMock(),
         _CFG,
@@ -2432,8 +2503,8 @@ def test_process_cross_file_const_ref_not_in_renames(mock_call, tmp_path):
         repo_root=str(tmp_path),
     )
     assert changed is True
-    assert "new.mod.B" in result
-    # old.mod.A not in accepted renames → no cross-file update for helpers.py.
+    assert "crispen.after.B" in result
+    # crispen.before.A not in accepted renames → no cross-file update for helpers.py.
     helpers_abs = str(helpers.resolve())
     assert helpers_abs not in cross
 
@@ -2442,10 +2513,10 @@ def test_process_cross_file_const_ref_not_in_renames(mock_call, tmp_path):
 def test_process_no_scan_file_no_const_processing(mock_call):
     """scan_file="" → const_map is empty, const post-processing skipped."""
     # Even with a const-ref style source, no scan_file means no const resolution.
-    src = 'TARGET = "old.mod.X"\n\n@patch(TARGET)\ndef test_f(m):\n    pass\n'
+    src = 'TARGET = "crispen.before.X"\n\n@patch(TARGET)\ndef test_f(m):\n    pass\n'
     # With scan_file="", const_map is empty, @patch(TARGET) is not collected.
     result, changed, cross = _process_file_source(
-        src, {"old.mod.X"}, "ctx", MagicMock(), _CFG, 1
+        src, {"crispen.before.X"}, "ctx", MagicMock(), _CFG, 1
     )
     assert result == src
     assert changed is False
@@ -2457,7 +2528,7 @@ def test_process_no_scan_file_no_const_processing(mock_call):
 def test_process_attr_const_cross_file_update(mock_call, tmp_path):
     """@patch(constants.TARGET) resolved via import → cross-file proposal returned."""
     constants_file = tmp_path / "constants.py"
-    constants_file.write_text('TARGET = "old.mod.X"\n', encoding="utf-8")
+    constants_file.write_text('TARGET = "crispen.before.X"\n', encoding="utf-8")
     src = (
         "import constants\n\n"
         "@patch(constants.TARGET)\n"
@@ -2466,12 +2537,17 @@ def test_process_attr_const_cross_file_update(mock_call, tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     mock_call.side_effect = [
-        _ok({"needs_rewrite": False, "patch_renames": {"old.mod.X": "new.mod.X"}}),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.after.X"},
+            }
+        ),
         _ok(_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         src,
-        {"old.mod.X"},
+        {"crispen.before.X"},
         "ctx",
         MagicMock(),
         _CFG,
@@ -2482,7 +2558,7 @@ def test_process_attr_const_cross_file_update(mock_call, tmp_path):
     # Cross-file proposal recorded for constants.py.
     constants_abs = str(constants_file.resolve())
     assert constants_abs in cross
-    assert cross[constants_abs] == {"old.mod.X": "new.mod.X"}
+    assert cross[constants_abs] == {"crispen.before.X": "crispen.after.X"}
 
 
 # ---------------------------------------------------------------------------
