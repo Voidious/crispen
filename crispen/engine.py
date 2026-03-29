@@ -1300,6 +1300,20 @@ def run_engine(
         _stats.file_limiter_lines_verified = sum(_fl_verified_entity_lines.values())
         yield from _recursive_msgs
 
+    # Flatten transitive chains in combined_patch_map.  When recursive splits
+    # run, round 1 may produce A→B and round 2 may produce B→C.  Without
+    # flattening, apply_patch_strings (single-pass) would leave consumers of
+    # A pointing at the intermediate path B instead of the final path C.
+    if combined_patch_map:
+        changed = True
+        while changed:
+            changed = False
+            for k in list(combined_patch_map):
+                v = combined_patch_map[k]
+                if v in combined_patch_map and combined_patch_map[v] != v:
+                    combined_patch_map[k] = combined_patch_map[v]
+                    changed = True
+
     # ------------------------------------------------------------------ #
     # Phase 4 — Update @patch strings after FileLimiter entity moves     #
     # ------------------------------------------------------------------ #

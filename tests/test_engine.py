@@ -3366,6 +3366,86 @@ def test_patch_update_accumulates_from_recursive_fl(tmp_path):
     )
 
 
+def test_patch_update_chain_flattening(tmp_path):
+    """Transitive chains in combined_patch_map are flattened before apply.
+
+    When a first split produces A→B and a recursive split produces B→C,
+    apply_patch_strings must map A directly to C, not to the intermediate B.
+    """
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    # big.py imports get_api_key and uses it; also defines func_0 (moved entity)
+    big_source = "from llm import get_api_key\n" + "".join(
+        f"def func_{i}(): get_api_key()\n" for i in range(10)
+    )
+    f.write_text(big_source, encoding="utf-8")
+
+    # Other file has @patch pointing at the imported alias in big.py
+    other = tmp_path / "test_other.py"
+    other.write_text(
+        '@patch("mypkg.big.get_api_key")\ndef test_it(): pass\n',
+        encoding="utf-8",
+    )
+
+    # First FL result: big.py → utils.py.
+    # utils.py is over max_file_lines so it will be queued for recursive split.
+    # It imports and uses get_api_key so the alias ends up in utils's map entry.
+    utils_source = "from llm import get_api_key\n" + "".join(
+        f"def helper_{i}(): get_api_key()\n" for i in range(10)
+    )
+    first_result = FileLimiterResult(
+        original_source="# big reduced\n",
+        new_files={"utils.py": utils_source},
+        messages=[],
+        abort=False,
+        entity_to_target={
+            "func_0": "utils.py"
+        },  # non-empty to trigger _build_patch_map
+    )
+
+    # Second FL result (recursive split of utils.py) → helpers.py
+    helpers_source = "from llm import get_api_key\n" "def helper_0(): get_api_key()\n"
+    second_result = FileLimiterResult(
+        original_source="# utils reduced\n",
+        new_files={"helpers.py": helpers_source},
+        messages=[],
+        abort=False,
+        entity_to_target={"helper_0": "helpers.py"},  # non-empty
+    )
+
+    call_count = 0
+
+    def _fl_side_effect(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        return first_result if call_count == 1 else second_result
+
+    with patch(_FL_PATCH, side_effect=_fl_side_effect):
+        list(
+            run_engine(
+                {str(f): [(1, len(big_source.splitlines()))]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_recursive=True,
+                    file_limiter_patch_update="basic",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+
+    # Round 1 map: mypkg.big.get_api_key → mypkg.utils.get_api_key
+    # Round 2 map: mypkg.utils.get_api_key → mypkg.helpers.get_api_key
+    # After flattening: mypkg.big.get_api_key → mypkg.helpers.get_api_key
+    # Without flattening the test file would still hold the intermediate path.
+    updated = other.read_text(encoding="utf-8")
+    assert (
+        "mypkg.helpers.get_api_key" in updated
+    ), f"Expected chain-flattened path but got: {updated!r}"
+
+
 # ---------------------------------------------------------------------------
 # _add_fl_context (engine helper for "rewrite" patch mode)
 # ---------------------------------------------------------------------------
