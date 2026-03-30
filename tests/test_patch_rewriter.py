@@ -25,7 +25,9 @@ from crispen.patch_rewriter import (
     _extract_migration_reminder,
     _find_test_functions_to_update,
     _find_with_patch_paths_in_body,
+    _import_header,
     _is_patch_call,
+    _name_reference_map,
     _matches_any,
     _process_file_source,
     _resolve_import_to_file,
@@ -419,16 +421,23 @@ def test_body_scan_nested_in_if():
 # ---------------------------------------------------------------------------
 
 
-def test_build_context_with_diff():
+def test_build_context_no_diff():
+    # Diff is no longer included — only imports header and entity migration.
     ctx = _make_fl_ctx()
     msg = _build_context_message([ctx])
-    assert "```diff" in msg
-
-
-def test_build_context_no_diff_when_identical():
-    ctx = _make_fl_ctx(original_source="same\n", modified_source="same\n")
-    msg = _build_context_message([ctx])
     assert "```diff" not in msg
+
+
+def test_build_context_new_file_imports_and_refs():
+    # New-file section shows imports header and name-reference map; no bodies.
+    src = "import os\n\ndef my_func():\n    os.path.join('a', 'b')\n"
+    ctx = _make_fl_ctx(new_files={"sub_a.py": src, "sub_b.py": "class B: pass\n"})
+    msg = _build_context_message([ctx])
+    assert "**Imports:**" in msg
+    assert "import os" in msg
+    assert "**Name references**" in msg
+    assert "`os`: `my_func`" in msg
+    assert "def my_func" not in msg  # body not included
 
 
 def test_build_context_entity_migration_present():
@@ -452,6 +461,103 @@ def test_build_context_multiple_contexts():
     msg = _build_context_message([ctx1, ctx2])
     assert "pkg.big" in msg
     assert "pkg.large" in msg
+
+
+# ---------------------------------------------------------------------------
+# _import_header
+# ---------------------------------------------------------------------------
+
+
+def test_import_header_stops_before_def():
+    src = "import os\nfrom x import y\n\ndef foo():\n    pass\n"
+    assert _import_header(src) == "import os\nfrom x import y\n"
+
+
+def test_import_header_stops_before_class():
+    src = "import os\n\nclass Foo:\n    pass\n"
+    assert _import_header(src) == "import os\n"
+
+
+def test_import_header_stops_before_async_def():
+    src = "import os\nasync def foo(): pass\n"
+    assert _import_header(src) == "import os\n"
+
+
+def test_import_header_no_defs_returns_all():
+    src = "import os\nfrom x import y\n"
+    assert _import_header(src) == "import os\nfrom x import y\n"
+
+
+def test_import_header_empty_source():
+    assert _import_header("") == ""
+
+
+def test_import_header_strips_trailing_blanks():
+    src = "import os\n\n\ndef foo(): pass\n"
+    assert _import_header(src) == "import os\n"
+
+
+# ---------------------------------------------------------------------------
+# _name_reference_map
+# ---------------------------------------------------------------------------
+
+
+def test_name_reference_map_basic():
+    src = (
+        "import os\n"
+        "from x import Foo\n"
+        "\n"
+        "def alpha():\n"
+        "    os.getcwd()\n"
+        "    Foo()\n"
+        "\n"
+        "def beta():\n"
+        "    os.path.join('a', 'b')\n"
+    )
+    refs = _name_reference_map(src)
+    assert refs["os"] == ["alpha", "beta"]
+    assert refs["Foo"] == ["alpha"]
+
+
+def test_name_reference_map_alias():
+    src = "import libcst as cst\n\ndef run():\n    cst.parse_module('x')\n"
+    refs = _name_reference_map(src)
+    assert refs["cst"] == ["run"]
+
+
+def test_name_reference_map_unused_import():
+    # Imported but never referenced in a function body → absent from map.
+    src = "import os\n\ndef alpha():\n    pass\n"
+    refs = _name_reference_map(src)
+    assert "os" not in refs
+
+
+def test_name_reference_map_no_imports():
+    src = "def alpha():\n    x = 1\n"
+    assert _name_reference_map(src) == {}
+
+
+def test_name_reference_map_star_import_ignored():
+    # ``from x import *`` should not add anything (alias.name == "*" branch).
+    src = "from x import *\n\ndef alpha():\n    foo()\n"
+    refs = _name_reference_map(src)
+    assert refs == {}
+
+
+def test_name_reference_map_syntax_error():
+    assert _name_reference_map("def (broken:") == {}
+
+
+def test_name_reference_map_class():
+    src = (
+        "from x import Dep\n"
+        "\n"
+        "class MyClass:\n"
+        "    def method(self):\n"
+        "        return Dep()\n"
+    )
+    refs = _name_reference_map(src)
+    assert refs["Dep"] == ["MyClass"]
 
 
 # ---------------------------------------------------------------------------

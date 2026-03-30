@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import difflib
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -729,6 +728,68 @@ def _extract_migration_reminder(context_msg: str) -> str:
     return "## Entity migration (quick reference):\n" + "\n".join(lines) + "\n\n"
 
 
+def _import_header(source: str) -> str:
+    """Return the imports/header portion of a Python source file.
+
+    Stops before the first top-level ``def``/``class``/``async def`` line so
+    that function and class bodies are omitted.  Only the import declarations
+    (including ``if TYPE_CHECKING:`` blocks) are needed by the LLM to determine
+    which names are available in a module for patch-path resolution.
+    """
+    lines: List[str] = []
+    for line in source.splitlines(keepends=True):
+        if line.lstrip().startswith(("def ", "class ", "async def ")):
+            break
+        lines.append(line)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "".join(lines)
+
+
+def _name_reference_map(source: str) -> Dict[str, List[str]]:
+    """Return ``{imported_alias: [defn_names_that_use_it]}`` for *source*.
+
+    For each top-level import alias (e.g. ``cst`` from ``import libcst as cst``,
+    or ``DuplicateExtractor`` from a ``from … import`` statement) this collects
+    which top-level function and class definitions reference that name.  The
+    result lets the LLM determine which sub-module's local binding of a name is
+    the correct patch target — it's the sub-module whose callers live there.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+
+    # Collect all top-level imported aliases (the local name, i.e. what code uses).
+    imported: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.asname if alias.asname else alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    imported.add(alias.asname if alias.asname else alias.name)
+
+    # For each top-level function / class, record which imported names it uses.
+    refs: Dict[str, List[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        defn_name = node.name
+        seen: Set[str] = set()
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Name)
+                and child.id in imported
+                and child.id not in seen
+            ):
+                seen.add(child.id)
+                refs.setdefault(child.id, []).append(defn_name)
+
+    return refs
+
+
 def _build_context_message(fl_contexts: List[_FLContext]) -> str:
     """Build the shared LLM prompt context describing all split files."""
     parts: List[str] = [
@@ -740,21 +801,6 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
     for ctx in fl_contexts:
         parts.append(f"\n## Split module: `{ctx.old_module}` ({ctx.filepath})\n")
 
-        orig_lines = ctx.original_source.splitlines(keepends=True)
-        mod_lines = ctx.modified_source.splitlines(keepends=True)
-        diff_lines = list(
-            difflib.unified_diff(
-                orig_lines,
-                mod_lines,
-                fromfile=f"{ctx.old_module} (before)",
-                tofile=f"{ctx.old_module} (after)",
-            )
-        )
-        if diff_lines:
-            parts.append("### Changes to original file (diff):\n```diff\n")
-            parts.extend(diff_lines)
-            parts.append("```\n")
-
         parts.append(
             f"### Modified original file `{ctx.old_module}` (current state):\n"
             "```python\n"
@@ -764,11 +810,23 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
 
         for rel_path, content in ctx.new_files.items():
             new_mod = ctx.new_module_paths.get(rel_path, rel_path)
-            parts.append(
-                f"### New file `{rel_path}` (module: `{new_mod}`):\n```python\n"
-            )
-            parts.append(content)
-            parts.append("```\n")
+            parts.append(f"### New file `{rel_path}` (module: `{new_mod}`):\n")
+            header = _import_header(content)
+            if header:
+                parts.append("**Imports:**\n```python\n")
+                parts.append(header)
+                parts.append("```\n")
+            ref_map = _name_reference_map(content)
+            if ref_map:
+                parts.append(
+                    "**Name references**"
+                    " (imported alias → top-level definitions that use it):\n"
+                )
+                for name in sorted(ref_map):
+                    callers = ref_map[name]
+                    parts.append(
+                        f"- `{name}`: {', '.join(f'`{c}`' for c in callers)}\n"
+                    )
 
         parts.append("### Entity migration:\n")
         for entity_name in sorted(ctx.entity_to_target):
@@ -1555,7 +1613,6 @@ def apply_patch_rewrite(
         config.provider, api_key, timeout=config.api_timeout, base_url=config.base_url
     )
 
-    context_msg = _build_context_message(fl_contexts)
     max_attempts = 1 + config.patch_update_retries
 
     per_file_abs = {str(Path(f).resolve()) for f in per_file}
@@ -1566,8 +1623,15 @@ def apply_patch_rewrite(
 
     # Update per_file sources (in memory, not yet written to disk).
     for filepath, state in per_file.items():
+        file_src = state["source"]
+        relevant_contexts = [
+            ctx
+            for ctx in fl_contexts
+            if any(path in file_src for path in ctx.forking_old_paths)
+        ]
+        context_msg = _build_context_message(relevant_contexts)
         new_src, changed, cross = _process_file_source(
-            state["source"],
+            file_src,
             all_forking_paths,
             context_msg,
             client,
@@ -1611,6 +1675,12 @@ def apply_patch_rewrite(
             src = py_file.read_text(encoding="utf-8")
         except OSError:
             continue
+        relevant_contexts = [
+            ctx
+            for ctx in fl_contexts
+            if any(path in src for path in ctx.forking_old_paths)
+        ]
+        context_msg = _build_context_message(relevant_contexts)
         new_src, changed, cross = _process_file_source(
             src,
             all_forking_paths,
