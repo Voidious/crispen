@@ -441,7 +441,7 @@ def _propose_files_step(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 30 + target_files * 40)
+    max_tokens = max(512, 30 + target_files * 60)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to propose output file set"
