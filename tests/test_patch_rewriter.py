@@ -2386,6 +2386,34 @@ def test_find_mix_literal_and_const(tmp_path):
     assert result[0].const_refs[0].patch_dec_idx == 1
 
 
+def test_find_non_matching_decorator_included_when_triggered(tmp_path):
+    """When one decorator matches, ALL resolvable decorators are included.
+
+    A test that patches get_api_key, make_client, and call_with_tool for
+    the same migrated function needs all three evaluated — even if only
+    call_with_tool's path is in old_paths.
+    """
+    src = (
+        'KEY = "crispen.mod.get_api_key"\n'
+        'CALL = "crispen.mod.call_with_tool"\n\n'
+        "@patch(KEY)\n"
+        "@patch(CALL)\n"
+        "def test_f(mock_call, mock_key):\n    pass\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    # Only CALL's value is in old_paths; KEY's value is not.
+    result = _find_test_functions_to_update(
+        src, {"crispen.mod.call_with_tool"}, scan_file=scan
+    )
+    assert len(result) == 1
+    paths = result[0].old_patch_paths
+    # Both paths must be present so the LLM can evaluate all decorators.
+    assert "crispen.mod.get_api_key" in paths
+    assert "crispen.mod.call_with_tool" in paths
+    # Both const refs must be recorded so their definitions can be updated.
+    assert len(result[0].const_refs) == 2
+
+
 def test_find_patch_no_args_increments_idx(tmp_path):
     """@patch() with no args increments patch_dec_idx before the const @patch."""
     src = (

@@ -577,8 +577,13 @@ class _PatchFunctionCollector(cst.CSTVisitor):
         self.functions: List[_TestFunctionInfo] = []
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
-        old_patch_paths: List[str] = []
-        const_refs: List[_ConstRef] = []
+        # Collect ALL resolvable patch paths from decorators, tracking which match.
+        # A function is only processed when at least one path matches old_paths, but
+        # when triggered we send ALL patch paths to the LLM so it can evaluate every
+        # @patch decorator — not just the ones that triggered collection.
+        all_patch_paths: List[str] = []  # every resolvable decorator patch string
+        all_const_refs: List[_ConstRef] = []  # const refs for every const @patch
+        has_match = False  # True when at least one decorator path matches old_paths
         patch_dec_idx = 0  # counts only @patch / *.patch decorators
 
         for dec in node.decorators:
@@ -594,20 +599,22 @@ class _PatchFunctionCollector(cst.CSTVisitor):
                 raw = arg0.value
                 if raw and raw[0] in ('"', "'") and not raw.startswith(('"""', "'''")):
                     inner = raw[1:-1]
+                    all_patch_paths.append(inner)
                     if _matches_any(inner, self._old_paths):
-                        old_patch_paths.append(inner)
+                        has_match = True
             elif isinstance(arg0, cst.Name) and arg0.value in self._const_map:
                 const_val, const_file = self._const_map[arg0.value]
-                if _matches_any(const_val, self._old_paths):
-                    old_patch_paths.append(const_val)
-                    const_refs.append(
-                        _ConstRef(
-                            const_name=arg0.value,
-                            source_file=const_file,
-                            resolved_value=const_val,
-                            patch_dec_idx=patch_dec_idx,
-                        )
+                all_patch_paths.append(const_val)
+                all_const_refs.append(
+                    _ConstRef(
+                        const_name=arg0.value,
+                        source_file=const_file,
+                        resolved_value=const_val,
+                        patch_dec_idx=patch_dec_idx,
                     )
+                )
+                if _matches_any(const_val, self._old_paths):
+                    has_match = True
             elif isinstance(arg0, cst.Attribute) and isinstance(arg0.value, cst.Name):
                 module_alias = arg0.value.value
                 attr_name = arg0.attr.value
@@ -615,16 +622,17 @@ class _PatchFunctionCollector(cst.CSTVisitor):
                     attr_map = self._attr_const_map[module_alias]
                     if attr_name in attr_map:
                         const_val, const_file = attr_map[attr_name]
-                        if _matches_any(const_val, self._old_paths):
-                            old_patch_paths.append(const_val)
-                            const_refs.append(
-                                _ConstRef(
-                                    const_name=f"{module_alias}.{attr_name}",
-                                    source_file=const_file,
-                                    resolved_value=const_val,
-                                    patch_dec_idx=patch_dec_idx,
-                                )
+                        all_patch_paths.append(const_val)
+                        all_const_refs.append(
+                            _ConstRef(
+                                const_name=f"{module_alias}.{attr_name}",
+                                source_file=const_file,
+                                resolved_value=const_val,
+                                patch_dec_idx=patch_dec_idx,
                             )
+                        )
+                        if _matches_any(const_val, self._old_paths):
+                            has_match = True
             patch_dec_idx += 1
 
         # Compute line range and extract full text before the early-return check so
@@ -644,15 +652,22 @@ class _PatchFunctionCollector(cst.CSTVisitor):
         body_paths = _find_with_patch_paths_in_body(
             original_full_text, self._old_paths, self._const_map, self._attr_const_map
         )
-        old_patch_paths.extend(body_paths)
+        if body_paths:
+            has_match = True
 
-        if not old_patch_paths:
+        if not has_match:
             return
+
+        # Include ALL decorator patch paths (not just matching ones) so the LLM
+        # evaluates every @patch in this function.  A single test may patch
+        # get_api_key, make_client, and call_with_tool for the same migrated
+        # function — each of those may need updating to a different sub-module.
+        old_patch_paths = all_patch_paths + body_paths
 
         # Build the full_text sent to the LLM: substitute constant names with
         # their string values so the LLM always sees plain string literals.
-        if const_refs:
-            subs = {ref.const_name: ref.resolved_value for ref in const_refs}
+        if all_const_refs:
+            subs = {ref.const_name: ref.resolved_value for ref in all_const_refs}
             llm_full_text = _substitute_consts_in_func_text(original_full_text, subs)
         else:
             llm_full_text = original_full_text
@@ -664,7 +679,7 @@ class _PatchFunctionCollector(cst.CSTVisitor):
                 old_patch_paths=old_patch_paths,
                 start_line=start_line,
                 end_line=end_line,
-                const_refs=const_refs,
+                const_refs=all_const_refs,
             )
         )
 
@@ -850,11 +865,15 @@ def _build_classify_prompt(
     parts = [context_msg, _PATCH_RULES]
     parts.append(
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
-        f"## Patch strings to evaluate:\n{paths_list}\n\n"
+        "## All @patch strings in this function (evaluate every one):\n"
+        f"{paths_list}\n\n"
     )
     if migration_reminder:
         parts.append(migration_reminder)
     parts.append(
+        "Every patch string listed above must be evaluated independently — "
+        "a single test function may need **multiple** patch strings updated, "
+        "each potentially pointing to a **different** new sub-module.\n\n"
         "For **each** patch string, work through these steps:\n"
         "1. Identify the production function F this test exercises "
         "(look at what the test calls or patches).\n"
