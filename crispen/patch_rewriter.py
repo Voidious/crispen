@@ -762,6 +762,31 @@ def _extract_migration_reminder(context_msg: str) -> str:
     return "## Entity migration (quick reference):\n" + "\n".join(lines) + "\n\n"
 
 
+def _extract_patch_lookup(context_msg: str) -> str:
+    """Extract the pre-computed patch target lookup from context_msg.
+
+    The lookup section lists which names moved to new sub-modules and which
+    remain in the original file.  Repeating it near the classify instructions
+    keeps the concrete name→module mapping in the model's immediate attention
+    window so it does not need to scan the full context.
+    """
+    lines: List[str] = []
+    capturing = False
+    for line in context_msg.splitlines():
+        stripped = line.rstrip()
+        if stripped == "### Patch target lookup (pre-computed):":
+            capturing = True
+            continue
+        if capturing:
+            if stripped.startswith("##"):
+                capturing = False
+            else:
+                lines.append(stripped)
+    if not lines:
+        return ""
+    return "### Patch target lookup (pre-computed):\n" + "\n".join(lines) + "\n\n"
+
+
 def _import_header(source: str) -> str:
     """Return the imports/header portion of a Python source file.
 
@@ -824,6 +849,32 @@ def _name_reference_map(source: str) -> Dict[str, List[str]]:
     return refs
 
 
+def _get_external_import_names(source: str) -> Set[str]:
+    """Return names externally imported in *source*, excluding level-1 re-exports.
+
+    Level-1 relative imports (``from .submodule import X``) are sibling re-exports
+    introduced by a file split and do not represent true external dependencies.
+    All other imports — absolute (``level=0``) and multi-level relative
+    (``level>=2``) — are included as genuine external bindings.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 1:
+                continue  # skip level-1 sibling re-exports
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname if alias.asname else alias.name)
+    return names
+
+
 def _build_context_message(fl_contexts: List[_FLContext]) -> str:
     """Build the shared LLM prompt context describing all split files."""
     parts: List[str] = [
@@ -868,6 +919,38 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
             new_mod = ctx.new_module_paths.get(target_rel, target_rel)
             parts.append(f"- `{entity_name}` → `{target_rel}` (module: `{new_mod}`)\n")
 
+        # Pre-compute which externally-imported names moved out of the original
+        # module versus which still live there.  This spares the LLM from having
+        # to scan thousands of tokens of source to answer that question.
+        orig_ext = _get_external_import_names(ctx.original_source)
+        mod_ext = _get_external_import_names(ctx.modified_source)
+        moved_out = orig_ext - mod_ext
+        still_in = orig_ext & mod_ext
+        if moved_out or still_in:
+            parts.append("### Patch target lookup (pre-computed):\n")
+            if moved_out:
+                parts.append(
+                    "Names no longer externally imported in the modified original "
+                    "(moved to a new sub-module during the split):\n"
+                )
+                for name in sorted(moved_out):
+                    homes: List[str] = []
+                    for rel_path, content in ctx.new_files.items():
+                        if name in _get_external_import_names(content):
+                            new_mod = ctx.new_module_paths.get(rel_path, rel_path)
+                            homes.append(f"`{new_mod}`")
+                    if homes:
+                        parts.append(f"- `{name}` → {', '.join(sorted(homes))}\n")
+                    else:
+                        parts.append(f"- `{name}` → (not found in new files)\n")
+            if still_in:
+                parts.append(
+                    "Names still externally imported in the modified original "
+                    "(check entity migration to determine the correct patch target):\n"
+                )
+                for name in sorted(still_in):
+                    parts.append(f"- `{name}`\n")
+
     return "".join(parts)
 
 
@@ -881,6 +964,7 @@ def _build_classify_prompt(
     """Build the user prompt for the per-function classify LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
     migration_reminder = _extract_migration_reminder(context_msg)
+    patch_lookup = _extract_patch_lookup(context_msg)
     parts = [context_msg, _PATCH_RULES]
     parts.append(
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
@@ -889,28 +973,49 @@ def _build_classify_prompt(
     )
     if migration_reminder:
         parts.append(migration_reminder)
+    if patch_lookup:
+        parts.append(patch_lookup)
     parts.append(
         "Every patch string listed above must be evaluated independently — "
         "a single test function may need **multiple** patch strings updated, "
         "each potentially pointing to a **different** new sub-module.\n\n"
-        "For **each** patch string, work through these steps:\n"
-        "1. Find N (the patched name — last component of the patch string).\n"
-        "2. Look at the **Modified original file** imports in the context above. "
-        "Is N imported from an external source there "
-        "(e.g. `from ...llm_client import N`, `from third_party import N`)? "
-        "Do NOT count a re-export from a new submodule "
-        "(e.g. `from .new_submodule import N`) as an import.\n"
-        "   - If N is **not** imported from an external source in the original file: "
-        "scan the **Imports** of each new file for N. "
-        "The new file that imports N externally is the new home — "
-        "update the patch to `new_module.N` and move to the next patch string.\n"
-        "   - If N **is** imported from an external source in the original file: "
-        "go to step 3.\n"
-        "3. Identify F (production function this test exercises).\n"
-        "4. Look up F in the Entity migration quick reference.\n"
-        "   - If F was **not migrated**: N is still resolved in the original module. "
-        "Patch unchanged.\n"
-        "   - If F was **migrated to M**: update patch to `M.N`.\n"
+    )
+    if patch_lookup:
+        parts.append(
+            "**For each patch string, resolve using the Patch target lookup above:**\n"
+            "1. Find N (the last component of the patch string, "
+            "e.g. `call_with_tool` in `pkg.module.call_with_tool`).\n"
+            "2. Check the lookup:\n"
+            '   - N listed under **"moved"**: '
+            "set the new patch to `new_module_path.N`. Done — next string.\n"
+            '   - N listed under **"still imported"** or not in the lookup at all:\n'
+            "     identify F (the production function being tested), look it up in "
+            "the Entity migration quick reference above.\n"
+            "     - F **not migrated** → patch unchanged.\n"
+            "     - F **migrated to M** → new patch = `M.N`.\n"
+        )
+    else:
+        parts.append(
+            "For **each** patch string, work through these steps:\n"
+            "1. Find N (the patched name — last component of the patch string).\n"
+            "2. Look at the **Modified original file** imports in the context above. "
+            "Is N imported from an external source there "
+            "(e.g. `from ...llm_client import N`, `from third_party import N`)? "
+            "Do NOT count a re-export from a new submodule "
+            "(e.g. `from .new_submodule import N`) as an import.\n"
+            "   - If N is **not** imported from an external source in the original "
+            "file: scan the **Imports** of each new file for N. "
+            "The new file that imports N externally is the new home — "
+            "update the patch to `new_module.N` and move to the next string.\n"
+            "   - If N **is** imported from an external source in the original file: "
+            "go to step 3.\n"
+            "3. Identify F (production function this test exercises).\n"
+            "4. Look up F in the Entity migration quick reference.\n"
+            "   - If F was **not migrated**: N is still resolved in the original "
+            "module. Patch unchanged.\n"
+            "   - If F was **migrated to M**: update patch to `M.N`.\n"
+        )
+    parts.append(
         "Include **every** evaluated path in `patch_renames`. "
         "Set `needs_rewrite` to True only for structural changes "
         "(new decorators, new mock parameters, or body edits).\n"

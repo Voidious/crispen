@@ -23,10 +23,12 @@ from crispen.patch_rewriter import (
     _build_rewrite_verify_prompt,
     _compiles,
     _extract_migration_reminder,
+    _extract_patch_lookup,
     _find_test_functions_to_update,
     _find_with_patch_paths_in_body,
     _import_header,
     _is_patch_call,
+    _get_external_import_names,
     _name_reference_map,
     _matches_any,
     _process_file_source,
@@ -639,6 +641,185 @@ def test_extract_migration_reminder_heading_stops_capture():
 
 
 # ---------------------------------------------------------------------------
+# _get_external_import_names
+# ---------------------------------------------------------------------------
+
+
+def test_get_external_import_names_absolute():
+    src = "from pkg import Foo\nimport os\n"
+    names = _get_external_import_names(src)
+    assert "Foo" in names
+    assert "os" in names
+
+
+def test_get_external_import_names_level1_skipped():
+    src = "from .sub import Bar\nfrom . import Baz\n"
+    names = _get_external_import_names(src)
+    assert names == set()
+
+
+def test_get_external_import_names_level2_included():
+    src = "from ..pkg import Foo\nfrom ...llm_client import call_with_tool\n"
+    names = _get_external_import_names(src)
+    assert "Foo" in names
+    assert "call_with_tool" in names
+
+
+def test_get_external_import_names_star_import_skipped():
+    src = "from pkg import *\n"
+    names = _get_external_import_names(src)
+    assert names == set()
+
+
+def test_get_external_import_names_asname():
+    src = "import libcst as cst\nfrom pkg import Foo as F\n"
+    names = _get_external_import_names(src)
+    assert "cst" in names
+    assert "F" in names
+    assert "libcst" not in names
+    assert "Foo" not in names
+
+
+def test_get_external_import_names_syntax_error():
+    assert _get_external_import_names("def (broken:") == set()
+
+
+# ---------------------------------------------------------------------------
+# _extract_patch_lookup
+# ---------------------------------------------------------------------------
+
+
+def _make_ctx_with_ext_imports() -> _FLContext:
+    """Context where original_source has real external imports that moved."""
+    orig = "from ...llm_client import call_with_tool\ndef foo(): pass\n"
+    mod = "from .llm_planning import call_with_tool\n"
+    new_files = {
+        "llm_planning.py": (
+            "from ...llm_client import call_with_tool\ndef advise(): call_with_tool()\n"
+        )
+    }
+    return _make_fl_ctx(
+        original_source=orig,
+        modified_source=mod,
+        new_files=new_files,
+        new_module_paths={"llm_planning.py": "pkg.llm_planning"},
+        entity_to_target={"advise": "llm_planning.py"},
+    )
+
+
+def test_extract_patch_lookup_basic():
+    ctx_msg = _build_context_message([_make_ctx_with_ext_imports()])
+    lookup = _extract_patch_lookup(ctx_msg)
+    assert "Patch target lookup" in lookup
+    assert "call_with_tool" in lookup
+    assert "pkg.llm_planning" in lookup
+
+
+def test_extract_patch_lookup_no_section():
+    # Default fixture has no external imports → no lookup section generated.
+    ctx_msg = _build_context_message([_make_fl_ctx()])
+    assert _extract_patch_lookup(ctx_msg) == ""
+
+
+def test_extract_patch_lookup_multiple_contexts():
+    ctx1 = _make_ctx_with_ext_imports()
+    orig2 = "from ...config import CrispenConfig\ndef bar(): pass\n"
+    mod2 = "from .cfg import CrispenConfig\n"
+    new2 = {"cfg.py": "from ...config import CrispenConfig\ndef run(): pass\n"}
+    ctx2 = _make_fl_ctx(
+        old_module="pkg.other",
+        filepath="/proj/pkg/other.py",
+        original_source=orig2,
+        modified_source=mod2,
+        new_files=new2,
+        new_module_paths={"cfg.py": "pkg.cfg"},
+        entity_to_target={"run": "cfg.py"},
+    )
+    ctx_msg = _build_context_message([ctx1, ctx2])
+    lookup = _extract_patch_lookup(ctx_msg)
+    assert "call_with_tool" in lookup
+    assert "CrispenConfig" in lookup
+
+
+def test_extract_patch_lookup_still_in_section():
+    # Name in both original and modified → appears under "still imported".
+    orig = "from ...llm_client import call_with_tool, make_client\ndef foo(): pass\n"
+    mod = (
+        "from ...llm_client import make_client\n"
+        "from .llm_planning import call_with_tool\n"
+    )
+    new_files = {
+        "llm_planning.py": (
+            "from ...llm_client import call_with_tool\ndef advise(): pass\n"
+        )
+    }
+    ctx = _make_fl_ctx(
+        original_source=orig,
+        modified_source=mod,
+        new_files=new_files,
+        new_module_paths={"llm_planning.py": "pkg.llm_planning"},
+        entity_to_target={"advise": "llm_planning.py"},
+    )
+    ctx_msg = _build_context_message([ctx])
+    lookup = _extract_patch_lookup(ctx_msg)
+    assert "call_with_tool" in lookup
+    assert "make_client" in lookup
+    assert "still" in lookup
+
+
+def test_extract_patch_lookup_name_not_in_new_files():
+    # Name moved out but not found in any new file → "(not found in new files)".
+    orig = "from ...llm_client import call_with_tool\ndef foo(): pass\n"
+    mod = ""  # name removed
+    new_files = {"sub.py": "class X: pass\n"}  # no imports
+    ctx = _make_fl_ctx(
+        original_source=orig,
+        modified_source=mod,
+        new_files=new_files,
+        new_module_paths={"sub.py": "pkg.sub"},
+        entity_to_target={},
+    )
+    ctx_msg = _build_context_message([ctx])
+    lookup = _extract_patch_lookup(ctx_msg)
+    assert "not found in new files" in lookup
+
+
+# ---------------------------------------------------------------------------
+# _build_context_message: patch target lookup section
+# ---------------------------------------------------------------------------
+
+
+def test_build_context_lookup_present_when_names_moved():
+    ctx_msg = _build_context_message([_make_ctx_with_ext_imports()])
+    assert "Patch target lookup" in ctx_msg
+    assert "call_with_tool" in ctx_msg
+
+
+def test_build_context_lookup_absent_when_no_ext_imports():
+    # Default fixture has class defs only — no external imports.
+    ctx_msg = _build_context_message([_make_fl_ctx()])
+    assert "Patch target lookup" not in ctx_msg
+
+
+def test_build_context_lookup_only_still_in():
+    # All external imports preserved in modified original → only "still imported"
+    # section, no "moved" section.  Covers the if moved_out: False branch.
+    orig = "from ...llm_client import make_client\ndef foo(): pass\n"
+    mod = "from ...llm_client import make_client\nfrom .sub import helper\n"
+    ctx = _make_fl_ctx(
+        original_source=orig,
+        modified_source=mod,
+        new_files={"sub.py": "def helper(): pass\n"},
+        new_module_paths={"sub.py": "pkg.sub"},
+        entity_to_target={"helper": "sub.py"},
+    )
+    ctx_msg = _build_context_message([ctx])
+    assert "Patch target lookup" in ctx_msg
+    assert "still" in ctx_msg
+    assert "moved" not in ctx_msg
+
+
+# ---------------------------------------------------------------------------
 # _build_classify_prompt
 # ---------------------------------------------------------------------------
 
@@ -676,6 +857,20 @@ def test_build_classify_prompt_multiple_paths():
     )
     assert "crispen.before.X" in prompt
     assert "crispen.before.Y" in prompt
+
+
+def test_build_classify_prompt_with_lookup():
+    # When the context has a patch target lookup, it appears in the classify prompt
+    # and the simplified lookup-based algorithm is used.
+    ctx_msg = _build_context_message([_make_ctx_with_ext_imports()])
+    prompt = _build_classify_prompt(
+        ctx_msg, "def test_f(): pass", ["pkg.big.call_with_tool"]
+    )
+    assert "Patch target lookup" in prompt
+    assert "call_with_tool" in prompt
+    assert "pkg.llm_planning" in prompt
+    assert "patch_renames" in prompt
+    assert "Entity migration (quick reference)" in prompt
 
 
 # ---------------------------------------------------------------------------
