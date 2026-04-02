@@ -982,17 +982,20 @@ def _build_classify_prompt(
     )
     if patch_lookup:
         parts.append(
-            "**For each patch string, resolve using the Patch target lookup above:**\n"
-            "1. Find N (the last component of the patch string, "
+            "**For each patch string:**\n"
+            "1. Find N (the last component, "
             "e.g. `call_with_tool` in `pkg.module.call_with_tool`).\n"
-            "2. Check the lookup:\n"
-            '   - N listed under **"moved"**: '
-            "set the new patch to `new_module_path.N`. Done — next string.\n"
-            '   - N listed under **"still imported"** or not in the lookup at all:\n'
-            "     identify F (the production function being tested), look it up in "
-            "the Entity migration quick reference above.\n"
-            "     - F **not migrated** → patch unchanged.\n"
-            "     - F **migrated to M** → new patch = `M.N`.\n"
+            "2. Identify F (the production function being tested). "
+            "Look up F in the Entity migration quick reference:\n"
+            "   - F **not migrated** (stays in original module): "
+            "patch is **unchanged** — F still resolves N from the original "
+            "module's namespace (via re-export or direct import).\n"
+            "   - F **migrated to module M**: the patch must be updated. "
+            "Now use the Patch target lookup to find N's new home:\n"
+            '     - N listed under **"moved to X"**: '
+            "new patch = `X.N` (X is the sub-module that now imports N).\n"
+            '     - N listed under **"still imported"** or not in the lookup: '
+            "new patch = `M.N` (M imports N locally).\n"
         )
     else:
         parts.append(
