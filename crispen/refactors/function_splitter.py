@@ -575,6 +575,8 @@ def _llm_name_helpers(
     tasks: List[_SplitTask],
     tool_choice_override: Optional[str] = None,
     _timing_out=None,
+    rate_limit_retries: int = 6,
+    rate_limit_backoff: float = 20.0,
 ) -> List[str]:
     """Single LLM call to name all helper functions. Falls back on error."""
     task_texts = []
@@ -606,6 +608,8 @@ def _llm_name_helpers(
         [{"role": "user", "content": prompt}],
         caller="FunctionSplitter",
         tool_choice_override=tool_choice_override,
+        rate_limit_retries=rate_limit_retries,
+        rate_limit_backoff=rate_limit_backoff,
     )
     if _timing_out is not None:
         _timing_out.append(result)
@@ -772,6 +776,8 @@ class FunctionSplitter(Refactor):
         tool_choice: Optional[str] = None,
         api_timeout: float = 60.0,
         current_file: str = "",
+        rate_limit_retries: int = 6,
+        rate_limit_backoff: float = 20.0,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self.current_file = current_file
@@ -783,6 +789,8 @@ class FunctionSplitter(Refactor):
         self._tool_choice = tool_choice
         self._api_timeout = api_timeout
         self._hard_timeout = api_timeout + 30
+        self._rate_limit_retries = rate_limit_retries
+        self._rate_limit_backoff = rate_limit_backoff
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -872,6 +880,8 @@ class FunctionSplitter(Refactor):
                     tasks,
                     tool_choice_override=self._tool_choice,
                     _timing_out=timing,
+                    rate_limit_retries=self._rate_limit_retries,
+                    rate_limit_backoff=self._rate_limit_backoff,
                 )
                 if timing:  # pragma: no branch
                     lr = timing[0]

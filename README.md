@@ -125,6 +125,14 @@ llm_verify_retries = 2
 # FileLimiter: additional retry attempts after an LLM-related failure (default: 2)
 file_limiter_retries = 2
 
+# Rate-limit (HTTP 429) retry settings.
+# rate_limit_retries: additional attempts after a 429 response (default: 6 = 7 total).
+#   Set to 0 to disable retries and raise an error immediately on the first 429.
+# rate_limit_backoff: initial wait in seconds before the first retry (default: 20.0).
+#   Each retry doubles the delay: 20, 40, 80, 160, 320, 640 seconds.
+rate_limit_retries = 6
+rate_limit_backoff = 20.0
+
 # FileLimiter: recursively split newly-created files that are still over the
 # limit (default: true). The recursion terminates when each new file is either
 # under the limit, aborted (cannot be split), or produces no further oversized files.

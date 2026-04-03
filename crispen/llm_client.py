@@ -97,27 +97,49 @@ def call_with_tool(
     messages: list,
     caller: str = "crispen",
     tool_choice_override: Optional[str] = None,
+    rate_limit_retries: int = 6,
+    rate_limit_backoff: float = 20.0,
 ) -> LLMCallResult:
     """Call the LLM with forced tool use; return an LLMCallResult.
 
     ``tool_input`` is None when the model did not invoke the tool.
     Raises CrispenAPIError on API errors.
+
+    HTTP 429 rate-limit responses are retried up to *rate_limit_retries* times
+    with exponential backoff starting at *rate_limit_backoff* seconds.
     """
     t0 = time.perf_counter()
+    _rl_delay = rate_limit_backoff
     if provider == "anthropic":
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                tools=[tool],
-                tool_choice={"type": "tool", "name": tool_name},
-                messages=messages,
-            )
-        except anthropic.APIError as exc:
-            raise CrispenAPIError(
-                f"{caller}: Anthropic API error: {exc}\n"
-                "Commit blocked. To skip all hooks: git commit --no-verify"
-            ) from exc
+        for _attempt in range(rate_limit_retries + 1):  # pragma: no branch
+            try:
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    tools=[tool],
+                    tool_choice={"type": "tool", "name": tool_name},
+                    messages=messages,
+                )
+                break
+            except anthropic.APIError as exc:
+                if (
+                    getattr(exc, "status_code", None) == 429
+                    and _attempt < rate_limit_retries
+                ):
+                    print(
+                        f"crispen: {caller}: rate limit (429), retrying in"
+                        f" {_rl_delay:.0f}s"
+                        f" (attempt {_attempt + 2}/{rate_limit_retries + 1})...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(_rl_delay)
+                    _rl_delay *= 2
+                    continue
+                raise CrispenAPIError(
+                    f"{caller}: Anthropic API error: {exc}\n"
+                    "Commit blocked. To skip all hooks: git commit --no-verify"
+                ) from exc
         tool_input = None
         for block in response.content:
             if block.type == "tool_use" and block.name == tool_name:
@@ -156,32 +178,48 @@ def call_with_tool(
         }
         if provider == "moonshot":
             create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        try:
-            response = client.chat.completions.create(**create_kwargs)
-        except openai.BadRequestError as exc:
-            if getattr(exc, "code", None) == "invalid_prompt":
-                # Content policy flag — print warning and return None gracefully
-                # so callers skip the function rather than crashing the pipeline.
-                print(
-                    f"crispen: {caller}: {provider} API error: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return LLMCallResult(
-                    tool_input=None,
-                    elapsed=time.perf_counter() - t0,
-                    input_tokens=0,
-                    output_tokens=0,
-                )
-            raise CrispenAPIError(
-                f"{caller}: {provider} API error: {exc}\n"
-                "Commit blocked. To skip all hooks: git commit --no-verify"
-            ) from exc
-        except openai.APIError as exc:
-            raise CrispenAPIError(
-                f"{caller}: {provider} API error: {exc}\n"
-                "Commit blocked. To skip all hooks: git commit --no-verify"
-            ) from exc
+        for _attempt in range(rate_limit_retries + 1):  # pragma: no branch
+            try:
+                response = client.chat.completions.create(**create_kwargs)
+                break
+            except openai.BadRequestError as exc:
+                if getattr(exc, "code", None) == "invalid_prompt":
+                    # Content policy flag — print warning and return None gracefully
+                    # so callers skip the function rather than crashing the pipeline.
+                    print(
+                        f"crispen: {caller}: {provider} API error: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return LLMCallResult(
+                        tool_input=None,
+                        elapsed=time.perf_counter() - t0,
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
+                raise CrispenAPIError(
+                    f"{caller}: {provider} API error: {exc}\n"
+                    "Commit blocked. To skip all hooks: git commit --no-verify"
+                ) from exc
+            except openai.APIError as exc:
+                if (
+                    getattr(exc, "status_code", None) == 429
+                    and _attempt < rate_limit_retries
+                ):
+                    print(
+                        f"crispen: {caller}: rate limit (429), retrying in"
+                        f" {_rl_delay:.0f}s"
+                        f" (attempt {_attempt + 2}/{rate_limit_retries + 1})...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(_rl_delay)
+                    _rl_delay *= 2
+                    continue
+                raise CrispenAPIError(
+                    f"{caller}: {provider} API error: {exc}\n"
+                    "Commit blocked. To skip all hooks: git commit --no-verify"
+                ) from exc
         tool_input = None
         if response.choices and response.choices[0].message.tool_calls:
             tc = response.choices[0].message.tool_calls[0]

@@ -252,6 +252,113 @@ def test_call_with_tool_anthropic_api_error():
             )
 
 
+def test_call_with_tool_anthropic_429_retries_then_succeeds(monkeypatch, capsys):
+    """429 from Anthropic triggers sleep + retry; succeeds on second attempt."""
+
+    class _RateLimit429(Exception):
+        status_code = 429
+
+    sleep_calls = []
+    monkeypatch.setattr(
+        "crispen.llm_client.time.sleep", lambda s: sleep_calls.append(s)
+    )
+
+    with patch("crispen.llm_client.anthropic") as mock_ant:
+        mock_ant.APIError = _RateLimit429
+        client = MagicMock()
+        success_resp = _make_anthropic_response(
+            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "ok"}
+        )
+        client.messages.create.side_effect = [_RateLimit429("overloaded"), success_resp]
+        result = call_with_tool(
+            client,
+            "anthropic",
+            "claude-sonnet-4-6",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+            caller="Test",
+            rate_limit_retries=2,
+            rate_limit_backoff=5.0,
+        )
+
+    assert result.tool_input == {"is_valid_duplicate": True, "reason": "ok"}
+    assert sleep_calls == [5.0]
+    err = capsys.readouterr().err
+    assert "rate limit (429)" in err
+    assert "attempt 2/3" in err
+
+
+def test_call_with_tool_anthropic_429_exponential_backoff(monkeypatch):
+    """Backoff doubles on each successive 429 retry."""
+
+    class _RateLimit429(Exception):
+        status_code = 429
+
+    sleep_calls = []
+    monkeypatch.setattr(
+        "crispen.llm_client.time.sleep", lambda s: sleep_calls.append(s)
+    )
+
+    with patch("crispen.llm_client.anthropic") as mock_ant:
+        mock_ant.APIError = _RateLimit429
+        client = MagicMock()
+        success_resp = _make_anthropic_response(
+            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "ok"}
+        )
+        client.messages.create.side_effect = [
+            _RateLimit429("rl"),
+            _RateLimit429("rl"),
+            success_resp,
+        ]
+        call_with_tool(
+            client,
+            "anthropic",
+            "claude-sonnet-4-6",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+            rate_limit_retries=3,
+            rate_limit_backoff=10.0,
+        )
+
+    assert sleep_calls == [10.0, 20.0]
+
+
+def test_call_with_tool_anthropic_429_exhausts_retries(monkeypatch):
+    """When all retries are exhausted on 429, CrispenAPIError is raised."""
+
+    class _RateLimit429(Exception):
+        status_code = 429
+
+    sleep_calls = []
+    monkeypatch.setattr(
+        "crispen.llm_client.time.sleep", lambda s: sleep_calls.append(s)
+    )
+
+    with patch("crispen.llm_client.anthropic") as mock_ant:
+        mock_ant.APIError = _RateLimit429
+        client = MagicMock()
+        client.messages.create.side_effect = _RateLimit429("rate limited")
+        with pytest.raises(CrispenAPIError, match="Anthropic API error"):
+            call_with_tool(
+                client,
+                "anthropic",
+                "claude-sonnet-4-6",
+                256,
+                _TOOL,
+                "evaluate_duplicate",
+                _MESSAGES,
+                caller="Test",
+                rate_limit_retries=2,
+                rate_limit_backoff=5.0,
+            )
+
+    assert sleep_calls == [5.0, 10.0]
+
+
 def test_call_with_tool_anthropic_returns_timing_and_tokens():
     client = MagicMock()
     client.messages.create.return_value = _make_anthropic_response(
@@ -543,6 +650,93 @@ def test_call_with_tool_openai_usage_attribute_error_returns_zero_tokens():
         )
     assert result.input_tokens == 0
     assert result.output_tokens == 0
+
+
+def test_call_with_tool_openai_429_retries_then_succeeds(monkeypatch, capsys):
+    """429 from OpenAI triggers sleep + retry; succeeds on second attempt."""
+
+    class _APIError(Exception):
+        pass
+
+    class _BadRequest(_APIError):
+        code = "other"
+
+    class _RateLimit429(_APIError):
+        status_code = 429
+
+    sleep_calls = []
+    monkeypatch.setattr(
+        "crispen.llm_client.time.sleep", lambda s: sleep_calls.append(s)
+    )
+
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _BadRequest
+        mock_oai.APIError = _APIError
+        client = MagicMock()
+        success_resp = _make_openai_response(
+            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "ok"}
+        )
+        client.chat.completions.create.side_effect = [
+            _RateLimit429("overloaded"),
+            success_resp,
+        ]
+        result = call_with_tool(
+            client,
+            "openai",
+            "gpt-4o",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+            caller="Test",
+            rate_limit_retries=2,
+            rate_limit_backoff=5.0,
+        )
+
+    assert result.tool_input == {"is_valid_duplicate": True, "reason": "ok"}
+    assert sleep_calls == [5.0]
+    err = capsys.readouterr().err
+    assert "rate limit (429)" in err
+    assert "attempt 2/3" in err
+
+
+def test_call_with_tool_openai_429_exhausts_retries(monkeypatch):
+    """When all OpenAI retries are exhausted on 429, CrispenAPIError is raised."""
+
+    class _APIError(Exception):
+        pass
+
+    class _BadRequest(_APIError):
+        code = "other"
+
+    class _RateLimit429(_APIError):
+        status_code = 429
+
+    sleep_calls = []
+    monkeypatch.setattr(
+        "crispen.llm_client.time.sleep", lambda s: sleep_calls.append(s)
+    )
+
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _BadRequest
+        mock_oai.APIError = _APIError
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _RateLimit429("rate limited")
+        with pytest.raises(CrispenAPIError, match="openai API error"):
+            call_with_tool(
+                client,
+                "openai",
+                "gpt-4o",
+                256,
+                _TOOL,
+                "evaluate_duplicate",
+                _MESSAGES,
+                caller="Test",
+                rate_limit_retries=1,
+                rate_limit_backoff=5.0,
+            )
+
+    assert sleep_calls == [5.0]
 
 
 def test_call_with_tool_tool_choice_override():

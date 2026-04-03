@@ -874,6 +874,8 @@ def run_engine(
                         match_functions=_should_run("match_function", config),
                         timing=config.timing,
                         current_file=filepath,
+                        rate_limit_retries=config.rate_limit_retries,
+                        rate_limit_backoff=config.rate_limit_backoff,
                     )
                 elif RefactorClass is FunctionSplitter:
                     transformer = FunctionSplitter(
@@ -888,6 +890,8 @@ def run_engine(
                         tool_choice=config.tool_choice,
                         api_timeout=config.api_timeout,
                         current_file=filepath,
+                        rate_limit_retries=config.rate_limit_retries,
+                        rate_limit_backoff=config.rate_limit_backoff,
                     )
                 else:
                     transformer = RefactorClass(

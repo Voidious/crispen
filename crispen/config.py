@@ -66,6 +66,15 @@ class CrispenConfig:
     # total attempts.  Deterministic failures (single-SCC abort) are not retried.
     file_limiter_retries: int = 2
 
+    # Number of additional attempts after an HTTP 429 (rate limit) response.
+    # 0 means no retry: the error is raised immediately on the first 429.
+    # Default 6 = seven total attempts.
+    rate_limit_retries: int = 6
+    # Initial wait time in seconds before the first retry after a 429 response.
+    # Each subsequent retry doubles the delay (exponential backoff).
+    # E.g. with the default 20s: 20, 40, 80, 160, 320, 640 seconds.
+    rate_limit_backoff: float = 20.0
+
     # When True, any new file created by FileLimiter that still exceeds
     # max_file_lines is passed through FileLimiter again recursively.  The
     # recursion terminates naturally: each pass either reduces the file below
@@ -172,6 +181,8 @@ def format_header(config: "CrispenConfig") -> List[str]:
     lines.append(f"  {'extraction_retries:':<{w}}{config.extraction_retries}")
     lines.append(f"  {'llm_verify_retries:':<{w}}{config.llm_verify_retries}")
     lines.append(f"  {'file_limiter_retries:':<{w}}{config.file_limiter_retries}")
+    lines.append(f"  {'rate_limit_retries:':<{w}}{config.rate_limit_retries}")
+    lines.append(f"  {'rate_limit_backoff:':<{w}}{config.rate_limit_backoff}s")
     if config.base_url is not None:
         lines.append(f"  {'base_url:':<{w}}{config.base_url}")
     return lines

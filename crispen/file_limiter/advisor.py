@@ -328,6 +328,8 @@ def _advise_set3(
         messages,
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
+        rate_limit_retries=config.rate_limit_retries,
+        rate_limit_backoff=config.rate_limit_backoff,
     )
     if _acc is not None:
         _acc.elapsed += result.elapsed
@@ -461,6 +463,8 @@ def _propose_files_step(
         messages,
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
+        rate_limit_retries=config.rate_limit_retries,
+        rate_limit_backoff=config.rate_limit_backoff,
     )
     if _acc is not None:
         _acc.elapsed += result.elapsed
@@ -626,6 +630,8 @@ def _assign_placements_chunk(
         messages,
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
+        rate_limit_retries=config.rate_limit_retries,
+        rate_limit_backoff=config.rate_limit_backoff,
     )
     if _acc is not None:
         _acc.elapsed += result.elapsed
@@ -871,6 +877,8 @@ def _rename_conflicting_chunk(
         messages,
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
+        rate_limit_retries=config.rate_limit_retries,
+        rate_limit_backoff=config.rate_limit_backoff,
     )
     if _acc is not None:
         _acc.elapsed += result.elapsed

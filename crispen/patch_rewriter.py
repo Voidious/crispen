@@ -1288,6 +1288,8 @@ def _process_file_source(
                     [{"role": "user", "content": classify_prompt}],
                     caller="patch_rewriter",
                     tool_choice_override=config.tool_choice,
+                    rate_limit_retries=config.rate_limit_retries,
+                    rate_limit_backoff=config.rate_limit_backoff,
                 )
                 if _acc is not None:
                     _acc.calls += 1
@@ -1338,6 +1340,8 @@ def _process_file_source(
                         [{"role": "user", "content": rewrite_prompt}],
                         caller="patch_rewriter",
                         tool_choice_override=config.tool_choice,
+                        rate_limit_retries=config.rate_limit_retries,
+                        rate_limit_backoff=config.rate_limit_backoff,
                     )
                     if _acc is not None:
                         _acc.calls += 1
@@ -1380,6 +1384,8 @@ def _process_file_source(
                         [{"role": "user", "content": rewrite_verify_prompt}],
                         caller="patch_rewriter",
                         tool_choice_override=config.tool_choice,
+                        rate_limit_retries=config.rate_limit_retries,
+                        rate_limit_backoff=config.rate_limit_backoff,
                     )
                     if _acc is not None:
                         _acc.calls += 1
@@ -1476,6 +1482,8 @@ def _process_file_source(
                     [{"role": "user", "content": no_change_verify_prompt}],
                     caller="patch_rewriter",
                     tool_choice_override=config.tool_choice,
+                    rate_limit_retries=config.rate_limit_retries,
+                    rate_limit_backoff=config.rate_limit_backoff,
                 )
                 if _acc is not None:
                     _acc.calls += 1
@@ -1554,6 +1562,8 @@ def _process_file_source(
                         [{"role": "user", "content": vc_prompt}],
                         caller="patch_rewriter",
                         tool_choice_override=config.tool_choice,
+                        rate_limit_retries=config.rate_limit_retries,
+                        rate_limit_backoff=config.rate_limit_backoff,
                     )
                     if _acc is not None:
                         _acc.calls += 1
@@ -1639,6 +1649,8 @@ def _process_file_source(
                 [{"role": "user", "content": verify_prompt}],
                 caller="patch_rewriter",
                 tool_choice_override=config.tool_choice,
+                rate_limit_retries=config.rate_limit_retries,
+                rate_limit_backoff=config.rate_limit_backoff,
             )
             if _acc is not None:
                 _acc.calls += 1
