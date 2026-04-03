@@ -795,6 +795,47 @@ def test_build_context_lookup_present_when_names_moved():
     assert "call_with_tool" in ctx_msg
 
 
+def test_build_context_lookup_annotates_using_entities():
+    # When a moved-out name is used by a top-level entity in a new file, the
+    # lookup entry should include "used by: <entity>" so the LLM can pick the
+    # right sub-module when the name appears in multiple new files.
+    orig = "from ...llm_client import call_with_tool\ndef foo(): pass\n"
+    mod = "from .sub import call_with_tool\n"
+    new_files = {
+        "sub.py": (
+            "from ...llm_client import call_with_tool\n"
+            "def _do_work(): call_with_tool()\n"
+        )
+    }
+    ctx = _make_fl_ctx(
+        original_source=orig,
+        modified_source=mod,
+        new_files=new_files,
+        new_module_paths={"sub.py": "pkg.sub"},
+        entity_to_target={"_do_work": "sub.py"},
+    )
+    ctx_msg = _build_context_message([ctx])
+    assert "used by" in ctx_msg
+    assert "_do_work" in ctx_msg
+
+
+def test_build_context_lookup_no_using_entities_when_name_unused():
+    # If a moved-out name is imported but not referenced by any top-level entity,
+    # the entry should not include a "used by" annotation.
+    orig = "from ...llm_client import call_with_tool\ndef foo(): pass\n"
+    mod = "from .sub import call_with_tool\n"
+    new_files = {"sub.py": "from ...llm_client import call_with_tool\n"}
+    ctx = _make_fl_ctx(
+        original_source=orig,
+        modified_source=mod,
+        new_files=new_files,
+        new_module_paths={"sub.py": "pkg.sub"},
+        entity_to_target={},
+    )
+    ctx_msg = _build_context_message([ctx])
+    assert "used by" not in ctx_msg
+
+
 def test_build_context_lookup_absent_when_no_ext_imports():
     # Default fixture has class defs only — no external imports.
     ctx_msg = _build_context_message([_make_fl_ctx()])
@@ -901,6 +942,18 @@ def test_build_func_verify_prompt_multiple_renames():
     assert "crispen.after.Y" in prompt
 
 
+def test_build_func_verify_prompt_includes_patch_lookup():
+    # When the context has a patch lookup section, it should be repeated near
+    # the verify instructions.
+    ctx_msg = _build_context_message([_make_ctx_with_ext_imports()])
+    prompt = _build_func_verify_prompt(
+        ctx_msg,
+        "def test_f(): pass",
+        {"pkg.old.call_with_tool": "pkg.llm_planning.call_with_tool"},
+    )
+    assert "Patch target lookup" in prompt
+
+
 # ---------------------------------------------------------------------------
 # _build_no_change_verify_prompt
 # ---------------------------------------------------------------------------
@@ -916,6 +969,18 @@ def test_build_no_change_verify_prompt_includes_migration_reminder():
     )
     assert "crispen.before.X" in prompt
     assert "Entity migration" in prompt
+
+
+def test_build_no_change_verify_prompt_includes_patch_lookup():
+    # When the context has a patch lookup section, it should be repeated near
+    # the verify instructions so the model doesn't have to scan the full context.
+    ctx_msg = _build_context_message([_make_ctx_with_ext_imports()])
+    prompt = _build_no_change_verify_prompt(
+        ctx_msg,
+        "def test_f(): pass",
+        ["pkg.old.call_with_tool"],
+    )
+    assert "Patch target lookup" in prompt
 
 
 # ---------------------------------------------------------------------------

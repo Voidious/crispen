@@ -926,6 +926,12 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
         mod_ext = _get_external_import_names(ctx.modified_source)
         moved_out = orig_ext - mod_ext
         still_in = orig_ext & mod_ext
+        # Pre-compute ref_maps (imported name → using entities) for each new file
+        # so multi-home names can be annotated with which entities use them.
+        ref_maps_by_file: Dict[str, Dict[str, List[str]]] = {
+            rel_path: _name_reference_map(content)
+            for rel_path, content in ctx.new_files.items()
+        }
         if moved_out or still_in:
             parts.append("### Patch target lookup (pre-computed):\n")
             if moved_out:
@@ -938,7 +944,15 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
                     for rel_path, content in ctx.new_files.items():
                         if name in _get_external_import_names(content):
                             new_mod = ctx.new_module_paths.get(rel_path, rel_path)
-                            homes.append(f"`{new_mod}`")
+                            users = ref_maps_by_file.get(rel_path, {}).get(name, [])
+                            if users:
+                                homes.append(
+                                    f"`{new_mod}` (used by: "
+                                    + ", ".join(f"`{u}`" for u in users)
+                                    + ")"
+                                )
+                            else:
+                                homes.append(f"`{new_mod}`")
                     if homes:
                         parts.append(f"- `{name}` → {', '.join(sorted(homes))}\n")
                     else:
@@ -1043,6 +1057,7 @@ def _build_func_verify_prompt(
         f"- `{old}` → `{new}`" for old, new in patch_renames.items()
     )
     migration_reminder = _extract_migration_reminder(context_msg)
+    patch_lookup = _extract_patch_lookup(context_msg)
     parts = [
         context_msg,
         _PATCH_RULES,
@@ -1051,6 +1066,8 @@ def _build_func_verify_prompt(
     ]
     if migration_reminder:
         parts.append(migration_reminder)
+    if patch_lookup:
+        parts.append(patch_lookup)
     parts.append(
         "Are all these updates correct? Set `correct` to True only if every "
         "proposed patch string points to where the name is looked up after "
@@ -1068,6 +1085,7 @@ def _build_no_change_verify_prompt(
     """Build the user prompt for a no-change verify LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
     migration_reminder = _extract_migration_reminder(context_msg)
+    patch_lookup = _extract_patch_lookup(context_msg)
     parts = [
         context_msg,
         _PATCH_RULES,
@@ -1076,6 +1094,8 @@ def _build_no_change_verify_prompt(
     ]
     if migration_reminder:
         parts.append(migration_reminder)
+    if patch_lookup:
+        parts.append(patch_lookup)
     parts.append(
         "The proposed update is: **no patch strings need changing**.\n\n"
         "Is this correct? Set `correct` to True only if all @patch strings "
