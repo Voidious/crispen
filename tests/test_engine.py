@@ -3578,6 +3578,98 @@ def test_add_fl_context_normal(tmp_path):
     assert fl_list[0].modified_source == "modified\n"
 
 
+def test_add_fl_context_forked_import_alias_added(tmp_path):
+    """Import aliases forked across multiple new files are added to forking_old_paths.
+
+    When the original file imports ``call_with_tool`` and multiple new sub-files
+    also import it, basic mode skips it (forking).  _add_fl_context must still
+    add ``old_module.call_with_tool`` to forking_old_paths so the LLM rewrite
+    step can detect and update @patch decorators that reference it.
+    """
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    # Original file imports call_with_tool; both new sub-files also import it
+    # (forking) so basic mode left it out of combined_patch_map.
+    pre_split = "from external import call_with_tool\ndef F(): pass\n"
+    fl_result = FileLimiterResult(
+        original_source="modified\n",
+        new_files={
+            "a.py": (
+                "from external import call_with_tool\ncall_with_tool()\ndef F(): pass\n"
+            ),
+            "b.py": "from external import call_with_tool\ncall_with_tool()\n",
+        },
+        abort=False,
+        entity_to_target={"F": "a.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    # F is already in combined_patch_map (non-forking entity); call_with_tool
+    # is NOT in combined_patch_map (forked, skipped by basic mode).
+    combined = {"mypkg.big.F": "mypkg.a.F"}
+    _add_fl_context(fl_list, filepath, pre_split, fl_result, combined)
+    assert len(fl_list) == 1
+    # call_with_tool must be in forking_old_paths despite F being already mapped.
+    assert "mypkg.big.call_with_tool" in fl_list[0].forking_old_paths
+
+
+def test_add_fl_context_forked_import_alias_entity_name_skipped(tmp_path):
+    """Import alias that is also an entity name is skipped by the alias loop's continue.
+
+    Helper is in entity_to_target (not in combined_patch_map) so the entity
+    section already adds it to forking_old_paths.  The alias loop hits the
+    ``continue`` branch and does not process it again.  ``other`` (import alias
+    only, not an entity) is picked up by the alias loop instead.
+    """
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    pre_split = "from ext import Helper, other\ndef F(): pass\n"
+    fl_result = FileLimiterResult(
+        original_source="modified\n",
+        new_files={"a.py": "from ext import other\nother()\ndef F(): pass\n"},
+        abort=False,
+        # Helper is both an imported alias and a named entity (forking entity).
+        entity_to_target={"Helper": "a.py", "F": "a.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    # Neither entity is in combined_patch_map → both are forking.
+    _add_fl_context(fl_list, filepath, pre_split, fl_result, {})
+    assert len(fl_list) == 1
+    # Helper was added by the entity section; other was added by the alias loop.
+    assert "mypkg.big.Helper" in fl_list[0].forking_old_paths
+    assert "mypkg.big.other" in fl_list[0].forking_old_paths
+
+
+def test_add_fl_context_forked_import_alias_already_mapped_skipped(tmp_path):
+    """Import alias already in combined_patch_map is not re-added."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    # pre_split imports Helper (already mapped by basic) and call_with_tool (forked).
+    pre_split = "from ext import Helper, call_with_tool\ndef F(): pass\n"
+    fl_result = FileLimiterResult(
+        original_source="modified\n",
+        new_files={
+            "a.py": "from ext import call_with_tool\ncall_with_tool()\ndef F(): pass\n",
+            "b.py": "from ext import call_with_tool\ncall_with_tool()\n",
+        },
+        abort=False,
+        entity_to_target={"F": "a.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    # Helper is already in combined_patch_map (basic mapped it); call_with_tool is not.
+    combined = {
+        "mypkg.big.F": "mypkg.a.F",
+        "mypkg.big.Helper": "mypkg.a.Helper",
+    }
+    _add_fl_context(fl_list, filepath, pre_split, fl_result, combined)
+    assert len(fl_list) == 1
+    # Helper is already mapped → not added again; call_with_tool is forked → added.
+    assert "mypkg.big.Helper" not in fl_list[0].forking_old_paths
+    assert "mypkg.big.call_with_tool" in fl_list[0].forking_old_paths
+
+
 # ---------------------------------------------------------------------------
 # "rewrite" patch mode in Phase 4
 # ---------------------------------------------------------------------------

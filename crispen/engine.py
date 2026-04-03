@@ -487,6 +487,10 @@ def _add_fl_context(
     as a specific old path (``old_module.name``) so the LLM can find any
     ``with patch(old_module.name)`` calls without matching already-updated
     paths like ``old_module.sub.name`` that basic mode already rewrote.
+
+    Import aliases from the original file that basic mode skipped (forked
+    into multiple new sub-files) are also added so the LLM rewrite step
+    can determine the correct per-function patch target.
     """
     old_mod = _module_path_for_file(filepath)
     if old_mod is None:
@@ -509,6 +513,17 @@ def _add_fl_context(
             old_path = f"{old_mod}.{name}"
             if name not in all_entity_names and old_path not in combined_patch_map:
                 forking_old_paths.add(old_path)
+    # Also add import aliases from the original file that basic mode skipped
+    # because they appeared in multiple new sub-files (forking).  These
+    # aliases are absent from combined_patch_map but may still appear as
+    # @patch string targets in test files — the LLM rewrite step can resolve
+    # the correct sub-module for each test function individually.
+    for alias_name in _collect_imported_names(pre_split_src):
+        if alias_name in all_entity_names:
+            continue
+        old_path = f"{old_mod}.{alias_name}"
+        if old_path not in combined_patch_map:
+            forking_old_paths.add(old_path)
     if not forking_old_paths:
         return
     orig_dir = Path(filepath).parent
