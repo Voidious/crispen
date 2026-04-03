@@ -24,6 +24,7 @@ from crispen.patch_rewriter import (
     _compiles,
     _extract_migration_reminder,
     _extract_patch_lookup,
+    _extract_still_imported_names,
     _find_test_functions_to_update,
     _find_with_patch_paths_in_body,
     _import_header,
@@ -785,6 +786,76 @@ def test_extract_patch_lookup_name_not_in_new_files():
 
 
 # ---------------------------------------------------------------------------
+# _extract_still_imported_names
+# ---------------------------------------------------------------------------
+
+
+def test_extract_still_imported_names_basic():
+    ctx_msg = _build_context_message([_make_ctx_with_ext_imports()])
+    # _make_ctx_with_ext_imports has call_with_tool moved out — not still imported.
+    names = _extract_still_imported_names(ctx_msg)
+    assert "call_with_tool" not in names
+
+
+def test_extract_still_imported_names_finds_retained():
+    # Build a context where a name is retained in the modified original.
+    orig = "from ...llm_client import call_with_tool, make_client\ndef foo(): pass\n"
+    mod = (
+        "from ...llm_client import make_client\n"
+        "from .llm_planning import call_with_tool\n"
+    )
+    new_files = {
+        "llm_planning.py": (
+            "from ...llm_client import call_with_tool\ndef advise(): pass\n"
+        )
+    }
+    ctx = _make_fl_ctx(
+        original_source=orig,
+        modified_source=mod,
+        new_files=new_files,
+        new_module_paths={"llm_planning.py": "pkg.llm_planning"},
+        entity_to_target={"advise": "llm_planning.py"},
+    )
+    ctx_msg = _build_context_message([ctx])
+    names = _extract_still_imported_names(ctx_msg)
+    assert "make_client" in names
+    assert "call_with_tool" not in names
+
+
+def test_extract_still_imported_names_no_section():
+    # No lookup section in context → empty set.
+    names = _extract_still_imported_names("no relevant section here")
+    assert names == set()
+
+
+def test_extract_still_imported_names_section_ends_at_non_bullet():
+    # Section capture stops when a non-bullet line is encountered.
+    ctx_msg = (
+        "Names still externally imported in the modified original (check):\n"
+        "- `alpha`\n"
+        "- `beta`\n"
+        "\n"  # blank line — not a bullet, stops capture
+        "- `gamma`\n"  # not captured
+    )
+    names = _extract_still_imported_names(ctx_msg)
+    assert "alpha" in names
+    assert "beta" in names
+    assert "gamma" not in names
+
+
+def test_extract_still_imported_names_malformed_bullet_ignored():
+    # A bullet that starts with "- `" but has no closing backtick is silently skipped.
+    ctx_msg = (
+        "Names still externally imported in the modified original (check):\n"
+        "- `valid`\n"
+        "- `\n"  # malformed — no closing backtick → end <= 3 branch
+    )
+    names = _extract_still_imported_names(ctx_msg)
+    assert "valid" in names
+    assert len(names) == 1
+
+
+# ---------------------------------------------------------------------------
 # _build_context_message: patch target lookup section
 # ---------------------------------------------------------------------------
 
@@ -1352,6 +1423,69 @@ def test_process_no_change_corrections_no_splice(mock_call, tmp_path):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_name_invariant_filtered(mock_call):
+    # Verifier proposes corrections that rename the patched name itself
+    # (e.g. X → Y).  These must be filtered out; with an empty corrections set
+    # the no-change result falls through to retry logic — here retries=1 so
+    # the second classify call is made and returns no-change confirmed by verify.
+    verify_name_change_correction = {
+        "correct": False,
+        "issue": "module moved",
+        "corrections": {"crispen.before.X": "crispen.before.Y"},  # name changed!
+    }
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(verify_name_change_correction),
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_OK),
+    ]
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), cfg, 3
+    )
+    # Correction was filtered (name changed X→Y) — no change applied.
+    assert "crispen.before.Y" not in result
+    assert mock_call.call_count == 4
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_still_imported_guard(mock_call):
+    # Verifier proposes corrections that move a name listed as still-imported in
+    # the context message.  The still-imported guard must drop these corrections;
+    # with empty corrections the retry loop resumes and accepts no-change on verify.
+    still_imported_ctx = (
+        "Names still externally imported in the modified original (check):\n" "- `X`\n"
+    )
+    verify_still_imported_correction = {
+        "correct": False,
+        "issue": "hallucinated move",
+        "corrections": {"crispen.before.X": "crispen.sub.X"},  # X is still in orig
+    }
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(verify_still_imported_correction),
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_OK),
+    ]
+    from crispen.config import CrispenConfig
+
+    cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH,
+        _FORKING_PATHS,
+        still_imported_ctx,
+        MagicMock(),
+        cfg,
+        3,
+    )
+    # Correction was filtered (X still imported) — no change applied.
+    assert "crispen.sub.X" not in result
+    assert mock_call.call_count == 4
+
+
+@mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_verify_verbose(mock_call, capsys):
     # verbose=True prints 'verifying no-change' and 'ACCEPTED'.
     mock_call.side_effect = [_ok(_CLASSIFY_NO_CHANGE), _ok(_VERIFY_OK)]
@@ -1499,6 +1633,27 @@ def test_process_patch_renames_non_string_key(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_patch_renames_name_invariant_filtered(mock_call):
+    # LLM proposes renaming crispen.before.X → crispen.before.Y (name changed from
+    # X to Y).  A file split never renames an entity — only its module path changes.
+    # The rename must be filtered out, leaving no renames → triggers no-change verify.
+    mock_call.side_effect = [
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.before.Y"},
+            }
+        ),
+        _ok(_VERIFY_OK),  # no-change verify confirms
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
+    )
+    assert changed is False
+    assert mock_call.call_count == 2  # classify + no-change verify
 
 
 @mock_patch(_PATCH_CALL_TOOL)

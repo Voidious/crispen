@@ -787,6 +787,30 @@ def _extract_patch_lookup(context_msg: str) -> str:
     return "### Patch target lookup (pre-computed):\n" + "\n".join(lines) + "\n\n"
 
 
+def _extract_still_imported_names(context_msg: str) -> Set[str]:
+    """Extract names listed as 'still externally imported' in context_msg.
+
+    These names remain directly imported by the modified original file, so any
+    no-change verifier correction that tries to relocate them is a hallucination
+    and should be filtered out before applying.
+    """
+    names: Set[str] = set()
+    in_section = False
+    for line in context_msg.splitlines():
+        stripped = line.rstrip()
+        if stripped.startswith("Names still externally imported"):
+            in_section = True
+            continue
+        if in_section:
+            if not stripped.startswith("- `"):
+                in_section = False
+                continue
+            end = stripped.find("`", 3)
+            if end > 3:
+                names.add(stripped[3:end])
+    return names
+
+
 def _import_header(source: str) -> str:
     """Return the imports/header portion of a Python source file.
 
@@ -1423,6 +1447,10 @@ def _process_file_source(
                     # Renames like crispen.engine.X → libcst.metadata.X are always
                     # wrong (confusing import source with patch target).
                     and new.split(".")[0] == old.split(".")[0]
+                    # A rename must not change the patched name itself (last
+                    # component).  A split only relocates the defining module;
+                    # the entity name is unchanged.
+                    and new.rsplit(".", 1)[-1] == old.rsplit(".", 1)[-1]
                 )
             }
 
@@ -1491,8 +1519,19 @@ def _process_file_source(
                         and old != new
                         and old in func.old_patch_paths
                         and new.split(".")[0] == old.split(".")[0]
+                        and new.rsplit(".", 1)[-1] == old.rsplit(".", 1)[-1]
                     )
                 }
+                # Guard: drop corrections that try to move a name still directly
+                # imported in the modified original — a common verify hallucination
+                # where the model claims a name is "not in __init__" when it is.
+                still_imported = _extract_still_imported_names(context_msg)
+                if still_imported:
+                    corrections_renames = {
+                        old: new
+                        for old, new in corrections_renames.items()
+                        if old.rsplit(".", 1)[-1] not in still_imported
+                    }
                 if corrections_renames:
                     # Verifier provided corrections — verify before applying.
                     vc_prompt = _build_func_verify_prompt(
