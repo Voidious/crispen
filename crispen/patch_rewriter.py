@@ -1232,8 +1232,17 @@ def _process_file_source(
     func_splices: List[Tuple[int, int, str]] = []
     # Track string-swap funcs and their accepted renames for cross-file const handling.
     string_swap_results: List[Tuple[_TestFunctionInfo, Dict[str, str]]] = []
-    # Same-file const definition updates (applied after all splices).
-    same_file_const_map: Dict[str, str] = {}
+    # Same-file const definition proposals.
+    # Maps old_val → set of proposed new_vals.  Also tracks "passthrough" usages:
+    # tests that use the constant without renaming it.  When all renaming tests
+    # agree AND no test passes through unchanged, the constant definition is updated.
+    # When there is any conflict (passthrough + rename, or multiple different renames),
+    # each affected function gets its decorator inlined to the correct value instead.
+    same_file_proposals: Dict[str, Set[str]] = {}
+    same_file_passthrough: Set[str] = (
+        set()
+    )  # old_vals kept unchanged by at least one test
+    same_file_const_map: Dict[str, str] = {}  # populated after conflict resolution
 
     for func in functions:
         prev_issue: Optional[str] = None
@@ -1533,12 +1542,22 @@ def _process_file_source(
                 # Guard: drop corrections that try to move a name still directly
                 # imported in the modified original — a common verify hallucination
                 # where the model claims a name is "not in __init__" when it is.
+                # Exception: allow "deepening" corrections that move the name to a
+                # sub-module of the original (e.g. advisor.X → advisor.conflict.X).
+                # These are correct when the name was also imported into a new
+                # sub-module created by the split, so the sub-module binding exists
+                # and the original module binding stays independent.
                 still_imported = _extract_still_imported_names(context_msg)
                 if still_imported:
                     corrections_renames = {
                         old: new
                         for old, new in corrections_renames.items()
-                        if old.rsplit(".", 1)[-1] not in still_imported
+                        if (
+                            old.rsplit(".", 1)[-1] not in still_imported
+                            or new.rsplit(".", 1)[0].startswith(
+                                old.rsplit(".", 1)[0] + "."
+                            )
+                        )
                     }
                 if corrections_renames:
                     # Verifier provided corrections — verify before applying.
@@ -1706,7 +1725,7 @@ def _process_file_source(
                     attempts_left += 1  # allow one more outer iteration
                 # else (llm_verify_retries=0): retries exhausted — skip
 
-    # Collect cross-file and same-file constant definition updates.
+    # Collect cross-file and same-file constant proposals.
     cross_file_patch_maps: Dict[str, Dict[str, str]] = {}
     if string_swap_results and scan_file:
         scan_file_abs = str(Path(scan_file).resolve())
@@ -1714,13 +1733,67 @@ def _process_file_source(
             for ref in func.const_refs:
                 new_val = accepted.get(ref.resolved_value)
                 if new_val is None or new_val == ref.resolved_value:
+                    # Test uses the constant without renaming it → passthrough.
+                    if ref.source_file == scan_file_abs:
+                        same_file_passthrough.add(ref.resolved_value)
                     continue
                 if ref.source_file == scan_file_abs:
-                    same_file_const_map[ref.resolved_value] = new_val
+                    same_file_proposals.setdefault(ref.resolved_value, set()).add(
+                        new_val
+                    )
                 else:
                     cross_file_patch_maps.setdefault(ref.source_file, {})[
                         ref.resolved_value
                     ] = new_val
+
+        # Resolve same-file proposals into updates and per-function inlines.
+        # All renaming tests agree AND no passthrough → update the constant definition.
+        # Any conflict (passthrough + rename, OR multiple different renames) → inline
+        # the correct string directly into each affected function's decorator so the
+        # shared constant stays stable and each test sees the right patch target.
+        same_file_const_map = {
+            old: next(iter(new_set))
+            for old, new_set in same_file_proposals.items()
+            if len(new_set) == 1 and old not in same_file_passthrough
+        }
+        conflicting_old_vals = {
+            old
+            for old, new_set in same_file_proposals.items()
+            if len(new_set) > 1 or old in same_file_passthrough
+        }
+        if conflicting_old_vals:
+            for func, accepted in string_swap_results:
+                inline_subs: Dict[str, str] = {}
+                for ref in func.const_refs:
+                    if (
+                        ref.source_file == scan_file_abs
+                        and ref.resolved_value in conflicting_old_vals
+                    ):
+                        new_val = accepted.get(ref.resolved_value)
+                        if new_val and new_val != ref.resolved_value:
+                            inline_subs[ref.const_name] = new_val
+                if not inline_subs:
+                    continue
+                orig_text = "\n".join(source_lines[func.start_line - 1 : func.end_line])
+                # Start from any already-pending splice for this function.
+                base_text = orig_text
+                existing_idx: Optional[int] = None
+                for idx_i, (sl, el, txt) in enumerate(func_splices):
+                    if sl == func.start_line and el == func.end_line:
+                        base_text = txt
+                        existing_idx = idx_i
+                        break
+                inlined = _substitute_consts_in_func_text(base_text, inline_subs)
+                if inlined == base_text:
+                    continue  # pragma: no cover
+                if existing_idx is not None:
+                    func_splices[existing_idx] = (
+                        func.start_line,
+                        func.end_line,
+                        inlined,
+                    )
+                else:
+                    func_splices.append((func.start_line, func.end_line, inlined))
 
     if not func_splices and not same_file_const_map:
         return source, False, cross_file_patch_maps

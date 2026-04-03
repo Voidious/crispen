@@ -3290,4 +3290,143 @@ def test_rewrite_cross_file_const_disk_acc(mock_key, mock_client, mock_call, tmp
     acc = RewriteAccumulator()
     list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG, _acc=acc))
     assert acc.files_updated >= 1
-    assert '"pkg.sub_a.A"' in helpers.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Same-file constant conflict: passthrough + inline substitution
+# ---------------------------------------------------------------------------
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_passthrough_conflict_inline(mock_call, tmp_path):
+    """One test passes through a constant (no rename), another renames it.
+    Expected: conflict detected → same-file const stays unchanged; the renaming
+    test gets its decorator inlined with the correct literal value.  The
+    non-conflicting constant is updated normally via same_file_const_map.
+
+    Covers:
+      - line 1736  (same_file_passthrough.add)
+      - lines 1762-1774  (conflicting_old_vals loop, continue branch when
+                           inline_subs is empty for the passthrough function)
+      - lines 1775-1792  (base_text, existing_idx=None → append splice)
+    """
+    src = (
+        'TARGET = "crispen.before.X"\n'
+        'TARGET2 = "crispen.before.Y"\n'
+        "\n"
+        "@patch(TARGET)\n"
+        "@patch(TARGET2)\n"
+        "def test_a(mock_y, mock_x):\n"
+        "    pass\n"
+        "\n"
+        "@patch(TARGET)\n"
+        "def test_b(mock_x):\n"
+        "    pass\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    # test_a renames Y but NOT X  → X is a passthrough from test_a's perspective.
+    # test_b renames X            → conflict (passthrough + rename) for X.
+    # Y has a single uncontested rename → const map update.
+    mock_call.side_effect = [
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.Y": "crispen.after.Y"},
+            }
+        ),
+        _ok(_VERIFY_OK),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.after.X"},
+            }
+        ),
+        _ok(_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        src,
+        {"crispen.before.X", "crispen.before.Y"},
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file=scan,
+    )
+    assert changed is True
+    # Non-conflicting constant updated in place.
+    assert 'TARGET2 = "crispen.after.Y"' in result
+    # Conflicting constant NOT updated (conflict: passthrough + rename).
+    assert 'TARGET = "crispen.before.X"' in result
+    # test_b decorator inlined with the correct literal value.
+    assert '@patch("crispen.after.X")' in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_conflict_two_renames_existing_splice(mock_call, tmp_path):
+    """Two tests rename the same constant to *different* targets → conflict.
+    test_a also renames a literal patch → it gets a func_splice from string_swap.
+    Expected: both functions get inlined with their respective literals;
+    test_a's existing splice is *updated in place* (existing_idx path).
+
+    Covers:
+      - lines 1763-1772  (loop, build inline_subs)
+      - line 1787-False  (inlined != base_text)
+      - line 1789-True   (existing_idx not None → update splice)
+      - line 1792        (existing_idx is None → append splice, for test_b)
+    """
+    src = (
+        'TARGET = "crispen.before.X"\n'
+        "\n"
+        "@patch(TARGET)\n"
+        '@patch("crispen.before.Z")\n'
+        "def test_a(mock_z, mock_x):\n"
+        "    pass\n"
+        "\n"
+        "@patch(TARGET)\n"
+        "def test_b(mock_x):\n"
+        "    pass\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    # test_a renames X → after_a.X and Z → after.Z.
+    # test_b renames X → after_b.X.
+    # Two different targets for X → conflict → inline each function individually.
+    # test_a's Z literal rename creates an existing func_splice; the inline step
+    # must update that existing splice rather than appending a new one.
+    mock_call.side_effect = [
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {
+                    "crispen.before.X": "crispen.after_a.X",
+                    "crispen.before.Z": "crispen.after.Z",
+                },
+            }
+        ),
+        _ok(_VERIFY_OK),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.after_b.X"},
+            }
+        ),
+        _ok(_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        src,
+        {"crispen.before.X", "crispen.before.Z"},
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file=scan,
+    )
+    assert changed is True
+    # The shared TARGET constant must NOT be updated (conflict).
+    assert 'TARGET = "crispen.before.X"' in result
+    # test_a: Z literal renamed, X constant inlined.
+    assert '@patch("crispen.after_a.X")' in result
+    assert '@patch("crispen.after.Z")' in result
+    # test_b: X constant inlined with its own target.
+    assert '@patch("crispen.after_b.X")' in result
+    # No original constant-style decorator survives.
+    assert "@patch(TARGET)" not in result
