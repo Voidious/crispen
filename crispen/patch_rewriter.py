@@ -816,66 +816,6 @@ def _extract_still_imported_names(context_msg: str) -> Set[str]:
     return names
 
 
-def _extract_moved_out_names(context_msg: str) -> Set[str]:
-    """Extract names listed as removed from the modified original in context_msg.
-    These names are no longer in the original module after the split.  Any rename
-    that tries to *shallow* a patch path for one of these names (reducing module
-    depth) would produce a path that doesn't exist — it must be blocked.
-    """
-    names: Set[str] = set()
-    in_section = False
-    for line in context_msg.splitlines():
-        stripped = line.rstrip()
-        if stripped.startswith("Names REMOVED from the modified original"):
-            in_section = True
-            continue
-        if in_section:
-            if not stripped.startswith("- `"):
-                in_section = False
-                continue
-            end = stripped.find("`", 3)
-            if end > 3:
-                names.add(stripped[3:end])
-    return names
-
-
-def _extract_still_in_orig_users(context_msg: str) -> Dict[str, List[str]]:
-    """Extract the 'used in original module by' annotations from still-imported names.
-
-    Returns ``{name: [func1, func2, ...]}`` for each still-imported name that
-    has an 'used in original module by:' annotation in context_msg.  These users
-    are functions in the original (pre-split) module that call the name directly,
-    so any @patch path targeting them must remain at the original module level.
-    """
-    result: Dict[str, List[str]] = {}
-    in_section = False
-    for line in context_msg.splitlines():
-        stripped = line.rstrip()
-        if stripped.startswith("Names still externally imported"):
-            in_section = True
-            continue
-        if in_section:
-            if not stripped.startswith("- `"):
-                in_section = False
-                continue
-            end_name = stripped.find("`", 3)
-            if end_name <= 3:
-                continue
-            name = stripped[3:end_name]
-            orig_prefix = "used in original module by: "
-            if orig_prefix not in stripped:
-                continue
-            idx = stripped.index(orig_prefix) + len(orig_prefix)
-            rest = stripped[idx:]
-            if ";" in rest:
-                rest = rest[: rest.index(";")]
-            parts = rest.split("`")
-            users = [parts[i] for i in range(1, len(parts), 2) if parts[i]]
-            if users:
-                result[name] = users
-    return result
-
-
 def _is_bad_rename(
     old: str,
     new: str,
@@ -1000,6 +940,41 @@ def _get_external_import_names(source: str) -> Set[str]:
                 if alias.name != "*":
                     names.add(alias.asname if alias.asname else alias.name)
     return names
+
+
+def _build_rename_guard_sets(
+    fl_contexts: List[_FLContext],
+) -> Tuple[Set[str], Set[str], Dict[str, List[str]]]:
+    """Derive rename-guard data directly from the split contexts.
+
+    Returns ``(moved_out_names, still_imported, orig_users_map)`` where:
+    - ``moved_out_names`` — names removed from the modified original during the
+      split (patching the original path would raise AttributeError).
+    - ``still_imported`` — names still directly imported by the modified original.
+    - ``orig_users_map`` — maps each still-imported name to the top-level
+      functions in the modified original that reference it.
+    """
+    moved_out_names: Set[str] = set()
+    still_imported: Set[str] = set()
+    orig_users_map: Dict[str, List[str]] = {}
+    for ctx in fl_contexts:
+        orig_ext = _get_external_import_names(ctx.original_source)
+        mod_ext = _get_external_import_names(ctx.modified_source)
+        moved_out_names |= orig_ext - mod_ext
+        still_in = orig_ext & mod_ext
+        still_imported |= still_in
+        ref_map = _name_reference_map(ctx.modified_source)
+        for name in still_in:
+            users = ref_map.get(name, [])
+            if users:
+                if name in orig_users_map:
+                    # Merge without duplicates when name appears in multiple contexts.
+                    orig_users_map[name] = list(
+                        dict.fromkeys(orig_users_map[name] + users)
+                    )
+                else:
+                    orig_users_map[name] = users
+    return moved_out_names, still_imported, orig_users_map
 
 
 def _build_context_message(fl_contexts: List[_FLContext]) -> str:
@@ -1353,6 +1328,9 @@ def _process_file_source(
     repo_root: Optional[str] = None,
     verbose: bool = False,
     _acc: Optional[RewriteAccumulator] = None,
+    moved_out_names: Optional[Set[str]] = None,
+    still_imported: Optional[Set[str]] = None,
+    orig_users_map: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[str, bool, Dict[str, Dict[str, str]]]:
     """Scan *source* for @patch functions matching *all_forking_paths* and update.
 
@@ -1385,10 +1363,14 @@ def _process_file_source(
     )  # old_vals kept unchanged by at least one test
     same_file_const_map: Dict[str, str] = {}  # populated after conflict resolution
 
-    # Pre-compute name sets once for all per-function rename guards.
-    _moved_out_names = _extract_moved_out_names(context_msg)
-    _orig_users_map = _extract_still_in_orig_users(context_msg)
-    _still_imported = _extract_still_imported_names(context_msg)
+    # Use caller-supplied guard sets (derived from _FLContext objects directly).
+    _moved_out_names: Set[str] = (
+        moved_out_names if moved_out_names is not None else set()
+    )
+    _orig_users_map: Dict[str, List[str]] = (
+        orig_users_map if orig_users_map is not None else {}
+    )
+    _still_imported: Set[str] = still_imported if still_imported is not None else set()
 
     for func in functions:
         prev_issue: Optional[str] = None
@@ -2101,6 +2083,7 @@ def apply_patch_rewrite(
             if any(path in file_src for path in ctx.forking_old_paths)
         ]
         context_msg = _build_context_message(relevant_contexts)
+        _moved_out, _still_in, _orig_users = _build_rename_guard_sets(relevant_contexts)
         new_src, changed, cross = _process_file_source(
             file_src,
             all_forking_paths,
@@ -2112,6 +2095,9 @@ def apply_patch_rewrite(
             repo_root=repo_root,
             verbose=verbose,
             _acc=_acc,
+            moved_out_names=_moved_out,
+            still_imported=_still_in,
+            orig_users_map=_orig_users,
         )
         if changed:
             state["source"] = new_src
@@ -2152,6 +2138,7 @@ def apply_patch_rewrite(
             if any(path in src for path in ctx.forking_old_paths)
         ]
         context_msg = _build_context_message(relevant_contexts)
+        _moved_out, _still_in, _orig_users = _build_rename_guard_sets(relevant_contexts)
         new_src, changed, cross = _process_file_source(
             src,
             all_forking_paths,
@@ -2163,6 +2150,9 @@ def apply_patch_rewrite(
             repo_root=repo_root,
             verbose=verbose,
             _acc=_acc,
+            moved_out_names=_moved_out,
+            still_imported=_still_in,
+            orig_users_map=_orig_users,
         )
         if changed:
             py_file.write_text(new_src, encoding="utf-8")

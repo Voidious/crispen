@@ -24,9 +24,8 @@ from crispen.patch_rewriter import (
     _compiles,
     _extract_migration_reminder,
     _extract_patch_lookup,
-    _extract_moved_out_names,
+    _build_rename_guard_sets,
     _extract_still_imported_names,
-    _extract_still_in_orig_users,
     _is_bad_rename,
     _find_test_functions_to_update,
     _find_with_patch_paths_in_body,
@@ -859,112 +858,104 @@ def test_extract_still_imported_names_malformed_bullet_ignored():
 
 
 # ---------------------------------------------------------------------------
-# _extract_moved_out_names
+# _build_rename_guard_sets
 # ---------------------------------------------------------------------------
 
 
-def test_extract_moved_out_names_basic():
-    ctx_msg = (
-        "Names REMOVED from the modified original during the split —"
-        " patching at `original_module.name` WILL raise AttributeError:\n"
-        "- `call_with_tool`\n"
-        "- `_helper`\n"
+def test_build_rename_guard_sets_moved_out():
+    # call_with_tool is in original_source but removed from modified_source.
+    ctx = _make_fl_ctx(
+        original_source="from ...llm_client import call_with_tool\ndef f(): pass\n",
+        modified_source="from .sub import call_with_tool\n",
+        new_files={"sub.py": "from ...llm_client import call_with_tool\n"},
     )
-    names = _extract_moved_out_names(ctx_msg)
-    assert "call_with_tool" in names
-    assert "_helper" in names
+    moved_out, still_in, orig_users = _build_rename_guard_sets([ctx])
+    assert "call_with_tool" in moved_out
+    assert "call_with_tool" not in still_in
 
 
-def test_extract_moved_out_names_no_section():
-    names = _extract_moved_out_names("nothing here")
-    assert names == set()
-
-
-def test_extract_moved_out_names_section_ends_at_non_bullet():
-    ctx_msg = (
-        "Names REMOVED from the modified original during the split — raising:\n"
-        "- `foo`\n"
-        "\n"  # blank line — ends section
-        "- `bar`\n"  # not captured
+def test_build_rename_guard_sets_still_imported():
+    # make_client stays in modified_source as an external import.
+    ctx = _make_fl_ctx(
+        original_source=(
+            "from ...llm_client import make_client, call_with_tool\n"
+            "def advise(): make_client()\n"
+        ),
+        modified_source=(
+            "from ...llm_client import make_client\ndef advise(): make_client()\n"
+        ),
+        new_files={"sub.py": "from ...llm_client import call_with_tool\n"},
     )
-    names = _extract_moved_out_names(ctx_msg)
-    assert "foo" in names
-    assert "bar" not in names
+    moved_out, still_in, orig_users = _build_rename_guard_sets([ctx])
+    assert "make_client" in still_in
+    assert "call_with_tool" in moved_out
+    assert "make_client" not in moved_out
 
 
-def test_extract_moved_out_names_malformed_bullet_ignored():
-    ctx_msg = (
-        "Names REMOVED from the modified original during the split — raising:\n"
-        "- `valid`\n"
-        "- `\n"  # malformed — no closing backtick
+def test_build_rename_guard_sets_orig_users_map():
+    # make_client is still imported and used by advise in modified_source.
+    ctx = _make_fl_ctx(
+        original_source="from ...llm_client import make_client\ndef advise(): pass\n",
+        modified_source=(
+            "from ...llm_client import make_client\ndef advise(): make_client()\n"
+        ),
+        new_files={},
     )
-    names = _extract_moved_out_names(ctx_msg)
-    assert "valid" in names
-    assert len(names) == 1
+    _, _, orig_users = _build_rename_guard_sets([ctx])
+    assert orig_users.get("make_client") == ["advise"]
 
 
-# ---------------------------------------------------------------------------
-# _extract_still_in_orig_users
-# ---------------------------------------------------------------------------
-
-
-def test_extract_still_in_orig_users_basic():
-    ctx_msg = (
-        "Names still externally imported in the modified original:\n"
-        "- `make_client` — used in original module by: `advise_file_limiter`\n"
-        "- `get_api_key` — used in original module by: `advise_file_limiter`;"
-        " also somewhere\n"
+def test_build_rename_guard_sets_no_users_not_in_map():
+    # make_client is still imported but not referenced by any top-level def.
+    ctx = _make_fl_ctx(
+        original_source="from ...llm_client import make_client\ndef advise(): pass\n",
+        modified_source="from ...llm_client import make_client\ndef advise(): pass\n",
+        new_files={},
     )
-    result = _extract_still_in_orig_users(ctx_msg)
-    assert result["make_client"] == ["advise_file_limiter"]
-    assert result["get_api_key"] == ["advise_file_limiter"]
+    _, _, orig_users = _build_rename_guard_sets([ctx])
+    assert "make_client" not in orig_users
 
 
-def test_extract_still_in_orig_users_no_annotation():
-    # Names without 'used in original module by:' are not included.
-    ctx_msg = (
-        "Names still externally imported in the modified original:\n"
-        "- `make_client` — available in placement too\n"
+def test_build_rename_guard_sets_empty_contexts():
+    moved_out, still_in, orig_users = _build_rename_guard_sets([])
+    assert moved_out == set()
+    assert still_in == set()
+    assert orig_users == {}
+
+
+def test_build_rename_guard_sets_merges_multiple_contexts():
+    # Two contexts each contributing one still-in name with users.
+    ctx1 = _make_fl_ctx(
+        original_source="from ...a import foo\ndef f1(): foo()\n",
+        modified_source="from ...a import foo\ndef f1(): foo()\n",
+        new_files={},
     )
-    result = _extract_still_in_orig_users(ctx_msg)
-    assert result == {}
-
-
-def test_extract_still_in_orig_users_no_section():
-    result = _extract_still_in_orig_users("nothing here")
-    assert result == {}
-
-
-def test_extract_still_in_orig_users_section_ends_at_non_bullet():
-    ctx_msg = (
-        "Names still externally imported in the modified original:\n"
-        "- `make_client` — used in original module by: `foo`\n"
-        "\n"  # ends section
-        "- `other` — used in original module by: `bar`\n"
+    ctx2 = _make_fl_ctx(
+        original_source="from ...b import bar\ndef f2(): bar()\n",
+        modified_source="from ...b import bar\ndef f2(): bar()\n",
+        new_files={},
     )
-    result = _extract_still_in_orig_users(ctx_msg)
-    assert "make_client" in result
-    assert "other" not in result
+    _, still_in, orig_users = _build_rename_guard_sets([ctx1, ctx2])
+    assert "foo" in still_in
+    assert "bar" in still_in
+    assert orig_users["foo"] == ["f1"]
+    assert orig_users["bar"] == ["f2"]
 
 
-def test_extract_still_in_orig_users_malformed_name_bullet_ignored():
-    ctx_msg = (
-        "Names still externally imported in the modified original:\n"
-        "- `\n"  # malformed — end_name <= 3
-        "- `make_client` — used in original module by: `advise_file_limiter`\n"
+def test_build_rename_guard_sets_deduplicates_merged_users():
+    # Same name+user in two contexts → appears once in orig_users_map.
+    ctx1 = _make_fl_ctx(
+        original_source="from ...a import foo\ndef f1(): foo()\n",
+        modified_source="from ...a import foo\ndef f1(): foo()\n",
+        new_files={},
     )
-    result = _extract_still_in_orig_users(ctx_msg)
-    assert "make_client" in result
-
-
-def test_extract_still_in_orig_users_empty_users_skipped():
-    # Backtick split produces no non-empty odd-indexed parts: trailing empty backtick.
-    ctx_msg = (
-        "Names still externally imported in the modified original:\n"
-        "- `make_client` — used in original module by: `\n"
+    ctx2 = _make_fl_ctx(
+        original_source="from ...a import foo\ndef f1(): foo()\n",
+        modified_source="from ...a import foo\ndef f1(): foo()\n",
+        new_files={},
     )
-    result = _extract_still_in_orig_users(ctx_msg)
-    assert result == {}
+    _, _, orig_users = _build_rename_guard_sets([ctx1, ctx2])
+    assert orig_users["foo"].count("f1") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1717,6 +1708,7 @@ def test_process_no_change_corrections_still_imported_guard(mock_call):
         MagicMock(),
         cfg,
         3,
+        still_imported={"X"},
     )
     # Correction was filtered (X still imported) — no change applied.
     assert "crispen.sub.X" not in result
