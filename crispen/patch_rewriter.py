@@ -961,12 +961,16 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
             rel_path: _name_reference_map(content)
             for rel_path, content in ctx.new_files.items()
         }
+        # Also compute a ref_map for the modified original so still_in entries
+        # can be annotated with which original-module entities use each name.
+        orig_mod_ref_map = _name_reference_map(ctx.modified_source)
         if moved_out or still_in:
             parts.append("### Patch target lookup (pre-computed):\n")
             if moved_out:
                 parts.append(
-                    "Names no longer externally imported in the modified original "
-                    "(moved to a new sub-module during the split):\n"
+                    "Names REMOVED from the modified original during the split"
+                    " — patching at `original_module.name` WILL raise"
+                    " AttributeError at test time:\n"
                 )
                 for name in sorted(moved_out):
                     homes: List[str] = []
@@ -992,6 +996,7 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
                     "(check entity migration to determine the correct patch target):\n"
                 )
                 for name in sorted(still_in):
+                    orig_users = orig_mod_ref_map.get(name, [])
                     home_annotations: List[str] = []
                     for rp, content in ctx.new_files.items():
                         if name in _get_external_import_names(content):
@@ -1005,16 +1010,26 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
                                 )
                             else:
                                 home_annotations.append(f"`{new_mod}`")
+                    orig_note = (
+                        "used in original module by: "
+                        + ", ".join(f"`{u}`" for u in orig_users)
+                        + "; "
+                        if orig_users
+                        else ""
+                    )
                     if home_annotations:
                         parts.append(
-                            f"- `{name}` — also externally imported in: "
+                            f"- `{name}` — {orig_note}also externally imported in: "
                             + ", ".join(sorted(home_annotations))
                             + "; patch at that submodule only if the test's"
                             " F is one of the listed 'used by' functions\n"
                         )
                     else:
                         parts.append(
-                            f"- `{name}` — NOT imported in any new submodule\n"
+                            f"- `{name}` — {orig_note}NOT imported in any new"
+                            " submodule\n"
+                            if orig_note
+                            else f"- `{name}` — NOT imported in any new submodule\n"
                         )
 
     return "".join(parts)
