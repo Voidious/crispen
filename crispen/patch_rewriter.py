@@ -823,10 +823,11 @@ def _is_bad_rename(
     still_imported: Set[str],
     orig_users_map: Dict[str, List[str]],
     test_text: str,
+    new_module_imports: Optional[Dict[str, Set[str]]] = None,
 ) -> bool:
     """Return True if the rename (old → new) is a known-incorrect hallucination.
 
-    Two patterns are blocked:
+    Three patterns are blocked:
 
     A) **Shallowing a moved-out name**: the name is no longer in the original
        module, so a rename that *reduces* module depth (e.g.
@@ -839,6 +840,11 @@ def _is_bad_rename(
        Deepening the patch path (e.g. ``advisor.make_client`` →
        ``advisor.placement.make_client``) would miss the binding that the tested
        function actually resolves — another AttributeError.
+
+    C) **Target module doesn't import the name**: the proposed target sub-module
+       is a known new file (from the split) but its source does not import the
+       name being patched.  Patching at that path would always raise
+       AttributeError regardless of which function is being tested.
     """
     name = old.rsplit(".", 1)[-1]
     old_depth = len(old.rsplit(".", 1)[0].split("."))
@@ -850,6 +856,16 @@ def _is_bad_rename(
     if name in still_imported and new_depth > old_depth and name in orig_users_map:
         for user in orig_users_map[name]:
             if user in test_text:
+                return True
+    # Pattern C: target module is a known new file that doesn't import the name.
+    # Only applies to names tracked as external imports (moved_out or still_imported)
+    # so that locally-defined symbols (classes, functions) are never blocked.
+    if new_module_imports is not None and (
+        name in moved_out_names or name in still_imported
+    ):
+        new_mod_path = new.rsplit(".", 1)[0]
+        if new_mod_path in new_module_imports:
+            if name not in new_module_imports[new_mod_path]:
                 return True
     return False
 
@@ -944,19 +960,23 @@ def _get_external_import_names(source: str) -> Set[str]:
 
 def _build_rename_guard_sets(
     fl_contexts: List[_FLContext],
-) -> Tuple[Set[str], Set[str], Dict[str, List[str]]]:
+) -> Tuple[Set[str], Set[str], Dict[str, List[str]], Dict[str, Set[str]]]:
     """Derive rename-guard data directly from the split contexts.
 
-    Returns ``(moved_out_names, still_imported, orig_users_map)`` where:
+    Returns ``(moved_out_names, still_imported, orig_users_map,
+    new_module_imports)`` where:
     - ``moved_out_names`` — names removed from the modified original during the
       split (patching the original path would raise AttributeError).
     - ``still_imported`` — names still directly imported by the modified original.
     - ``orig_users_map`` — maps each still-imported name to the top-level
       functions in the modified original that reference it.
+    - ``new_module_imports`` — maps each new sub-module's dotted path to the set
+      of external names it imports (for Pattern C guard).
     """
     moved_out_names: Set[str] = set()
     still_imported: Set[str] = set()
     orig_users_map: Dict[str, List[str]] = {}
+    new_module_imports: Dict[str, Set[str]] = {}
     for ctx in fl_contexts:
         orig_ext = _get_external_import_names(ctx.original_source)
         mod_ext = _get_external_import_names(ctx.modified_source)
@@ -974,7 +994,10 @@ def _build_rename_guard_sets(
                     )
                 else:
                     orig_users_map[name] = users
-    return moved_out_names, still_imported, orig_users_map
+        for rel_path, content in ctx.new_files.items():
+            mod_path = ctx.new_module_paths.get(rel_path, rel_path)
+            new_module_imports[mod_path] = _get_external_import_names(content)
+    return moved_out_names, still_imported, orig_users_map, new_module_imports
 
 
 def _build_context_message(fl_contexts: List[_FLContext]) -> str:
@@ -1331,6 +1354,7 @@ def _process_file_source(
     moved_out_names: Optional[Set[str]] = None,
     still_imported: Optional[Set[str]] = None,
     orig_users_map: Optional[Dict[str, List[str]]] = None,
+    new_module_imports: Optional[Dict[str, Set[str]]] = None,
 ) -> Tuple[str, bool, Dict[str, Dict[str, str]]]:
     """Scan *source* for @patch functions matching *all_forking_paths* and update.
 
@@ -1371,6 +1395,7 @@ def _process_file_source(
         orig_users_map if orig_users_map is not None else {}
     )
     _still_imported: Set[str] = still_imported if still_imported is not None else set()
+    _new_module_imports: Optional[Dict[str, Set[str]]] = new_module_imports
 
     for func in functions:
         prev_issue: Optional[str] = None
@@ -1597,6 +1622,28 @@ def _process_file_source(
                 )
             }
 
+            # Pre-filter: drop renames that are structurally impossible regardless
+            # of which function the test exercises.  Running this before the verify
+            # call prevents the verifier from being confused by impossible renames
+            # in the proposed set, and — if everything is dropped — redirects
+            # naturally into the no-change verify path so a retry can fire.
+            if patch_renames and (
+                _moved_out_names or _still_imported or _new_module_imports
+            ):
+                patch_renames = {
+                    old: new
+                    for old, new in patch_renames.items()
+                    if not _is_bad_rename(
+                        old,
+                        new,
+                        _moved_out_names,
+                        _still_imported,
+                        _orig_users_map,
+                        func.full_text,
+                        _new_module_imports,
+                    )
+                }
+
             if not patch_renames:
                 # Verify the "no change needed" conclusion.
                 no_change_verify_prompt = _build_no_change_verify_prompt(
@@ -1674,7 +1721,7 @@ def _process_file_source(
                 #      original-module caller (wrong binding intercepted)
                 # The second filter retains the pre-existing guard: drop any
                 # still-in name that isn't being deepened into a true sub-module.
-                if _still_imported or _moved_out_names:
+                if _still_imported or _moved_out_names or _new_module_imports:
                     corrections_renames = {
                         old: new
                         for old, new in corrections_renames.items()
@@ -1685,6 +1732,7 @@ def _process_file_source(
                             _still_imported,
                             _orig_users_map,
                             func.full_text,
+                            _new_module_imports,
                         )
                         and (
                             old.rsplit(".", 1)[-1] not in _still_imported
@@ -1829,6 +1877,7 @@ def _process_file_source(
                         _still_imported,
                         _orig_users_map,
                         func.full_text,
+                        _new_module_imports,
                     )
                 }
                 orig_text = "\n".join(source_lines[func.start_line - 1 : func.end_line])
@@ -1864,6 +1913,7 @@ def _process_file_source(
                         _still_imported,
                         _orig_users_map,
                         func.full_text,
+                        _new_module_imports,
                     )
                 }
                 orig_text = "\n".join(source_lines[func.start_line - 1 : func.end_line])
@@ -2083,7 +2133,9 @@ def apply_patch_rewrite(
             if any(path in file_src for path in ctx.forking_old_paths)
         ]
         context_msg = _build_context_message(relevant_contexts)
-        _moved_out, _still_in, _orig_users = _build_rename_guard_sets(relevant_contexts)
+        _moved_out, _still_in, _orig_users, _new_mod_imports = _build_rename_guard_sets(
+            relevant_contexts
+        )
         new_src, changed, cross = _process_file_source(
             file_src,
             all_forking_paths,
@@ -2098,6 +2150,7 @@ def apply_patch_rewrite(
             moved_out_names=_moved_out,
             still_imported=_still_in,
             orig_users_map=_orig_users,
+            new_module_imports=_new_mod_imports,
         )
         if changed:
             state["source"] = new_src
@@ -2138,7 +2191,9 @@ def apply_patch_rewrite(
             if any(path in src for path in ctx.forking_old_paths)
         ]
         context_msg = _build_context_message(relevant_contexts)
-        _moved_out, _still_in, _orig_users = _build_rename_guard_sets(relevant_contexts)
+        _moved_out, _still_in, _orig_users, _new_mod_imports = _build_rename_guard_sets(
+            relevant_contexts
+        )
         new_src, changed, cross = _process_file_source(
             src,
             all_forking_paths,
@@ -2153,6 +2208,7 @@ def apply_patch_rewrite(
             moved_out_names=_moved_out,
             still_imported=_still_in,
             orig_users_map=_orig_users,
+            new_module_imports=_new_mod_imports,
         )
         if changed:
             py_file.write_text(new_src, encoding="utf-8")
