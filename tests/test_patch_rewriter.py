@@ -916,6 +916,7 @@ def test_build_context_lookup_absent_when_no_ext_imports():
 def test_build_context_lookup_only_still_in():
     # All external imports preserved in modified original → only "still imported"
     # section, no "moved" section.  Covers the if moved_out: False branch.
+    # sub.py does NOT import make_client → "NOT imported in any new submodule".
     orig = "from ...llm_client import make_client\ndef foo(): pass\n"
     mod = "from ...llm_client import make_client\nfrom .sub import helper\n"
     ctx = _make_fl_ctx(
@@ -929,6 +930,26 @@ def test_build_context_lookup_only_still_in():
     assert "Patch target lookup" in ctx_msg
     assert "still" in ctx_msg
     assert "moved" not in ctx_msg
+    assert "NOT imported in any new submodule" in ctx_msg
+
+
+def test_build_context_lookup_still_in_also_in_new_submodule():
+    # A still-in name that is ALSO imported in a new submodule → "also imported in"
+    # annotation.  Covers the new_homes branch introduced for the make_client fix.
+    orig = "from ...llm_client import make_client\ndef foo(): pass\n"
+    mod = "from ...llm_client import make_client\nfrom .sub import helper\n"
+    ctx = _make_fl_ctx(
+        original_source=orig,
+        modified_source=mod,
+        new_files={
+            "sub.py": "from ...llm_client import make_client\ndef helper(): pass\n"
+        },
+        new_module_paths={"sub.py": "pkg.sub"},
+        entity_to_target={"helper": "sub.py"},
+    )
+    ctx_msg = _build_context_message([ctx])
+    assert "also imported in" in ctx_msg
+    assert "pkg.sub" in ctx_msg
 
 
 # ---------------------------------------------------------------------------

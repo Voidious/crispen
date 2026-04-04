@@ -97,8 +97,12 @@ _PATCH_RULES = (
     "4. Look up **F** in the entity migration table:\n"
     "   - If F was **not migrated**: N is still resolved in the original module "
     "when F runs. Leave the patch unchanged.\n"
-    "   - If F was **migrated to new module M**: update the patch to `M.N` "
-    "(M imports N locally, creating its own binding).\n"
+    "   - If F was **migrated to new module M**: before updating, "
+    "check M's **Imports** section in the context and confirm N appears "
+    "there. If N is NOT listed in M's imports, do NOT update the patch "
+    "to `M.N` — leave the patch pointing to the module that still "
+    "externally imports N (i.e. the original module). "
+    "If N IS listed in M's imports, update the patch to `M.N`.\n"
     "5. **Re-exports do NOT count as imports for step 2.** "
     "If `old_module/__init__.py` has `from .submodule import N` "
     "that is a re-export, not a true import into the original module's own "
@@ -987,7 +991,21 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
                     "(check entity migration to determine the correct patch target):\n"
                 )
                 for name in sorted(still_in):
-                    parts.append(f"- `{name}`\n")
+                    new_homes = sorted(
+                        ctx.new_module_paths.get(rp, rp)
+                        for rp, content in ctx.new_files.items()
+                        if name in _get_external_import_names(content)
+                    )
+                    if new_homes:
+                        parts.append(
+                            f"- `{name}` — also imported in: "
+                            + ", ".join(f"`{h}`" for h in new_homes)
+                            + "\n"
+                        )
+                    else:
+                        parts.append(
+                            f"- `{name}` — NOT imported in any new submodule\n"
+                        )
 
     return "".join(parts)
 
