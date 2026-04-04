@@ -933,9 +933,34 @@ def test_build_context_lookup_only_still_in():
     assert "NOT imported in any new submodule" in ctx_msg
 
 
-def test_build_context_lookup_still_in_also_in_new_submodule():
-    # A still-in name that is ALSO imported in a new submodule → "also imported in"
-    # annotation.  Covers the new_homes branch introduced for the make_client fix.
+def test_build_context_lookup_still_in_also_in_new_submodule_with_users():
+    # A still-in name imported by a new submodule whose entity USES it →
+    # annotation shows "used by" and the submodule-only caveat.
+    orig = "from ...llm_client import make_client\ndef foo(): pass\n"
+    mod = "from ...llm_client import make_client\nfrom .sub import helper\n"
+    ctx = _make_fl_ctx(
+        original_source=orig,
+        modified_source=mod,
+        new_files={
+            "sub.py": (
+                "from ...llm_client import make_client\n"
+                "def helper(): make_client()\n"
+            )
+        },
+        new_module_paths={"sub.py": "pkg.sub"},
+        entity_to_target={"helper": "sub.py"},
+    )
+    ctx_msg = _build_context_message([ctx])
+    assert "also externally imported in" in ctx_msg
+    assert "pkg.sub" in ctx_msg
+    assert "used by" in ctx_msg
+    assert "helper" in ctx_msg
+    assert "only if the test" in ctx_msg
+
+
+def test_build_context_lookup_still_in_also_in_new_submodule_no_users():
+    # A still-in name imported by a new submodule but NOT referenced by any
+    # top-level entity → annotation shows the submodule without "used by".
     orig = "from ...llm_client import make_client\ndef foo(): pass\n"
     mod = "from ...llm_client import make_client\nfrom .sub import helper\n"
     ctx = _make_fl_ctx(
@@ -948,8 +973,10 @@ def test_build_context_lookup_still_in_also_in_new_submodule():
         entity_to_target={"helper": "sub.py"},
     )
     ctx_msg = _build_context_message([ctx])
-    assert "also imported in" in ctx_msg
+    assert "also externally imported in" in ctx_msg
     assert "pkg.sub" in ctx_msg
+    # No entity in sub.py uses make_client → no "(used by: ...)" parenthetical.
+    assert "(used by:" not in ctx_msg
 
 
 # ---------------------------------------------------------------------------

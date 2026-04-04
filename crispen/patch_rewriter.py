@@ -96,7 +96,8 @@ _PATCH_RULES = (
     "(look at what the test calls or constructs).\n"
     "4. Look up **F** in the entity migration table:\n"
     "   - If F was **not migrated**: N is still resolved in the original module "
-    "when F runs. Leave the patch unchanged.\n"
+    "when F runs. Leave the patch unchanged — even if the lookup section "
+    "shows N is 'also imported in' a new submodule.\n"
     "   - If F was **migrated to new module M**: before updating, "
     "check M's **Imports** section in the context and confirm N appears "
     "there. If N is NOT listed in M's imports, do NOT update the patch "
@@ -991,16 +992,25 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
                     "(check entity migration to determine the correct patch target):\n"
                 )
                 for name in sorted(still_in):
-                    new_homes = sorted(
-                        ctx.new_module_paths.get(rp, rp)
-                        for rp, content in ctx.new_files.items()
-                        if name in _get_external_import_names(content)
-                    )
-                    if new_homes:
+                    home_annotations: List[str] = []
+                    for rp, content in ctx.new_files.items():
+                        if name in _get_external_import_names(content):
+                            new_mod = ctx.new_module_paths.get(rp, rp)
+                            users = ref_maps_by_file.get(rp, {}).get(name, [])
+                            if users:
+                                home_annotations.append(
+                                    f"`{new_mod}` (used by: "
+                                    + ", ".join(f"`{u}`" for u in users)
+                                    + ")"
+                                )
+                            else:
+                                home_annotations.append(f"`{new_mod}`")
+                    if home_annotations:
                         parts.append(
-                            f"- `{name}` — also imported in: "
-                            + ", ".join(f"`{h}`" for h in new_homes)
-                            + "\n"
+                            f"- `{name}` — also externally imported in: "
+                            + ", ".join(sorted(home_annotations))
+                            + "; patch at that submodule only if the test's"
+                            " F is one of the listed 'used by' functions\n"
                         )
                     else:
                         parts.append(
