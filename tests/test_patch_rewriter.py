@@ -24,7 +24,10 @@ from crispen.patch_rewriter import (
     _compiles,
     _extract_migration_reminder,
     _extract_patch_lookup,
+    _extract_moved_out_names,
     _extract_still_imported_names,
+    _extract_still_in_orig_users,
+    _is_bad_rename,
     _find_test_functions_to_update,
     _find_with_patch_paths_in_body,
     _import_header,
@@ -853,6 +856,193 @@ def test_extract_still_imported_names_malformed_bullet_ignored():
     names = _extract_still_imported_names(ctx_msg)
     assert "valid" in names
     assert len(names) == 1
+
+
+# ---------------------------------------------------------------------------
+# _extract_moved_out_names
+# ---------------------------------------------------------------------------
+
+
+def test_extract_moved_out_names_basic():
+    ctx_msg = (
+        "Names REMOVED from the modified original during the split —"
+        " patching at `original_module.name` WILL raise AttributeError:\n"
+        "- `call_with_tool`\n"
+        "- `_helper`\n"
+    )
+    names = _extract_moved_out_names(ctx_msg)
+    assert "call_with_tool" in names
+    assert "_helper" in names
+
+
+def test_extract_moved_out_names_no_section():
+    names = _extract_moved_out_names("nothing here")
+    assert names == set()
+
+
+def test_extract_moved_out_names_section_ends_at_non_bullet():
+    ctx_msg = (
+        "Names REMOVED from the modified original during the split — raising:\n"
+        "- `foo`\n"
+        "\n"  # blank line — ends section
+        "- `bar`\n"  # not captured
+    )
+    names = _extract_moved_out_names(ctx_msg)
+    assert "foo" in names
+    assert "bar" not in names
+
+
+def test_extract_moved_out_names_malformed_bullet_ignored():
+    ctx_msg = (
+        "Names REMOVED from the modified original during the split — raising:\n"
+        "- `valid`\n"
+        "- `\n"  # malformed — no closing backtick
+    )
+    names = _extract_moved_out_names(ctx_msg)
+    assert "valid" in names
+    assert len(names) == 1
+
+
+# ---------------------------------------------------------------------------
+# _extract_still_in_orig_users
+# ---------------------------------------------------------------------------
+
+
+def test_extract_still_in_orig_users_basic():
+    ctx_msg = (
+        "Names still externally imported in the modified original:\n"
+        "- `make_client` — used in original module by: `advise_file_limiter`\n"
+        "- `get_api_key` — used in original module by: `advise_file_limiter`;"
+        " also somewhere\n"
+    )
+    result = _extract_still_in_orig_users(ctx_msg)
+    assert result["make_client"] == ["advise_file_limiter"]
+    assert result["get_api_key"] == ["advise_file_limiter"]
+
+
+def test_extract_still_in_orig_users_no_annotation():
+    # Names without 'used in original module by:' are not included.
+    ctx_msg = (
+        "Names still externally imported in the modified original:\n"
+        "- `make_client` — available in placement too\n"
+    )
+    result = _extract_still_in_orig_users(ctx_msg)
+    assert result == {}
+
+
+def test_extract_still_in_orig_users_no_section():
+    result = _extract_still_in_orig_users("nothing here")
+    assert result == {}
+
+
+def test_extract_still_in_orig_users_section_ends_at_non_bullet():
+    ctx_msg = (
+        "Names still externally imported in the modified original:\n"
+        "- `make_client` — used in original module by: `foo`\n"
+        "\n"  # ends section
+        "- `other` — used in original module by: `bar`\n"
+    )
+    result = _extract_still_in_orig_users(ctx_msg)
+    assert "make_client" in result
+    assert "other" not in result
+
+
+def test_extract_still_in_orig_users_malformed_name_bullet_ignored():
+    ctx_msg = (
+        "Names still externally imported in the modified original:\n"
+        "- `\n"  # malformed — end_name <= 3
+        "- `make_client` — used in original module by: `advise_file_limiter`\n"
+    )
+    result = _extract_still_in_orig_users(ctx_msg)
+    assert "make_client" in result
+
+
+def test_extract_still_in_orig_users_empty_users_skipped():
+    # Backtick split produces no non-empty odd-indexed parts: trailing empty backtick.
+    ctx_msg = (
+        "Names still externally imported in the modified original:\n"
+        "- `make_client` — used in original module by: `\n"
+    )
+    result = _extract_still_in_orig_users(ctx_msg)
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# _is_bad_rename
+# ---------------------------------------------------------------------------
+
+
+def test_is_bad_rename_pattern_a_shallowing_moved_out():
+    # advisor.placement.call_with_tool → advisor.call_with_tool
+    # call_with_tool is moved out; new_depth < old_depth → bad
+    assert _is_bad_rename(
+        "crispen.advisor.placement.call_with_tool",
+        "crispen.advisor.call_with_tool",
+        moved_out_names={"call_with_tool"},
+        still_imported=set(),
+        orig_users_map={},
+        test_text="",
+    )
+
+
+def test_is_bad_rename_pattern_a_deepening_moved_out_ok():
+    # Deepening a moved-out name is fine (not shallowing).
+    assert not _is_bad_rename(
+        "crispen.advisor.call_with_tool",
+        "crispen.advisor.placement.call_with_tool",
+        moved_out_names={"call_with_tool"},
+        still_imported=set(),
+        orig_users_map={},
+        test_text="",
+    )
+
+
+def test_is_bad_rename_pattern_b_deepening_still_in_with_orig_user_in_test():
+    # advisor.make_client → advisor.placement.make_client
+    # make_client is still_imported, orig user advise_file_limiter is in test body → bad
+    assert _is_bad_rename(
+        "crispen.advisor.make_client",
+        "crispen.advisor.placement.make_client",
+        moved_out_names=set(),
+        still_imported={"make_client"},
+        orig_users_map={"make_client": ["advise_file_limiter"]},
+        test_text="def test_foo():\n    advise_file_limiter(src)\n",
+    )
+
+
+def test_is_bad_rename_pattern_b_deepening_still_in_no_orig_user_in_test():
+    # Same deepening but test body doesn't contain advise_file_limiter → ok
+    assert not _is_bad_rename(
+        "crispen.advisor.make_client",
+        "crispen.advisor.placement.make_client",
+        moved_out_names=set(),
+        still_imported={"make_client"},
+        orig_users_map={"make_client": ["advise_file_limiter"]},
+        test_text="def test_foo():\n    _propose_files_step(src)\n",
+    )
+
+
+def test_is_bad_rename_pattern_b_deepening_no_orig_users_map():
+    # Name is still_imported but not in orig_users_map → not blocked
+    assert not _is_bad_rename(
+        "crispen.advisor.make_client",
+        "crispen.advisor.placement.make_client",
+        moved_out_names=set(),
+        still_imported={"make_client"},
+        orig_users_map={},
+        test_text="def test_foo():\n    advise_file_limiter(src)\n",
+    )
+
+
+def test_is_bad_rename_not_bad_when_no_relevant_sets():
+    assert not _is_bad_rename(
+        "a.b.foo",
+        "a.b.c.foo",
+        moved_out_names=set(),
+        still_imported=set(),
+        orig_users_map={},
+        test_text="",
+    )
 
 
 # ---------------------------------------------------------------------------

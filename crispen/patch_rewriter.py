@@ -816,6 +816,104 @@ def _extract_still_imported_names(context_msg: str) -> Set[str]:
     return names
 
 
+def _extract_moved_out_names(context_msg: str) -> Set[str]:
+    """Extract names listed as removed from the modified original in context_msg.
+    These names are no longer in the original module after the split.  Any rename
+    that tries to *shallow* a patch path for one of these names (reducing module
+    depth) would produce a path that doesn't exist — it must be blocked.
+    """
+    names: Set[str] = set()
+    in_section = False
+    for line in context_msg.splitlines():
+        stripped = line.rstrip()
+        if stripped.startswith("Names REMOVED from the modified original"):
+            in_section = True
+            continue
+        if in_section:
+            if not stripped.startswith("- `"):
+                in_section = False
+                continue
+            end = stripped.find("`", 3)
+            if end > 3:
+                names.add(stripped[3:end])
+    return names
+
+
+def _extract_still_in_orig_users(context_msg: str) -> Dict[str, List[str]]:
+    """Extract the 'used in original module by' annotations from still-imported names.
+
+    Returns ``{name: [func1, func2, ...]}`` for each still-imported name that
+    has an 'used in original module by:' annotation in context_msg.  These users
+    are functions in the original (pre-split) module that call the name directly,
+    so any @patch path targeting them must remain at the original module level.
+    """
+    result: Dict[str, List[str]] = {}
+    in_section = False
+    for line in context_msg.splitlines():
+        stripped = line.rstrip()
+        if stripped.startswith("Names still externally imported"):
+            in_section = True
+            continue
+        if in_section:
+            if not stripped.startswith("- `"):
+                in_section = False
+                continue
+            end_name = stripped.find("`", 3)
+            if end_name <= 3:
+                continue
+            name = stripped[3:end_name]
+            orig_prefix = "used in original module by: "
+            if orig_prefix not in stripped:
+                continue
+            idx = stripped.index(orig_prefix) + len(orig_prefix)
+            rest = stripped[idx:]
+            if ";" in rest:
+                rest = rest[: rest.index(";")]
+            parts = rest.split("`")
+            users = [parts[i] for i in range(1, len(parts), 2) if parts[i]]
+            if users:
+                result[name] = users
+    return result
+
+
+def _is_bad_rename(
+    old: str,
+    new: str,
+    moved_out_names: Set[str],
+    still_imported: Set[str],
+    orig_users_map: Dict[str, List[str]],
+    test_text: str,
+) -> bool:
+    """Return True if the rename (old → new) is a known-incorrect hallucination.
+
+    Two patterns are blocked:
+
+    A) **Shallowing a moved-out name**: the name is no longer in the original
+       module, so a rename that *reduces* module depth (e.g.
+       ``advisor.placement.call_with_tool`` → ``advisor.call_with_tool``) points
+       at a non-existent binding and will raise AttributeError.
+
+    B) **Deepening a still-in name whose original-module users appear in the test
+       body**: the name is still in the original module AND the test calls a
+       function (e.g. ``advise_file_limiter``) that uses the name at that level.
+       Deepening the patch path (e.g. ``advisor.make_client`` →
+       ``advisor.placement.make_client``) would miss the binding that the tested
+       function actually resolves — another AttributeError.
+    """
+    name = old.rsplit(".", 1)[-1]
+    old_depth = len(old.rsplit(".", 1)[0].split("."))
+    new_depth = len(new.rsplit(".", 1)[0].split("."))
+    # Pattern A: shallowing a moved-out name
+    if name in moved_out_names and new_depth < old_depth:
+        return True
+    # Pattern B: deepening a still-in name when original-module callers are in test
+    if name in still_imported and new_depth > old_depth and name in orig_users_map:
+        for user in orig_users_map[name]:
+            if user in test_text:
+                return True
+    return False
+
+
 def _import_header(source: str) -> str:
     """Return the imports/header portion of a Python source file.
 
@@ -1287,6 +1385,11 @@ def _process_file_source(
     )  # old_vals kept unchanged by at least one test
     same_file_const_map: Dict[str, str] = {}  # populated after conflict resolution
 
+    # Pre-compute name sets once for all per-function rename guards.
+    _moved_out_names = _extract_moved_out_names(context_msg)
+    _orig_users_map = _extract_still_in_orig_users(context_msg)
+    _still_imported = _extract_still_imported_names(context_msg)
+
     for func in functions:
         prev_issue: Optional[str] = None
         prev_proposed: Optional[str] = None
@@ -1582,21 +1685,27 @@ def _process_file_source(
                         and new.rsplit(".", 1)[-1] == old.rsplit(".", 1)[-1]
                     )
                 }
-                # Guard: drop corrections that try to move a name still directly
-                # imported in the modified original — a common verify hallucination
-                # where the model claims a name is "not in __init__" when it is.
-                # Exception: allow "deepening" corrections that move the name to a
-                # sub-module of the original (e.g. advisor.X → advisor.conflict.X).
-                # These are correct when the name was also imported into a new
-                # sub-module created by the split, so the sub-module binding exists
-                # and the original module binding stays independent.
-                still_imported = _extract_still_imported_names(context_msg)
-                if still_imported:
+                # Guard: drop corrections that are known-incorrect hallucinations.
+                # _is_bad_rename blocks two patterns:
+                #   A) shallowing a moved-out name (would raise AttributeError)
+                #   B) deepening a still-in name when the test exercises the
+                #      original-module caller (wrong binding intercepted)
+                # The second filter retains the pre-existing guard: drop any
+                # still-in name that isn't being deepened into a true sub-module.
+                if _still_imported or _moved_out_names:
                     corrections_renames = {
                         old: new
                         for old, new in corrections_renames.items()
-                        if (
-                            old.rsplit(".", 1)[-1] not in still_imported
+                        if not _is_bad_rename(
+                            old,
+                            new,
+                            _moved_out_names,
+                            _still_imported,
+                            _orig_users_map,
+                            func.full_text,
+                        )
+                        and (
+                            old.rsplit(".", 1)[-1] not in _still_imported
                             or new.rsplit(".", 1)[0].startswith(
                                 old.rsplit(".", 1)[0] + "."
                             )
@@ -1727,12 +1836,24 @@ def _process_file_source(
                     flush=True,
                 )
             if v.tool_input is None:
-                # Verify failed; accept renames.
+                # Verify failed; accept renames — but still filter bad ones.
+                patch_renames_safe = {
+                    old: new
+                    for old, new in patch_renames.items()
+                    if not _is_bad_rename(
+                        old,
+                        new,
+                        _moved_out_names,
+                        _still_imported,
+                        _orig_users_map,
+                        func.full_text,
+                    )
+                }
                 orig_text = "\n".join(source_lines[func.start_line - 1 : func.end_line])
-                new_text = apply_patch_strings(orig_text, patch_renames)
+                new_text = apply_patch_strings(orig_text, patch_renames_safe)
                 if new_text != orig_text:
                     func_splices.append((func.start_line, func.end_line, new_text))
-                string_swap_results.append((func, patch_renames))
+                string_swap_results.append((func, patch_renames_safe))
                 break
 
             verify_correct = v.tool_input.get("correct", False)
@@ -1751,11 +1872,23 @@ def _process_file_source(
                         flush=True,
                     )
             if verify_correct:
+                patch_renames_safe = {
+                    old: new
+                    for old, new in patch_renames.items()
+                    if not _is_bad_rename(
+                        old,
+                        new,
+                        _moved_out_names,
+                        _still_imported,
+                        _orig_users_map,
+                        func.full_text,
+                    )
+                }
                 orig_text = "\n".join(source_lines[func.start_line - 1 : func.end_line])
-                new_text = apply_patch_strings(orig_text, patch_renames)
+                new_text = apply_patch_strings(orig_text, patch_renames_safe)
                 if new_text != orig_text:
                     func_splices.append((func.start_line, func.end_line, new_text))
-                string_swap_results.append((func, patch_renames))
+                string_swap_results.append((func, patch_renames_safe))
                 break
             else:
                 if rename_verify_retries_left > 0:
