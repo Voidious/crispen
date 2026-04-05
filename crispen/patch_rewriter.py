@@ -1117,8 +1117,10 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
                         parts.append(
                             f"- `{name}` — {orig_note}also externally imported in: "
                             + ", ".join(sorted(home_annotations))
-                            + "; patch at that submodule only if the test's"
-                            " F is one of the listed 'used by' functions\n"
+                            + "; if F was **migrated to that submodule** (check the"
+                            " entity migration table), update the patch to"
+                            " `submodule.N` — F may call N directly or via a helper"
+                            " in the same module\n"
                         )
                     else:
                         parts.append(
@@ -1172,7 +1174,8 @@ def _build_classify_prompt(
             '     - N listed under **"moved to X"**: '
             "new patch = `X.N` (X is the sub-module that now imports N).\n"
             '     - N listed under **"still imported"** or not in the lookup: '
-            "new patch = `M.N` (M imports N locally).\n"
+            "new patch = `M.N` (M imports N locally — F may call N directly"
+            " or via a helper in M; either way M's local binding must be patched).\n"
         )
     else:
         parts.append(

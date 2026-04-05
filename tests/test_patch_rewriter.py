@@ -1203,7 +1203,7 @@ def test_build_context_lookup_only_still_in():
 
 def test_build_context_lookup_still_in_also_in_new_submodule_with_users():
     # A still-in name imported by a new submodule whose entity USES it →
-    # annotation shows "used by" and the submodule-only caveat.
+    # annotation shows "used by" and the migration-based guidance.
     orig = "from ...llm_client import make_client\ndef foo(): pass\n"
     mod = "from ...llm_client import make_client\nfrom .sub import helper\n"
     ctx = _make_fl_ctx(
@@ -1223,7 +1223,8 @@ def test_build_context_lookup_still_in_also_in_new_submodule_with_users():
     assert "pkg.sub" in ctx_msg
     assert "used by" in ctx_msg
     assert "helper" in ctx_msg
-    assert "only if the test" in ctx_msg
+    assert "migrated to that submodule" in ctx_msg
+    assert "via a helper" in ctx_msg
 
 
 def test_build_context_lookup_still_in_also_in_new_submodule_no_users():
