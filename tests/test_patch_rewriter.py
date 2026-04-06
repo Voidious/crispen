@@ -11,6 +11,9 @@ from crispen.llm_client import LLMCallResult
 from crispen.patch_rewriter import (
     _FLContext,
     RewriteAccumulator,
+    _CgIndex,
+    _CG_MAX_DEPTH,
+    _CG_MAX_MODULES,
     _apply_cross_file_const_updates,
     _build_attr_const_map,
     _build_classify_prompt,
@@ -21,6 +24,13 @@ from crispen.patch_rewriter import (
     _build_no_change_verify_prompt,
     _build_rewrite_func_prompt,
     _build_rewrite_verify_prompt,
+    _callgraph_update_file,
+    _cg_build_index,
+    _cg_collect_called_names,
+    _cg_collect_defined_names,
+    _cg_collect_func_body_calls,
+    _cg_file_to_module_and_package,
+    _cg_parse_imports,
     _compiles,
     _extract_migration_reminder,
     _extract_patch_lookup,
@@ -35,9 +45,11 @@ from crispen.patch_rewriter import (
     _name_reference_map,
     _matches_any,
     _process_file_source,
+    _resolve_forking_path_via_callgraph,
     _resolve_import_to_file,
     _splice_function,
     _substitute_consts_in_func_text,
+    apply_patch_callgraph,
     apply_patch_rewrite,
 )
 
@@ -3748,3 +3760,1594 @@ def test_process_conflict_two_renames_existing_splice(mock_call, tmp_path):
     assert '@patch("crispen.after_b.X")' in result
     # No original constant-style decorator survives.
     assert "@patch(TARGET)" not in result
+
+
+# ---------------------------------------------------------------------------
+# Call-graph helpers: _cg_collect_called_names
+# ---------------------------------------------------------------------------
+
+
+def test_cg_collect_called_names_name_and_attr():
+    src = "foo()\nobj.bar()\n"
+    result = _cg_collect_called_names(src)
+    assert "foo" in result
+    assert "bar" in result
+
+
+def test_cg_collect_called_names_complex_func():
+    # f()() — outer call's func is a Call node (neither Name nor Attribute).
+    src = "f()()\n"
+    result = _cg_collect_called_names(src)
+    # Only the inner call's name is collected (f), the outer call is skipped.
+    assert "f" in result
+
+
+def test_cg_collect_called_names_parse_error():
+    assert _cg_collect_called_names("def f(:\n") == set()
+
+
+def test_cg_collect_called_names_no_calls():
+    assert _cg_collect_called_names("x = 1\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _cg_collect_func_body_calls
+# ---------------------------------------------------------------------------
+
+
+def test_cg_collect_func_body_calls_found():
+    src = "def helper(): foo()\ndef other(): bar()\n"
+    result = _cg_collect_func_body_calls(src, "helper")
+    assert "foo" in result
+    assert "bar" not in result
+
+
+def test_cg_collect_func_body_calls_not_found():
+    src = "def helper(): foo()\n"
+    assert _cg_collect_func_body_calls(src, "missing") == set()
+
+
+def test_cg_collect_func_body_calls_parse_error():
+    assert _cg_collect_func_body_calls("def f(:\n", "f") == set()
+
+
+def test_cg_collect_func_body_calls_attribute_call():
+    src = "def helper(): obj.method()\n"
+    result = _cg_collect_func_body_calls(src, "helper")
+    assert "method" in result
+
+
+def test_cg_collect_func_body_calls_complex_func():
+    # f()() inside a function body — outer call's func is a Call, not Name/Attribute.
+    src = "def helper(): f()()\n"
+    result = _cg_collect_func_body_calls(src, "helper")
+    assert "f" in result  # inner call collected; outer (complex func) silently skipped
+
+
+def test_cg_collect_func_body_calls_skips_non_function_nodes():
+    # Module-level assignment before the function — should be skipped.
+    src = "X = 1\ndef helper(): foo()\n"
+    result = _cg_collect_func_body_calls(src, "helper")
+    assert "foo" in result
+
+
+# ---------------------------------------------------------------------------
+# _cg_collect_defined_names
+# ---------------------------------------------------------------------------
+
+
+def test_cg_collect_defined_names_functions_and_classes():
+    src = "def foo(): pass\nclass Bar: pass\nasync def baz(): pass\n"
+    result = _cg_collect_defined_names(src)
+    assert result == {"foo", "Bar", "baz"}
+
+
+def test_cg_collect_defined_names_parse_error():
+    assert _cg_collect_defined_names("def f(:\n") == set()
+
+
+def test_cg_collect_defined_names_empty():
+    assert _cg_collect_defined_names("x = 1\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _cg_file_to_module_and_package
+# ---------------------------------------------------------------------------
+
+
+def test_cg_file_to_module_regular(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    f = pkg / "helpers.py"
+    f.touch()
+    mod, pkg_path = _cg_file_to_module_and_package(f, tmp_path)
+    assert mod == "pkg.helpers"
+    assert pkg_path == "pkg"
+
+
+def test_cg_file_to_module_init(tmp_path):
+    d = tmp_path / "pkg" / "utils"
+    d.mkdir(parents=True)
+    f = d / "__init__.py"
+    f.touch()
+    mod, pkg_path = _cg_file_to_module_and_package(f, tmp_path)
+    assert mod == "pkg.utils"
+    assert pkg_path == "pkg.utils"
+
+
+def test_cg_file_to_module_top_level(tmp_path):
+    f = tmp_path / "helpers.py"
+    f.touch()
+    mod, pkg_path = _cg_file_to_module_and_package(f, tmp_path)
+    assert mod == "helpers"
+    assert pkg_path == ""
+
+
+def test_cg_file_to_module_nested(tmp_path):
+    d = tmp_path / "a" / "b"
+    d.mkdir(parents=True)
+    f = d / "c.py"
+    f.touch()
+    mod, pkg_path = _cg_file_to_module_and_package(f, tmp_path)
+    assert mod == "a.b.c"
+    assert pkg_path == "a.b"
+
+
+# ---------------------------------------------------------------------------
+# _cg_parse_imports
+# ---------------------------------------------------------------------------
+
+
+def test_cg_parse_imports_from_import():
+    assert _cg_parse_imports("from pkg.sub import foo\n", "pkg") == {
+        "foo": ("pkg.sub", "foo")
+    }
+
+
+def test_cg_parse_imports_import_simple():
+    result = _cg_parse_imports("import os\n", "pkg")
+    assert result["os"] == ("os", "os")
+
+
+def test_cg_parse_imports_import_dotted():
+    result = _cg_parse_imports("import pkg.sub\n", "")
+    assert result["pkg"] == ("pkg.sub", "pkg.sub")
+
+
+def test_cg_parse_imports_import_as():
+    result = _cg_parse_imports("import os as o\n", "pkg")
+    assert result["o"] == ("os", "os")
+
+
+def test_cg_parse_imports_from_import_as():
+    assert _cg_parse_imports("from pkg import foo as bar\n", "pkg") == {
+        "bar": ("pkg", "foo")
+    }
+
+
+def test_cg_parse_imports_relative_level1():
+    # `from . import helper` with package "pkg.sub" → mod = "pkg.sub"
+    assert _cg_parse_imports("from . import helper\n", "pkg.sub") == {
+        "helper": ("pkg.sub", "helper")
+    }
+
+
+def test_cg_parse_imports_relative_level2():
+    # `from .. import foo` with package "pkg.sub" → base = "pkg"
+    assert _cg_parse_imports("from .. import foo\n", "pkg.sub") == {
+        "foo": ("pkg", "foo")
+    }
+
+
+def test_cg_parse_imports_relative_with_module():
+    # `from .utils import helper` with package "pkg" → mod = "pkg.utils"
+    assert _cg_parse_imports("from .utils import helper\n", "pkg") == {
+        "helper": ("pkg.utils", "helper")
+    }
+
+
+def test_cg_parse_imports_relative_with_empty_base():
+    # `from .sub import foo` with empty package → base="" → mod = "sub"
+    assert _cg_parse_imports("from .sub import foo\n", "") == {"foo": ("sub", "foo")}
+
+
+def test_cg_parse_imports_relative_no_module():
+    # `from . import bar` with package "pkg.sub" → mod = "pkg.sub"
+    assert _cg_parse_imports("from . import bar\n", "pkg.sub") == {
+        "bar": ("pkg.sub", "bar")
+    }
+
+
+def test_cg_parse_imports_star_skipped():
+    assert _cg_parse_imports("from pkg import *\n", "pkg") == {}
+
+
+def test_cg_parse_imports_syntax_error():
+    assert _cg_parse_imports("def f(:\n", "pkg") == {}
+
+
+def test_cg_parse_imports_too_deep_relative():
+    # level=3 with package="pkg" → go_up=2 > len(["pkg"])=1 → skipped
+    assert _cg_parse_imports("from ... import foo\n", "pkg") == {}
+
+
+def test_cg_parse_imports_level2_with_submodule():
+    # `from ..utils import foo` with package "pkg.sub" → base="pkg" → "pkg.utils"
+    assert _cg_parse_imports("from ..utils import foo\n", "pkg.sub") == {
+        "foo": ("pkg.utils", "foo")
+    }
+
+
+# ---------------------------------------------------------------------------
+# _CgIndex.get_imports
+# ---------------------------------------------------------------------------
+
+
+def test_cg_index_get_imports_cached():
+    index = _CgIndex(
+        module_to_source={"pkg.mod": "from pkg.sub import foo\n"},
+        module_to_package={"pkg.mod": "pkg"},
+        module_to_defs={"pkg.mod": set()},
+        file_to_module={},
+    )
+    r1 = index.get_imports("pkg.mod")
+    r2 = index.get_imports("pkg.mod")  # second call — cached
+    assert r1 == r2 == {"foo": ("pkg.sub", "foo")}
+    assert "pkg.mod" in index._import_cache
+
+
+def test_cg_index_get_imports_missing_module():
+    index = _CgIndex(
+        module_to_source={},
+        module_to_package={},
+        module_to_defs={},
+        file_to_module={},
+    )
+    assert index.get_imports("nonexistent") == {}
+
+
+# ---------------------------------------------------------------------------
+# _cg_build_index
+# ---------------------------------------------------------------------------
+
+
+def test_cg_build_index_from_repo(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.py").write_text("def foo(): pass\n", encoding="utf-8")
+    index = _cg_build_index(str(tmp_path), {}, [])
+    assert "pkg.mod" in index.module_to_source
+    assert "foo" in index.module_to_defs["pkg.mod"]
+    assert index.module_to_package["pkg.mod"] == "pkg"
+
+
+def test_cg_build_index_per_file_override(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    f = pkg / "mod.py"
+    f.write_text("def old(): pass\n", encoding="utf-8")
+    abs_path = str(f.resolve())
+    index = _cg_build_index(str(tmp_path), {abs_path: "def new(): pass\n"}, [])
+    assert "new" in index.module_to_defs["pkg.mod"]
+    assert "old" not in index.module_to_defs["pkg.mod"]
+
+
+def test_cg_build_index_no_repo_root():
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="",
+        modified_source="",
+        new_files={"placement.py": "def helper(): pass\n"},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths=set(),
+    )
+    index = _cg_build_index(None, {}, [ctx])
+    assert "pkg.placement" in index.module_to_source
+    assert index.file_to_module == {}
+
+
+def test_cg_build_index_excluded_dirs(tmp_path):
+    venv = tmp_path / ".venv"
+    venv.mkdir()
+    (venv / "mod.py").write_text("def foo(): pass\n", encoding="utf-8")
+    index = _cg_build_index(str(tmp_path), {}, [])
+    assert "mod" not in index.module_to_source
+
+
+def test_cg_build_index_new_files_from_context():
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="",
+        modified_source="",
+        new_files={"placement.py": "def helper(): pass\n"},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths=set(),
+    )
+    index = _cg_build_index(None, {}, [ctx])
+    assert "helper" in index.module_to_defs["pkg.placement"]
+    assert index.module_to_package["pkg.placement"] == "pkg"
+
+
+def test_cg_build_index_init_package(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from .sub import foo\n", encoding="utf-8")
+    (pkg / "sub.py").write_text("def foo(): pass\n", encoding="utf-8")
+    index = _cg_build_index(str(tmp_path), {}, [])
+    assert "pkg" in index.module_to_source
+    assert index.module_to_package["pkg"] == "pkg"
+
+
+def test_cg_build_index_already_in_index():
+    ctx1 = _FLContext(
+        filepath="/proj/orig.py",
+        old_module="orig",
+        original_source="",
+        modified_source="",
+        new_files={"placement.py": "def first(): pass\n"},
+        new_module_paths={"placement.py": "pkg.shared"},
+        entity_to_target={},
+        forking_old_paths=set(),
+    )
+    ctx2 = _FLContext(
+        filepath="/proj/orig2.py",
+        old_module="orig2",
+        original_source="",
+        modified_source="",
+        new_files={"placement.py": "def second(): pass\n"},
+        new_module_paths={"placement.py": "pkg.shared"},  # same module path
+        entity_to_target={},
+        forking_old_paths=set(),
+    )
+    index = _cg_build_index(None, {}, [ctx1, ctx2])
+    assert "first" in index.module_to_defs["pkg.shared"]
+    assert "second" not in index.module_to_defs["pkg.shared"]
+
+
+def test_cg_build_index_oserror(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    bad = pkg / "bad.py"
+    bad.write_text("def foo(): pass\n", encoding="utf-8")
+    bad.chmod(0o000)
+    try:
+        index = _cg_build_index(str(tmp_path), {}, [])
+        assert "pkg.bad" not in index.module_to_source
+    finally:
+        bad.chmod(0o644)
+
+
+def test_cg_build_index_missing_module_path():
+    ctx = _FLContext(
+        filepath="/proj/orig.py",
+        old_module="orig",
+        original_source="",
+        modified_source="",
+        new_files={"placement.py": "def helper(): pass\n"},
+        new_module_paths={},  # rel_path missing → new_mod = None → skip
+        entity_to_target={},
+        forking_old_paths=set(),
+    )
+    index = _cg_build_index(None, {}, [ctx])
+    assert "placement.py" not in index.module_to_source
+
+
+def test_cg_build_index_empty_src():
+    ctx = _FLContext(
+        filepath="/proj/orig.py",
+        old_module="orig",
+        original_source="",
+        modified_source="",
+        new_files={"placement.py": ""},  # empty src → skipped
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths=set(),
+    )
+    index = _cg_build_index(None, {}, [ctx])
+    assert "pkg.placement" not in index.module_to_source
+
+
+def test_cg_build_index_init_package_new_file():
+    # __init__.py as a new file: pkg = new_mod (not rsplit)
+    ctx = _FLContext(
+        filepath="/proj/orig.py",
+        old_module="orig",
+        original_source="",
+        modified_source="",
+        new_files={"__init__.py": "def init_fn(): pass\n"},
+        new_module_paths={"__init__.py": "pkg.sub"},
+        entity_to_target={},
+        forking_old_paths=set(),
+    )
+    index = _cg_build_index(None, {}, [ctx])
+    assert index.module_to_package["pkg.sub"] == "pkg.sub"
+
+
+def test_cg_build_index_top_level_new_file():
+    # new_mod without a dot → package = ""
+    ctx = _FLContext(
+        filepath="/proj/orig.py",
+        old_module="orig",
+        original_source="",
+        modified_source="",
+        new_files={"placement.py": "def helper(): pass\n"},
+        new_module_paths={"placement.py": "placement"},  # no dot
+        entity_to_target={},
+        forking_old_paths=set(),
+    )
+    index = _cg_build_index(None, {}, [ctx])
+    assert index.module_to_package.get("placement") == ""
+
+
+# ---------------------------------------------------------------------------
+# _resolve_forking_path_via_callgraph — BFS helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_bfs_ctx() -> _FLContext:
+    """Context with placement.py (helper) and conflict.py (resolve) using use_fn."""
+    return _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="from .placement import helper\n",
+        new_files={
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n",
+            "conflict.py": "from external import use_fn\ndef resolve(): use_fn()\n",
+        },
+        new_module_paths={
+            "placement.py": "pkg.placement",
+            "conflict.py": "pkg.conflict",
+        },
+        entity_to_target={"helper": "placement.py"},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+
+
+def _make_bfs_index(test_src: str, calling_module: str = "pkg.test_mod") -> _CgIndex:
+    """Minimal index: only the calling module's source (for import resolution)."""
+    parts = calling_module.split(".")
+    pkg = ".".join(parts[:-1]) if len(parts) > 1 else ""
+    return _CgIndex(
+        module_to_source={calling_module: test_src},
+        module_to_package={calling_module: pkg},
+        module_to_defs={calling_module: set()},
+        file_to_module={},
+    )
+
+
+# ---------------------------------------------------------------------------
+# _resolve_forking_path_via_callgraph — tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_callgraph_no_calling_module():
+    ctx = _make_bfs_ctx()
+    index = _make_bfs_index("from pkg.placement import helper\n")
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): helper()\n", ctx, index, ""
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_pre_check_fails():
+    # original_source has no external import of 'use_fn' → pre-check fails
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="def helper(): use_fn()\n",  # not imported externally
+        modified_source="",
+        new_files={"placement.py": "def helper(): use_fn()\n"},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    index = _make_bfs_index("from pkg.placement import helper\n")
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_no_terminal():
+    # New files don't reference 'use_fn' → terminal empty → None
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": "def helper(): pass\n"},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    index = _make_bfs_index("from pkg.placement import helper\n")
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_direct_call():
+    # Test directly calls 'helper'; helper in placement uses use_fn.
+    ctx = _make_bfs_ctx()
+    index = _make_bfs_index("from pkg.placement import helper\n")
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result == "pkg.placement.use_fn"
+
+
+def test_resolve_callgraph_multi_hop():
+    # Test → intermediary → helper → terminal (placement.use_fn)
+    ctx = _make_bfs_ctx()
+    middle_src = "from pkg.placement import helper\ndef intermediary(): helper()\n"
+    test_src = "from pkg.middle import intermediary\n"
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.middle": middle_src},
+        module_to_package={"pkg.test_mod": "pkg", "pkg.middle": "pkg"},
+        module_to_defs={"pkg.test_mod": set(), "pkg.middle": {"intermediary"}},
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): intermediary()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result == "pkg.placement.use_fn"
+
+
+def test_resolve_callgraph_reexport():
+    # Test imports helper from pkg.orig; pkg.orig re-exports helper from placement.
+    # Re-export is followed without incrementing depth.
+    ctx = _make_bfs_ctx()
+    orig_src = "from .placement import helper\n"  # re-exports (fn not defined)
+    test_src = "from pkg.orig import helper\n"
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.orig": orig_src},
+        module_to_package={"pkg.test_mod": "pkg", "pkg.orig": "pkg"},
+        module_to_defs={"pkg.test_mod": set(), "pkg.orig": set()},  # helper not defined
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result == "pkg.placement.use_fn"
+
+
+def test_resolve_callgraph_multiple_candidates():
+    # Both placement.helper and conflict.resolve are reachable → ambiguous → None.
+    ctx = _make_bfs_ctx()
+    test_src = "from pkg.placement import helper\n" "from pkg.conflict import resolve\n"
+    index = _make_bfs_index(test_src)
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): helper(); resolve()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_not_reachable():
+    # Test doesn't import anything relevant → BFS queue empty → None.
+    ctx = _make_bfs_ctx()
+    index = _make_bfs_index("")  # no imports
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): unrelated()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_new_submodule_non_terminal():
+    # Test imports 'other' from placement; 'other' doesn't use use_fn.
+    # 'other' is in a new sub-module but NOT in terminal → skipped.
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={
+            "placement.py": (
+                "from external import use_fn\n"
+                "def helper(): use_fn()\n"
+                "def other(): pass\n"
+            )
+        },
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = "from pkg.placement import other\n"
+    index = _make_bfs_index(test_src)
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): other()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_visited_dedup():
+    # 'intermediary' and 'inter2' both map to same (module, func); processed once.
+    ctx = _make_bfs_ctx()
+    middle_src = "from pkg.placement import helper\ndef intermediary(): helper()\n"
+    test_src = (
+        "from pkg.middle import intermediary\n"
+        "from pkg.middle import intermediary as inter2\n"
+    )
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.middle": middle_src},
+        module_to_package={"pkg.test_mod": "pkg", "pkg.middle": "pkg"},
+        module_to_defs={"pkg.test_mod": set(), "pkg.middle": {"intermediary"}},
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn",
+        "def test_f(): intermediary(); inter2()\n",
+        ctx,
+        index,
+        "pkg.test_mod",
+    )
+    assert result == "pkg.placement.use_fn"
+
+
+def test_resolve_callgraph_empty_new_file():
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={
+            "empty.py": "",
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n",
+        },
+        new_module_paths={"empty.py": "pkg.empty", "placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    index = _make_bfs_index("from pkg.placement import helper\n")
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result == "pkg.placement.use_fn"
+
+
+def test_resolve_callgraph_missing_module_path():
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": "from external import use_fn\ndef f(): use_fn()\n"},
+        new_module_paths={},  # missing → terminal empty → None
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    index = _make_bfs_index("from pkg.placement import f\n")
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): f()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_missing_source():
+    # Called function's module is not in the index → src=None → continue
+    ctx = _make_bfs_ctx()
+    test_src = "from pkg.missing import something\n"
+    index = _make_bfs_index(test_src)
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): something()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_func_defined_no_calls():
+    # Function IS defined but has no imported calls → BFS dead-end → None
+    ctx = _make_bfs_ctx()
+    middle_src = "def standalone(): pass\n"
+    test_src = "from pkg.middle import standalone\n"
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.middle": middle_src},
+        module_to_package={"pkg.test_mod": "pkg", "pkg.middle": "pkg"},
+        module_to_defs={"pkg.test_mod": set(), "pkg.middle": {"standalone"}},
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): standalone()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_body_call_not_importable():
+    # Function's body calls something not in its import map → BFS dead-end → None
+    ctx = _make_bfs_ctx()
+    middle_src = "def fn(): bar()\n"  # bar not imported
+    test_src = "from pkg.middle import fn\n"
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.middle": middle_src},
+        module_to_package={"pkg.test_mod": "pkg", "pkg.middle": "pkg"},
+        module_to_defs={"pkg.test_mod": set(), "pkg.middle": {"fn"}},
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): fn()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_func_not_defined_not_reexported():
+    # func_name not defined and not re-exported → BFS dead-end → None
+    ctx = _make_bfs_ctx()
+    middle_src = "def other(): pass\n"  # 'fn' not defined, not re-exported
+    test_src = "from pkg.middle import fn\n"
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.middle": middle_src},
+        module_to_package={"pkg.test_mod": "pkg", "pkg.middle": "pkg"},
+        module_to_defs={"pkg.test_mod": set(), "pkg.middle": {"other"}},
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): fn()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_body_call_already_visited():
+    # fn_a → fn_b → fn_a (mutual recursion); fn_a already visited when fn_b adds it
+    ctx = _make_bfs_ctx()
+    m_a = "from pkg.m_b import fn_b\ndef fn_a(): fn_b()\n"
+    m_b = "from pkg.m_a import fn_a\ndef fn_b(): fn_a()\n"
+    test_src = "from pkg.m_a import fn_a\n"
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.m_a": m_a, "pkg.m_b": m_b},
+        module_to_package={
+            "pkg.test_mod": "pkg",
+            "pkg.m_a": "pkg",
+            "pkg.m_b": "pkg",
+        },
+        module_to_defs={
+            "pkg.test_mod": set(),
+            "pkg.m_a": {"fn_a"},
+            "pkg.m_b": {"fn_b"},
+        },
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): fn_a()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_reexport_already_visited():
+    # m_x re-exports fn_x from m_y; m_y re-exports fn_x from m_x (cycle).
+    # When m_y checks re-export, (m_x, fn_x) is already visited → skip.
+    ctx = _make_bfs_ctx()
+    m_x = "from pkg.m_y import fn_x\n"  # re-exports fn_x from m_y
+    m_y = "from pkg.m_x import fn_x\n"  # re-exports fn_x from m_x (cycle)
+    test_src = "from pkg.m_x import fn_x\n"
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.m_x": m_x, "pkg.m_y": m_y},
+        module_to_package={
+            "pkg.test_mod": "pkg",
+            "pkg.m_x": "pkg",
+            "pkg.m_y": "pkg",
+        },
+        module_to_defs={"pkg.test_mod": set(), "pkg.m_x": set(), "pkg.m_y": set()},
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): fn_x()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_depth_limit():
+    # Chain of _CG_MAX_DEPTH + 1 hops; last function calls terminal but is cut off.
+    n = _CG_MAX_DEPTH + 1  # 13 intermediate functions
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"end.py": "from external import use_fn\ndef end_fn(): use_fn()\n"},
+        new_module_paths={"end.py": "pkg.end"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    modules = {}
+    for i in range(n):
+        if i < n - 1:
+            src = f"from pkg.m{i + 1} import f{i + 1}\ndef f{i}(): f{i + 1}()\n"
+        else:
+            src = f"from pkg.end import end_fn\ndef f{i}(): end_fn()\n"
+        modules[f"pkg.m{i}"] = src
+    modules["pkg.test_mod"] = "from pkg.m0 import f0\n"
+    defs = {m: _cg_collect_defined_names(s) for m, s in modules.items()}
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs=defs,
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): f0()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_module_limit():
+    # Re-export chain of _CG_MAX_MODULES + 1 unique modules; 51st is cut off.
+    n = _CG_MAX_MODULES  # 50 re-export hops before the cut-off
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"end.py": "from external import use_fn\ndef final(): use_fn()\n"},
+        new_module_paths={"end.py": "pkg.end"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    modules = {}
+    for i in range(n + 1):
+        if i < n:
+            modules[f"pkg.m{i}"] = f"from pkg.m{i + 1} import fn\n"
+        else:
+            modules[f"pkg.m{i}"] = "from pkg.end import final\ndef fn(): final()\n"
+    modules["pkg.test_mod"] = "from pkg.m0 import fn\n"
+    defs = {m: _cg_collect_defined_names(s) for m, s in modules.items()}
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs=defs,
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): fn()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+def test_resolve_callgraph_same_module_twice():
+    """Two called names both resolve to the same intermediate module.
+
+    The second BFS entry hits the 'module already in modules_seen' fast path
+    (branch 1250->1255 in patch_rewriter.py).
+    """
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"end.py": "from external import use_fn\ndef final(): use_fn()\n"},
+        new_module_paths={"end.py": "pkg.end"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    # Both fn_a and fn_b live in pkg.middle; neither calls anything reachable.
+    middle_src = "def fn_a(): pass\ndef fn_b(): pass\n"
+    modules = {
+        "pkg.test_mod": "from pkg.middle import fn_a, fn_b\n",
+        "pkg.middle": middle_src,
+    }
+    defs = {m: _cg_collect_defined_names(s) for m, s in modules.items()}
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs=defs,
+        file_to_module={},
+    )
+    # BFS enqueues (pkg.middle, fn_a, 0) and (pkg.middle, fn_b, 0).
+    # First pop adds pkg.middle to modules_seen; second pop hits the fast path.
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): fn_a(); fn_b()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _callgraph_update_file — helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_cuf_contexts() -> list:
+    """FL context with placement (helper) and conflict (resolve) using use_fn."""
+    return [
+        _FLContext(
+            filepath="/proj/pkg/orig.py",
+            old_module="pkg.orig",
+            original_source="from external import use_fn\ndef helper(): use_fn()\n",
+            modified_source="from .placement import helper\n",
+            new_files={
+                "placement.py": (
+                    "from external import use_fn\ndef helper(): use_fn()\n"
+                ),
+                "conflict.py": (
+                    "from external import use_fn\ndef resolve(): use_fn()\n"
+                ),
+            },
+            new_module_paths={
+                "placement.py": "pkg.placement",
+                "conflict.py": "pkg.conflict",
+            },
+            entity_to_target={"helper": "placement.py"},
+            forking_old_paths={"pkg.orig.use_fn"},
+        )
+    ]
+
+
+def _make_cuf_index(scan_abs: str, test_src: str) -> _CgIndex:
+    """Minimal index for _callgraph_update_file: maps scan_abs → 'pkg.test_mod'."""
+    return _CgIndex(
+        module_to_source={"pkg.test_mod": test_src},
+        module_to_package={"pkg.test_mod": "pkg"},
+        module_to_defs={"pkg.test_mod": set()},
+        file_to_module={scan_abs: "pkg.test_mod"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# _callgraph_update_file — tests
+# ---------------------------------------------------------------------------
+
+
+def test_callgraph_update_file_no_functions():
+    src = "x = 1\n"
+    result, changed = _callgraph_update_file(
+        src, {"pkg.orig.use_fn"}, _make_cuf_contexts()
+    )
+    assert not changed
+    assert result == src
+
+
+def test_callgraph_update_file_index_none(tmp_path):
+    # index=None → BFS skipped → no resolution even if test calls helper.
+    test_src = (
+        "from pkg.placement import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(mock_use_fn):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=None,
+    )
+    assert not changed
+
+
+def test_callgraph_update_file_string_literal_resolved(tmp_path):
+    test_src = (
+        "from pkg.placement import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(mock_use_fn):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.placement.use_fn")' in result
+
+
+def test_callgraph_update_file_no_resolution(tmp_path):
+    # Test calls 'unrelated' — not imported → BFS queue empty → no resolution.
+    test_src = (
+        '@patch("pkg.orig.use_fn")\n' "def test_f(mock_use_fn):\n" "    unrelated()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=index,
+    )
+    assert not changed
+
+
+def test_callgraph_update_file_const_ref_unanimous(tmp_path):
+    test_src = (
+        "from pkg.placement import helper\n"
+        '_PATCH_USE = "pkg.orig.use_fn"\n'
+        "@patch(_PATCH_USE)\n"
+        "def test_a(mock_use_fn):\n"
+        "    helper()\n"
+        "\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_b(mock_use_fn):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '_PATCH_USE = "pkg.placement.use_fn"' in result
+    assert "@patch(_PATCH_USE)" in result
+
+
+def test_callgraph_update_file_const_ref_conflicting(tmp_path):
+    # test_a: helper() → placement; test_b: resolve() → conflict → conflicting.
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n",
+            "conflict.py": "from external import use_fn\ndef resolve(): use_fn()\n",
+        },
+        new_module_paths={
+            "placement.py": "pkg.placement",
+            "conflict.py": "pkg.conflict",
+        },
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.placement import helper\n"
+        "from pkg.conflict import resolve\n"
+        '_PATCH_USE = "pkg.orig.use_fn"\n'
+        "@patch(_PATCH_USE)\n"
+        "def test_a(mock_use_fn):\n"
+        "    helper()\n"
+        "\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_b(mock_use_fn):\n"
+        "    resolve()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src, {"pkg.orig.use_fn"}, [ctx], scan_file=scan, index=index
+    )
+    assert changed
+    assert '_PATCH_USE = "pkg.orig.use_fn"' in result  # const def unchanged
+    assert '@patch("pkg.placement.use_fn")' in result  # test_a inlined
+    assert '@patch("pkg.conflict.use_fn")' in result  # test_b inlined
+
+
+def test_callgraph_update_file_non_forking_path_skipped(tmp_path):
+    test_src = (
+        "from pkg.placement import helper\n"
+        '@patch("pkg.stable.some_func")\n'
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(mock_use_fn, mock_some):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.placement.use_fn")' in result
+    assert '@patch("pkg.stable.some_func")' in result  # unchanged
+
+
+def test_callgraph_update_file_multi_context_second_matches(tmp_path):
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx_a = _FLContext(
+        filepath="/proj/pkg/other.py",
+        old_module="pkg.other",
+        original_source="from external import other_fn\n",
+        modified_source="",
+        new_files={},
+        new_module_paths={},
+        entity_to_target={},
+        forking_old_paths={"pkg.other.other_fn"},
+    )
+    ctx_b = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.placement import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(mock_use_fn):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn", "pkg.other.other_fn"},
+        [ctx_a, ctx_b],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.placement.use_fn")' in result
+
+
+def test_callgraph_update_file_const_ref_no_resolution_passthrough(tmp_path):
+    test_src = (
+        '_PATCH_USE = "pkg.orig.use_fn"\n'
+        "@patch(_PATCH_USE)\n"
+        "def test_f(mock_use_fn):\n"
+        "    unrelated()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=index,
+    )
+    assert not changed
+    assert '_PATCH_USE = "pkg.orig.use_fn"' in result
+
+
+def test_callgraph_update_file_const_ref_partial_resolution(tmp_path):
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn, other_fn\n",
+        modified_source="",
+        new_files={
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n"
+        },
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn", "pkg.orig.other_fn"},
+    )
+    test_src = (
+        "from pkg.placement import helper\n"
+        '_PATCH_USE = "pkg.orig.use_fn"\n'
+        '_PATCH_OTHER = "pkg.orig.other_fn"\n'
+        "@patch(_PATCH_OTHER)\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_f(mock_use, mock_other):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn", "pkg.orig.other_fn"},
+        [ctx],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '_PATCH_USE = "pkg.placement.use_fn"' in result
+    assert '_PATCH_OTHER = "pkg.orig.other_fn"' in result
+
+
+def test_callgraph_update_file_inline_no_inline_subs_continue(tmp_path):
+    # test_a: string literal (no const_refs → inline_subs empty → continue)
+    # test_b: const ref → placement; test_c: const ref → conflict → conflicting
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n",
+            "conflict.py": "from external import use_fn\ndef resolve(): use_fn()\n",
+        },
+        new_module_paths={
+            "placement.py": "pkg.placement",
+            "conflict.py": "pkg.conflict",
+        },
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.placement import helper\n"
+        "from pkg.conflict import resolve\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_a(m):\n"
+        "    helper()\n"
+        "\n"
+        '_PATCH_USE = "pkg.orig.use_fn"\n'
+        "@patch(_PATCH_USE)\n"
+        "def test_b(m):\n"
+        "    helper()\n"
+        "\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_c(m):\n"
+        "    resolve()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src, {"pkg.orig.use_fn"}, [ctx], scan_file=scan, index=index
+    )
+    assert changed
+    assert '@patch("pkg.placement.use_fn")' in result  # test_a updated
+    assert '@patch("pkg.conflict.use_fn")' in result  # test_c inlined
+
+
+def test_callgraph_update_file_inline_ref_from_different_file(tmp_path):
+    # Const ref from constants.py (≠ scan_file) → inline_subs empty → no change.
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n",
+            "conflict.py": "from external import use_fn\ndef resolve(): use_fn()\n",
+        },
+        new_module_paths={
+            "placement.py": "pkg.placement",
+            "conflict.py": "pkg.conflict",
+        },
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    constants_file = tmp_path / "constants.py"
+    constants_file.write_text('_PATCH_USE = "pkg.orig.use_fn"\n', encoding="utf-8")
+    test_src = (
+        "from constants import _PATCH_USE\n"
+        "from pkg.placement import helper\n"
+        "from pkg.conflict import resolve\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_b(m):\n"
+        "    helper()\n"
+        "\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_c(m):\n"
+        "    resolve()\n"
+    )
+    scan_file = tmp_path / "test_cases.py"
+    scan_file.write_text(test_src, encoding="utf-8")
+    scan = str(scan_file)
+    # Build index from disk so file_to_module is populated for test_cases.py
+    index = _cg_build_index(str(tmp_path), {}, [ctx])
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx],
+        scan_file=scan,
+        repo_root=str(tmp_path),
+        index=index,
+    )
+    assert not changed
+
+
+def test_callgraph_update_file_inline_new_val_same_as_old(tmp_path):
+    # placement.py → "pkg.orig" (same as old_module); test_b→helper→same val; skipped.
+    # test_c → resolve → "pkg.conflict" → different val → inlined → changed.
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n",
+            "conflict.py": "from external import use_fn\ndef resolve(): use_fn()\n",
+        },
+        new_module_paths={
+            "placement.py": "pkg.orig",  # same as old_module → new_val == old_val
+            "conflict.py": "pkg.conflict",
+        },
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.orig import helper\n"
+        "from pkg.conflict import resolve\n"
+        '_PATCH_USE = "pkg.orig.use_fn"\n'
+        "@patch(_PATCH_USE)\n"
+        "def test_b(m):\n"
+        "    helper()\n"
+        "\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_c(m):\n"
+        "    resolve()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src, {"pkg.orig.use_fn"}, [ctx], scan_file=scan, index=index
+    )
+    assert changed  # test_c inlined to pkg.conflict.use_fn
+
+
+def test_callgraph_update_file_inline_existing_splice_updated(tmp_path):
+    # test_a: use_fn → func_splice; other_fn const ref conflicting → inline.
+    # Inline finds existing splice and updates it.  test_b: const → new splice.
+    placement_src = (
+        "from external import use_fn, other_fn\n" "def helper(): use_fn(); other_fn()\n"
+    )
+    conflict2_src = "from external import other_fn\ndef resolve2(): other_fn()\n"
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn, other_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src, "conflict2.py": conflict2_src},
+        new_module_paths={
+            "placement.py": "pkg.placement",
+            "conflict2.py": "pkg.conflict2",
+        },
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn", "pkg.orig.other_fn"},
+    )
+    test_src = (
+        "from pkg.placement import helper\n"
+        "from pkg.conflict2 import resolve2\n"
+        '_PATCH_OTHER = "pkg.orig.other_fn"\n'
+        '@patch("pkg.orig.use_fn")\n'
+        "@patch(_PATCH_OTHER)\n"
+        "def test_a(m_other, m_use):\n"
+        "    helper()\n"
+        "\n"
+        "@patch(_PATCH_OTHER)\n"
+        "def test_b(m_other):\n"
+        "    resolve2()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn", "pkg.orig.other_fn"},
+        [ctx],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.placement.use_fn")' in result
+    assert '@patch("pkg.placement.other_fn")' in result
+    assert '@patch("pkg.conflict2.other_fn")' in result
+
+
+def test_callgraph_update_file_verbose(tmp_path, capsys):
+    test_src = (
+        "from pkg.placement import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(mock_use_fn):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=index,
+        verbose=True,
+    )
+    captured = capsys.readouterr()
+    assert "patch_callgraph" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# apply_patch_callgraph
+# ---------------------------------------------------------------------------
+
+
+def test_apply_patch_callgraph_empty_contexts():
+    result = list(apply_patch_callgraph([], {}, "/repo"))
+    assert result == []
+
+
+def test_apply_patch_callgraph_no_forking_paths():
+    ctx = _make_fl_ctx(forking_old_paths=set())
+    result = list(apply_patch_callgraph([ctx], {}, "/repo"))
+    assert result == []
+
+
+def test_apply_patch_callgraph_per_file_update(tmp_path):
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    conflict_src = "from external import use_fn\ndef resolve(): use_fn()\n"
+    ctx = _FLContext(
+        filepath=str(tmp_path / "pkg" / "orig.py"),
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src, "conflict.py": conflict_src},
+        new_module_paths={
+            "placement.py": "pkg.placement",
+            "conflict.py": "pkg.conflict",
+        },
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    file_src = (
+        "from pkg.placement import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(mock_use_fn):\n"
+        "    helper()\n"
+    )
+    test_file = tmp_path / "test_orig.py"
+    test_file.write_text(file_src, encoding="utf-8")
+    per_file = {str(test_file): {"source": file_src, "msgs": []}}
+    list(apply_patch_callgraph([ctx], per_file, str(tmp_path)))
+    assert '@patch("pkg.placement.use_fn")' in per_file[str(test_file)]["source"]
+
+
+def test_apply_patch_callgraph_repo_scan(tmp_path):
+    test_file = tmp_path / "test_something.py"
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    test_file.write_text(
+        "from pkg.placement import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(mock_use_fn):\n"
+        "    helper()\n",
+        encoding="utf-8",
+    )
+    ctx = _FLContext(
+        filepath=str(tmp_path / "pkg" / "orig.py"),
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    msgs = list(apply_patch_callgraph([ctx], {}, str(tmp_path)))
+    updated = test_file.read_text(encoding="utf-8")
+    assert '@patch("pkg.placement.use_fn")' in updated
+    assert any("call-graph" in m for m in msgs)
+
+
+def test_apply_patch_callgraph_repo_scan_no_change(tmp_path):
+    test_file = tmp_path / "test_something.py"
+    test_file.write_text("def test_f(): pass\n", encoding="utf-8")
+    ctx = _FLContext(
+        filepath=str(tmp_path / "pkg" / "orig.py"),
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": "from external import use_fn\ndef f(): use_fn()\n"},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    msgs = list(apply_patch_callgraph([ctx], {}, str(tmp_path)))
+    assert msgs == []
+
+
+def test_apply_patch_callgraph_repo_root_none():
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={},
+        new_module_paths={},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    result = list(apply_patch_callgraph([ctx], {}, None))
+    assert result == []
+
+
+def test_apply_patch_callgraph_per_file_no_change(tmp_path):
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx = _FLContext(
+        filepath=str(tmp_path / "pkg" / "orig.py"),
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    file_src = "# pkg.orig.use_fn mentioned here but no test functions.\nx = 1\n"
+    key = str(tmp_path / "module.py")
+    per_file = {key: {"source": file_src, "msgs": []}}
+    list(apply_patch_callgraph([ctx], per_file, None))
+    assert per_file[key]["source"] == file_src
+
+
+def test_apply_patch_callgraph_per_file_no_match(tmp_path):
+    """per_file entry whose source contains no forking path string → continue."""
+    ctx = _FLContext(
+        filepath=str(tmp_path / "pkg" / "orig.py"),
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n"
+        },
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    file_src = "x = 1\n"  # no mention of forking path
+    key = str(tmp_path / "module.py")
+    per_file = {key: {"source": file_src, "msgs": []}}
+    list(apply_patch_callgraph([ctx], per_file, None))
+    assert per_file[key]["source"] == file_src
+
+
+def test_apply_patch_callgraph_repo_scan_oserror(tmp_path):
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx = _FLContext(
+        filepath=str(tmp_path / "orig.py"),
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    bad_file = tmp_path / "test_bad.py"
+    bad_file.write_text(
+        '@patch("pkg.orig.use_fn")\ndef test_f(): helper()\n', encoding="utf-8"
+    )
+    bad_file.chmod(0o000)
+    try:
+        msgs = list(apply_patch_callgraph([ctx], {}, str(tmp_path)))
+        assert msgs == []
+    finally:
+        bad_file.chmod(0o644)
+
+
+def test_apply_patch_callgraph_repo_scan_file_no_change(tmp_path):
+    test_file = tmp_path / "helper.py"
+    test_file.write_text(
+        "# references pkg.orig.use_fn in a comment\nx = 1\n",
+        encoding="utf-8",
+    )
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx = _FLContext(
+        filepath=str(tmp_path / "orig.py"),
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    msgs = list(apply_patch_callgraph([ctx], {}, str(tmp_path)))
+    assert msgs == []
+    assert "x = 1" in test_file.read_text(encoding="utf-8")
+
+
+def test_apply_patch_callgraph_excluded_dirs(tmp_path):
+    venv_dir = tmp_path / ".venv"
+    venv_dir.mkdir()
+    excluded_file = venv_dir / "test_something.py"
+    excluded_file.write_text(
+        '@patch("pkg.orig.use_fn")\ndef test_f(): helper()\n', encoding="utf-8"
+    )
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx = _FLContext(
+        filepath=str(tmp_path / "orig.py"),
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    msgs = list(apply_patch_callgraph([ctx], {}, str(tmp_path)))
+    assert '@patch("pkg.orig.use_fn")' in excluded_file.read_text(encoding="utf-8")
+    assert msgs == []

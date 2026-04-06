@@ -3862,3 +3862,108 @@ def test_patch_update_rewrite_mode_recursive_fl_context_added(tmp_path):
     mock_rewrite.assert_called_once()
     contexts = mock_rewrite.call_args[0][0]
     assert any("mypkg.medium.MyClass" in ctx.forking_old_paths for ctx in contexts)
+
+
+_CG_PATCH = "crispen.engine.apply_patch_callgraph"
+
+
+def test_patch_update_callgraph_yields_message(tmp_path):
+    """apply_patch_callgraph message increments patch_update_edits and is yielded."""
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    # Entity appears in two callers → forking → _fl_all_contexts is populated
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={
+            "utils.py": "class MyClass: pass\n",
+            "caller_a.py": "from .big import MyClass\nMyClass()\n",
+            "caller_b.py": "from .big import MyClass\nMyClass()\n",
+        },
+        messages=[],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+
+    cg_msg = "test_other.py: patch_callgraph: resolved MyClass"
+
+    stats = RunStats()
+    with (
+        patch(_FL_PATCH, return_value=fl_result),
+        patch(_CG_PATCH, return_value=iter([cg_msg])) as mock_cg,
+    ):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="basic",
+                ),
+                _repo_root=str(tmp_path),
+                stats=stats,
+            )
+        )
+
+    mock_cg.assert_called_once()
+    assert cg_msg in msgs
+    assert stats.patch_update_edits >= 1
+
+
+def test_patch_update_ignore_mode_recursive_fl_entity_to_target(tmp_path):
+    """'ignore' mode: recursive FL result with entity_to_target skips _add_fl_context."""  # noqa: E501
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "big.py"
+    f.write_text("".join(f"var_{i} = {i}\n" for i in range(10)), encoding="utf-8")
+
+    medium_src = "".join(f"med_{i} = {i}\n" for i in range(6))
+    main_fl_result = FileLimiterResult(
+        original_source="# big_reduced\n",
+        new_files={"medium.py": medium_src},
+        messages=[],
+        abort=False,
+        entity_to_target={},  # empty — no _add_fl_context for main result
+    )
+
+    # Recursive FL result has non-empty entity_to_target; with "ignore" mode the
+    # branch at engine.py line 1278 is False → _add_fl_context is not called.
+    recursive_fl_result = FileLimiterResult(
+        original_source="# medium_reduced\n",
+        new_files={"small.py": "class MyClass: pass\n"},
+        messages=[],
+        abort=False,
+        entity_to_target={"MyClass": "small.py"},
+    )
+
+    medium_path = pkg / "medium.py"
+    call_count = 0
+
+    def _fl_side_effect(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            medium_path.write_text(medium_src, encoding="utf-8")
+            return main_fl_result
+        return recursive_fl_result
+
+    with patch(_FL_PATCH, side_effect=_fl_side_effect):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 10)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_recursive=True,
+                    file_limiter_patch_update="ignore",
+                ),
+                _repo_root=str(tmp_path),
+            )
+        )
+
+    assert call_count == 2  # main pass + one recursive pass
+    assert not any("callgraph" in m for m in msgs)

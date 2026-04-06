@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING, Union
@@ -50,6 +51,30 @@ class _ConstRef:
     source_file: str  # absolute path of the file where the constant is defined
     resolved_value: str  # the old string value (e.g. "myapp.service.MyClass")
     patch_dec_idx: int  # 0-based index among @patch decorators on this function
+
+
+@dataclass
+class _CgIndex:
+    """Pre-built call-graph index for BFS-based forking path resolution.
+
+    Built once per ``apply_patch_callgraph`` call by scanning the repo and
+    adding new sub-module sources from each :class:`_FLContext`.  Import maps
+    are resolved lazily and cached on first access.
+    """
+
+    module_to_source: Dict[str, str]  # dotted module path → source
+    module_to_package: Dict[str, str]  # dotted module path → package path
+    module_to_defs: Dict[str, Set[str]]  # dotted module path → top-level names
+    file_to_module: Dict[str, str]  # abs file path → dotted module path
+    _import_cache: Dict[str, Dict[str, Tuple[str, str]]] = field(default_factory=dict)
+
+    def get_imports(self, module: str) -> Dict[str, Tuple[str, str]]:
+        """Return ``{local_name: (module_path, orig_name)}`` for *module*, cached."""
+        if module not in self._import_cache:
+            src = self.module_to_source.get(module, "")
+            pkg = self.module_to_package.get(module, "")
+            self._import_cache[module] = _cg_parse_imports(src, pkg)
+        return self._import_cache[module]
 
 
 @dataclass
@@ -956,6 +981,297 @@ def _get_external_import_names(source: str) -> Set[str]:
                 if alias.name != "*":
                     names.add(alias.asname if alias.asname else alias.name)
     return names
+
+
+# ---------------------------------------------------------------------------
+# Call-graph tracing helpers (algorithmic forking resolution)
+# ---------------------------------------------------------------------------
+
+_CG_MAX_DEPTH = 12  # maximum BFS hops from test function to a sub-module target
+_CG_MAX_MODULES = 50  # maximum distinct modules visited per resolution attempt
+
+
+def _cg_collect_called_names(source: str) -> Set[str]:
+    """Return all function/attribute names called anywhere in *source*."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                names.add(node.func.attr)
+    return names
+
+
+def _cg_collect_func_body_calls(source: str, func_name: str) -> Set[str]:
+    """Return names called within *func_name*'s body in *source*.
+
+    Searches for the first function definition named *func_name* in the
+    module-level body and collects all Call targets within it.  Returns an
+    empty set when the function is not found or *source* fails to parse.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != func_name:
+            continue
+        calls: Set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                if isinstance(child.func, ast.Name):
+                    calls.add(child.func.id)
+                elif isinstance(child.func, ast.Attribute):
+                    calls.add(child.func.attr)
+        return calls
+    return set()
+
+
+def _cg_collect_defined_names(source: str) -> Set[str]:
+    """Return top-level function and class names defined in *source*."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def _cg_file_to_module_and_package(file_path: Path, repo_root: Path) -> Tuple[str, str]:
+    """Return ``(module_dotted_path, package_dotted_path)`` for a ``.py`` file.
+
+    ``pkg/utils/__init__.py`` → ``("pkg.utils", "pkg.utils")``.
+    ``pkg/utils/helpers.py``  → ``("pkg.utils.helpers", "pkg.utils")``.
+    """
+    rel = file_path.relative_to(repo_root)
+    parts = list(rel.parts)
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+        module = ".".join(parts)
+        package = module
+    else:
+        parts[-1] = parts[-1][:-3]
+        module = ".".join(parts)
+        package = ".".join(parts[:-1])
+    return module, package
+
+
+def _cg_parse_imports(source: str, package: str) -> Dict[str, Tuple[str, str]]:
+    """Parse import statements in *source*.
+
+    Returns ``local_name → (module, orig_name)``.
+
+    *package* is the dotted path of the package that contains this module
+    (used to resolve relative imports).  For example, for a file at
+    ``pkg/utils/helpers.py`` the package is ``"pkg.utils"``.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    result: Dict[str, Tuple[str, str]] = {}
+    pkg_parts = package.split(".") if package else []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname if alias.asname else alias.name.split(".")[0]
+                result[local] = (alias.name, alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level > 0:
+                # Relative import: level=1 means same package (0 levels up),
+                # level=2 means one level up, etc.
+                go_up = node.level - 1
+                if go_up > len(pkg_parts):
+                    continue  # invalid — can't go above root
+                base_parts = pkg_parts[: len(pkg_parts) - go_up] if go_up else pkg_parts
+                base = ".".join(base_parts)
+                if node.module:
+                    mod_path = f"{base}.{node.module}" if base else node.module
+                else:
+                    mod_path = base
+            else:
+                mod_path = node.module or ""  # pragma: no branch
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname if alias.asname else alias.name
+                result[local] = (mod_path, alias.name)
+    return result
+
+
+def _cg_build_index(
+    repo_root: Optional[str],
+    per_file_sources: Dict[str, str],
+    fl_contexts: List[_FLContext],
+) -> _CgIndex:
+    """Build a repo-wide :class:`_CgIndex` for BFS call-graph resolution.
+
+    Scans all ``.py`` files under *repo_root* (using *per_file_sources* as
+    in-memory overrides for modified files), then adds new sub-module sources
+    from each :class:`_FLContext` that are not yet on disk.
+    """
+    module_to_source: Dict[str, str] = {}
+    module_to_package: Dict[str, str] = {}
+    module_to_defs: Dict[str, Set[str]] = {}
+    file_to_module: Dict[str, str] = {}
+
+    if repo_root is not None:
+        repo_root_path = Path(repo_root).resolve()
+        for py_file in repo_root_path.rglob("*.py"):
+            rel_parts = py_file.relative_to(repo_root_path).parts
+            if any(p in _EXCLUDED_DIR_NAMES for p in rel_parts[:-1]):
+                continue
+            try:
+                mod, pkg = _cg_file_to_module_and_package(py_file, repo_root_path)
+            except ValueError:  # pragma: no cover
+                continue
+            abs_path = str(py_file.resolve())
+            src = per_file_sources.get(abs_path)
+            if src is None:
+                try:
+                    src = py_file.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+            module_to_source[mod] = src
+            module_to_package[mod] = pkg
+            module_to_defs[mod] = _cg_collect_defined_names(src)
+            file_to_module[abs_path] = mod
+
+    # Add new sub-module sources (in-memory; not yet written to disk).
+    for ctx in fl_contexts:
+        for rel_path, src in ctx.new_files.items():
+            new_mod = ctx.new_module_paths.get(rel_path)
+            if not new_mod or not src or new_mod in module_to_source:
+                continue
+            pkg = (
+                new_mod
+                if Path(rel_path).name == "__init__.py"
+                else (new_mod.rsplit(".", 1)[0] if "." in new_mod else "")
+            )
+            module_to_source[new_mod] = src
+            module_to_package[new_mod] = pkg
+            module_to_defs[new_mod] = _cg_collect_defined_names(src)
+
+    return _CgIndex(
+        module_to_source=module_to_source,
+        module_to_package=module_to_package,
+        module_to_defs=module_to_defs,
+        file_to_module=file_to_module,
+    )
+
+
+def _resolve_forking_path_via_callgraph(
+    forking_name: str,
+    func_text: str,
+    ctx: _FLContext,
+    index: _CgIndex,
+    calling_module: str,
+) -> Optional[str]:
+    """Resolve a forking @patch path by BFS across the repo call graph.
+
+    Starting from the test function's direct calls (resolved through
+    *calling_module*'s import statements), performs a BFS across the repo
+    index to find which new sub-module's function is transitively reachable.
+    Returns the new dotted path when exactly one sub-module qualifies;
+    returns ``None`` when zero or multiple qualify or when the pre-check fails.
+
+    Module-level re-exports (``from .sub import F`` where ``F`` is not defined
+    locally) are followed without consuming depth budget, so that the split
+    original file does not artificially cap traversal depth.
+
+    Limits: :data:`_CG_MAX_DEPTH` hops and :data:`_CG_MAX_MODULES` distinct
+    modules per resolution attempt.
+    """
+    if not calling_module:
+        return None
+    if forking_name not in _get_external_import_names(ctx.original_source):
+        return None
+
+    # Terminal set: (sub_module_path, func_name) → new dotted path.
+    terminal: Dict[Tuple[str, str], str] = {}
+    for rel_path, src in ctx.new_files.items():
+        if not src:
+            continue
+        new_mod = ctx.new_module_paths.get(rel_path)
+        if new_mod is None:
+            continue
+        ref_map = _name_reference_map(src)
+        if forking_name not in ref_map:
+            continue
+        for f_name in ref_map[forking_name]:
+            terminal[(new_mod, f_name)] = f"{new_mod}.{forking_name}"
+
+    if not terminal:
+        return None
+
+    new_module_set = set(ctx.new_module_paths.values())
+
+    visited: Set[Tuple[str, str]] = set()
+    modules_seen: Set[str] = set()
+    candidates: Set[str] = set()
+    queue = deque()  # (module_path, func_name, depth)
+
+    init_imports = index.get_imports(calling_module)
+    for called_name in _cg_collect_called_names(func_text):
+        if called_name in init_imports:
+            mod, name = init_imports[called_name]
+            queue.append((mod, name, 0))
+
+    while queue:
+        module, func_name, depth = queue.popleft()
+        key = (module, func_name)
+
+        if key in terminal:
+            candidates.add(terminal[key])
+            continue  # don't recurse further into new sub-modules
+
+        if module in new_module_set:
+            continue  # new sub-module but not a terminal function — skip
+
+        if key in visited:
+            continue
+        visited.add(key)
+
+        if depth >= _CG_MAX_DEPTH:
+            continue
+
+        if module not in modules_seen:
+            if len(modules_seen) >= _CG_MAX_MODULES:
+                continue
+            modules_seen.add(module)
+
+        src = index.module_to_source.get(module)
+        if src is None:
+            continue
+
+        if func_name in index.module_to_defs.get(module, set()):
+            # Function is defined here — follow its body calls.
+            body_calls = _cg_collect_func_body_calls(src, func_name)
+            mod_imports = index.get_imports(module)
+            for called_name in body_calls:
+                if called_name in mod_imports:
+                    next_mod, next_name = mod_imports[called_name]
+                    if (next_mod, next_name) not in visited:
+                        queue.append((next_mod, next_name, depth + 1))
+        else:
+            # Not defined here — follow a module-level re-export if present.
+            mod_imports = index.get_imports(module)
+            if func_name in mod_imports:
+                rexport_mod, rexport_name = mod_imports[func_name]
+                if (rexport_mod, rexport_name) not in visited:
+                    queue.append((rexport_mod, rexport_name, depth))
+
+    return next(iter(candidates)) if len(candidates) == 1 else None
 
 
 def _build_rename_guard_sets(
@@ -2082,6 +2398,256 @@ def _apply_cross_file_const_updates(
                 f"{abs_file}: patch_update: "
                 "updated @patch constant definition (rewrite)"
             )
+
+
+# ---------------------------------------------------------------------------
+# Call-graph algorithmic resolution
+# ---------------------------------------------------------------------------
+
+
+def _callgraph_update_file(
+    source: str,
+    all_forking_paths: Set[str],
+    fl_contexts: List[_FLContext],
+    scan_file: str = "",
+    repo_root: Optional[str] = None,
+    index: Optional[_CgIndex] = None,
+    verbose: bool = False,
+) -> Tuple[str, bool]:
+    """Apply call-graph-resolved @patch updates to *source*.
+
+    For each test function with forking @patch targets, attempts to determine
+    the correct new sub-module for each target via BFS call-graph tracing
+    using *index*.  Only updates a target when exactly one new sub-module in
+    the call graph uses it.
+
+    Returns ``(updated_source, was_changed)``.
+    """
+    functions = _find_test_functions_to_update(
+        source, all_forking_paths, scan_file, repo_root
+    )
+    if not functions:
+        return source, False
+
+    source_lines = source.splitlines()
+    func_splices: List[Tuple[int, int, str]] = []
+    same_file_proposals: Dict[str, Set[str]] = {}
+    same_file_passthrough: Set[str] = set()
+    resolved_results: List[Tuple[_TestFunctionInfo, Dict[str, str]]] = []
+    scan_file_abs = str(Path(scan_file).resolve()) if scan_file else ""
+    calling_module = ""
+    if index is not None and scan_file_abs:
+        calling_module = index.file_to_module.get(scan_file_abs, "")
+
+    for func in functions:
+        # Const-ref old_vals for forking paths (handled via proposals, not string swap).
+        const_ref_vals: Set[str] = {
+            ref.resolved_value
+            for ref in func.const_refs
+            if ref.resolved_value in all_forking_paths
+        }
+
+        # Attempt call-graph resolution for each forking old path.
+        resolved: Dict[str, str] = {}
+        for old_path in func.old_patch_paths:
+            if old_path not in all_forking_paths:
+                continue
+            name = old_path.rsplit(".", 1)[-1]
+            for ctx in fl_contexts:
+                if old_path not in ctx.forking_old_paths:
+                    continue
+                if index is None:
+                    new_path = None
+                else:
+                    new_path = _resolve_forking_path_via_callgraph(
+                        name, func.full_text, ctx, index, calling_module
+                    )
+                if new_path is not None:
+                    resolved[old_path] = new_path
+                    break
+
+        if not resolved:
+            # Nothing resolved — record passthroughs for any const refs.
+            for old_val in const_ref_vals:
+                same_file_passthrough.add(old_val)
+            continue
+
+        # Track const proposals and passthroughs.
+        for old_val in const_ref_vals:
+            if old_val in resolved:
+                same_file_proposals.setdefault(old_val, set()).add(resolved[old_val])
+            else:
+                same_file_passthrough.add(old_val)
+
+        # Apply STRING LITERAL resolutions (not const refs) as a func splice.
+        string_res = {
+            old: new for old, new in resolved.items() if old not in const_ref_vals
+        }
+        orig_text = "\n".join(source_lines[func.start_line - 1 : func.end_line])
+        new_text = (
+            apply_patch_strings(orig_text, string_res) if string_res else orig_text
+        )
+        if new_text != orig_text:
+            func_splices.append((func.start_line, func.end_line, new_text))
+
+        resolved_results.append((func, resolved))
+        if verbose:
+            print(
+                f"crispen: patch_callgraph: resolved '{func.function_name}'"
+                f" in '{scan_file}'",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    # Resolve same-file const proposals into definition updates or per-function inlines.
+    same_file_const_map: Dict[str, str] = {
+        old: next(iter(new_set))
+        for old, new_set in same_file_proposals.items()
+        if len(new_set) == 1 and old not in same_file_passthrough
+    }
+    conflicting = {
+        old
+        for old, new_set in same_file_proposals.items()
+        if len(new_set) > 1 or old in same_file_passthrough
+    }
+
+    # Inline conflicting const resolutions per function.
+    if conflicting:
+        for func, accepted in resolved_results:
+            inline_subs: Dict[str, str] = {}
+            for ref in func.const_refs:
+                if (
+                    ref.source_file == scan_file_abs
+                    and ref.resolved_value in conflicting
+                    and ref.resolved_value in accepted
+                ):
+                    new_val = accepted[ref.resolved_value]
+                    if new_val != ref.resolved_value:
+                        inline_subs[ref.const_name] = new_val
+            if not inline_subs:
+                continue
+            orig_text = "\n".join(source_lines[func.start_line - 1 : func.end_line])
+            base_text = orig_text
+            existing_idx: Optional[int] = None
+            for idx_i, (sl, el, txt) in enumerate(func_splices):
+                if sl == func.start_line and el == func.end_line:
+                    base_text = txt
+                    existing_idx = idx_i
+                    break
+            inlined = _substitute_consts_in_func_text(base_text, inline_subs)
+            if inlined == base_text:
+                continue  # pragma: no cover
+            if existing_idx is not None:
+                func_splices[existing_idx] = (func.start_line, func.end_line, inlined)
+            else:
+                func_splices.append((func.start_line, func.end_line, inlined))
+
+    if not func_splices and not same_file_const_map:
+        return source, False
+
+    result_source = source
+    for start_line, end_line, new_text in sorted(func_splices, key=lambda x: -x[0]):
+        result_source = _splice_function(result_source, start_line, end_line, new_text)
+    if same_file_const_map:
+        result_source = apply_patch_strings(result_source, same_file_const_map)
+    return result_source, result_source != source
+
+
+def apply_patch_callgraph(
+    fl_contexts: List[_FLContext],
+    per_file: Dict[str, Any],
+    repo_root: Optional[str],
+    verbose: bool = False,
+) -> Iterator[str]:
+    """Algorithmically resolve forking @patch paths via call-graph tracing.
+
+    For each @patch decorator referencing a forking old path, finds which new
+    sub-module in the call graph of the test function imports and uses the
+    patched name.  When exactly one such sub-module exists the decorator is
+    updated without any LLM involvement.
+
+    Should be called after "basic" ``apply_patch_strings`` so already-resolved
+    paths are not re-processed.  For "rewrite" mode the updated file sources
+    will not contain the resolved old paths any more, so ``apply_patch_rewrite``
+    only processes what call-graph tracing left unresolved.
+    """
+    if not fl_contexts:
+        return
+
+    all_forking_paths: Set[str] = set()
+    for ctx in fl_contexts:
+        all_forking_paths |= ctx.forking_old_paths
+
+    if not all_forking_paths:
+        return
+
+    # Build repo-wide index once; per_file in-memory sources override disk.
+    per_file_sources = {
+        str(Path(fp).resolve()): state["source"] for fp, state in per_file.items()
+    }
+    index = _cg_build_index(repo_root, per_file_sources, fl_contexts)
+
+    per_file_abs = {str(Path(f).resolve()) for f in per_file}
+
+    for filepath, state in per_file.items():
+        file_src = state["source"]
+        relevant_contexts = [
+            ctx
+            for ctx in fl_contexts
+            if any(path in file_src for path in ctx.forking_old_paths)
+        ]
+        if not relevant_contexts:
+            continue
+        new_src, changed = _callgraph_update_file(
+            file_src,
+            all_forking_paths,
+            relevant_contexts,
+            scan_file=filepath,
+            repo_root=repo_root,
+            index=index,
+            verbose=verbose,
+        )
+        if changed:
+            state["source"] = new_src
+            state["msgs"].append(
+                f"{filepath}: patch_update: updated @patch strings (call-graph)"
+            )
+
+    if repo_root is None:
+        return
+
+    repo_root_path = Path(repo_root)
+    for py_file in sorted(repo_root_path.rglob("*.py")):
+        if str(py_file.resolve()) in per_file_abs:
+            continue
+        if any(
+            part in _EXCLUDED_DIR_NAMES
+            for part in py_file.relative_to(repo_root_path).parts[:-1]
+        ):
+            continue
+        try:
+            src = py_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        relevant_contexts = [
+            ctx
+            for ctx in fl_contexts
+            if any(path in src for path in ctx.forking_old_paths)
+        ]
+        if not relevant_contexts:
+            continue
+        new_src, changed = _callgraph_update_file(
+            src,
+            all_forking_paths,
+            relevant_contexts,
+            scan_file=str(py_file),
+            repo_root=repo_root,
+            index=index,
+            verbose=verbose,
+        )
+        if changed:
+            py_file.write_text(new_src, encoding="utf-8")
+            yield f"{py_file}: patch_update: updated @patch strings (call-graph)"
 
 
 # ---------------------------------------------------------------------------

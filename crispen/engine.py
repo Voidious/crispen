@@ -16,7 +16,12 @@ from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvi
 from .config import CrispenConfig, format_header, load_config
 from .errors import CrispenAPIError
 from .file_limiter.runner import FileLimiterResult, run_file_limiter
-from .patch_rewriter import _FLContext, RewriteAccumulator, apply_patch_rewrite
+from .patch_rewriter import (
+    _FLContext,
+    RewriteAccumulator,
+    apply_patch_callgraph,
+    apply_patch_rewrite,
+)
 from .patch_updater import apply_patch_strings
 from .refactors.caller_updater import CallerUpdater
 from .refactors.duplicate_extractor import DuplicateExtractor
@@ -1187,7 +1192,7 @@ def run_engine(
                         filepath, fl_result, Path(filepath).parent, pre_split_src
                     )
                 )
-                if config.file_limiter_patch_update == "rewrite":
+                if config.file_limiter_patch_update in ("basic", "rewrite"):
                     _add_fl_context(
                         _fl_all_contexts,
                         filepath,
@@ -1270,7 +1275,7 @@ def run_engine(
                 combined_patch_map.update(
                     _build_patch_map(r_path, r_result, Path(r_path).parent, r_source)
                 )
-                if config.file_limiter_patch_update == "rewrite":
+                if config.file_limiter_patch_update in ("basic", "rewrite"):
                     _add_fl_context(
                         _fl_all_contexts,
                         r_path,
@@ -1370,6 +1375,13 @@ def run_engine(
                 py_file.write_text(new_src, encoding="utf-8")
                 _stats.patch_update_edits += 1
                 yield f"{py_file}: patch_update: updated @patch strings"
+
+    if config.file_limiter_patch_update in ("basic", "rewrite") and _fl_all_contexts:
+        for _cg_msg in apply_patch_callgraph(
+            _fl_all_contexts, per_file, repo_root, verbose=verbose
+        ):
+            _stats.patch_update_edits += 1
+            yield _cg_msg
 
     if config.file_limiter_patch_update == "rewrite" and _fl_all_contexts:
         _rewrite_acc = RewriteAccumulator()
