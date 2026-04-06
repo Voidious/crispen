@@ -83,7 +83,8 @@ class _TestFunctionInfo:
 
     function_name: str
     full_text: str  # text sent to LLM (constants substituted with their values)
-    old_patch_paths: List[str]
+    old_patch_paths: List[str]  # forking paths that need LLM attention
+    stable_patch_paths: List[str]  # already-correct paths (set by basic mode)
     start_line: int  # 1-indexed, inclusive (includes decorators)
     end_line: int  # 1-indexed, inclusive
     const_refs: List[_ConstRef] = field(default_factory=list)
@@ -626,11 +627,14 @@ class _PatchFunctionCollector(cst.CSTVisitor):
         self.functions: List[_TestFunctionInfo] = []
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
-        # Collect ALL resolvable patch paths from decorators, tracking which match.
-        # A function is only processed when at least one path matches old_paths, but
-        # when triggered we send ALL patch paths to the LLM so it can evaluate every
-        # @patch decorator — not just the ones that triggered collection.
-        all_patch_paths: List[str] = []  # every resolvable decorator patch string
+        # Collect resolvable patch paths from decorators, split into two buckets:
+        #   forking_dec_paths  — paths matching old_paths (need LLM attention)
+        #   stable_dec_paths   — paths not matching old_paths (already correct)
+        # A function is only collected when at least one decorator path matches
+        # old_paths.  The LLM receives only forking paths to evaluate; stable
+        # paths are shown separately with a "do not modify" instruction.
+        forking_dec_paths: List[str] = []  # decorator paths matching old_paths
+        stable_dec_paths: List[str] = []  # decorator paths already correct
         all_const_refs: List[_ConstRef] = []  # const refs for every const @patch
         has_match = False  # True when at least one decorator path matches old_paths
         patch_dec_idx = 0  # counts only @patch / *.patch decorators
@@ -648,12 +652,13 @@ class _PatchFunctionCollector(cst.CSTVisitor):
                 raw = arg0.value
                 if raw and raw[0] in ('"', "'") and not raw.startswith(('"""', "'''")):
                     inner = raw[1:-1]
-                    all_patch_paths.append(inner)
                     if _matches_any(inner, self._old_paths):
+                        forking_dec_paths.append(inner)
                         has_match = True
+                    else:
+                        stable_dec_paths.append(inner)
             elif isinstance(arg0, cst.Name) and arg0.value in self._const_map:
                 const_val, const_file = self._const_map[arg0.value]
-                all_patch_paths.append(const_val)
                 all_const_refs.append(
                     _ConstRef(
                         const_name=arg0.value,
@@ -663,7 +668,10 @@ class _PatchFunctionCollector(cst.CSTVisitor):
                     )
                 )
                 if _matches_any(const_val, self._old_paths):
+                    forking_dec_paths.append(const_val)
                     has_match = True
+                else:
+                    stable_dec_paths.append(const_val)
             elif isinstance(arg0, cst.Attribute) and isinstance(arg0.value, cst.Name):
                 module_alias = arg0.value.value
                 attr_name = arg0.attr.value
@@ -671,7 +679,6 @@ class _PatchFunctionCollector(cst.CSTVisitor):
                     attr_map = self._attr_const_map[module_alias]
                     if attr_name in attr_map:
                         const_val, const_file = attr_map[attr_name]
-                        all_patch_paths.append(const_val)
                         all_const_refs.append(
                             _ConstRef(
                                 const_name=f"{module_alias}.{attr_name}",
@@ -681,7 +688,10 @@ class _PatchFunctionCollector(cst.CSTVisitor):
                             )
                         )
                         if _matches_any(const_val, self._old_paths):
+                            forking_dec_paths.append(const_val)
                             has_match = True
+                        else:
+                            stable_dec_paths.append(const_val)
             patch_dec_idx += 1
 
         # Compute line range and extract full text before the early-return check so
@@ -707,14 +717,16 @@ class _PatchFunctionCollector(cst.CSTVisitor):
         if not has_match:
             return
 
-        # Include ALL decorator patch paths (not just matching ones) so the LLM
-        # evaluates every @patch in this function.  A single test may patch
-        # get_api_key, make_client, and call_with_tool for the same migrated
-        # function — each of those may need updating to a different sub-module.
-        old_patch_paths = all_patch_paths + body_paths
+        # old_patch_paths: only forking paths (need LLM attention).
+        # body_paths already contains only forking paths (filtered in
+        # _find_with_patch_paths_in_body). stable_dec_paths holds the
+        # already-correct paths that should not be re-evaluated.
+        old_patch_paths = forking_dec_paths + body_paths
 
         # Build the full_text sent to the LLM: substitute constant names with
         # their string values so the LLM always sees plain string literals.
+        # Substitute ALL const refs (both forking and stable) so the full
+        # function text is coherent and the LLM can follow the mock params.
         if all_const_refs:
             subs = {ref.const_name: ref.resolved_value for ref in all_const_refs}
             llm_full_text = _substitute_consts_in_func_text(original_full_text, subs)
@@ -726,6 +738,7 @@ class _PatchFunctionCollector(cst.CSTVisitor):
                 function_name=node.name.value,
                 full_text=llm_full_text,
                 old_patch_paths=old_patch_paths,
+                stable_patch_paths=stable_dec_paths,
                 start_line=start_line,
                 end_line=end_line,
                 const_refs=all_const_refs,
@@ -1455,6 +1468,7 @@ def _build_classify_prompt(
     old_patch_paths: List[str],
     prev_issue: Optional[str] = None,
     prev_proposed: Optional[str] = None,
+    stable_patch_paths: Optional[List[str]] = None,
 ) -> str:
     """Build the user prompt for the per-function classify LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
@@ -1463,21 +1477,28 @@ def _build_classify_prompt(
     parts = [context_msg, _PATCH_RULES]
     parts.append(
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
-        "## All @patch strings in this function (evaluate every one):\n"
+        "## Patch strings that need updating:\n"
         f"{paths_list}\n\n"
     )
+    if stable_patch_paths:
+        stable_list = "\n".join(f"- `{p}`" for p in stable_patch_paths)
+        parts.append(
+            "## Patch strings already correct — do not modify:\n" f"{stable_list}\n\n"
+        )
     if migration_reminder:
         parts.append(migration_reminder)
     if patch_lookup:
         parts.append(patch_lookup)
     parts.append(
-        "Every patch string listed above must be evaluated independently — "
-        "a single test function may need **multiple** patch strings updated, "
-        "each potentially pointing to a **different** new sub-module.\n\n"
+        "Every patch string in the **'Patch strings that need updating'** list "
+        "must be evaluated independently — a single test function may need "
+        "**multiple** strings updated, each potentially pointing to a **different** "
+        "new sub-module. Do **not** modify any string listed under "
+        "'Patch strings already correct'.\n\n"
     )
     if patch_lookup:
         parts.append(
-            "**For each patch string:**\n"
+            "**For each patch string that needs updating:**\n"
             "1. Find N (the last component, "
             "e.g. `call_with_tool` in `pkg.module.call_with_tool`).\n"
             "2. Identify F (the production function being tested). "
@@ -1495,7 +1516,7 @@ def _build_classify_prompt(
         )
     else:
         parts.append(
-            "For **each** patch string, work through these steps:\n"
+            "For **each** patch string that needs updating, work through these steps:\n"
             "1. Find N (the patched name — last component of the patch string).\n"
             "2. Look at the **Modified original file** imports in the context above. "
             "Is N imported from an external source there "
@@ -1515,7 +1536,10 @@ def _build_classify_prompt(
             "   - If F was **migrated to M**: update patch to `M.N`.\n"
         )
     parts.append(
-        "Include **every** evaluated path in `patch_renames`. "
+        "Include every path from the 'Patch strings that need updating' list in "
+        "`patch_renames` (mapping old → new, or old → old if unchanged). "
+        "Do **not** include paths from 'Patch strings already correct' in "
+        "`patch_renames`. "
         "Set `needs_rewrite` to True only for structural changes "
         "(new decorators, new mock parameters, or body edits).\n"
     )
@@ -1563,6 +1587,7 @@ def _build_no_change_verify_prompt(
     context_msg: str,
     function_text: str,
     old_patch_paths: List[str],
+    stable_patch_paths: Optional[List[str]] = None,
 ) -> str:
     """Build the user prompt for a no-change verify LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
@@ -1572,19 +1597,27 @@ def _build_no_change_verify_prompt(
         context_msg,
         _PATCH_RULES,
         f"\n## Test function:\n```python\n{function_text}\n```\n\n"
-        f"## Patch strings in this test (no update proposed):\n{paths_list}\n\n",
+        f"## Patch strings under review (no update proposed):\n{paths_list}\n\n",
     ]
+    if stable_patch_paths:
+        stable_list = "\n".join(f"- `{p}`" for p in stable_patch_paths)
+        parts.append(
+            "## Patch strings already correct — do not include in corrections:\n"
+            f"{stable_list}\n\n"
+        )
     if migration_reminder:
         parts.append(migration_reminder)
     if patch_lookup:
         parts.append(patch_lookup)
     parts.append(
-        "The proposed update is: **no patch strings need changing**.\n\n"
-        "Is this correct? Set `correct` to True only if all @patch strings "
-        "in this function still point to the correct location after the split.\n"
+        "The proposed update is: **no changes needed to the reviewed patch "
+        "strings**.\n\n"
+        "Is this correct? Set `correct` to True only if all reviewed @patch strings "
+        "still point to the correct location after the split.\n"
         "When you reject (correct=false): populate `corrections` with "
-        "{current_path: corrected_path} for each string listed above that "
-        "needs renaming — use the exact strings from the list as keys. "
+        "{current_path: corrected_path} for each reviewed string that "
+        "needs renaming — use the exact strings from the 'under review' list as keys. "
+        "Do **not** include strings from 'already correct' in corrections. "
         "The `issue` field is for explaining why the current path is wrong, "
         "not for describing the fix. "
         "Only leave `corrections` empty if the fix requires an entirely new "
@@ -1598,6 +1631,7 @@ def _build_rewrite_func_prompt(
     function_text: str,
     old_patch_paths: List[str],
     prev_error: Optional[str] = None,
+    stable_patch_paths: Optional[List[str]] = None,
 ) -> str:
     """Build the user prompt for the full function rewrite LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
@@ -1607,10 +1641,19 @@ def _build_rewrite_func_prompt(
     parts.append(
         f"\n## Test function to rewrite:\n```python\n{function_text}\n```\n\n"
         f"## Patch strings that need updating:\n{paths_list}\n\n"
-        "Rewrite the complete function. You may add new @patch decorators with "
-        "corresponding mock parameters and setup code. Preserve all original "
-        "test logic. Return the complete function including all decorators and "
-        "body.\n"
+    )
+    if stable_patch_paths:
+        stable_list = "\n".join(f"- `{p}`" for p in stable_patch_paths)
+        parts.append(
+            "## Patch strings already correct — do not modify:\n" f"{stable_list}\n\n"
+        )
+    parts.append(
+        "Rewrite the complete function, updating ONLY the patch strings listed "
+        "under 'Patch strings that need updating'. Do **not** modify any @patch "
+        "decorator listed under 'Patch strings already correct'. "
+        "You may add new @patch decorators with corresponding mock parameters "
+        "and setup code. Preserve all original test logic. Return the complete "
+        "function including all decorators and body.\n"
     )
     return "".join(parts)
 
@@ -1750,6 +1793,7 @@ def _process_file_source(
                     func.old_patch_paths,
                     prev_issue,
                     prev_proposed,
+                    stable_patch_paths=func.stable_patch_paths or None,
                 )
                 retry_label = " (retry)" if prev_issue is not None else ""
                 if verbose:
@@ -1802,6 +1846,7 @@ def _process_file_source(
                         func.full_text,
                         func.old_patch_paths,
                         prev_error,
+                        stable_patch_paths=func.stable_patch_paths or None,
                     )
                     if verbose:
                         retry_rw = " (retry)" if prev_error is not None else ""
@@ -1966,7 +2011,10 @@ def _process_file_source(
             if not patch_renames:
                 # Verify the "no change needed" conclusion.
                 no_change_verify_prompt = _build_no_change_verify_prompt(
-                    context_msg, func.full_text, func.old_patch_paths
+                    context_msg,
+                    func.full_text,
+                    func.old_patch_paths,
+                    stable_patch_paths=func.stable_patch_paths or None,
                 )
                 if verbose:
                     print(
@@ -2448,10 +2496,9 @@ def _callgraph_update_file(
         }
 
         # Attempt call-graph resolution for each forking old path.
+        # old_patch_paths contains only forking paths by construction.
         resolved: Dict[str, str] = {}
         for old_path in func.old_patch_paths:
-            if old_path not in all_forking_paths:
-                continue
             name = old_path.rsplit(".", 1)[-1]
             for ctx in fl_contexts:
                 if old_path not in ctx.forking_old_paths:

@@ -1314,6 +1314,21 @@ def test_build_classify_prompt_with_lookup():
     assert "Entity migration (quick reference)" in prompt
 
 
+def test_build_classify_prompt_with_stable_paths():
+    # stable_patch_paths appear in a separate "already correct" section and
+    # the forking path remains in the "needs updating" section.
+    prompt = _build_classify_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        ["crispen.before.X"],
+        stable_patch_paths=["crispen.after.Y"],
+    )
+    assert "crispen.before.X" in prompt
+    assert "crispen.after.Y" in prompt
+    assert "already correct" in prompt
+    assert "do not modify" in prompt
+
+
 # ---------------------------------------------------------------------------
 # _build_func_verify_prompt
 # ---------------------------------------------------------------------------
@@ -1383,6 +1398,21 @@ def test_build_no_change_verify_prompt_includes_patch_lookup():
     assert "Patch target lookup" in prompt
 
 
+def test_build_no_change_verify_prompt_with_stable_paths():
+    # stable_patch_paths appear in a separate "already correct" section and
+    # the instruction tells the verifier not to include them in corrections.
+    prompt = _build_no_change_verify_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        ["crispen.before.X"],
+        stable_patch_paths=["crispen.after.Y"],
+    )
+    assert "crispen.before.X" in prompt
+    assert "crispen.after.Y" in prompt
+    assert "already correct" in prompt
+    assert "do not include" in prompt
+
+
 # ---------------------------------------------------------------------------
 # _build_rewrite_func_prompt
 # ---------------------------------------------------------------------------
@@ -1406,6 +1436,21 @@ def test_build_rewrite_func_prompt_with_error():
     )
     assert "Previous rewrite was invalid" in prompt
     assert "SyntaxError on line 3" in prompt
+
+
+def test_build_rewrite_func_prompt_with_stable_paths():
+    # stable_patch_paths appear in a separate "already correct" section and
+    # the instruction tells the LLM not to modify them.
+    prompt = _build_rewrite_func_prompt(
+        _ctx_msg(),
+        "def test_f(): pass",
+        ["crispen.before.X"],
+        stable_patch_paths=["crispen.after.Y"],
+    )
+    assert "crispen.before.X" in prompt
+    assert "crispen.after.Y" in prompt
+    assert "already correct" in prompt
+    assert "do not modify" in prompt.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -3131,12 +3176,13 @@ def test_find_mix_literal_and_const(tmp_path):
     assert result[0].const_refs[0].patch_dec_idx == 1
 
 
-def test_find_non_matching_decorator_included_when_triggered(tmp_path):
-    """When one decorator matches, ALL resolvable decorators are included.
+def test_find_non_matching_decorator_split_into_stable(tmp_path):
+    """Non-matching decorators go to stable_patch_paths, not old_patch_paths.
 
-    A test that patches get_api_key, make_client, and call_with_tool for
-    the same migrated function needs all three evaluated — even if only
-    call_with_tool's path is in old_paths.
+    A test that patches get_api_key (already correct) and call_with_tool
+    (forking, needs rewrite) should have only call_with_tool in old_patch_paths
+    and get_api_key in stable_patch_paths so the LLM is not asked to evaluate
+    the already-correct path.
     """
     src = (
         'KEY = "crispen.mod.get_api_key"\n'
@@ -3146,15 +3192,15 @@ def test_find_non_matching_decorator_included_when_triggered(tmp_path):
         "def test_f(mock_call, mock_key):\n    pass\n"
     )
     scan = str(tmp_path / "test_foo.py")
-    # Only CALL's value is in old_paths; KEY's value is not.
+    # Only CALL's value is in old_paths; KEY's value is already correct.
     result = _find_test_functions_to_update(
         src, {"crispen.mod.call_with_tool"}, scan_file=scan
     )
     assert len(result) == 1
-    paths = result[0].old_patch_paths
-    # Both paths must be present so the LLM can evaluate all decorators.
-    assert "crispen.mod.get_api_key" in paths
-    assert "crispen.mod.call_with_tool" in paths
+    # Forking path goes to old_patch_paths only.
+    assert result[0].old_patch_paths == ["crispen.mod.call_with_tool"]
+    # Already-correct path goes to stable_patch_paths.
+    assert result[0].stable_patch_paths == ["crispen.mod.get_api_key"]
     # Both const refs must be recorded so their definitions can be updated.
     assert len(result[0].const_refs) == 2
 
