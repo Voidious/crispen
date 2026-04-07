@@ -3741,7 +3741,7 @@ def test_patch_update_rewrite_mode_records_llm_stats(tmp_path):
     )
 
     def _rewrite_with_acc(
-        fl_contexts, per_file, repo_root, config, verbose=False, _acc=None
+        fl_contexts, per_file, repo_root, config, verbose=False, _acc=None, **_kwargs
     ):
         if _acc is not None:
             _acc.calls = 2

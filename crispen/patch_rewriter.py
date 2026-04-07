@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from collections import deque
 from dataclasses import dataclass, field
@@ -1006,6 +1007,7 @@ def _get_external_import_names(source: str) -> Set[str]:
 
 _CG_MAX_DEPTH = 12  # maximum BFS hops from test function to a sub-module target
 _CG_MAX_MODULES = 50  # maximum distinct modules visited per resolution attempt
+_CG_CANDIDATES_LLM_THRESHOLD = 10  # max candidates to include in LLM prompts
 
 
 def _cg_collect_called_names(source: str) -> Set[str]:
@@ -1187,34 +1189,36 @@ def _cg_build_index(
     )
 
 
-def _resolve_forking_path_via_callgraph(
+def _resolve_forking_path_candidates(
     forking_name: str,
     func_text: str,
     ctx: _FLContext,
     index: _CgIndex,
     calling_module: str,
-) -> Optional[str]:
-    """Resolve a forking @patch path by BFS across the repo call graph.
+) -> Tuple[Optional[str], List[str], bool]:
+    """BFS call-graph resolution returning the full candidate set.
 
-    Starting from the test function's direct calls (resolved through
-    *calling_module*'s import statements), performs a BFS across the repo
-    index to find which new sub-module's function is transitively reachable.
-    Returns the new dotted path when exactly one sub-module qualifies;
-    returns ``None`` when zero or multiple qualify or when the pre-check fails.
+    Returns ``(resolved_path, sorted_candidates, truncated)`` where:
 
-    Module-level re-exports (``from .sub import F`` where ``F`` is not defined
-    locally) are followed without consuming depth budget, so that the split
-    original file does not artificially cap traversal depth.
-
-    Limits: :data:`_CG_MAX_DEPTH` hops and :data:`_CG_MAX_MODULES` distinct
-    modules per resolution attempt.
+    - ``resolved_path`` — the single new dotted path when exactly one candidate
+      is found; ``None`` when zero or multiple candidates exist or when the
+      pre-check fails.
+    - ``sorted_candidates`` — all candidate paths discovered (may be empty).
+      Only meaningful when ``truncated`` is ``False``; when limits were hit the
+      list may be incomplete so callers must not rely on it for validation.
+    - ``truncated`` — ``True`` when :data:`_CG_MAX_DEPTH` or
+      :data:`_CG_MAX_MODULES` was reached during traversal, indicating the
+      candidate list may be incomplete.
     """
     if not calling_module:
-        return None
+        return None, [], False
     if forking_name not in _get_external_import_names(ctx.original_source):
-        return None
+        return None, [], False
 
-    # Terminal set: (sub_module_path, func_name) → new dotted path.
+    # Terminal set: (module_path, func_name) → new dotted path.
+    # Includes new sub-modules AND the original module: if some functions that
+    # call forking_name remained in the original file after the split, patching
+    # the original path is still correct for tests exercising those functions.
     terminal: Dict[Tuple[str, str], str] = {}
     for rel_path, src in ctx.new_files.items():
         if not src:
@@ -1228,14 +1232,22 @@ def _resolve_forking_path_via_callgraph(
         for f_name in ref_map[forking_name]:
             terminal[(new_mod, f_name)] = f"{new_mod}.{forking_name}"
 
+    # Original module: use the post-split source so only functions that actually
+    # remained there (and still reference forking_name) contribute terminals.
+    if ctx.modified_source:
+        orig_ref_map = _name_reference_map(ctx.modified_source)
+        for f_name in orig_ref_map.get(forking_name, []):
+            terminal[(ctx.old_module, f_name)] = f"{ctx.old_module}.{forking_name}"
+
     if not terminal:
-        return None
+        return None, [], False
 
     new_module_set = set(ctx.new_module_paths.values())
 
     visited: Set[Tuple[str, str]] = set()
     modules_seen: Set[str] = set()
     candidates: Set[str] = set()
+    truncated = False
     queue = deque()  # (module_path, func_name, depth)
 
     init_imports = index.get_imports(calling_module)
@@ -1260,10 +1272,12 @@ def _resolve_forking_path_via_callgraph(
         visited.add(key)
 
         if depth >= _CG_MAX_DEPTH:
+            truncated = True
             continue
 
         if module not in modules_seen:
             if len(modules_seen) >= _CG_MAX_MODULES:
+                truncated = True
                 continue
             modules_seen.add(module)
 
@@ -1288,7 +1302,38 @@ def _resolve_forking_path_via_callgraph(
                 if (rexport_mod, rexport_name) not in visited:
                     queue.append((rexport_mod, rexport_name, depth))
 
-    return next(iter(candidates)) if len(candidates) == 1 else None
+    sorted_cands = sorted(candidates)
+    if len(candidates) == 1:
+        return next(iter(candidates)), sorted_cands, truncated
+    return None, sorted_cands, truncated
+
+
+def _resolve_forking_path_via_callgraph(
+    forking_name: str,
+    func_text: str,
+    ctx: _FLContext,
+    index: _CgIndex,
+    calling_module: str,
+) -> Optional[str]:
+    """Resolve a forking @patch path by BFS across the repo call graph.
+
+    Starting from the test function's direct calls (resolved through
+    *calling_module*'s import statements), performs a BFS across the repo
+    index to find which new sub-module's function is transitively reachable.
+    Returns the new dotted path when exactly one sub-module qualifies;
+    returns ``None`` when zero or multiple qualify or when the pre-check fails.
+
+    Module-level re-exports (``from .sub import F`` where ``F`` is not defined
+    locally) are followed without consuming depth budget, so that the split
+    original file does not artificially cap traversal depth.
+
+    Limits: :data:`_CG_MAX_DEPTH` hops and :data:`_CG_MAX_MODULES` distinct
+    modules per resolution attempt.
+    """
+    path, _, _ = _resolve_forking_path_candidates(
+        forking_name, func_text, ctx, index, calling_module
+    )
+    return path
 
 
 def _build_rename_guard_sets(
@@ -1473,6 +1518,7 @@ def _build_classify_prompt(
     prev_issue: Optional[str] = None,
     prev_proposed: Optional[str] = None,
     stable_patch_paths: Optional[List[str]] = None,
+    candidates_per_path: Optional[Dict[str, List[str]]] = None,
 ) -> str:
     """Build the user prompt for the per-function classify LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
@@ -1547,6 +1593,23 @@ def _build_classify_prompt(
         "Set `needs_rewrite` to True only for structural changes "
         "(new decorators, new mock parameters, or body edits).\n"
     )
+    if candidates_per_path:
+        small_cands = {
+            old: cands
+            for old, cands in candidates_per_path.items()
+            if cands and len(cands) <= _CG_CANDIDATES_LLM_THRESHOLD
+        }
+        if small_cands:
+            parts.append(
+                "\n## Call-graph candidate paths (from static analysis):\n"
+                "Static call-graph analysis narrowed the possible new locations "
+                "for each path below. Your answer MUST use one of the listed "
+                "candidates as the new value:\n"
+            )
+            for old in sorted(small_cands):
+                cands_str = ", ".join(f"`{c}`" for c in small_cands[old])
+                parts.append(f"- `{old}` → must be one of: {cands_str}\n")
+            parts.append("\n")
     if prev_issue:
         parts.append(
             f"\n## Previous attempt was rejected:\n"
@@ -1561,6 +1624,7 @@ def _build_func_verify_prompt(
     context_msg: str,
     function_text: str,
     patch_renames: Dict[str, str],
+    candidates_per_path: Optional[Dict[str, List[str]]] = None,
 ) -> str:
     """Build the user prompt for a per-function rename verify LLM call."""
     rename_lines = "\n".join(
@@ -1578,6 +1642,21 @@ def _build_func_verify_prompt(
         parts.append(migration_reminder)
     if patch_lookup:
         parts.append(patch_lookup)
+    if candidates_per_path:
+        small_cands = {
+            old: cands
+            for old, cands in candidates_per_path.items()
+            if cands and len(cands) <= _CG_CANDIDATES_LLM_THRESHOLD
+        }
+        if small_cands:
+            parts.append(
+                "\n## Call-graph candidate paths (from static analysis):\n"
+                "Valid new locations for each old path (from call-graph analysis):\n"
+            )
+            for old in sorted(small_cands):
+                cands_str = ", ".join(f"`{c}`" for c in small_cands[old])
+                parts.append(f"- `{old}` → valid options: {cands_str}\n")
+            parts.append("\n")
     parts.append(
         "Are all these updates correct? Set `correct` to True only if every "
         "proposed patch string points to where the name is looked up after "
@@ -1592,6 +1671,7 @@ def _build_no_change_verify_prompt(
     function_text: str,
     old_patch_paths: List[str],
     stable_patch_paths: Optional[List[str]] = None,
+    candidates_per_path: Optional[Dict[str, List[str]]] = None,
 ) -> str:
     """Build the user prompt for a no-change verify LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
@@ -1613,6 +1693,22 @@ def _build_no_change_verify_prompt(
         parts.append(migration_reminder)
     if patch_lookup:
         parts.append(patch_lookup)
+    if candidates_per_path:
+        small_cands = {
+            old: cands
+            for old, cands in candidates_per_path.items()
+            if cands and len(cands) <= _CG_CANDIDATES_LLM_THRESHOLD
+        }
+        if small_cands:
+            parts.append(
+                "\n## Call-graph candidate paths (from static analysis):\n"
+                "These paths require updates — call-graph found the following "
+                "valid new locations:\n"
+            )
+            for old in sorted(small_cands):
+                cands_str = ", ".join(f"`{c}`" for c in small_cands[old])
+                parts.append(f"- `{old}` → must be one of: {cands_str}\n")
+            parts.append("\n")
     parts.append(
         "The proposed update is: **no changes needed to the reviewed patch "
         "strings**.\n\n"
@@ -1636,6 +1732,7 @@ def _build_rewrite_func_prompt(
     old_patch_paths: List[str],
     prev_error: Optional[str] = None,
     stable_patch_paths: Optional[List[str]] = None,
+    candidates_per_path: Optional[Dict[str, List[str]]] = None,
 ) -> str:
     """Build the user prompt for the full function rewrite LLM call."""
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
@@ -1651,6 +1748,21 @@ def _build_rewrite_func_prompt(
         parts.append(
             "## Patch strings already correct — do not modify:\n" f"{stable_list}\n\n"
         )
+    if candidates_per_path:
+        small_cands = {
+            old: cands
+            for old, cands in candidates_per_path.items()
+            if cands and len(cands) <= _CG_CANDIDATES_LLM_THRESHOLD
+        }
+        if small_cands:
+            parts.append(
+                "## Call-graph candidate paths (from static analysis):\n"
+                "Static analysis narrowed the valid new locations for each path:\n"
+            )
+            for old in sorted(small_cands):
+                cands_str = ", ".join(f"`{c}`" for c in small_cands[old])
+                parts.append(f"- `{old}` → must be one of: {cands_str}\n")
+            parts.append("\n")
     parts.append(
         "Rewrite the complete function, updating ONLY the patch strings listed "
         "under 'Patch strings that need updating'. Do **not** modify any @patch "
@@ -1666,13 +1778,31 @@ def _build_rewrite_verify_prompt(
     context_msg: str,
     original_function_text: str,
     rewritten_function_text: str,
+    candidates_per_path: Optional[Dict[str, List[str]]] = None,
 ) -> str:
     """Build the user prompt for a full-rewrite verify LLM call."""
     parts = [
         context_msg,
         _PATCH_RULES,
         f"\n## Original test function:\n```python\n{original_function_text}\n```\n\n"
-        f"## Rewritten test function:\n```python\n{rewritten_function_text}\n```\n\n"
+        f"## Rewritten test function:\n```python\n{rewritten_function_text}\n```\n\n",
+    ]
+    if candidates_per_path:
+        small_cands = {
+            old: cands
+            for old, cands in candidates_per_path.items()
+            if cands and len(cands) <= _CG_CANDIDATES_LLM_THRESHOLD
+        }
+        if small_cands:
+            parts.append(
+                "## Call-graph candidate paths (from static analysis):\n"
+                "Static analysis narrowed the valid new locations for each path:\n"
+            )
+            for old in sorted(small_cands):
+                cands_str = ", ".join(f"`{c}`" for c in small_cands[old])
+                parts.append(f"- `{old}` → must be one of: {cands_str}\n")
+            parts.append("\n")
+    parts.append(
         "Verify that the rewrite is correct:\n"
         "- All @patch strings point to where the name is looked up after the split.\n"
         "- All mock parameters correspond correctly to their @patch decorators "
@@ -1680,7 +1810,7 @@ def _build_rewrite_verify_prompt(
         "- All original test logic is preserved — no hallucinated code, no "
         "missing assertions or setup.\n"
         "Set `correct` to True only if all of the above are satisfied.\n",
-    ]
+    )
     return "".join(parts)
 
 
@@ -1699,6 +1829,88 @@ def _splice_function(
     new_lines = new_func_text.splitlines(True)
     lines[start_line - 1 : end_line] = new_lines
     return "".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Candidates constraint check
+# ---------------------------------------------------------------------------
+
+
+def _candidates_check(
+    patch_renames: Dict[str, str],
+    old_patch_paths: List[str],
+    candidates: Dict[str, List[str]],
+) -> Optional[str]:
+    """Return a rejection reason if LLM output conflicts with call-graph candidates.
+
+    *candidates* maps each old patch path to a list of valid new paths found by
+    the call-graph BFS (populated only when multiple candidates were found and
+    the BFS was not truncated by limits).
+
+    Returns ``None`` when the output is consistent with candidates, or when no
+    candidates are available for the paths in question.
+    """
+    for old in old_patch_paths:
+        cands = candidates.get(old)
+        if not cands:
+            continue
+        proposed_new = patch_renames.get(old)
+        if proposed_new is None:
+            # No rename proposed, but candidates exist — a rename IS needed.
+            return (
+                f"`{old}` requires an update — call-graph found it moved to: "
+                + ", ".join(f"`{c}`" for c in cands)
+            )
+        if proposed_new not in cands:
+            return (
+                f"Proposed `{proposed_new}` for `{old}` is not among the "
+                "call-graph candidates: " + ", ".join(f"`{c}`" for c in cands)
+            )
+    return None
+
+
+# Matches the first string arg of any ``patch(...)`` or ``X.patch(...)`` call.
+_PATCH_ARG_RE = re.compile(r'\bpatch\s*\(\s*["\']([^"\']+)["\']')
+
+
+def _patch_strings_in_text(text: str) -> Set[str]:
+    """Return all first-argument string values from ``patch(...)`` calls in *text*."""
+    return set(_PATCH_ARG_RE.findall(text))
+
+
+def _rewrite_candidates_check(
+    old_patch_paths: List[str],
+    new_func_text: str,
+    candidates: Dict[str, List[str]],
+) -> Optional[str]:
+    """Verify rewritten function's patch strings against call-graph candidates.
+
+    Extracts patch string values from *new_func_text* and checks each old path
+    that has candidates:
+
+    - If the old path is still present → the path was not updated, but it must be.
+    - If the old path is absent and none of its candidates appear → updated to
+      an unknown target not sanctioned by the call-graph.
+
+    Returns ``None`` when the rewrite is consistent with candidates, or an error
+    string describing the first problem found.
+    """
+    new_strings = _patch_strings_in_text(new_func_text)
+    for old in old_patch_paths:
+        cands = candidates.get(old)
+        if not cands:
+            continue
+        if old in new_strings:
+            return (
+                f"`{old}` was not updated — call-graph found it moved to: "
+                + ", ".join(f"`{c}`" for c in cands)
+            )
+        if not any(c in new_strings for c in cands):
+            return (
+                f"`{old}` was not updated to a valid call-graph candidate: "
+                + ", ".join(f"`{c}`" for c in cands)
+            )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1721,6 +1933,7 @@ def _process_file_source(
     still_imported: Optional[Set[str]] = None,
     orig_users_map: Optional[Dict[str, List[str]]] = None,
     new_module_imports: Optional[Dict[str, Set[str]]] = None,
+    cg_candidates: Optional[Dict[str, Dict[str, List[str]]]] = None,
 ) -> Tuple[str, bool, Dict[str, Dict[str, str]]]:
     """Scan *source* for @patch functions matching *all_forking_paths* and update.
 
@@ -1764,6 +1977,11 @@ def _process_file_source(
     _new_module_imports: Optional[Dict[str, Set[str]]] = new_module_imports
 
     for func in functions:
+        # Per-function call-graph candidates: old_path → sorted list of new paths.
+        # Only populated when BFS found multiple candidates without hitting limits.
+        func_candidates: Dict[str, List[str]] = (cg_candidates or {}).get(
+            func.function_name, {}
+        )
         prev_issue: Optional[str] = None
         prev_proposed: Optional[str] = None
         attempts_left = max_attempts
@@ -1798,6 +2016,7 @@ def _process_file_source(
                     prev_issue,
                     prev_proposed,
                     stable_patch_paths=func.stable_patch_paths or None,
+                    candidates_per_path=func_candidates or None,
                 )
                 retry_label = " (retry)" if prev_issue is not None else ""
                 if verbose:
@@ -1851,6 +2070,7 @@ def _process_file_source(
                         func.old_patch_paths,
                         prev_error,
                         stable_patch_paths=func.stable_patch_paths or None,
+                        candidates_per_path=func_candidates or None,
                     )
                     if verbose:
                         retry_rw = " (retry)" if prev_error is not None else ""
@@ -1893,9 +2113,20 @@ def _process_file_source(
                     if not _compiles(new_func_text):
                         prev_error = "Rewritten function is not valid Python."
                         continue
+                    # Candidates pre-check: algorithmic validation before LLM verify.
+                    if func_candidates:
+                        rw_cand_issue = _rewrite_candidates_check(
+                            func.old_patch_paths, new_func_text, func_candidates
+                        )
+                        if rw_cand_issue:
+                            prev_error = rw_cand_issue
+                            continue
                     # LLM verify step.
                     rewrite_verify_prompt = _build_rewrite_verify_prompt(
-                        context_msg, func.full_text, new_func_text
+                        context_msg,
+                        func.full_text,
+                        new_func_text,
+                        candidates_per_path=func_candidates or None,
                     )
                     if verbose:
                         print(
@@ -2012,6 +2243,18 @@ def _process_file_source(
                     )
                 }
 
+            # Candidates pre-check: if the call-graph found valid candidates for a
+            # path (multiple new homes, BFS not truncated), verify the LLM's proposal
+            # matches one of them.  If not, reject and retry without calling LLM verify.
+            if func_candidates:
+                cand_issue = _candidates_check(
+                    patch_renames, func.old_patch_paths, func_candidates
+                )
+                if cand_issue:
+                    prev_issue = cand_issue
+                    prev_proposed = str(patch_renames) if patch_renames else "no change"
+                    continue
+
             if not patch_renames:
                 # Verify the "no change needed" conclusion.
                 no_change_verify_prompt = _build_no_change_verify_prompt(
@@ -2019,6 +2262,7 @@ def _process_file_source(
                     func.full_text,
                     func.old_patch_paths,
                     stable_patch_paths=func.stable_patch_paths or None,
+                    candidates_per_path=func_candidates or None,
                 )
                 if verbose:
                     print(
@@ -2115,7 +2359,10 @@ def _process_file_source(
                 if corrections_renames:
                     # Verifier provided corrections — verify before applying.
                     vc_prompt = _build_func_verify_prompt(
-                        context_msg, func.full_text, corrections_renames
+                        context_msg,
+                        func.full_text,
+                        corrections_renames,
+                        candidates_per_path=func_candidates or None,
                     )
                     if verbose:
                         print(
@@ -2202,7 +2449,10 @@ def _process_file_source(
 
             # Verify the renames.
             verify_prompt = _build_func_verify_prompt(
-                context_msg, func.full_text, patch_renames
+                context_msg,
+                func.full_text,
+                patch_renames,
+                candidates_per_path=func_candidates or None,
             )
             if verbose:
                 print(
@@ -2465,7 +2715,7 @@ def _callgraph_update_file(
     repo_root: Optional[str] = None,
     index: Optional[_CgIndex] = None,
     verbose: bool = False,
-) -> Tuple[str, bool]:
+) -> Tuple[str, bool, Dict[str, Dict[str, List[str]]]]:
     """Apply call-graph-resolved @patch updates to *source*.
 
     For each test function with forking @patch targets, attempts to determine
@@ -2473,19 +2723,23 @@ def _callgraph_update_file(
     using *index*.  Only updates a target when exactly one new sub-module in
     the call graph uses it.
 
-    Returns ``(updated_source, was_changed)``.
+    Returns ``(updated_source, was_changed, unresolved_candidates)`` where
+    *unresolved_candidates* maps ``{func_name: {old_path: sorted_candidates}}``
+    for paths that were ambiguous (multiple candidates, BFS not truncated).
     """
     functions = _find_test_functions_to_update(
         source, all_forking_paths, scan_file, repo_root
     )
     if not functions:
-        return source, False
+        return source, False, {}
 
     source_lines = source.splitlines()
     func_splices: List[Tuple[int, int, str]] = []
     same_file_proposals: Dict[str, Set[str]] = {}
     same_file_passthrough: Set[str] = set()
     resolved_results: List[Tuple[_TestFunctionInfo, Dict[str, str]]] = []
+    # func_name → old_path → sorted candidates (multiple, non-truncated BFS results)
+    unresolved_candidates: Dict[str, Dict[str, List[str]]] = {}
     scan_file_abs = str(Path(scan_file).resolve()) if scan_file else ""
     calling_module = ""
     if index is not None and scan_file_abs:
@@ -2508,14 +2762,24 @@ def _callgraph_update_file(
                 if old_path not in ctx.forking_old_paths:
                     continue
                 if index is None:
-                    new_path = None
+                    new_path, cands, truncated = None, [], False
                 else:
-                    new_path = _resolve_forking_path_via_callgraph(
+                    new_path, cands, truncated = _resolve_forking_path_candidates(
                         name, func.full_text, ctx, index, calling_module
                     )
                 if new_path is not None:
                     resolved[old_path] = new_path
+                    # Clear any previously saved candidates for this path.
+                    func_cands = unresolved_candidates.get(func.function_name, {})
+                    func_cands.pop(old_path, None)
+                    if not func_cands and func.function_name in unresolved_candidates:
+                        del unresolved_candidates[func.function_name]
                     break
+                # Multiple candidates without truncation → save for rewrite mode.
+                if len(cands) > 1 and not truncated:
+                    unresolved_candidates.setdefault(func.function_name, {})[
+                        old_path
+                    ] = cands
 
         if not resolved:
             # Nothing resolved — record passthroughs for any const refs.
@@ -2594,14 +2858,14 @@ def _callgraph_update_file(
                 func_splices.append((func.start_line, func.end_line, inlined))
 
     if not func_splices and not same_file_const_map:
-        return source, False
+        return source, False, unresolved_candidates
 
     result_source = source
     for start_line, end_line, new_text in sorted(func_splices, key=lambda x: -x[0]):
         result_source = _splice_function(result_source, start_line, end_line, new_text)
     if same_file_const_map:
         result_source = apply_patch_strings(result_source, same_file_const_map)
-    return result_source, result_source != source
+    return result_source, result_source != source, unresolved_candidates
 
 
 def apply_patch_callgraph(
@@ -2609,6 +2873,7 @@ def apply_patch_callgraph(
     per_file: Dict[str, Any],
     repo_root: Optional[str],
     verbose: bool = False,
+    candidates_out: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None,
 ) -> Iterator[str]:
     """Algorithmically resolve forking @patch paths via call-graph tracing.
 
@@ -2616,6 +2881,12 @@ def apply_patch_callgraph(
     sub-module in the call graph of the test function imports and uses the
     patched name.  When exactly one such sub-module exists the decorator is
     updated without any LLM involvement.
+
+    When *candidates_out* is provided it is populated with unresolved-but-ambiguous
+    results: ``{abs_filepath: {func_name: {old_path: sorted_candidates}}}``.
+    Only paths where BFS found multiple candidates without hitting traversal limits
+    are recorded.  This data can be passed to :func:`apply_patch_rewrite` so the
+    LLM receives a constrained multiple-choice question instead of a free-form one.
 
     Should be called after "basic" ``apply_patch_strings`` so already-resolved
     paths are not re-processed.  For "rewrite" mode the updated file sources
@@ -2649,7 +2920,7 @@ def apply_patch_callgraph(
         ]
         if not relevant_contexts:
             continue
-        new_src, changed = _callgraph_update_file(
+        new_src, changed, unresolved = _callgraph_update_file(
             file_src,
             all_forking_paths,
             relevant_contexts,
@@ -2663,6 +2934,9 @@ def apply_patch_callgraph(
             state["msgs"].append(
                 f"{filepath}: patch_update: updated @patch strings (call-graph)"
             )
+        if unresolved and candidates_out is not None:
+            abs_fp = str(Path(filepath).resolve())
+            candidates_out[abs_fp] = unresolved
 
     if repo_root is None:
         return
@@ -2687,7 +2961,7 @@ def apply_patch_callgraph(
         ]
         if not relevant_contexts:
             continue
-        new_src, changed = _callgraph_update_file(
+        new_src, changed, unresolved = _callgraph_update_file(
             src,
             all_forking_paths,
             relevant_contexts,
@@ -2699,6 +2973,8 @@ def apply_patch_callgraph(
         if changed:
             py_file.write_text(new_src, encoding="utf-8")
             yield f"{py_file}: patch_update: updated @patch strings (call-graph)"
+        if unresolved and candidates_out is not None:
+            candidates_out[str(py_file.resolve())] = unresolved
 
 
 # ---------------------------------------------------------------------------
@@ -2713,6 +2989,7 @@ def apply_patch_rewrite(
     config: "CrispenConfig",
     verbose: bool = False,
     _acc: Optional[RewriteAccumulator] = None,
+    cg_candidates: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None,
 ) -> Iterator[str]:
     """Update @patch strings for forking entities using LLM.
 
@@ -2720,6 +2997,10 @@ def apply_patch_rewrite(
     entities that basic mode skipped because they appeared in multiple callers.
     Also resolves named constants used as @patch arguments and updates their
     definitions when all usages agree on the same new value.
+
+    When *cg_candidates* is provided (populated by :func:`apply_patch_callgraph`),
+    per-file call-graph candidate lists are passed to the LLM prompts and used to
+    pre-validate LLM output: ``{abs_filepath: {func_name: {old_path: candidates}}}``.
     """
     if not fl_contexts:
         return
@@ -2756,6 +3037,8 @@ def apply_patch_rewrite(
         _moved_out, _still_in, _orig_users, _new_mod_imports = _build_rename_guard_sets(
             relevant_contexts
         )
+        abs_fp = str(Path(filepath).resolve())
+        file_cands = (cg_candidates or {}).get(abs_fp) or None
         new_src, changed, cross = _process_file_source(
             file_src,
             all_forking_paths,
@@ -2771,6 +3054,7 @@ def apply_patch_rewrite(
             still_imported=_still_in,
             orig_users_map=_orig_users,
             new_module_imports=_new_mod_imports,
+            cg_candidates=file_cands,
         )
         if changed:
             state["source"] = new_src
@@ -2814,6 +3098,7 @@ def apply_patch_rewrite(
         _moved_out, _still_in, _orig_users, _new_mod_imports = _build_rename_guard_sets(
             relevant_contexts
         )
+        file_cands = (cg_candidates or {}).get(str(py_file.resolve())) or None
         new_src, changed, cross = _process_file_source(
             src,
             all_forking_paths,
@@ -2829,6 +3114,7 @@ def apply_patch_rewrite(
             still_imported=_still_in,
             orig_users_map=_orig_users,
             new_module_imports=_new_mod_imports,
+            cg_candidates=file_cands,
         )
         if changed:
             py_file.write_text(new_src, encoding="utf-8")

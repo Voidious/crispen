@@ -43,6 +43,7 @@ file_limiter_subdir_split = true
 file_limiter_pytest_conftest = true
 file_limiter_reexports = "imported"
 file_limiter_patch_update = "ignore"
+patch_update_retries = 2
 timing = "detailed"
 
 [tool.pytest.ini_options]

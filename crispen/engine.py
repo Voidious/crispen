@@ -1376,9 +1376,14 @@ def run_engine(
                 _stats.patch_update_edits += 1
                 yield f"{py_file}: patch_update: updated @patch strings"
 
+    _cg_candidates: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
     if config.file_limiter_patch_update in ("basic", "rewrite") and _fl_all_contexts:
         for _cg_msg in apply_patch_callgraph(
-            _fl_all_contexts, per_file, repo_root, verbose=verbose
+            _fl_all_contexts,
+            per_file,
+            repo_root,
+            verbose=verbose,
+            candidates_out=_cg_candidates,
         ):
             _stats.patch_update_edits += 1
             yield _cg_msg
@@ -1392,6 +1397,7 @@ def run_engine(
             config,
             verbose=verbose,
             _acc=_rewrite_acc,
+            cg_candidates=_cg_candidates or None,
         )
         _stats.patch_rewrite_llm_calls += _rewrite_acc.calls
         if _rewrite_acc.elapsed > 0 or _rewrite_acc.input_tokens > 0:

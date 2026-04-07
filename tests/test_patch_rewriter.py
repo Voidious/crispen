@@ -12,6 +12,7 @@ from crispen.patch_rewriter import (
     _FLContext,
     RewriteAccumulator,
     _CgIndex,
+    _CG_CANDIDATES_LLM_THRESHOLD,
     _CG_MAX_DEPTH,
     _CG_MAX_MODULES,
     _apply_cross_file_const_updates,
@@ -25,6 +26,9 @@ from crispen.patch_rewriter import (
     _build_rewrite_func_prompt,
     _build_rewrite_verify_prompt,
     _callgraph_update_file,
+    _candidates_check,
+    _patch_strings_in_text,
+    _rewrite_candidates_check,
     _cg_build_index,
     _cg_collect_called_names,
     _cg_collect_defined_names,
@@ -45,6 +49,7 @@ from crispen.patch_rewriter import (
     _name_reference_map,
     _matches_any,
     _process_file_source,
+    _resolve_forking_path_candidates,
     _resolve_forking_path_via_callgraph,
     _resolve_import_to_file,
     _splice_function,
@@ -4737,7 +4742,7 @@ def _make_cuf_index(scan_abs: str, test_src: str) -> _CgIndex:
 
 def test_callgraph_update_file_no_functions():
     src = "x = 1\n"
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         src, {"pkg.orig.use_fn"}, _make_cuf_contexts()
     )
     assert not changed
@@ -4753,7 +4758,7 @@ def test_callgraph_update_file_index_none(tmp_path):
         "    helper()\n"
     )
     scan = str(tmp_path / "test_foo.py")
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn"},
         _make_cuf_contexts(),
@@ -4772,7 +4777,7 @@ def test_callgraph_update_file_string_literal_resolved(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn"},
         _make_cuf_contexts(),
@@ -4790,7 +4795,7 @@ def test_callgraph_update_file_no_resolution(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn"},
         _make_cuf_contexts(),
@@ -4814,7 +4819,7 @@ def test_callgraph_update_file_const_ref_unanimous(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn"},
         _make_cuf_contexts(),
@@ -4858,7 +4863,7 @@ def test_callgraph_update_file_const_ref_conflicting(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src, {"pkg.orig.use_fn"}, [ctx], scan_file=scan, index=index
     )
     assert changed
@@ -4877,7 +4882,7 @@ def test_callgraph_update_file_non_forking_path_skipped(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn"},
         _make_cuf_contexts(),
@@ -4919,7 +4924,7 @@ def test_callgraph_update_file_multi_context_second_matches(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn", "pkg.other.other_fn"},
         [ctx_a, ctx_b],
@@ -4939,7 +4944,7 @@ def test_callgraph_update_file_const_ref_no_resolution_passthrough(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn"},
         _make_cuf_contexts(),
@@ -4974,7 +4979,7 @@ def test_callgraph_update_file_const_ref_partial_resolution(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn", "pkg.orig.other_fn"},
         [ctx],
@@ -5023,7 +5028,7 @@ def test_callgraph_update_file_inline_no_inline_subs_continue(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src, {"pkg.orig.use_fn"}, [ctx], scan_file=scan, index=index
     )
     assert changed
@@ -5068,7 +5073,7 @@ def test_callgraph_update_file_inline_ref_from_different_file(tmp_path):
     scan = str(scan_file)
     # Build index from disk so file_to_module is populated for test_cases.py
     index = _cg_build_index(str(tmp_path), {}, [ctx])
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn"},
         [ctx],
@@ -5112,7 +5117,7 @@ def test_callgraph_update_file_inline_new_val_same_as_old(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src, {"pkg.orig.use_fn"}, [ctx], scan_file=scan, index=index
     )
     assert changed  # test_c inlined to pkg.conflict.use_fn
@@ -5153,7 +5158,7 @@ def test_callgraph_update_file_inline_existing_splice_updated(tmp_path):
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed = _callgraph_update_file(
+    result, changed, _unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn", "pkg.orig.other_fn"},
         [ctx],
@@ -5185,6 +5190,839 @@ def test_callgraph_update_file_verbose(tmp_path, capsys):
     )
     captured = capsys.readouterr()
     assert "patch_callgraph" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# _resolve_forking_path_candidates — full result (truncation / candidates)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_forking_path_candidates_single():
+    # Single candidate: path returned, candidates=[path], truncated=False.
+    ctx = _make_bfs_ctx()
+    index = _make_bfs_index("from pkg.placement import helper\n")
+    path, cands, truncated = _resolve_forking_path_candidates(
+        "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
+    )
+    assert path == "pkg.placement.use_fn"
+    assert cands == ["pkg.placement.use_fn"]
+    assert not truncated
+
+
+def test_resolve_forking_path_candidates_multiple():
+    # Multiple candidates → path=None, cands=[...], truncated=False.
+    ctx = _make_bfs_ctx()
+    test_src = "from pkg.placement import helper\nfrom pkg.conflict import resolve\n"
+    index = _make_bfs_index(test_src)
+    path, cands, truncated = _resolve_forking_path_candidates(
+        "use_fn",
+        "def test_f(): helper(); resolve()\n",
+        ctx,
+        index,
+        "pkg.test_mod",
+    )
+    assert path is None
+    assert sorted(cands) == ["pkg.conflict.use_fn", "pkg.placement.use_fn"]
+    assert not truncated
+
+
+def test_resolve_forking_path_candidates_no_calling_module():
+    ctx = _make_bfs_ctx()
+    index = _make_bfs_index("from pkg.placement import helper\n")
+    path, cands, truncated = _resolve_forking_path_candidates(
+        "use_fn", "def test_f(): helper()\n", ctx, index, ""
+    )
+    assert path is None
+    assert cands == []
+    assert not truncated
+
+
+def test_resolve_forking_path_candidates_truncated_depth():
+    # Chain of exactly _CG_MAX_DEPTH + 1 hops; the last hop is cut off → truncated=True.
+    # Chain: test_mod -[f0]-> mid0 -> mid1 -> ... -> mid{n-1} -[helper]-> placement
+    # n = _CG_MAX_DEPTH + 1 intermediate modules; helper is at depth n-1 = 13,
+    # but the depth limit cuts off at depth 12 before enqueuing helper.
+    n = _CG_MAX_DEPTH + 1  # 13 hops from test_mod to placement
+    ctx = _make_bfs_ctx()
+    all_src: dict = {}
+    all_src["pkg.test_mod"] = "from pkg.mid0 import f0\n"
+    for i in range(n):
+        caller = f"f{i}"
+        if i < n - 1:
+            callee = f"f{i + 1}"
+            callee_mod = f"pkg.mid{i + 1}"
+        else:
+            callee = "helper"
+            callee_mod = "pkg.placement"
+        all_src[f"pkg.mid{i}"] = (
+            f"from {callee_mod} import {callee}\n" f"def {caller}(): {callee}()\n"
+        )
+    all_src["pkg.placement"] = "from external import use_fn\ndef helper(): use_fn()\n"
+    index = _CgIndex(
+        module_to_source=all_src,
+        module_to_package={m: "pkg" for m in all_src},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in all_src.items()},
+        file_to_module={},
+    )
+    path, cands, truncated = _resolve_forking_path_candidates(
+        "use_fn", "def test_f(): f0()\n", ctx, index, "pkg.test_mod"
+    )
+    assert path is None
+    assert truncated
+
+
+def test_resolve_forking_path_candidates_truncated_modules():
+    # Re-export chain of _CG_MAX_MODULES + 1 intermediate modules; the last one
+    # is cut off before pkg.placement (a terminal) is ever reached.
+    n = _CG_MAX_MODULES + 1
+    ctx = _make_bfs_ctx()
+    src_map: dict = {}
+    for i in range(n):
+        next_mod = f"pkg.m{i + 1}" if i < n - 1 else "pkg.placement"
+        src_map[f"pkg.m{i}"] = f"from {next_mod} import helper\n"
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    src_map["pkg.placement"] = placement_src
+    test_src = "from pkg.m0 import helper\n"
+    all_src = {"pkg.test_mod": test_src, **src_map}
+    index = _CgIndex(
+        module_to_source=all_src,
+        module_to_package={m: "pkg" for m in all_src},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in all_src.items()},
+        file_to_module={},
+    )
+    path, cands, truncated = _resolve_forking_path_candidates(
+        "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
+    )
+    assert path is None
+    assert truncated
+
+
+def test_resolve_forking_path_candidates_original_module_only():
+    # modified_source still has a function using use_fn; no new sub-file uses it.
+    # → only terminal is (pkg.orig, func_a) → unique resolution to original path.
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source=("from external import use_fn\n" "def func_a(): use_fn()\n"),
+        new_files={
+            "placement.py": "from external import other\ndef helper(): other()\n"
+        },
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    orig_src = ctx.modified_source
+    test_src = "from pkg.orig import func_a\n"
+    modules = {"pkg.test_mod": test_src, "pkg.orig": orig_src}
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
+        file_to_module={},
+    )
+    path, cands, truncated = _resolve_forking_path_candidates(
+        "use_fn", "def test_f(): func_a()\n", ctx, index, "pkg.test_mod"
+    )
+    assert path == "pkg.orig.use_fn"
+    assert cands == ["pkg.orig.use_fn"]
+    assert not truncated
+
+
+def test_resolve_forking_path_candidates_original_and_new_both_candidates():
+    # modified_source keeps func_a (uses use_fn); placement.py moves func_b
+    # (also uses use_fn).  Test calls both → 2 candidates → ambiguous.
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source=("from external import use_fn\n" "def func_a(): use_fn()\n"),
+        new_files={
+            "placement.py": (
+                "from external import use_fn\n" "def func_b(): use_fn()\n"
+            ),
+        },
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    orig_src = ctx.modified_source
+    placement_src = ctx.new_files["placement.py"]
+    test_src = "from pkg.orig import func_a\nfrom pkg.placement import func_b\n"
+    modules = {
+        "pkg.test_mod": test_src,
+        "pkg.orig": orig_src,
+        "pkg.placement": placement_src,
+    }
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
+        file_to_module={},
+    )
+    path, cands, truncated = _resolve_forking_path_candidates(
+        "use_fn",
+        "def test_f(): func_a(); func_b()\n",
+        ctx,
+        index,
+        "pkg.test_mod",
+    )
+    assert path is None  # ambiguous
+    assert sorted(cands) == ["pkg.orig.use_fn", "pkg.placement.use_fn"]
+    assert not truncated
+
+
+# ---------------------------------------------------------------------------
+# _candidates_check
+# ---------------------------------------------------------------------------
+
+
+def test_candidates_check_no_candidates():
+    # No candidates for any path → None.
+    assert _candidates_check({"pkg.orig.A": "pkg.sub.A"}, ["pkg.orig.A"], {}) is None
+
+
+def test_candidates_check_rename_valid():
+    # Rename is in candidates → None.
+    cands = {"pkg.orig.A": ["pkg.placement.A", "pkg.helpers.A"]}
+    assert (
+        _candidates_check({"pkg.orig.A": "pkg.placement.A"}, ["pkg.orig.A"], cands)
+        is None
+    )
+
+
+def test_candidates_check_rename_invalid():
+    # Rename proposes a path not in candidates → error message.
+    cands = {"pkg.orig.A": ["pkg.placement.A"]}
+    result = _candidates_check({"pkg.orig.A": "pkg.wrong.A"}, ["pkg.orig.A"], cands)
+    assert result is not None
+    assert "pkg.wrong.A" in result
+    assert "pkg.placement.A" in result
+
+
+def test_candidates_check_no_change_with_candidates():
+    # No rename proposed for a path that has candidates → error message.
+    cands = {"pkg.orig.A": ["pkg.placement.A"]}
+    result = _candidates_check({}, ["pkg.orig.A"], cands)
+    assert result is not None
+    assert "pkg.orig.A" in result
+    assert "pkg.placement.A" in result
+
+
+def test_candidates_check_path_not_in_candidates():
+    # Another path has no candidates → passes; only paths with candidates are checked.
+    cands = {"pkg.orig.A": ["pkg.placement.A"]}
+    # pkg.orig.B has no candidates; even though no rename proposed → None
+    assert _candidates_check({}, ["pkg.orig.B"], cands) is None
+
+
+# ---------------------------------------------------------------------------
+# _callgraph_update_file — candidates collected when multiple found
+# ---------------------------------------------------------------------------
+
+
+def test_callgraph_update_file_multiple_candidates_saved(tmp_path):
+    # Both placement and conflict are reachable → 2 candidates → saved.
+    test_src = (
+        "from pkg.placement import helper\n"
+        "from pkg.conflict import resolve\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(m):\n"
+        "    helper()\n"
+        "    resolve()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed, unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=index,
+    )
+    assert not changed  # ambiguous → no update
+    assert "test_f" in unresolved
+    assert "pkg.orig.use_fn" in unresolved["test_f"]
+    cands = unresolved["test_f"]["pkg.orig.use_fn"]
+    assert sorted(cands) == ["pkg.conflict.use_fn", "pkg.placement.use_fn"]
+
+
+def test_callgraph_update_file_resolved_clears_candidates(tmp_path):
+    # Single ctx with unique resolution → no candidates saved.
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.placement import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(m):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed, unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert "test_f" not in unresolved  # unique resolution → no candidates saved
+
+
+def test_callgraph_update_file_resolved_clears_function_entry(tmp_path):
+    # ctx_ambig gives 2 candidates (saves to unresolved); ctx_uniq resolves uniquely →
+    # unresolved entry for the function is deleted (line 2695).
+    test_src = (
+        "from pkg.placement import helper\n"
+        "from pkg.conflict import resolve\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(m):\n"
+        "    helper()\n"
+        "    resolve()\n"
+    )
+    ctx_ambig = _make_cuf_contexts()[0]  # both placement and conflict → 2 candidates
+    ctx_uniq = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="from .placement import helper\n",
+        new_files={
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n",
+        },
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed, unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx_ambig, ctx_uniq],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert "test_f" not in unresolved  # ctx_uniq resolved → entry deleted
+
+
+# ---------------------------------------------------------------------------
+# apply_patch_callgraph — candidates_out parameter
+# ---------------------------------------------------------------------------
+
+
+def test_apply_patch_callgraph_candidates_out_per_file(tmp_path):
+    # Multiple candidates → saved in candidates_out for per_file entry.
+    test_src = (
+        "from pkg.placement import helper\n"
+        "from pkg.conflict import resolve\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(m):\n"
+        "    helper()\n"
+        "    resolve()\n"
+    )
+    test_file = tmp_path / "test_orig.py"
+    test_file.write_text(test_src, encoding="utf-8")
+    per_file = {str(test_file): {"source": test_src, "msgs": []}}
+    candidates_out: dict = {}
+    list(
+        apply_patch_callgraph(
+            _make_cuf_contexts(), per_file, str(tmp_path), candidates_out=candidates_out
+        )
+    )
+    abs_fp = str(test_file.resolve())
+    assert abs_fp in candidates_out
+    assert "test_f" in candidates_out[abs_fp]
+
+
+def test_apply_patch_callgraph_candidates_out_disk_file(tmp_path):
+    # Multiple candidates → saved in candidates_out for disk file.
+    test_src = (
+        "from pkg.placement import helper\n"
+        "from pkg.conflict import resolve\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(m):\n"
+        "    helper()\n"
+        "    resolve()\n"
+    )
+    test_file = tmp_path / "test_orig.py"
+    test_file.write_text(test_src, encoding="utf-8")
+    candidates_out: dict = {}
+    list(
+        apply_patch_callgraph(
+            _make_cuf_contexts(), {}, str(tmp_path), candidates_out=candidates_out
+        )
+    )
+    abs_fp = str(test_file.resolve())
+    assert abs_fp in candidates_out
+    assert "test_f" in candidates_out[abs_fp]
+
+
+# ---------------------------------------------------------------------------
+# Prompt builders — candidates_per_path parameter
+# ---------------------------------------------------------------------------
+
+
+def _make_fl_ctx_simple():
+    """Minimal FLContext for prompt builder tests."""
+    return _FLContext(
+        filepath="/repo/pkg/big.py",
+        old_module="pkg.big",
+        original_source="from external import A\ndef f(): A()\n",
+        modified_source="from .sub_a import f\n",
+        new_files={"sub_a.py": "from external import A\ndef f(): A()\n"},
+        new_module_paths={"sub_a.py": "pkg.sub_a"},
+        entity_to_target={"f": "sub_a.py"},
+        forking_old_paths={"pkg.big.A"},
+    )
+
+
+def test_build_classify_prompt_with_candidates():
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    prompt = _build_classify_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        ["pkg.big.A"],
+        candidates_per_path={"pkg.big.A": ["pkg.sub_a.A", "pkg.sub_b.A"]},
+    )
+    assert "Call-graph candidate paths" in prompt
+    assert "pkg.sub_a.A" in prompt
+    assert "pkg.sub_b.A" in prompt
+
+
+def test_build_classify_prompt_candidates_above_threshold():
+    # Candidates count > threshold → section not included.
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    many_cands = [f"pkg.sub_{i}.A" for i in range(_CG_CANDIDATES_LLM_THRESHOLD + 1)]
+    prompt = _build_classify_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        ["pkg.big.A"],
+        candidates_per_path={"pkg.big.A": many_cands},
+    )
+    assert "Call-graph candidate paths" not in prompt
+
+
+def test_build_func_verify_prompt_with_candidates():
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    prompt = _build_func_verify_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        {"pkg.big.A": "pkg.sub_a.A"},
+        candidates_per_path={"pkg.big.A": ["pkg.sub_a.A", "pkg.sub_b.A"]},
+    )
+    assert "Call-graph candidate paths" in prompt
+    assert "pkg.sub_a.A" in prompt
+
+
+def test_build_func_verify_prompt_candidates_above_threshold():
+    # All candidate lists exceed the threshold → section not included.
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    many_cands = [f"pkg.sub_{i}.A" for i in range(_CG_CANDIDATES_LLM_THRESHOLD + 1)]
+    prompt = _build_func_verify_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        {"pkg.big.A": "pkg.sub_a.A"},
+        candidates_per_path={"pkg.big.A": many_cands},
+    )
+    assert "Call-graph candidate paths" not in prompt
+
+
+def test_build_no_change_verify_prompt_with_candidates():
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    prompt = _build_no_change_verify_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        ["pkg.big.A"],
+        candidates_per_path={"pkg.big.A": ["pkg.sub_a.A"]},
+    )
+    assert "Call-graph candidate paths" in prompt
+    assert "pkg.sub_a.A" in prompt
+
+
+def test_build_no_change_verify_prompt_candidates_above_threshold():
+    # All candidate lists exceed the threshold → section not included.
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    many_cands = [f"pkg.sub_{i}.A" for i in range(_CG_CANDIDATES_LLM_THRESHOLD + 1)]
+    prompt = _build_no_change_verify_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        ["pkg.big.A"],
+        candidates_per_path={"pkg.big.A": many_cands},
+    )
+    assert "Call-graph candidate paths" not in prompt
+
+
+def test_build_rewrite_func_prompt_with_candidates():
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    prompt = _build_rewrite_func_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        ["pkg.big.A"],
+        candidates_per_path={"pkg.big.A": ["pkg.sub_a.A", "pkg.helpers.A"]},
+    )
+    assert "Call-graph candidate paths" in prompt
+    assert "pkg.sub_a.A" in prompt
+    assert "pkg.helpers.A" in prompt
+
+
+def test_build_rewrite_func_prompt_candidates_above_threshold():
+    # All candidate lists exceed the threshold → section not included.
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    many_cands = [f"pkg.sub_{i}.A" for i in range(_CG_CANDIDATES_LLM_THRESHOLD + 1)]
+    prompt = _build_rewrite_func_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        ["pkg.big.A"],
+        candidates_per_path={"pkg.big.A": many_cands},
+    )
+    assert "Call-graph candidate paths" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# _patch_strings_in_text
+# ---------------------------------------------------------------------------
+
+
+def test_patch_strings_in_text_decorator():
+    text = '@patch("pkg.mod.A")\ndef test_f(m): pass\n'
+    assert _patch_strings_in_text(text) == {"pkg.mod.A"}
+
+
+def test_patch_strings_in_text_attribute_decorator():
+    text = '@mock.patch("pkg.mod.B")\ndef test_f(m): pass\n'
+    assert _patch_strings_in_text(text) == {"pkg.mod.B"}
+
+
+def test_patch_strings_in_text_context_manager():
+    text = 'def test_f():\n    with patch("pkg.mod.C") as m: pass\n'
+    assert _patch_strings_in_text(text) == {"pkg.mod.C"}
+
+
+def test_patch_strings_in_text_multiple():
+    text = (
+        '@patch("pkg.mod.A")\n' '@mock.patch("pkg.mod.B")\n' "def test_f(a, b): pass\n"
+    )
+    assert _patch_strings_in_text(text) == {"pkg.mod.A", "pkg.mod.B"}
+
+
+def test_patch_strings_in_text_empty():
+    assert _patch_strings_in_text("def test_f(): pass\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _rewrite_candidates_check
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_candidates_check_no_candidates():
+    # No candidates for any path → None.
+    text = '@patch("pkg.mod.A")\ndef test_f(m): pass\n'
+    assert _rewrite_candidates_check(["pkg.mod.A"], text, {}) is None
+
+
+def test_rewrite_candidates_check_valid_rename():
+    # Old path absent, one candidate present → None.
+    text = '@patch("pkg.placement.A")\ndef test_f(m): pass\n'
+    cands = {"pkg.mod.A": ["pkg.placement.A", "pkg.other.A"]}
+    assert _rewrite_candidates_check(["pkg.mod.A"], text, cands) is None
+
+
+def test_rewrite_candidates_check_old_still_present():
+    # Old path still present even though candidates exist → error.
+    text = '@patch("pkg.mod.A")\ndef test_f(m): pass\n'
+    cands = {"pkg.mod.A": ["pkg.placement.A"]}
+    result = _rewrite_candidates_check(["pkg.mod.A"], text, cands)
+    assert result is not None
+    assert "pkg.mod.A" in result
+    assert "pkg.placement.A" in result
+
+
+def test_rewrite_candidates_check_renamed_to_unknown():
+    # Old path absent but none of the candidates appear → error.
+    text = '@patch("pkg.wrong.A")\ndef test_f(m): pass\n'
+    cands = {"pkg.mod.A": ["pkg.placement.A", "pkg.other.A"]}
+    result = _rewrite_candidates_check(["pkg.mod.A"], text, cands)
+    assert result is not None
+    assert "pkg.placement.A" in result
+
+
+def test_rewrite_candidates_check_path_without_candidates_ignored():
+    # A path with no candidates in the dict → skip it.
+    text = '@patch("pkg.mod.B")\ndef test_f(m): pass\n'
+    cands = {"pkg.mod.A": ["pkg.placement.A"]}  # A has candidates, B does not
+    assert _rewrite_candidates_check(["pkg.mod.B"], text, cands) is None
+
+
+# ---------------------------------------------------------------------------
+# _build_rewrite_verify_prompt — candidates_per_path
+# ---------------------------------------------------------------------------
+
+
+def test_build_rewrite_verify_prompt_with_candidates():
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    prompt = _build_rewrite_verify_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        "def test_f(): pass\n",
+        candidates_per_path={"pkg.big.A": ["pkg.sub_a.A", "pkg.sub_b.A"]},
+    )
+    assert "Call-graph candidate paths" in prompt
+    assert "pkg.sub_a.A" in prompt
+
+
+def test_build_rewrite_verify_prompt_candidates_above_threshold():
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    many_cands = [f"pkg.sub_{i}.A" for i in range(_CG_CANDIDATES_LLM_THRESHOLD + 1)]
+    prompt = _build_rewrite_verify_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        "def test_f(): pass\n",
+        candidates_per_path={"pkg.big.A": many_cands},
+    )
+    assert "Call-graph candidate paths" not in prompt
+
+
+def test_build_rewrite_verify_prompt_no_candidates():
+    ctx = _make_fl_ctx_simple()
+    context_msg = _build_context_message([ctx])
+    prompt = _build_rewrite_verify_prompt(
+        context_msg,
+        "def test_f(): pass\n",
+        "def test_f(): pass\n",
+    )
+    assert "Call-graph candidate paths" not in prompt
+    assert "Verify that the rewrite is correct" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _process_file_source — candidates pre-check
+# ---------------------------------------------------------------------------
+
+
+_PATCH_MAKE_CLIENT = "crispen.patch_rewriter.make_client"
+_PATCH_GET_KEY_PR = "crispen.patch_rewriter.get_api_key"
+_PATCH_CALL_PR = "crispen.patch_rewriter.call_with_tool"
+
+
+def _make_process_cfg():
+    return CrispenConfig(patch_update_retries=1, llm_verify_retries=0)
+
+
+@mock_patch(_PATCH_CALL_PR)
+@mock_patch(_PATCH_MAKE_CLIENT)
+@mock_patch(_PATCH_GET_KEY_PR, return_value="key")
+def test_process_file_source_candidates_reject_no_change(
+    mock_key, mock_client, mock_call
+):
+    # LLM proposes no change but candidates exist → reject and retry.
+    # First classify: no rename → rejected by candidates check.
+    # Second classify: correct rename in candidates → verify → accepted.
+    src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
+    ctx = _FLContext(
+        filepath="/repo/pkg/big.py",
+        old_module="pkg.big",
+        original_source="from external import A\ndef f(): A()\n",
+        modified_source="from .sub_a import f\n",
+        new_files={"sub_a.py": "from external import A\ndef f(): A()\n"},
+        new_module_paths={"sub_a.py": "pkg.sub_a"},
+        entity_to_target={"f": "sub_a.py"},
+        forking_old_paths={"pkg.big.A"},
+    )
+    context_msg = _build_context_message([ctx])
+    mock_call.side_effect = [
+        # First classify: no rename (LLM says no change needed)
+        LLMCallResult(
+            tool_input={"needs_rewrite": False, "patch_renames": {}},
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        # Second classify (after candidates rejection): correct rename
+        LLMCallResult(
+            tool_input={
+                "needs_rewrite": False,
+                "patch_renames": {"pkg.big.A": "pkg.sub_a.A"},
+            },
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        # Verify rename
+        LLMCallResult(
+            tool_input={"correct": True, "corrections": {}, "issue": ""},
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+    ]
+    cg_candidates = {"test_f": {"pkg.big.A": ["pkg.sub_a.A"]}}
+    new_src, changed, _ = _process_file_source(
+        src,
+        {"pkg.big.A"},
+        context_msg,
+        mock_client.return_value,
+        _make_process_cfg(),
+        max_attempts=2,
+        cg_candidates=cg_candidates,
+    )
+    assert changed
+    assert "pkg.sub_a.A" in new_src
+    # Two classify calls + one verify call = 3
+    assert mock_call.call_count == 3
+
+
+@mock_patch(_PATCH_CALL_PR)
+@mock_patch(_PATCH_MAKE_CLIENT)
+@mock_patch(_PATCH_GET_KEY_PR, return_value="key")
+def test_process_file_source_candidates_reject_bad_rename(
+    mock_key, mock_client, mock_call
+):
+    # LLM proposes a rename not in candidates → rejected → retry with correct answer.
+    src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
+    ctx = _FLContext(
+        filepath="/repo/pkg/big.py",
+        old_module="pkg.big",
+        original_source="from external import A\ndef f(): A()\n",
+        modified_source="from .sub_a import f\n",
+        new_files={
+            "sub_a.py": "from external import A\ndef f(): A()\n",
+            "sub_b.py": "from external import A\ndef g(): A()\n",
+        },
+        new_module_paths={"sub_a.py": "pkg.sub_a", "sub_b.py": "pkg.sub_b"},
+        entity_to_target={"f": "sub_a.py"},
+        forking_old_paths={"pkg.big.A"},
+    )
+    context_msg = _build_context_message([ctx])
+    mock_call.side_effect = [
+        # First classify: wrong rename (not in candidates)
+        LLMCallResult(
+            tool_input={
+                "needs_rewrite": False,
+                "patch_renames": {"pkg.big.A": "pkg.sub_b.A"},
+            },
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        # Second classify: correct rename
+        LLMCallResult(
+            tool_input={
+                "needs_rewrite": False,
+                "patch_renames": {"pkg.big.A": "pkg.sub_a.A"},
+            },
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        # Verify
+        LLMCallResult(
+            tool_input={"correct": True, "corrections": {}, "issue": ""},
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+    ]
+    cg_candidates = {"test_f": {"pkg.big.A": ["pkg.sub_a.A"]}}
+    new_src, changed, _ = _process_file_source(
+        src,
+        {"pkg.big.A"},
+        context_msg,
+        mock_client.return_value,
+        _make_process_cfg(),
+        max_attempts=2,
+        cg_candidates=cg_candidates,
+    )
+    assert changed
+    assert "pkg.sub_a.A" in new_src
+    assert mock_call.call_count == 3
+
+
+@mock_patch(_PATCH_CALL_PR)
+@mock_patch(_PATCH_MAKE_CLIENT)
+@mock_patch(_PATCH_GET_KEY_PR, return_value="key")
+def test_process_file_source_rewrite_candidates_reject_and_retry(
+    mock_key, mock_client, mock_call
+):
+    # Rewrite returns old path still present → rewrite candidates check rejects
+    # without calling verify → retry; second rewrite uses valid candidate → accepted.
+    src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    complex_logic()\n'
+    ctx = _FLContext(
+        filepath="/repo/pkg/big.py",
+        old_module="pkg.big",
+        original_source="from external import A\ndef f(): A()\n",
+        modified_source="from .sub_a import f\n",
+        new_files={"sub_a.py": "from external import A\ndef f(): A()\n"},
+        new_module_paths={"sub_a.py": "pkg.sub_a"},
+        entity_to_target={"f": "sub_a.py"},
+        forking_old_paths={"pkg.big.A"},
+    )
+    context_msg = _build_context_message([ctx])
+    bad_rewrite = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    complex_logic()\n'
+    good_rewrite = '@patch("pkg.sub_a.A")\ndef test_f(mock_a):\n    complex_logic()\n'
+    mock_call.side_effect = [
+        # classify → needs rewrite
+        LLMCallResult(
+            tool_input={"needs_rewrite": True},
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        # rewrite 1: old path still present → rejected by _rewrite_candidates_check
+        LLMCallResult(
+            tool_input={"rewritten_function": bad_rewrite},
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        # rewrite 2: valid candidate
+        LLMCallResult(
+            tool_input={"rewritten_function": good_rewrite},
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        # verify
+        LLMCallResult(
+            tool_input={"correct": True, "issue": ""},
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+    ]
+    cg_candidates = {"test_f": {"pkg.big.A": ["pkg.sub_a.A"]}}
+    new_src, changed, _ = _process_file_source(
+        src,
+        {"pkg.big.A"},
+        context_msg,
+        mock_client.return_value,
+        _make_process_cfg(),
+        max_attempts=2,
+        cg_candidates=cg_candidates,
+    )
+    assert changed
+    assert "pkg.sub_a.A" in new_src
+    assert mock_call.call_count == 4  # classify + bad_rw + good_rw + verify
 
 
 # ---------------------------------------------------------------------------
