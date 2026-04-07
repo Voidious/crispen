@@ -1189,6 +1189,61 @@ def _cg_build_index(
     )
 
 
+def _expand_module_terminals(
+    src: str,
+    module: str,
+    forking_name: str,
+    terminal: Dict[Tuple[str, str], str],
+) -> None:
+    """Expand *terminal* in-place with transitive callers within *module*.
+
+    After direct references to *forking_name* are seeded into *terminal*, this
+    finds all locally-defined functions that call (directly or transitively)
+    any of those seed functions and adds them as terminals for the same path.
+
+    Example: if ``_helper`` directly calls ``use_fn`` and ``public_func`` calls
+    ``_helper``, both will be in the terminal after expansion — so the BFS can
+    match a test that calls ``public_func`` without needing to traverse inside
+    the sub-module.
+    """
+    direct = {f_name for (mod, f_name) in terminal if mod == module}
+    if not direct:
+        return
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return
+    # Collect top-level function names defined in this module.
+    local_defs: Set[str] = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    # For each local function, record which other local functions it calls.
+    local_calls: Dict[str, Set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        calls: Set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                if child.func.id in local_defs:
+                    calls.add(child.func.id)
+        local_calls[node.name] = calls
+    # Fixed-point expansion: add callers of already-reachable functions.
+    reachable = set(direct)
+    changed = True
+    while changed:
+        changed = False
+        for f_name, called_locals in local_calls.items():
+            if f_name not in reachable and called_locals & reachable:
+                reachable.add(f_name)
+                changed = True
+    new_path = f"{module}.{forking_name}"
+    for f_name in reachable - direct:
+        terminal[(module, f_name)] = new_path
+
+
 def _resolve_forking_path_candidates(
     forking_name: str,
     func_text: str,
@@ -1231,6 +1286,7 @@ def _resolve_forking_path_candidates(
             continue
         for f_name in ref_map[forking_name]:
             terminal[(new_mod, f_name)] = f"{new_mod}.{forking_name}"
+        _expand_module_terminals(src, new_mod, forking_name, terminal)
 
     # Original module: use the post-split source so only functions that actually
     # remained there (and still reference forking_name) contribute terminals.
@@ -1238,6 +1294,9 @@ def _resolve_forking_path_candidates(
         orig_ref_map = _name_reference_map(ctx.modified_source)
         for f_name in orig_ref_map.get(forking_name, []):
             terminal[(ctx.old_module, f_name)] = f"{ctx.old_module}.{forking_name}"
+        _expand_module_terminals(
+            ctx.modified_source, ctx.old_module, forking_name, terminal
+        )
 
     if not terminal:
         return None, [], False
@@ -1294,6 +1353,10 @@ def _resolve_forking_path_candidates(
                     next_mod, next_name = mod_imports[called_name]
                     if (next_mod, next_name) not in visited:
                         queue.append((next_mod, next_name, depth + 1))
+                elif called_name in index.module_to_defs.get(module, set()):
+                    # Locally defined in the same module — follow at same depth.
+                    if (module, called_name) not in visited:
+                        queue.append((module, called_name, depth))
         else:
             # Not defined here — follow a module-level re-export if present.
             mod_imports = index.get_imports(module)

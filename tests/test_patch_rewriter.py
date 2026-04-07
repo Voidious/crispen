@@ -16,6 +16,7 @@ from crispen.patch_rewriter import (
     _CG_MAX_DEPTH,
     _CG_MAX_MODULES,
     _apply_cross_file_const_updates,
+    _expand_module_terminals,
     _build_attr_const_map,
     _build_classify_prompt,
     _build_const_map,
@@ -5369,6 +5370,157 @@ def test_resolve_forking_path_candidates_original_and_new_both_candidates():
     )
     assert path is None  # ambiguous
     assert sorted(cands) == ["pkg.orig.use_fn", "pkg.placement.use_fn"]
+    assert not truncated
+
+
+# ---------------------------------------------------------------------------
+# _expand_module_terminals
+# ---------------------------------------------------------------------------
+
+
+def test_expand_module_terminals_no_direct():
+    # No direct terminal in this module → nothing added.
+    terminal: dict = {}
+    _expand_module_terminals(
+        "def a(): b()\ndef b(): pass\n", "pkg.mod", "use_fn", terminal
+    )
+    assert terminal == {}
+
+
+def test_expand_module_terminals_direct_only():
+    # A direct terminal is seeded before calling; only transitive callers are added.
+    terminal: dict = {("pkg.mod", "b"): "pkg.mod.use_fn"}
+    _expand_module_terminals(
+        "def a(): b()\ndef b(): use_fn()\n", "pkg.mod", "use_fn", terminal
+    )
+    # a calls b (direct terminal) → a becomes transitive terminal.
+    assert terminal[("pkg.mod", "a")] == "pkg.mod.use_fn"
+    # Original direct entry unchanged.
+    assert terminal[("pkg.mod", "b")] == "pkg.mod.use_fn"
+
+
+def test_expand_module_terminals_multi_level():
+    # c → b → a (direct); all three end up in terminal.
+    terminal: dict = {("pkg.mod", "a"): "pkg.mod.use_fn"}
+    src = "def a(): use_fn()\ndef b(): a()\ndef c(): b()\n"
+    _expand_module_terminals(src, "pkg.mod", "use_fn", terminal)
+    assert ("pkg.mod", "b") in terminal
+    assert ("pkg.mod", "c") in terminal
+
+
+def test_expand_module_terminals_syntax_error():
+    # Unparseable source → silently returns without modifying terminal.
+    terminal: dict = {("pkg.mod", "a"): "pkg.mod.use_fn"}
+    _expand_module_terminals("def (broken\n", "pkg.mod", "use_fn", terminal)
+    # Only the original entry remains.
+    assert list(terminal.keys()) == [("pkg.mod", "a")]
+
+
+def test_expand_module_terminals_unrelated_module():
+    # Direct terminal is in a different module → nothing added for pkg.other.
+    terminal: dict = {("pkg.mod", "a"): "pkg.mod.use_fn"}
+    _expand_module_terminals("def b(): a()\n", "pkg.other", "use_fn", terminal)
+    # b is in pkg.other which has no direct terminals → not added.
+    assert ("pkg.other", "b") not in terminal
+
+
+# ---------------------------------------------------------------------------
+# BFS local-call following (intra-module)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_forking_path_candidates_intra_module_chain():
+    # BFS follows locally-defined calls within a non-terminal intermediate module.
+    # Chain: test_mod → pkg.service.public_func
+    #                        (local) ↓
+    #                   pkg.service._local_helper
+    #                        (import) ↓
+    #                   pkg.placement.use_target  ← terminal (calls use_fn)
+    #
+    # pkg.service is neither orig nor a new sub-file, so _expand_module_terminals
+    # never seeds it.  The elif branch in the BFS must queue _local_helper from
+    # public_func's body so we eventually reach the terminal in pkg.placement.
+    placement_src = "from external import use_fn\ndef use_target(): use_fn()\n"
+    service_src = (
+        "from pkg.placement import use_target\n"
+        "def _local_helper(): use_target()\n"
+        "def public_func(): _local_helper()\n"
+    )
+    ctx2 = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="from .placement import use_target\n",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={"use_target": "placement.py"},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = "from pkg.service import public_func\n"
+    modules = {
+        "pkg.test_mod": test_src,
+        "pkg.service": service_src,
+        "pkg.placement": placement_src,
+    }
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
+        file_to_module={},
+    )
+    path, cands, truncated = _resolve_forking_path_candidates(
+        "use_fn",
+        "def test_f(): public_func()\n",
+        ctx2,
+        index,
+        "pkg.test_mod",
+    )
+    assert path == "pkg.placement.use_fn"
+    assert cands == ["pkg.placement.use_fn"]
+    assert not truncated
+
+
+def test_resolve_forking_path_candidates_intra_module_local_already_visited():
+    # The elif branch fires but the visited guard suppresses re-queuing.
+    # A recursive function calls itself: when processing its body calls, itself
+    # is already in visited → (module, called_name) in visited → branch skipped.
+    placement_src = "from external import use_fn\ndef use_target(): use_fn()\n"
+    service_src = (
+        "from pkg.placement import use_target\n"
+        # recursive_func calls use_target (imported) AND itself (local, recursive)
+        "def recursive_func(n): use_target() if n <= 0 else recursive_func(n-1)\n"
+    )
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="from .placement import use_target\n",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={"use_target": "placement.py"},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = "from pkg.service import recursive_func\n"
+    modules = {
+        "pkg.test_mod": test_src,
+        "pkg.service": service_src,
+        "pkg.placement": placement_src,
+    }
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
+        file_to_module={},
+    )
+    path, cands, truncated = _resolve_forking_path_candidates(
+        "use_fn",
+        "def test_f(): recursive_func(5)\n",
+        ctx,
+        index,
+        "pkg.test_mod",
+    )
+    # recursive_func's body calls reach use_target (terminal in pkg.placement).
+    assert path == "pkg.placement.use_fn"
     assert not truncated
 
 
