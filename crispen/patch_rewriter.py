@@ -1301,7 +1301,14 @@ def _resolve_forking_path_candidates(
     if not terminal:
         return None, [], False
 
-    new_module_set = set(ctx.new_module_paths.values())
+    # Exclude __init__.py entries: the package __init__ acts as a transparent
+    # re-export shim after a split and should be traversed like any other module
+    # so BFS can follow calls through it to the implementing sub-module.
+    new_module_set = {
+        mod
+        for rel, mod in ctx.new_module_paths.items()
+        if not rel.endswith("__init__.py")
+    }
 
     visited: Set[Tuple[str, str]] = set()
     modules_seen: Set[str] = set()

@@ -4417,6 +4417,44 @@ def test_resolve_callgraph_new_submodule_non_terminal():
     assert result is None
 
 
+def test_resolve_callgraph_init_reexport():
+    # pkg/orig.py split into pkg/orig/__init__.py (re-exports helper) and
+    # pkg/orig/placement.py (defines helper, uses use_fn).
+    # Test imports helper from pkg.orig (the new __init__).
+    # __init__ is excluded from new_module_set so BFS traverses through it
+    # and follows the re-export to placement.py, finding the terminal.
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={
+            "orig/__init__.py": "from .placement import helper\n",
+            "orig/placement.py": (
+                "from external import use_fn\ndef helper(): use_fn()\n"
+            ),
+        },
+        new_module_paths={
+            "orig/__init__.py": "pkg.orig",
+            "orig/placement.py": "pkg.orig.placement",
+        },
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    init_src = "from .placement import helper\n"
+    test_src = "from pkg.orig import helper\n"
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.orig": init_src},
+        module_to_package={"pkg.test_mod": "pkg", "pkg.orig": "pkg.orig"},
+        module_to_defs={"pkg.test_mod": set(), "pkg.orig": set()},
+        file_to_module={},
+    )
+    result = _resolve_forking_path_via_callgraph(
+        "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
+    )
+    assert result == "pkg.orig.placement.use_fn"
+
+
 def test_resolve_callgraph_visited_dedup():
     # 'intermediary' and 'inter2' both map to same (module, func); processed once.
     ctx = _make_bfs_ctx()
