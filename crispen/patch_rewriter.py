@@ -1250,25 +1250,30 @@ def _resolve_forking_path_candidates(
     ctx: _FLContext,
     index: _CgIndex,
     calling_module: str,
-) -> Tuple[Optional[str], List[str], bool]:
+) -> Tuple[Optional[str], List[str], bool, List[str]]:
     """BFS call-graph resolution returning the full candidate set.
 
-    Returns ``(resolved_path, sorted_candidates, truncated)`` where:
+    Returns ``(resolved_path, sorted_candidates, truncated, static_candidates)``
+    where:
 
     - ``resolved_path`` — the single new dotted path when exactly one candidate
       is found; ``None`` when zero or multiple candidates exist or when the
       pre-check fails.
-    - ``sorted_candidates`` — all candidate paths discovered (may be empty).
+    - ``sorted_candidates`` — BFS-reachable candidate paths (may be empty).
       Only meaningful when ``truncated`` is ``False``; when limits were hit the
       list may be incomplete so callers must not rely on it for validation.
     - ``truncated`` — ``True`` when :data:`_CG_MAX_DEPTH` or
       :data:`_CG_MAX_MODULES` was reached during traversal, indicating the
       candidate list may be incomplete.
+    - ``static_candidates`` — all possible new paths derived from the terminal
+      set (independent of BFS reachability).  When ``sorted_candidates`` is
+      empty and ``truncated`` is ``False``, callers may fall back to this set
+      as the constraint for LLM prompts and verification.
     """
     if not calling_module:
-        return None, [], False
+        return None, [], False, []
     if forking_name not in _get_external_import_names(ctx.original_source):
-        return None, [], False
+        return None, [], False, []
 
     # Terminal set: (module_path, func_name) → new dotted path.
     # Includes new sub-modules AND the original module: if some functions that
@@ -1299,7 +1304,11 @@ def _resolve_forking_path_candidates(
         )
 
     if not terminal:
-        return None, [], False
+        return None, [], False, []
+
+    # Static candidates: all possible new paths from the terminal set, before
+    # BFS filtering.  Used as fallback when BFS finds no reachable candidates.
+    static_cands = sorted(set(terminal.values()))
 
     # Exclude __init__.py entries: the package __init__ acts as a transparent
     # re-export shim after a split and should be traversed like any other module
@@ -1374,8 +1383,8 @@ def _resolve_forking_path_candidates(
 
     sorted_cands = sorted(candidates)
     if len(candidates) == 1:
-        return next(iter(candidates)), sorted_cands, truncated
-    return None, sorted_cands, truncated
+        return next(iter(candidates)), sorted_cands, truncated, static_cands
+    return None, sorted_cands, truncated, static_cands
 
 
 def _resolve_forking_path_via_callgraph(
@@ -1400,7 +1409,7 @@ def _resolve_forking_path_via_callgraph(
     Limits: :data:`_CG_MAX_DEPTH` hops and :data:`_CG_MAX_MODULES` distinct
     modules per resolution attempt.
     """
-    path, _, _ = _resolve_forking_path_candidates(
+    path, _, _, _ = _resolve_forking_path_candidates(
         forking_name, func_text, ctx, index, calling_module
     )
     return path
@@ -2832,10 +2841,12 @@ def _callgraph_update_file(
                 if old_path not in ctx.forking_old_paths:
                     continue
                 if index is None:
-                    new_path, cands, truncated = None, [], False
+                    new_path, cands, truncated, static_cands = None, [], False, []
                 else:
-                    new_path, cands, truncated = _resolve_forking_path_candidates(
-                        name, func.full_text, ctx, index, calling_module
+                    new_path, cands, truncated, static_cands = (
+                        _resolve_forking_path_candidates(
+                            name, func.full_text, ctx, index, calling_module
+                        )
                     )
                 if new_path is not None:
                     resolved[old_path] = new_path
@@ -2845,11 +2856,28 @@ def _callgraph_update_file(
                     if not func_cands and func.function_name in unresolved_candidates:
                         del unresolved_candidates[func.function_name]
                     break
-                # Multiple candidates without truncation → save for rewrite mode.
+                # Multiple BFS candidates without truncation → save for rewrite mode.
                 if len(cands) > 1 and not truncated:
                     unresolved_candidates.setdefault(func.function_name, {})[
                         old_path
                     ] = cands
+                elif len(cands) == 0 and not truncated and static_cands:
+                    # BFS found no reachable candidates; fall back to the full
+                    # static terminal set (all new modules that use the entity).
+                    if len(static_cands) == 1:
+                        resolved[old_path] = static_cands[0]
+                        func_cands = unresolved_candidates.get(func.function_name, {})
+                        func_cands.pop(old_path, None)
+                        if (
+                            not func_cands
+                            and func.function_name in unresolved_candidates
+                        ):
+                            del unresolved_candidates[func.function_name]
+                        break
+                    else:
+                        unresolved_candidates.setdefault(func.function_name, {})[
+                            old_path
+                        ] = static_cands
 
         if not resolved:
             # Nothing resolved — record passthroughs for any const refs.

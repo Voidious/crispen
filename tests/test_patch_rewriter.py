@@ -4829,12 +4829,13 @@ def test_callgraph_update_file_string_literal_resolved(tmp_path):
 
 def test_callgraph_update_file_no_resolution(tmp_path):
     # Test calls 'unrelated' — not imported → BFS queue empty → no resolution.
+    # Static fallback has 2 candidates (placement + conflict) → unresolved saved.
     test_src = (
         '@patch("pkg.orig.use_fn")\n' "def test_f(mock_use_fn):\n" "    unrelated()\n"
     )
     scan = str(tmp_path / "test_foo.py")
     index = _make_cuf_index(scan, test_src)
-    result, changed, _unresolved = _callgraph_update_file(
+    result, changed, unresolved = _callgraph_update_file(
         test_src,
         {"pkg.orig.use_fn"},
         _make_cuf_contexts(),
@@ -4842,6 +4843,77 @@ def test_callgraph_update_file_no_resolution(tmp_path):
         index=index,
     )
     assert not changed
+    cands = unresolved.get("test_f", {}).get("pkg.orig.use_fn", [])
+    assert sorted(cands) == ["pkg.conflict.use_fn", "pkg.placement.use_fn"]
+
+
+def test_callgraph_update_file_zero_cands_single_static_auto_resolve(tmp_path):
+    # BFS finds 0 candidates but static terminal has exactly 1 → auto-resolve.
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        '@patch("pkg.orig.use_fn")\n' "def test_f(mock_use_fn):\n" "    unrelated()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed, unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.placement.use_fn")' in result
+    assert "test_f" not in unresolved
+
+
+def test_callgraph_update_file_zero_cands_single_static_clears_unresolved(tmp_path):
+    # ctx_ambig: BFS finds 2 candidates (saves to unresolved).
+    # ctx_uniq_static: BFS finds 0, static has 1 → auto-resolves AND clears the
+    # previously saved unresolved entry (exercises the delete-entry branch).
+    test_src = (
+        "from pkg.placement import helper\n"
+        "from pkg.conflict import resolve\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(m):\n"
+        "    helper()\n"
+        "    resolve()\n"
+    )
+    ctx_ambig = _make_cuf_contexts()[0]  # placement + conflict → 2 BFS candidates
+    ctx_uniq_static = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"singleton.py": "from external import use_fn\ndef fn(): use_fn()\n"},
+        new_module_paths={"singleton.py": "pkg.singleton"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    scan = str(tmp_path / "test_foo.py")
+    # Index only knows pkg.test_mod; pkg.placement/conflict have no source so
+    # ctx_uniq_static's BFS reaches 0 candidates while static_cands = 1.
+    index = _make_cuf_index(scan, test_src)
+    result, changed, unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx_ambig, ctx_uniq_static],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.singleton.use_fn")' in result
+    assert "test_f" not in unresolved  # static single-cand cleared the entry
 
 
 def test_callgraph_update_file_const_ref_unanimous(tmp_path):
@@ -5240,7 +5312,7 @@ def test_resolve_forking_path_candidates_single():
     # Single candidate: path returned, candidates=[path], truncated=False.
     ctx = _make_bfs_ctx()
     index = _make_bfs_index("from pkg.placement import helper\n")
-    path, cands, truncated = _resolve_forking_path_candidates(
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
         "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
     )
     assert path == "pkg.placement.use_fn"
@@ -5253,7 +5325,7 @@ def test_resolve_forking_path_candidates_multiple():
     ctx = _make_bfs_ctx()
     test_src = "from pkg.placement import helper\nfrom pkg.conflict import resolve\n"
     index = _make_bfs_index(test_src)
-    path, cands, truncated = _resolve_forking_path_candidates(
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
         "use_fn",
         "def test_f(): helper(); resolve()\n",
         ctx,
@@ -5268,7 +5340,7 @@ def test_resolve_forking_path_candidates_multiple():
 def test_resolve_forking_path_candidates_no_calling_module():
     ctx = _make_bfs_ctx()
     index = _make_bfs_index("from pkg.placement import helper\n")
-    path, cands, truncated = _resolve_forking_path_candidates(
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
         "use_fn", "def test_f(): helper()\n", ctx, index, ""
     )
     assert path is None
@@ -5303,7 +5375,7 @@ def test_resolve_forking_path_candidates_truncated_depth():
         module_to_defs={m: _cg_collect_defined_names(s) for m, s in all_src.items()},
         file_to_module={},
     )
-    path, cands, truncated = _resolve_forking_path_candidates(
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
         "use_fn", "def test_f(): f0()\n", ctx, index, "pkg.test_mod"
     )
     assert path is None
@@ -5329,7 +5401,7 @@ def test_resolve_forking_path_candidates_truncated_modules():
         module_to_defs={m: _cg_collect_defined_names(s) for m, s in all_src.items()},
         file_to_module={},
     )
-    path, cands, truncated = _resolve_forking_path_candidates(
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
         "use_fn", "def test_f(): helper()\n", ctx, index, "pkg.test_mod"
     )
     assert path is None
@@ -5360,7 +5432,7 @@ def test_resolve_forking_path_candidates_original_module_only():
         module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
         file_to_module={},
     )
-    path, cands, truncated = _resolve_forking_path_candidates(
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
         "use_fn", "def test_f(): func_a()\n", ctx, index, "pkg.test_mod"
     )
     assert path == "pkg.orig.use_fn"
@@ -5399,7 +5471,7 @@ def test_resolve_forking_path_candidates_original_and_new_both_candidates():
         module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
         file_to_module={},
     )
-    path, cands, truncated = _resolve_forking_path_candidates(
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
         "use_fn",
         "def test_f(): func_a(); func_b()\n",
         ctx,
@@ -5506,7 +5578,7 @@ def test_resolve_forking_path_candidates_intra_module_chain():
         module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
         file_to_module={},
     )
-    path, cands, truncated = _resolve_forking_path_candidates(
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
         "use_fn",
         "def test_f(): public_func()\n",
         ctx2,
@@ -5550,7 +5622,7 @@ def test_resolve_forking_path_candidates_intra_module_local_already_visited():
         module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
         file_to_module={},
     )
-    path, cands, truncated = _resolve_forking_path_candidates(
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
         "use_fn",
         "def test_f(): recursive_func(5)\n",
         ctx,
