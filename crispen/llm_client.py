@@ -108,11 +108,11 @@ def call_with_tool(
     HTTP 429 rate-limit responses are retried up to *rate_limit_retries* times
     with exponential backoff starting at *rate_limit_backoff* seconds.
     """
-    t0 = time.perf_counter()
     _rl_delay = rate_limit_backoff
     if provider == "anthropic":
         for _attempt in range(rate_limit_retries + 1):  # pragma: no branch
             try:
+                t0 = time.perf_counter()
                 response = client.messages.create(
                     model=model,
                     max_tokens=max_tokens,
@@ -180,6 +180,7 @@ def call_with_tool(
             create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         for _attempt in range(rate_limit_retries + 1):  # pragma: no branch
             try:
+                t0 = time.perf_counter()
                 response = client.chat.completions.create(**create_kwargs)
                 break
             except openai.BadRequestError as exc:
