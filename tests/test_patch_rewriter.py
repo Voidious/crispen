@@ -9,6 +9,7 @@ import libcst as cst
 from crispen.config import CrispenConfig
 from crispen.llm_client import LLMCallResult
 from crispen.patch_rewriter import (
+    _ConstRef,
     _FLContext,
     RewriteAccumulator,
     _CgIndex,
@@ -54,6 +55,7 @@ from crispen.patch_rewriter import (
     _resolve_forking_path_via_callgraph,
     _resolve_import_to_file,
     _splice_function,
+    _restore_const_refs,
     _substitute_consts_in_func_text,
     apply_patch_callgraph,
     apply_patch_rewrite,
@@ -2608,6 +2610,51 @@ def test_process_verbose_rewrite_compile_retry(mock_call, capsys):
 
 
 # ---------------------------------------------------------------------------
+# _process_file_source — const ref restoration after full rewrite
+# ---------------------------------------------------------------------------
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_rewrite_restores_unchanged_const_ref(mock_call):
+    """After full rewrite, @patch("value") left unchanged → reverted to @patch(NAME)."""
+    src = (
+        'STABLE = "pkg.stable.X"\n'
+        'TARGET = "pkg.big.A"\n\n'
+        "@patch(STABLE)\n"
+        "@patch(TARGET)\n"
+        "def test_f(mock_stable, mock_target):\n"
+        "    pass\n"
+    )
+    # LLM updates TARGET but leaves STABLE's substituted literal unchanged.
+    rewritten = (
+        '@patch("pkg.stable.X")\n'
+        '@patch("pkg.sub_a.A")\n'
+        "def test_f(mock_stable, mock_target):\n"
+        "    pass\n"
+    )
+    mock_call.side_effect = [
+        _ok({"needs_rewrite": True}),
+        _ok({"rewritten_function": rewritten}),
+        _ok({"correct": True, "issue": ""}),
+    ]
+    result, changed, _ = _process_file_source(
+        src,
+        {"pkg.big.A"},
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file="tests/test_foo.py",
+    )
+    assert changed is True
+    # STABLE decorator reverted to named constant form.
+    assert "@patch(STABLE)" in result
+    assert '@patch("pkg.stable.X")' not in result
+    # TARGET decorator keeps the LLM's updated literal value.
+    assert '@patch("pkg.sub_a.A")' in result
+
+
+# ---------------------------------------------------------------------------
 # apply_patch_rewrite
 # ---------------------------------------------------------------------------
 
@@ -3123,6 +3170,115 @@ def test_substitute_attr_non_name_base():
     code = "@patch(a.b.c)\ndef test_f(mock):\n    pass\n"
     result = _substitute_consts_in_func_text(code, {"a.b.c": "should.not.replace"})
     assert "@patch(a.b.c)" in result
+
+
+# ---------------------------------------------------------------------------
+# _restore_const_refs
+# ---------------------------------------------------------------------------
+
+
+def _make_ref(const_name: str, resolved_value: str) -> _ConstRef:
+    return _ConstRef(
+        const_name=const_name,
+        source_file="/proj/tests/helpers.py",
+        resolved_value=resolved_value,
+        patch_dec_idx=0,
+    )
+
+
+def test_restore_reverts_unchanged_plain_name():
+    """@patch("value") whose value matches a const_ref → reverted to @patch(NAME)."""
+    code = '@patch("myapp.svc.MyClass")\ndef test_f(mock): pass\n'
+    refs = [_make_ref("TARGET", "myapp.svc.MyClass")]
+    result = _restore_const_refs(code, refs)
+    assert "@patch(TARGET)" in result
+    assert '"myapp.svc.MyClass"' not in result
+
+
+def test_restore_reverts_unchanged_attr_form():
+    """@patch("value") matching module.CONST ref → reverted to @patch(module.CONST)."""
+    code = '@patch("myapp.svc.MyClass")\ndef test_f(mock): pass\n'
+    refs = [_make_ref("constants.TARGET", "myapp.svc.MyClass")]
+    result = _restore_const_refs(code, refs)
+    assert "@patch(constants.TARGET)" in result
+    assert '"myapp.svc.MyClass"' not in result
+
+
+def test_restore_leaves_changed_value_as_literal():
+    """@patch("new.value") where new.value is not in const_refs → kept as literal."""
+    code = '@patch("myapp.new.MyClass")\ndef test_f(mock): pass\n'
+    refs = [_make_ref("TARGET", "myapp.old.MyClass")]
+    result = _restore_const_refs(code, refs)
+    assert '@patch("myapp.new.MyClass")' in result
+
+
+def test_restore_empty_refs_unchanged():
+    """No const_refs → text returned as-is."""
+    code = '@patch("myapp.svc.MyClass")\ndef test_f(mock): pass\n'
+    assert _restore_const_refs(code, []) == code
+
+
+def test_restore_parse_error_returns_original():
+    """Unparseable text → original returned unchanged."""
+    code = "def f(:\n"
+    refs = [_make_ref("TARGET", "myapp.svc.X")]
+    assert _restore_const_refs(code, refs) == code
+
+
+def test_restore_empty_args_patch_unchanged():
+    """@patch() with no args → left as-is."""
+    code = "@patch()\ndef test_f(): pass\n"
+    refs = [_make_ref("TARGET", "myapp.svc.MyClass")]
+    assert _restore_const_refs(code, refs) == code
+
+
+def test_restore_non_string_arg_unchanged():
+    """@patch(NAME) where arg is a Name node (not SimpleString) → left as-is."""
+    code = "@patch(OTHER_NAME)\ndef test_f(mock): pass\n"
+    refs = [_make_ref("TARGET", "myapp.svc.MyClass")]
+    result = _restore_const_refs(code, refs)
+    assert "@patch(OTHER_NAME)" in result
+
+
+def test_restore_non_patch_call_untouched():
+    """other_func("value") is not a patch call → left as-is."""
+    code = (
+        '@patch("myapp.svc.MyClass")\n'
+        "def test_f(mock):\n"
+        '    other_func("myapp.svc.OtherClass")\n'
+    )
+    refs = [
+        _make_ref("TARGET", "myapp.svc.MyClass"),
+        _make_ref("OTHER", "myapp.svc.OtherClass"),
+    ]
+    result = _restore_const_refs(code, refs)
+    assert "@patch(TARGET)" in result
+    assert 'other_func("myapp.svc.OtherClass")' in result
+
+
+def test_restore_single_quote_string():
+    """SimpleString with single quotes → still reverted."""
+    code = "@patch('myapp.svc.MyClass')\ndef test_f(mock): pass\n"
+    refs = [_make_ref("TARGET", "myapp.svc.MyClass")]
+    result = _restore_const_refs(code, refs)
+    assert "@patch(TARGET)" in result
+
+
+def test_restore_partial_revert_mixed():
+    """One decorator changed, one unchanged → only unchanged one is reverted."""
+    code = (
+        '@patch("myapp.svc.MyClass")\n'
+        '@patch("myapp.new.Y")\n'
+        "def test_f(m1, m2): pass\n"
+    )
+    # MyClass unchanged (should revert), Y was updated by LLM (keep literal)
+    refs = [
+        _make_ref("TARGET", "myapp.svc.MyClass"),
+        _make_ref("Y_CONST", "myapp.old.Y"),  # old value; new value won't match
+    ]
+    result = _restore_const_refs(code, refs)
+    assert "@patch(TARGET)" in result
+    assert '@patch("myapp.new.Y")' in result
 
 
 # ---------------------------------------------------------------------------

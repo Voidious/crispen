@@ -534,6 +534,55 @@ def _substitute_consts_in_func_text(
     return tree.visit(_ConstSubstitutor(substitutions)).code
 
 
+class _ConstReverter(cst.CSTTransformer):
+    """Reverse ``@patch("value")`` → ``@patch(NAME)`` for unchanged constants."""
+
+    def __init__(self, reverse_map: Dict[str, str]) -> None:
+        self._rev = reverse_map  # {resolved_value: const_name}
+
+    def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.Call:
+        if not _is_patch_call(updated_node):
+            return updated_node
+        if not updated_node.args:
+            return updated_node
+        arg0 = updated_node.args[0].value
+        if not isinstance(arg0, cst.SimpleString):
+            return updated_node
+        inner = ast.literal_eval(arg0.value)
+        if not isinstance(inner, str) or inner not in self._rev:
+            return updated_node
+        const_name = self._rev[inner]
+        if "." in const_name:
+            mod, attr = const_name.split(".", 1)
+            new_arg_val: cst.BaseExpression = cst.Attribute(
+                value=cst.Name(mod),
+                attr=cst.Name(attr),
+                dot=cst.Dot(),
+            )
+        else:
+            new_arg_val = cst.Name(const_name)
+        new_arg = updated_node.args[0].with_changes(value=new_arg_val)
+        return updated_node.with_changes(args=(new_arg,) + updated_node.args[1:])
+
+
+def _restore_const_refs(func_text: str, const_refs: List["_ConstRef"]) -> str:
+    """Restore @patch constant references the LLM left as their substituted values.
+
+    Before calling the LLM, constant names are expanded to their string values
+    (``@patch(NAME)`` → ``@patch("value")``).  Any decorator the LLM left with
+    the original value should be reverted to the named-constant form so the
+    output file matches the source style.
+    """
+    if not const_refs:
+        return func_text
+    reverse_map = {ref.resolved_value: ref.const_name for ref in const_refs}
+    try:
+        tree = cst.parse_module(func_text)
+    except cst.ParserSyntaxError:
+        return func_text
+    return tree.visit(_ConstReverter(reverse_map)).code
+
+
 # ---------------------------------------------------------------------------
 # Body scan: collect patch() paths from ``with patch(...)`` context managers
 # ---------------------------------------------------------------------------
@@ -2192,6 +2241,11 @@ def _process_file_source(
                     if not _compiles(new_func_text):
                         prev_error = "Rewritten function is not valid Python."
                         continue
+                    # Restore any @patch constant references the LLM left unchanged.
+                    if func.const_refs:
+                        new_func_text = _restore_const_refs(
+                            new_func_text, func.const_refs
+                        )
                     # Candidates pre-check: algorithmic validation before LLM verify.
                     if func_candidates:
                         rw_cand_issue = _rewrite_candidates_check(
