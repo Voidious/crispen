@@ -4170,7 +4170,7 @@ def test_abs_package_for_dir_root_level(tmp_path):
 
 def test_abs_package_for_dir_no_project_root(monkeypatch):
     monkeypatch.setattr(
-        "crispen.file_limiter.code_gen._find_project_root", lambda _p: None
+        "crispen.file_limiter.code_gen.imports._find_project_root", lambda _p: None
     )
     assert _abs_package_for_dir("/some/random/path/test_engine.py") is None
 
@@ -4180,7 +4180,7 @@ def test_abs_package_for_dir_non_ancestor_root(tmp_path, monkeypatch):
     other_dir = tmp_path / "other"
     other_dir.mkdir()
     monkeypatch.setattr(
-        "crispen.file_limiter.code_gen._find_project_root", lambda _p: other_dir
+        "crispen.file_limiter.code_gen.imports._find_project_root", lambda _p: other_dir
     )
     test_file = tmp_path / "tests" / "test_engine.py"
     test_file.parent.mkdir()
