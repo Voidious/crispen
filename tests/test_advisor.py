@@ -89,8 +89,8 @@ def _propose_ok(*filenames: str) -> LLMCallResult:
 
 _CONFIG = CrispenConfig()
 _PATCH_KEY = "crispen.file_limiter.advisor.get_api_key"
-_PATCH_CLIENT = "crispen.file_limiter.advisor.make_client"
-_PATCH_CALL = "crispen.file_limiter.advisor.call_with_tool"
+_PATCH_CLIENT = "crispen.file_limiter.advisor.placement.make_client"
+_PATCH_CALL = "crispen.file_limiter.advisor.placement.call_with_tool"
 
 
 # ---------------------------------------------------------------------------
@@ -882,9 +882,9 @@ def test_resolve_api_key_error_propagates(monkeypatch):
         )
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_success(mock_key, mock_client, mock_call):
     """Happy path: forbidden_dir_stems and existing_file_stems both non-empty;
     prev_failure is False on the first (successful) attempt."""
@@ -916,9 +916,9 @@ def test_resolve_success(mock_key, mock_client, mock_call):
     assert mock_call.call_count == 1
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_llm_none_returns_none(mock_key, mock_client, mock_call):
     """LLM returns None → resolve returns None."""
     mock_key.return_value = "key"
@@ -936,9 +936,9 @@ def test_resolve_llm_none_returns_none(mock_key, mock_client, mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_forbidden_target_returns_none(mock_key, mock_client, mock_call):
     """LLM picks a target that is in forbidden_files → resolve returns None."""
     mock_key.return_value = "key"
@@ -964,9 +964,9 @@ def test_resolve_forbidden_target_returns_none(mock_key, mock_client, mock_call)
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_incomplete_response_returns_none(mock_key, mock_client, mock_call):
     """LLM returns fewer placements than groups → len mismatch → None."""
     mock_key.return_value = "key"
@@ -986,9 +986,9 @@ def test_resolve_incomplete_response_returns_none(mock_key, mock_client, mock_ca
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_retry_succeeds(mock_key, mock_client, mock_call):
     """First attempt None, second succeeds; covers if prev_failure: True branch."""
     mock_key.return_value = "key"
@@ -1018,9 +1018,9 @@ def test_resolve_retry_succeeds(mock_key, mock_client, mock_call):
     assert mock_call.call_count == 2
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_empty_forbidden_dir_stems(mock_key, mock_client, mock_call):
     """existing_dirs empty → forbidden_dir_stems empty → branch False."""
     mock_key.return_value = "key"
@@ -1045,9 +1045,9 @@ def test_resolve_empty_forbidden_dir_stems(mock_key, mock_client, mock_call):
     assert result is not None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_empty_existing_file_stems(mock_key, mock_client, mock_call):
     """existing_files=frozenset() → file_stems empty → if existing_file_stems: False."""
     mock_key.return_value = "key"
@@ -1072,9 +1072,9 @@ def test_resolve_empty_existing_file_stems(mock_key, mock_client, mock_call):
     assert result is not None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_non_int_group_id(mock_key, mock_client, mock_call):
     """Non-integer group_id → isinstance check fails → skipped → len mismatch → None."""
     mock_key.return_value = "key"
@@ -1099,9 +1099,9 @@ def test_resolve_non_int_group_id(mock_key, mock_client, mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_out_of_range_group_id(mock_key, mock_client, mock_call):
     """Out-of-range group_id → range check fails → skipped → len mismatch → None."""
     mock_key.return_value = "key"
@@ -1126,9 +1126,9 @@ def test_resolve_out_of_range_group_id(mock_key, mock_client, mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_duplicate_group_id(mock_key, mock_client, mock_call):
     """Duplicate group_id → second entry skipped → len mismatch → None."""
     mock_key.return_value = "key"
@@ -1153,9 +1153,9 @@ def test_resolve_duplicate_group_id(mock_key, mock_client, mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_empty_target(mock_key, mock_client, mock_call):
     """Empty target_file → falsy check fails → skipped → len mismatch → None."""
     mock_key.return_value = "key"
@@ -1343,9 +1343,9 @@ def test_advise_verbose_set3_and_placement(mock_key, mock_client, mock_call, cap
     assert "file placements" in err
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_verbose(mock_key, mock_client, mock_call, capsys):
     """verbose=True exercises the print + _counter branches in
     _rename_conflicting_chunk (with _counter passed to cover the increment)."""
@@ -1412,9 +1412,9 @@ def test_advise_verbose_detailed_timing_prints(
     assert "→ done [" in err
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.placement.call_with_tool")
+@patch("crispen.file_limiter.advisor.placement.make_client")
+@patch("crispen.file_limiter.advisor.placement.get_api_key")
 def test_resolve_verbose_detailed_timing_print(
     mock_key, mock_client, mock_call, capsys
 ):
