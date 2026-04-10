@@ -334,6 +334,46 @@ def test_verify_blank_line_collapse_after_pruning_passes():
     assert vr.verified_functions == 1
 
 
+def test_verify_inline_import_not_pruned_with_surrounding_blanks_passes():
+    # Regression: entity has an inline import surrounded by blank lines that is
+    # NOT pruned to a top-level import in the new file.  After
+    # _strip_imports_by_line removes the import from the new file's content, the
+    # two surrounding blank lines merge into 3+ consecutive newlines before
+    # indented code — which _normalize_blank_lines in the new file did NOT
+    # collapse (it only runs before the import was stripped in verification).
+    # Verification must apply the same _EXCESS_BLANK_BODY_RE normalization to
+    # combined_no_imports so the blank-line count matches entity_no_imports.
+    post_source = (
+        "def test_foo():\n"
+        "    x = 1\n"
+        "\n"
+        "    import pathlib\n"
+        "\n"
+        "    y = pathlib.Path('.')\n"
+        "    return y\n"
+    )
+    entity = _make_entity("test_foo", 1, 8)
+    # New file keeps the inline import (not pruned — no module-level pathlib).
+    new_file_src = (
+        "def test_foo():\n"
+        "    x = 1\n"
+        "\n"
+        "    import pathlib\n"
+        "\n"
+        "    y = pathlib.Path('.')\n"
+        "    return y\n"
+    )
+    split = SplitResult(
+        new_files={"test_patch.py": new_file_src},
+        original_source="# original\n",
+        abort=False,
+    )
+    placements = [GroupPlacement(group=["test_foo"], target_file="test_patch.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    assert vr.verified_functions == 1
+
+
 def test_verify_entity_with_name_rewrites_passes():
     # The original entity references SAFE_MODE; after splitting it becomes
     # conversion.SAFE_MODE in the new file.  Verification must apply the

@@ -166,7 +166,10 @@ def _verify_preservation(
     lines = post_source.splitlines(keepends=True)
     combined_no_imports = _strip_imports_by_line(split.original_source)
     for content in split.new_files.values():
-        combined_no_imports += _strip_imports_by_line(content)
+        stripped = _strip_imports_by_line(content)
+        stripped = _EXCESS_BLANK_RE.sub("\n\n\n", stripped)
+        stripped = _EXCESS_BLANK_BODY_RE.sub("\n\n", stripped)
+        combined_no_imports += stripped
     name_to_file: Dict[str, str] = {
         name: p.target_file for p in placements for name in p.group
     }
