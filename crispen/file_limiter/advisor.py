@@ -478,18 +478,44 @@ def _propose_files_step(
             flush=True,
         )
     if result.tool_input is None:
+        if verbose:
+            print(
+                "crispen: FileLimiter:   propose failed: no tool call in response",
+                file=sys.stderr,
+                flush=True,
+            )
         return None
 
+    raw_files = result.tool_input.get("files", [])
     proposed: List[Tuple[str, str]] = []
     seen: set = set()
-    for item in result.tool_input.get("files", []):
+    filtered_names: List[str] = []
+    for item in raw_files:
         filename = item.get("filename", "")
         description = item.get("description", "")
         if filename and filename not in seen and filename not in existing_files:
             proposed.append((filename, description))
             seen.add(filename)
+        elif filename:
+            filtered_names.append(filename)
 
     if not proposed:
+        if verbose:
+            if not raw_files:
+                print(
+                    "crispen: FileLimiter:   propose failed: LLM returned empty"
+                    " files list",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"crispen: FileLimiter:   propose failed: all"
+                    f" {len(filtered_names)} filename(s) filtered"
+                    f" (existing or duplicate): {filtered_names}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         return None
     return proposed
 
@@ -971,8 +997,10 @@ def _assign_placements(
         if proposed_files is not None:
             break
         prev_propose_failure = (
-            "Your previous response was incomplete or contained no valid filenames. "
-            "Please return a non-empty list of proposed output files."
+            "Your previous response returned no valid filenames — either the"
+            " files list was empty or every name was already in use. "
+            "You MUST return a non-empty files list with new, unique filenames"
+            " that are not on the exclusion list."
         )
     if proposed_files is None:
         return None

@@ -2157,3 +2157,63 @@ def test_propose_all_retries_exhausted_aborts(mock_key, mock_client, mock_call):
         CrispenConfig(file_limiter_retries=0),  # no retries
     )
     assert plan.abort is True
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_propose_no_tool_call_verbose(mock_key, mock_client, mock_call, capsys):
+    """tool_input=None + verbose=True → logs 'no tool call in response'."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    entity = _make_entity("foo", 1, 50)
+    c = _classified(entities=[entity], set_2_groups=[["foo"]])
+    mock_call.return_value = _make_llm_result(None)
+    plan = advise_file_limiter(
+        c, "src/big.py", CrispenConfig(file_limiter_retries=0), verbose=True
+    )
+    assert plan.abort is True
+    assert "no tool call" in capsys.readouterr().err
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_propose_empty_files_list_verbose(mock_key, mock_client, mock_call, capsys):
+    """tool_input={"files": []} + verbose=True → logs 'empty files list'."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    entity = _make_entity("foo", 1, 50)
+    c = _classified(entities=[entity], set_2_groups=[["foo"]])
+    mock_call.return_value = _make_llm_result({"files": []})
+    plan = advise_file_limiter(
+        c, "src/big.py", CrispenConfig(file_limiter_retries=0), verbose=True
+    )
+    assert plan.abort is True
+    assert "empty files list" in capsys.readouterr().err
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
+def test_propose_all_filenames_filtered_verbose(
+    mock_key, mock_client, mock_call, capsys
+):
+    """All proposed filenames in existing_files + verbose=True → logs filtered names."""
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    entity = _make_entity("foo", 1, 50)
+    c = _classified(entities=[entity], set_2_groups=[["foo"]])
+    # Propose "taken.py" which is already in existing_files.
+    mock_call.return_value = _make_llm_result(
+        {"files": [{"filename": "taken.py", "description": "existing"}]}
+    )
+    plan = advise_file_limiter(
+        c,
+        "src/big.py",
+        CrispenConfig(file_limiter_retries=0),
+        existing_files=frozenset({"taken.py"}),
+        verbose=True,
+    )
+    assert plan.abort is True
+    assert "filtered" in capsys.readouterr().err
