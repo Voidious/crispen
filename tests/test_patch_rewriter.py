@@ -3831,22 +3831,21 @@ def test_rewrite_cross_file_const_disk_acc(mock_key, mock_client, mock_call, tmp
 
 
 # ---------------------------------------------------------------------------
-# Same-file constant conflict: passthrough + inline substitution
+# Same-file constant: passthrough + single proposal → const updated (no inline)
 # ---------------------------------------------------------------------------
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_passthrough_conflict_inline(mock_call, tmp_path):
-    """One test passes through a constant (no rename), another renames it.
-    Expected: conflict detected → same-file const stays unchanged; the renaming
-    test gets its decorator inlined with the correct literal value.  The
-    non-conflicting constant is updated normally via same_file_const_map.
+def test_process_passthrough_single_proposal_updates_const(mock_call, tmp_path):
+    """One test passes through a constant (no rename), another proposes one value.
+    Expected: since all proposals agree on one new value, the constant definition
+    is updated — no per-function inlining needed.  The passthrough function
+    continues using the const ref (which now points to the updated value).
 
     Covers:
-      - line 1736  (same_file_passthrough.add)
-      - lines 1762-1774  (conflicting_old_vals loop, continue branch when
-                           inline_subs is empty for the passthrough function)
-      - lines 1775-1792  (base_text, existing_idx=None → append splice)
+      - same_file_passthrough path (new_val is None → continue, no add)
+      - same_file_const_map populated for single-proposal (len==1) const
+        even when some tests pass through unchanged
     """
     src = (
         'TARGET = "crispen.before.X"\n'
@@ -3862,9 +3861,9 @@ def test_process_passthrough_conflict_inline(mock_call, tmp_path):
         "    pass\n"
     )
     scan = str(tmp_path / "test_foo.py")
-    # test_a renames Y but NOT X  → X is a passthrough from test_a's perspective.
-    # test_b renames X            → conflict (passthrough + rename) for X.
-    # Y has a single uncontested rename → const map update.
+    # test_a renames Y but NOT X  → X passthrough from test_a's perspective.
+    # test_b renames X            → single proposal for X (no disagreement).
+    # With passthrough no longer blocking: both X and Y go to same_file_const_map.
     mock_call.side_effect = [
         _ok(
             {
@@ -3891,12 +3890,12 @@ def test_process_passthrough_conflict_inline(mock_call, tmp_path):
         scan_file=scan,
     )
     assert changed is True
-    # Non-conflicting constant updated in place.
+    # Both constants updated via same_file_const_map.
+    assert 'TARGET = "crispen.after.X"' in result
     assert 'TARGET2 = "crispen.after.Y"' in result
-    # Conflicting constant NOT updated (conflict: passthrough + rename).
-    assert 'TARGET = "crispen.before.X"' in result
-    # test_b decorator inlined with the correct literal value.
-    assert '@patch("crispen.after.X")' in result
+    # Decorators stay as const refs — no inlining of literals.
+    assert "@patch(TARGET)" in result
+    assert '@patch("crispen.after.X")' not in result
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -3968,6 +3967,85 @@ def test_process_conflict_two_renames_existing_splice(mock_call, tmp_path):
     assert '@patch("crispen.after_b.X")' in result
     # No original constant-style decorator survives.
     assert "@patch(TARGET)" not in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_conflict_two_proposals_passthrough_function_continue(
+    mock_call, tmp_path
+):
+    """Two functions propose *different* values for TARGET → conflicting_old_vals.
+    A third function also uses TARGET but only renames a different const (TARGET_Y).
+    Expected: the third function is in string_swap_results but triggers the
+    ``continue`` branch in the conflicting_old_vals inline loop (inline_subs
+    empty for X); the other two get their decorators inlined individually.
+
+    Covers the ``if not inline_subs: continue`` branch inside the
+    ``if conflicting_old_vals:`` block (via two sub-paths):
+      - ref.resolved_value NOT in conflicting_old_vals (Y ref → loop continues)
+      - ref.resolved_value in conflicting_old_vals but new_val is None (X ref)
+    """
+    src = (
+        'TARGET = "crispen.before.X"\n'
+        'TARGET_Y = "crispen.before.Y"\n'
+        "\n"
+        "@patch(TARGET)\n"
+        "def test_a(mock_x):\n"
+        "    pass\n"
+        "\n"
+        "@patch(TARGET)\n"
+        "def test_b(mock_x):\n"
+        "    pass\n"
+        "\n"
+        "@patch(TARGET)\n"
+        "@patch(TARGET_Y)\n"
+        "def test_c(mock_y, mock_x):\n"
+        "    pass\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    # test_a → after_a.X; test_b → after_b.X (two different proposals → conflicting)
+    # test_c → renames Y only (not X) → in string_swap_results but inline_subs empty
+    #   for X → continue.  Y gets a single proposal → same_file_const_map update.
+    mock_call.side_effect = [
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.after_a.X"},
+            }
+        ),
+        _ok(_VERIFY_OK),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.X": "crispen.after_b.X"},
+            }
+        ),
+        _ok(_VERIFY_OK),
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.Y": "crispen.after.Y"},
+            }
+        ),
+        _ok(_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        src,
+        {"crispen.before.X", "crispen.before.Y"},
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file=scan,
+    )
+    assert changed is True
+    # X: conflicting (two proposals) → const unchanged, test_a and test_b inlined.
+    assert 'TARGET = "crispen.before.X"' in result
+    assert '@patch("crispen.after_a.X")' in result
+    assert '@patch("crispen.after_b.X")' in result
+    # Y: single proposal → const updated via same_file_const_map.
+    assert 'TARGET_Y = "crispen.after.Y"' in result
+    # test_c: in string_swap_results (renamed Y) but X inline_subs empty → continue.
+    assert "@patch(TARGET)" in result
 
 
 # ---------------------------------------------------------------------------
@@ -5220,6 +5298,50 @@ def test_callgraph_update_file_const_ref_no_resolution_passthrough(tmp_path):
     )
     assert not changed
     assert '_PATCH_USE = "pkg.orig.use_fn"' in result
+
+
+def test_callgraph_update_file_const_ref_passthrough_single_proposal_updates_const(
+    tmp_path,
+):
+    # test_a: BFS fails (calls unrelated()) → passthrough (if not resolved → continue).
+    # test_b: BFS → placement → single proposal for _PATCH_USE.
+    # Old: passthrough + single proposal → conflicting → inline test_b.
+    # New: single proposal (passthrough no longer blocks) → const def updated, no
+    #   inline.
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={
+            "placement.py": "from external import use_fn\ndef helper(): use_fn()\n",
+        },
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.placement import helper\n"
+        '_PATCH_USE = "pkg.orig.use_fn"\n'
+        "@patch(_PATCH_USE)\n"
+        "def test_a(m):\n"
+        "    unrelated()\n"
+        "\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_b(m):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed, _unresolved = _callgraph_update_file(
+        test_src, {"pkg.orig.use_fn"}, [ctx], scan_file=scan, index=index
+    )
+    assert changed
+    # Const definition updated (single proposal, passthrough no longer blocks).
+    assert '_PATCH_USE = "pkg.placement.use_fn"' in result
+    # Decorators stay as const refs — no per-function inlining.
+    assert "@patch(_PATCH_USE)" in result
+    assert '@patch("pkg.placement.use_fn")' not in result
 
 
 def test_callgraph_update_file_const_ref_partial_resolution(tmp_path):

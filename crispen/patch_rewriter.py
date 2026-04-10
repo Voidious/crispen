@@ -2085,13 +2085,11 @@ def _process_file_source(
     # Same-file const definition proposals.
     # Maps old_val → set of proposed new_vals.  Also tracks "passthrough" usages:
     # tests that use the constant without renaming it.  When all renaming tests
-    # agree AND no test passes through unchanged, the constant definition is updated.
-    # When there is any conflict (passthrough + rename, or multiple different renames),
-    # each affected function gets its decorator inlined to the correct value instead.
+    # agree on ONE new value (even if some tests pass through unchanged), the
+    # constant definition is updated — passthrough functions continue using the
+    # const and implicitly get the new value.  Only when proposals disagree
+    # (multiple different new values) is each affected function inlined individually.
     same_file_proposals: Dict[str, Set[str]] = {}
-    same_file_passthrough: Set[str] = (
-        set()
-    )  # old_vals kept unchanged by at least one test
     same_file_const_map: Dict[str, str] = {}  # populated after conflict resolution
 
     # Use caller-supplied guard sets (derived from _FLContext objects directly).
@@ -2695,9 +2693,6 @@ def _process_file_source(
             for ref in func.const_refs:
                 new_val = accepted.get(ref.resolved_value)
                 if new_val is None or new_val == ref.resolved_value:
-                    # Test uses the constant without renaming it → passthrough.
-                    if ref.source_file == scan_file_abs:
-                        same_file_passthrough.add(ref.resolved_value)
                     continue
                 if ref.source_file == scan_file_abs:
                     same_file_proposals.setdefault(ref.resolved_value, set()).add(
@@ -2709,19 +2704,17 @@ def _process_file_source(
                     ] = new_val
 
         # Resolve same-file proposals into updates and per-function inlines.
-        # All renaming tests agree AND no passthrough → update the constant definition.
-        # Any conflict (passthrough + rename, OR multiple different renames) → inline
-        # the correct string directly into each affected function's decorator so the
-        # shared constant stays stable and each test sees the right patch target.
+        # All renaming tests agree on ONE new value → update the constant definition,
+        # even when some tests pass through unchanged (they continue using the const
+        # and implicitly get the new value).  Only when proposals disagree (multiple
+        # different new values) → inline each affected function individually.
         same_file_const_map = {
             old: next(iter(new_set))
             for old, new_set in same_file_proposals.items()
-            if len(new_set) == 1 and old not in same_file_passthrough
+            if len(new_set) == 1
         }
         conflicting_old_vals = {
-            old
-            for old, new_set in same_file_proposals.items()
-            if len(new_set) > 1 or old in same_file_passthrough
+            old for old, new_set in same_file_proposals.items() if len(new_set) > 1
         }
         if conflicting_old_vals:
             for func, accepted in string_swap_results:
@@ -2869,7 +2862,6 @@ def _callgraph_update_file(
     source_lines = source.splitlines()
     func_splices: List[Tuple[int, int, str]] = []
     same_file_proposals: Dict[str, Set[str]] = {}
-    same_file_passthrough: Set[str] = set()
     resolved_results: List[Tuple[_TestFunctionInfo, Dict[str, str]]] = []
     # func_name → old_path → sorted candidates (multiple, non-truncated BFS results)
     unresolved_candidates: Dict[str, Dict[str, List[str]]] = {}
@@ -2934,17 +2926,12 @@ def _callgraph_update_file(
                         ] = static_cands
 
         if not resolved:
-            # Nothing resolved — record passthroughs for any const refs.
-            for old_val in const_ref_vals:
-                same_file_passthrough.add(old_val)
             continue
 
-        # Track const proposals and passthroughs.
+        # Track const proposals.
         for old_val in const_ref_vals:
             if old_val in resolved:
                 same_file_proposals.setdefault(old_val, set()).add(resolved[old_val])
-            else:
-                same_file_passthrough.add(old_val)
 
         # Apply STRING LITERAL resolutions (not const refs) as a func splice.
         string_res = {
@@ -2967,15 +2954,16 @@ def _callgraph_update_file(
             )
 
     # Resolve same-file const proposals into definition updates or per-function inlines.
+    # When all proposals agree on ONE new value, update the constant definition even if
+    # some functions passed through unchanged — they continue using the const and
+    # implicitly get the new value.  Only inline per-function when proposals disagree.
     same_file_const_map: Dict[str, str] = {
         old: next(iter(new_set))
         for old, new_set in same_file_proposals.items()
-        if len(new_set) == 1 and old not in same_file_passthrough
+        if len(new_set) == 1
     }
     conflicting = {
-        old
-        for old, new_set in same_file_proposals.items()
-        if len(new_set) > 1 or old in same_file_passthrough
+        old for old, new_set in same_file_proposals.items() if len(new_set) > 1
     }
 
     # Inline conflicting const resolutions per function.
