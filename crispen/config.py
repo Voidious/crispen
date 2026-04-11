@@ -146,7 +146,7 @@ class CrispenConfig:
     #             strings.  A second LLM verify step checks each proposal;
     #             failed chunks are retried up to patch_update_retries
     #             additional times before being skipped.
-    file_limiter_patch_update: str = "ignore"
+    file_limiter_patch_update: str = "basic"
 
     # Number of additional LLM verify+retry attempts for each function chunk
     # in "rewrite" mode.  0 means no retry: a chunk rejected by the verify
