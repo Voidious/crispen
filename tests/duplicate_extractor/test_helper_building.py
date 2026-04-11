@@ -127,6 +127,7 @@ def test_find_insertion_point_nested_func_ignores_unrelated_class():
         class _SplitTask:
             pass
 
+
         def _find_free_vars():
             x = 1
             def _collect_loads():
