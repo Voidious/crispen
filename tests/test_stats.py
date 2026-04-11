@@ -115,11 +115,35 @@ def test_merge_adds_file_limiter_fields():
 
 
 def test_merge_adds_patch_update_fields():
-    a = RunStats(patch_update_edits=2, patch_rewrite_llm_calls=3)
-    b = RunStats(patch_update_edits=4, patch_rewrite_llm_calls=1)
+    a = RunStats(
+        patch_update_edits=2,
+        patch_rewrite_llm_calls=3,
+        patch_single_candidate=1,
+        patch_cg_resolved=2,
+        patch_llm_no_change=3,
+        patch_llm_rename=4,
+        patch_llm_rewrite=5,
+        patch_edit_failures=6,
+    )
+    b = RunStats(
+        patch_update_edits=4,
+        patch_rewrite_llm_calls=1,
+        patch_single_candidate=10,
+        patch_cg_resolved=20,
+        patch_llm_no_change=30,
+        patch_llm_rename=40,
+        patch_llm_rewrite=50,
+        patch_edit_failures=60,
+    )
     a.merge(b)
     assert a.patch_update_edits == 6
     assert a.patch_rewrite_llm_calls == 4
+    assert a.patch_single_candidate == 11
+    assert a.patch_cg_resolved == 22
+    assert a.patch_llm_no_change == 33
+    assert a.patch_llm_rename == 44
+    assert a.patch_llm_rewrite == 55
+    assert a.patch_edit_failures == 66
 
 
 def test_total_edits_includes_patch_update():
@@ -237,6 +261,27 @@ def test_format_summary_with_files():
     assert "functions:           6" in text
     assert "classes:             2" in text
     assert "lines:               120" in text
+    # patch breakdown not shown when all zeros
+    assert "patch update changes:" not in text
+
+
+def test_format_summary_patch_breakdown():
+    s = RunStats()
+    s.patch_single_candidate = 3
+    s.patch_cg_resolved = 2
+    s.patch_llm_no_change = 5
+    s.patch_llm_rename = 4
+    s.patch_llm_rewrite = 1
+    s.patch_edit_failures = 0
+    lines = s.format_summary()
+    text = "\n".join(lines)
+    assert "patch update changes:" in text
+    assert "single candidate:    3" in text
+    assert "callgraph resolved:  2" in text
+    assert "LLM no-change:       5" in text
+    assert "LLM rename:          4" in text
+    assert "LLM rewrite:         1" in text
+    assert "edit failures:       0" in text
 
 
 # ---------------------------------------------------------------------------

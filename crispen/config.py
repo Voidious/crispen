@@ -194,6 +194,12 @@ def format_header(config: "CrispenConfig") -> List[str]:
     lines.append(f"  {'file_limiter_retries:':<{w}}{config.file_limiter_retries}")
     lines.append(f"  {'rate_limit_retries:':<{w}}{config.rate_limit_retries}")
     lines.append(f"  {'rate_limit_backoff:':<{w}}{config.rate_limit_backoff}s")
+    lines.append(f"  {'file_limiter_reexports:':<{w}}{config.file_limiter_reexports}")
+    lines.append(
+        f"  {'file_limiter_patch_update:':<{w}}{config.file_limiter_patch_update}"
+    )
+    if config.file_limiter_patch_update == "rewrite":
+        lines.append(f"  {'patch_update_retries:':<{w}}{config.patch_update_retries}")
     if config.base_url is not None:
         lines.append(f"  {'base_url:':<{w}}{config.base_url}")
     return lines

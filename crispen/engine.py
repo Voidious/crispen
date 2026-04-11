@@ -1341,11 +1341,13 @@ def run_engine(
     # ------------------------------------------------------------------ #
     # Phase 4 — Update @patch strings after FileLimiter entity moves     #
     # ------------------------------------------------------------------ #
+    _patch_acc = RewriteAccumulator()
     if (
         config.file_limiter_patch_update in ("basic", "rewrite")
         and combined_patch_map
         and repo_root
     ):
+        _stats.patch_single_candidate += len(combined_patch_map)
         # Update per_file sources still in memory (not yet written to disk).
         for filepath, state in per_file.items():
             new_src = apply_patch_strings(state["source"], combined_patch_map)
@@ -1385,32 +1387,38 @@ def run_engine(
             verbose=verbose,
             candidates_out=_cg_candidates,
             config=config,
+            _acc=_patch_acc,
         ):
             _stats.patch_update_edits += 1
             yield _cg_msg
 
     if config.file_limiter_patch_update == "rewrite" and _fl_all_contexts:
-        _rewrite_acc = RewriteAccumulator()
         yield from apply_patch_rewrite(
             _fl_all_contexts,
             per_file,
             repo_root,
             config,
             verbose=verbose,
-            _acc=_rewrite_acc,
+            _acc=_patch_acc,
             cg_candidates=_cg_candidates or None,
         )
-        _stats.patch_rewrite_llm_calls += _rewrite_acc.calls
-        if _rewrite_acc.elapsed > 0 or _rewrite_acc.input_tokens > 0:
+        _stats.patch_rewrite_llm_calls += _patch_acc.calls
+        if _patch_acc.elapsed > 0 or _patch_acc.input_tokens > 0:
             _stats.record_llm_call(
-                _rewrite_acc.elapsed,
-                _rewrite_acc.input_tokens,
-                _rewrite_acc.output_tokens,
+                _patch_acc.elapsed,
+                _patch_acc.input_tokens,
+                _patch_acc.output_tokens,
                 "file_limiter",
                 "patch_rewriter",
                 "",
             )
-        _stats.patch_update_edits += _rewrite_acc.files_updated
+        _stats.patch_update_edits += _patch_acc.files_updated
+
+    _stats.patch_cg_resolved += _patch_acc.cg_resolved
+    _stats.patch_llm_no_change += _patch_acc.no_change
+    _stats.patch_llm_rename += _patch_acc.rename
+    _stats.patch_llm_rewrite += _patch_acc.rewrite
+    _stats.patch_edit_failures += _patch_acc.edit_failures
 
     # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #

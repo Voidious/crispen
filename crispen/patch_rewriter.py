@@ -100,6 +100,13 @@ class RewriteAccumulator:
     input_tokens: int = 0
     output_tokens: int = 0
     files_updated: int = 0
+    cg_resolved: int = 0  # forking paths resolved by callgraph
+    no_change: int = 0  # functions LLM confirmed need no change
+    rename: int = 0  # functions LLM renamed via string-swap
+    rewrite: int = 0  # functions LLM fully rewrote
+    edit_failures: int = (
+        0  # functions where retries exhausted without a verified update
+    )
 
 
 _PATCH_RULES = (
@@ -2127,6 +2134,7 @@ def _process_file_source(
         # seeding it with the verifier's explanation as the initial prev_error.
         _rewrite_escalation_error: Optional[str] = None
         r = None  # may be skipped when escalating
+        _outcome: Optional[str] = None  # "no_change", "rename", or "rewrite"
 
         while attempts_left > 0:
             attempts_left -= 1
@@ -2198,6 +2206,7 @@ def _process_file_source(
                 rewrite_verify_retries_left = config.llm_verify_retries
                 prev_error: Optional[str] = _rewrite_escalation_error
                 _rewrite_escalation_error = None
+                _rw_ok = False
                 while rewrite_attempts > 0:
                     rewrite_attempts -= 1
                     rewrite_prompt = _build_rewrite_func_prompt(
@@ -2329,6 +2338,7 @@ def _process_file_source(
                                 file=sys.stderr,
                                 flush=True,
                             )
+                        _rw_ok = True
                         break
                     rv_issue = rv.tool_input.get("issue", "") if rv.tool_input else ""
                     if rewrite_verify_retries_left > 0:
@@ -2337,6 +2347,8 @@ def _process_file_source(
                         rewrite_attempts += 1  # don't burn compile retry budget
                         continue
                     # verify retries exhausted — skip this function
+                if _rw_ok:
+                    _outcome = "rewrite"
                 break  # done with this function (rewrite handled above)
 
             # String-swap: validate and filter renames.
@@ -2438,6 +2450,7 @@ def _process_file_source(
                         flush=True,
                     )
                 if v.tool_input is None:
+                    _outcome = "no_change"
                     break  # verify call failed; accept no-change
                 verify_correct = v.tool_input.get("correct", False)
                 issue = v.tool_input.get("issue", "")
@@ -2455,6 +2468,7 @@ def _process_file_source(
                             flush=True,
                         )
                 if verify_correct:
+                    _outcome = "no_change"
                     break  # confirmed: no change needed
                 # Check if verifier provided corrections for a direct apply.
                 corrections = v.tool_input.get("corrections") or {}
@@ -2564,6 +2578,7 @@ def _process_file_source(
                                 (func.start_line, func.end_line, new_text)
                             )
                         string_swap_results.append((func, corrections_renames))
+                        _outcome = "rename"
                         break
                     # Corrections verify rejected; update issue for retry/escalation.
                     issue = vc.tool_input.get("issue", "") or issue
@@ -2586,6 +2601,7 @@ def _process_file_source(
                     _rewrite_escalation_error = issue
                     attempts_left += 1  # allow one more outer iteration
                     continue
+                _outcome = "no_change"
                 break  # llm_verify_retries=0 → accept no-change
 
             # Verify the renames.
@@ -2647,6 +2663,7 @@ def _process_file_source(
                 if new_text != orig_text:
                     func_splices.append((func.start_line, func.end_line, new_text))
                 string_swap_results.append((func, patch_renames_safe))
+                _outcome = "rename"
                 break
 
             verify_correct = v.tool_input.get("correct", False)
@@ -2683,6 +2700,7 @@ def _process_file_source(
                 if new_text != orig_text:
                     func_splices.append((func.start_line, func.end_line, new_text))
                 string_swap_results.append((func, patch_renames_safe))
+                _outcome = "rename"
                 break
             else:
                 if rename_verify_retries_left > 0:
@@ -2694,6 +2712,16 @@ def _process_file_source(
                     _rewrite_escalation_error = issue
                     attempts_left += 1  # allow one more outer iteration
                 # else (llm_verify_retries=0): retries exhausted — skip
+
+        if _acc is not None:
+            if _outcome == "no_change":
+                _acc.no_change += 1
+            elif _outcome == "rename":
+                _acc.rename += 1
+            elif _outcome == "rewrite":
+                _acc.rewrite += 1
+            else:
+                _acc.edit_failures += 1
 
     # Collect cross-file and same-file constant proposals.
     cross_file_patch_maps: Dict[str, Dict[str, str]] = {}
@@ -2853,6 +2881,7 @@ def _callgraph_update_file(
     verbose: bool = False,
     max_depth: int = _CG_MAX_DEPTH,
     max_modules: int = _CG_MAX_MODULES,
+    _acc: Optional["RewriteAccumulator"] = None,
 ) -> Tuple[str, bool, Dict[str, Dict[str, List[str]]]]:
     """Apply call-graph-resolved @patch updates to *source*.
 
@@ -2971,6 +3000,8 @@ def _callgraph_update_file(
         if new_text != orig_text:
             func_splices.append((func.start_line, func.end_line, new_text))
 
+        if _acc is not None:
+            _acc.cg_resolved += len(resolved)
         resolved_results.append((func, resolved))
         if verbose:
             print(
@@ -3042,6 +3073,7 @@ def apply_patch_callgraph(
     verbose: bool = False,
     candidates_out: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None,
     config: Optional["CrispenConfig"] = None,
+    _acc: Optional["RewriteAccumulator"] = None,
 ) -> Iterator[str]:
     """Algorithmically resolve forking @patch paths via call-graph tracing.
 
@@ -3103,6 +3135,7 @@ def apply_patch_callgraph(
             verbose=verbose,
             max_depth=max_depth,
             max_modules=max_modules,
+            _acc=_acc,
         )
         if changed:
             state["source"] = new_src
@@ -3146,6 +3179,7 @@ def apply_patch_callgraph(
             verbose=verbose,
             max_depth=max_depth,
             max_modules=max_modules,
+            _acc=_acc,
         )
         if changed:
             py_file.write_text(new_src, encoding="utf-8")

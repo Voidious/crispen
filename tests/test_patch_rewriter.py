@@ -1948,7 +1948,7 @@ def test_process_no_change_verify_timing_detailed(mock_call, capsys):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_acc_accumulates(mock_call):
-    # _acc accumulates calls from both classify and no-change verify.
+    # _acc accumulates calls from both classify and no-change verify; no_change counted.
     mock_call.side_effect = [
         LLMCallResult(
             tool_input=_CLASSIFY_NO_CHANGE,
@@ -1971,6 +1971,23 @@ def test_process_no_change_acc_accumulates(mock_call):
     assert abs(acc.elapsed - 0.8) < 1e-9
     assert acc.input_tokens == 180
     assert acc.output_tokens == 15
+    assert acc.no_change == 1
+    assert acc.rename == 0
+    assert acc.rewrite == 0
+    assert acc.edit_failures == 0
+
+
+@mock_patch(_PATCH_CALL_TOOL, return_value=_ok(None))
+def test_process_acc_edit_failure_on_classify_none(mock_call):
+    # Classify returns tool_input=None → edit_failures incremented.
+    acc = RewriteAccumulator()
+    _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1, _acc=acc
+    )
+    assert acc.edit_failures == 1
+    assert acc.no_change == 0
+    assert acc.rename == 0
+    assert acc.rewrite == 0
 
 
 @mock_patch(
@@ -5059,6 +5076,28 @@ def test_callgraph_update_file_string_literal_resolved(tmp_path):
     )
     assert changed
     assert '@patch("pkg.placement.use_fn")' in result
+
+
+def test_callgraph_update_file_acc_cg_resolved(tmp_path):
+    # _acc.cg_resolved incremented for each resolved path.
+    test_src = (
+        "from pkg.placement import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(mock_use_fn):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    index = _make_cuf_index(scan, test_src)
+    acc = RewriteAccumulator()
+    _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=index,
+        _acc=acc,
+    )
+    assert acc.cg_resolved == 1
 
 
 def test_callgraph_update_file_no_resolution(tmp_path):
