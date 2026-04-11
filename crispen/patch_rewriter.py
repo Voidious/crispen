@@ -1078,7 +1078,13 @@ _CG_CANDIDATES_LLM_THRESHOLD = 10  # max candidates to include in LLM prompts
 
 
 def _cg_collect_called_names(source: str) -> Set[str]:
-    """Return all function/attribute names called anywhere in *source*."""
+    """Return all function/attribute names called anywhere in *source*.
+
+    For attribute-access calls like ``m.func()`` where the receiver is a plain
+    name, both the bare attribute (``"func"``) and the ``"alias.attr"`` form
+    (``"m.func"``) are emitted.  This lets the BFS distinguish between a
+    directly imported name and a name accessed through a module alias.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -1090,6 +1096,8 @@ def _cg_collect_called_names(source: str) -> Set[str]:
                 names.add(node.func.id)
             elif isinstance(node.func, ast.Attribute):
                 names.add(node.func.attr)
+                if isinstance(node.func.value, ast.Name):
+                    names.add(f"{node.func.value.id}.{node.func.attr}")
     return names
 
 
@@ -1099,6 +1107,9 @@ def _cg_collect_func_body_calls(source: str, func_name: str) -> Set[str]:
     Searches for the first function definition named *func_name* in the
     module-level body and collects all Call targets within it.  Returns an
     empty set when the function is not found or *source* fails to parse.
+
+    Like :func:`_cg_collect_called_names`, attribute-access calls of the form
+    ``alias.method()`` emit both ``"method"`` and ``"alias.method"``.
     """
     try:
         tree = ast.parse(source)
@@ -1116,8 +1127,37 @@ def _cg_collect_func_body_calls(source: str, func_name: str) -> Set[str]:
                     calls.add(child.func.id)
                 elif isinstance(child.func, ast.Attribute):
                     calls.add(child.func.attr)
+                    if isinstance(child.func.value, ast.Name):
+                        calls.add(f"{child.func.value.id}.{child.func.attr}")
         return calls
     return set()
+
+
+def _cg_resolve_call_to_import(
+    called_name: str,
+    imports: Dict[str, Tuple[str, str]],
+) -> Optional[Tuple[str, str]]:
+    """Resolve a called name to ``(module, func_name)`` via *imports*.
+
+    Handles two forms:
+
+    * Plain name (``"func"``): looked up directly in *imports*.
+    * Alias-access (``"alias.func"``): the alias is looked up in *imports* to
+      retrieve the target module; ``func`` becomes the function name within that
+      module.  This covers calls like ``import mymod as m; m.func()`` where
+      ``_cg_collect_called_names`` emits ``"m.func"``.
+
+    Returns ``None`` when the name cannot be resolved.
+    """
+    if "." in called_name:
+        alias, attr = called_name.split(".", 1)
+        if alias in imports:
+            mod, _ = imports[alias]
+            return (mod, attr)
+        return None
+    if called_name in imports:
+        return imports[called_name]
+    return None
 
 
 def _cg_collect_defined_names(source: str) -> Set[str]:
@@ -1396,9 +1436,9 @@ def _resolve_forking_path_candidates(
 
     init_imports = index.get_imports(calling_module)
     for called_name in _cg_collect_called_names(func_text):
-        if called_name in init_imports:
-            mod, name = init_imports[called_name]
-            queue.append((mod, name, 0))
+        resolved = _cg_resolve_call_to_import(called_name, init_imports)
+        if resolved is not None:
+            queue.append((resolved[0], resolved[1], 0))
 
     while queue:
         module, func_name, depth = queue.popleft()
@@ -1434,8 +1474,9 @@ def _resolve_forking_path_candidates(
             body_calls = _cg_collect_func_body_calls(src, func_name)
             mod_imports = index.get_imports(module)
             for called_name in body_calls:
-                if called_name in mod_imports:
-                    next_mod, next_name = mod_imports[called_name]
+                resolved = _cg_resolve_call_to_import(called_name, mod_imports)
+                if resolved is not None:
+                    next_mod, next_name = resolved
                     if (next_mod, next_name) not in visited:
                         queue.append((next_mod, next_name, depth + 1))
                 elif called_name in index.module_to_defs.get(module, set()):

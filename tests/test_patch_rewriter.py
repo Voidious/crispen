@@ -37,6 +37,7 @@ from crispen.patch_rewriter import (
     _cg_collect_func_body_calls,
     _cg_file_to_module_and_package,
     _cg_parse_imports,
+    _cg_resolve_call_to_import,
     _compiles,
     _extract_migration_reminder,
     _extract_patch_lookup,
@@ -4151,6 +4152,74 @@ def test_cg_collect_func_body_calls_skips_non_function_nodes():
 
 
 # ---------------------------------------------------------------------------
+# _cg_collect_called_names — alias-access form
+# ---------------------------------------------------------------------------
+
+
+def test_cg_collect_called_names_alias_access_emits_pair():
+    # ``m.func()`` should emit both ``"func"`` and ``"m.func"``.
+    src = "import mymod as m\nm.func()\n"
+    result = _cg_collect_called_names(src)
+    assert "func" in result
+    assert "m.func" in result
+
+
+def test_cg_collect_called_names_nested_attr_no_alias_pair():
+    # ``a.b.c()`` — the receiver of ``.c`` is itself an Attribute, not a Name;
+    # only the bare attr name is emitted (no alias pair for chained access).
+    src = "a.b.c()\n"
+    result = _cg_collect_called_names(src)
+    assert "c" in result
+    assert "b.c" not in result  # receiver is Attribute, not Name
+
+
+# ---------------------------------------------------------------------------
+# _cg_collect_func_body_calls — alias-access form
+# ---------------------------------------------------------------------------
+
+
+def test_cg_collect_func_body_calls_alias_access_emits_pair():
+    src = "import mymod as m\ndef helper(): m.process()\n"
+    result = _cg_collect_func_body_calls(src, "helper")
+    assert "process" in result
+    assert "m.process" in result
+
+
+def test_cg_collect_func_body_calls_nested_attr_no_alias_pair():
+    # Chained access ``a.b.c()`` — receiver of attr c is not a Name.
+    src = "def helper(): a.b.c()\n"
+    result = _cg_collect_func_body_calls(src, "helper")
+    assert "c" in result
+    assert "b.c" not in result
+
+
+# ---------------------------------------------------------------------------
+# _cg_resolve_call_to_import
+# ---------------------------------------------------------------------------
+
+
+def test_cg_resolve_call_plain_name():
+    imports = {"foo": ("pkg.sub", "foo"), "bar": ("pkg.other", "bar")}
+    assert _cg_resolve_call_to_import("foo", imports) == ("pkg.sub", "foo")
+
+
+def test_cg_resolve_call_alias_attr():
+    # ``m.process()`` — alias ``m`` maps to module ``mymod``; resolves to
+    # ``(mymod, "process")``.
+    imports = {"m": ("mymod", "mymod")}
+    assert _cg_resolve_call_to_import("m.process", imports) == ("mymod", "process")
+
+
+def test_cg_resolve_call_alias_attr_unknown_alias():
+    # Alias not in imports → None.
+    assert _cg_resolve_call_to_import("unknown.func", {"m": ("mymod", "mymod")}) is None
+
+
+def test_cg_resolve_call_plain_not_found():
+    assert _cg_resolve_call_to_import("missing", {"foo": ("pkg", "foo")}) is None
+
+
+# ---------------------------------------------------------------------------
 # _cg_collect_defined_names
 # ---------------------------------------------------------------------------
 
@@ -6001,6 +6070,86 @@ def test_resolve_forking_path_candidates_intra_module_local_already_visited():
     )
     # recursive_func's body calls reach use_target (terminal in pkg.placement).
     assert path == "pkg.placement.use_fn"
+    assert not truncated
+
+
+# ---------------------------------------------------------------------------
+# BFS — import alias traversal
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_forking_path_candidates_import_alias_direct():
+    # Test uses ``import pkg.placement as pl; pl.helper()`` to call the terminal.
+    # The BFS must follow ``pl.helper`` by resolving alias ``pl`` → ``pkg.placement``.
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="from .placement import helper\n",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={"helper": "placement.py"},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = "import pkg.placement as pl\n"
+    # Import map: "pl" → ("pkg.placement", "pkg.placement"); call "pl.helper()"
+    # → _cg_collect_called_names emits "pl.helper"; BFS resolves alias pl →
+    # module pkg.placement, queues (pkg.placement, "helper") → terminal hit.
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src},
+        module_to_package={"pkg.test_mod": "pkg"},
+        module_to_defs={"pkg.test_mod": set()},
+        file_to_module={},
+    )
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
+        "use_fn",
+        "def test_f(): pl.helper()\n",
+        ctx,
+        index,
+        "pkg.test_mod",
+    )
+    assert path == "pkg.placement.use_fn"
+    assert cands == ["pkg.placement.use_fn"]
+    assert not truncated
+
+
+def test_resolve_forking_path_candidates_body_call_via_alias():
+    # An intermediate function uses ``mod.helper()`` (module alias) to reach
+    # the terminal.  The BFS body-call step must follow the alias.
+    placement_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    service_src = "import pkg.placement as pl\n" "def public_func(): pl.helper()\n"
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="from .placement import helper\n",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={"helper": "placement.py"},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = "from pkg.service import public_func\n"
+    modules = {
+        "pkg.test_mod": test_src,
+        "pkg.service": service_src,
+        "pkg.placement": placement_src,
+    }
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
+        file_to_module={},
+    )
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
+        "use_fn",
+        "def test_f(): public_func()\n",
+        ctx,
+        index,
+        "pkg.test_mod",
+    )
+    assert path == "pkg.placement.use_fn"
+    assert cands == ["pkg.placement.use_fn"]
     assert not truncated
 
 
