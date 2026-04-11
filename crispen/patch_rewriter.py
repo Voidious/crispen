@@ -2075,7 +2075,12 @@ def _candidates_check(
             continue
         proposed_new = patch_renames.get(old)
         if proposed_new is None:
-            # No rename proposed, but candidates exist — a rename IS needed.
+            # No rename proposed. If the original path is itself one of the
+            # candidates (e.g. an import alias re-exported by the new __init__.py
+            # so it remains accessible at the same dotted path), keeping the patch
+            # unchanged is correct — don't treat it as an error.
+            if old in cands:
+                continue
             return (
                 f"`{old}` requires an update — call-graph found it moved to: "
                 + ", ".join(f"`{c}`" for c in cands)
@@ -2482,6 +2487,13 @@ def _process_file_source(
                     patch_renames, func.old_patch_paths, func_candidates
                 )
                 if cand_issue:
+                    if verbose:
+                        print(
+                            f"crispen: patch_rewriter: candidates check rejected:"
+                            f" {cand_issue}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     prev_issue = cand_issue
                     prev_proposed = str(patch_renames) if patch_renames else "no change"
                     continue

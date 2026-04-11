@@ -6250,6 +6250,13 @@ def test_candidates_check_path_not_in_candidates():
     assert _candidates_check({}, ["pkg.orig.B"], cands) is None
 
 
+def test_candidates_check_no_change_when_old_in_candidates():
+    # No rename proposed but old path is itself one of the candidates (e.g. the entity
+    # is still accessible at the original module via __init__.py re-export) → None.
+    cands = {"pkg.orig.A": ["pkg.orig.A", "pkg.resolver.A"]}
+    assert _candidates_check({}, ["pkg.orig.A"], cands) is None
+
+
 # ---------------------------------------------------------------------------
 # _callgraph_update_file — candidates collected when multiple found
 # ---------------------------------------------------------------------------
@@ -6724,6 +6731,66 @@ def test_process_file_source_candidates_reject_no_change(
     assert "pkg.sub_a.A" in new_src
     # Two classify calls + one verify call = 3
     assert mock_call.call_count == 3
+
+
+@mock_patch(_PATCH_CALL_PR)
+@mock_patch(_PATCH_MAKE_CLIENT)
+@mock_patch(_PATCH_GET_KEY_PR, return_value="key")
+def test_process_file_source_candidates_reject_verbose(
+    mock_key, mock_client, mock_call, capsys
+):
+    # verbose=True prints 'candidates check rejected' when cand_issue fires.
+    src = '@patch("pkg.big.A")\ndef test_f(mock_a):\n    pass\n'
+    ctx = _FLContext(
+        filepath="/repo/pkg/big.py",
+        old_module="pkg.big",
+        original_source="from external import A\ndef f(): A()\n",
+        modified_source="from .sub_a import f\n",
+        new_files={"sub_a.py": "from external import A\ndef f(): A()\n"},
+        new_module_paths={"sub_a.py": "pkg.sub_a"},
+        entity_to_target={"f": "sub_a.py"},
+        forking_old_paths={"pkg.big.A"},
+    )
+    context_msg = _build_context_message([ctx])
+    mock_call.side_effect = [
+        # First classify: no rename → rejected by candidates check.
+        LLMCallResult(
+            tool_input={"needs_rewrite": False, "patch_renames": {}},
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        # Second classify: correct rename
+        LLMCallResult(
+            tool_input={
+                "needs_rewrite": False,
+                "patch_renames": {"pkg.big.A": "pkg.sub_a.A"},
+            },
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+        # Verify rename
+        LLMCallResult(
+            tool_input={"correct": True, "corrections": {}, "issue": ""},
+            elapsed=0.1,
+            input_tokens=10,
+            output_tokens=5,
+        ),
+    ]
+    cg_candidates = {"test_f": {"pkg.big.A": ["pkg.sub_a.A"]}}
+    _process_file_source(
+        src,
+        {"pkg.big.A"},
+        context_msg,
+        mock_client.return_value,
+        _make_process_cfg(),
+        max_attempts=2,
+        cg_candidates=cg_candidates,
+        verbose=True,
+    )
+    err = capsys.readouterr().err
+    assert "candidates check rejected" in err
 
 
 @mock_patch(_PATCH_CALL_PR)
