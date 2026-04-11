@@ -1788,7 +1788,11 @@ def _build_classify_prompt(
         "Do **not** include paths from 'Patch strings already correct' in "
         "`patch_renames`. "
         "Set `needs_rewrite` to True only for structural changes "
-        "(new decorators, new mock parameters, or body edits).\n"
+        "(new decorators, new mock parameters, or body edits). "
+        "A rewrite is also needed when the split routes mock calls through more "
+        "than one sub-module that each import the patched name independently — "
+        "a single @patch path can only intercept calls in its own module, so a "
+        "new @patch decorator must be added for each sub-module involved.\n"
     )
     if candidates_per_path:
         small_cands = {
@@ -1859,6 +1863,13 @@ def _build_func_verify_prompt(
         "proposed patch string points to where the name is looked up after "
         "the split. Remember: renames must stay within the same top-level package "
         "(the first path component never changes).\n"
+        "Trace the full execution path for each mock call in the test: if the "
+        "mock has multiple side_effect entries or is asserted called multiple "
+        "times, each call may route through a different sub-module. Verify the "
+        "proposed path intercepts ALL of them, not just the first hop. Ground "
+        "your analysis in the test's actual construction — if a branch is not "
+        "triggered by the test's inputs (e.g. an empty list skips an `if` "
+        "block), do not assume that branch executes.\n"
     )
     return "".join(parts)
 
@@ -1911,6 +1922,12 @@ def _build_no_change_verify_prompt(
         "strings**.\n\n"
         "Is this correct? Set `correct` to True only if all reviewed @patch strings "
         "still point to the correct location after the split.\n"
+        "Trace the full execution path for each mock call in the test: if the "
+        "mock is called multiple times, each call may route through a different "
+        "sub-module — a single patch path only intercepts calls in its own "
+        "module. Ground your analysis in the test's actual construction — if a "
+        "branch is not triggered by the test's inputs (e.g. an empty list skips "
+        "an `if` block), do not assume that branch executes.\n"
         "When you reject (correct=false): populate `corrections` with "
         "{current_path: corrected_path} for each reviewed string that "
         "needs renaming — use the exact strings from the 'under review' list as keys. "
@@ -2183,10 +2200,11 @@ def _process_file_source(
         prev_proposed: Optional[str] = None
         attempts_left = max_attempts
         rename_verify_retries_left = config.llm_verify_retries
-        # When the no-change verify path exhausts retries we escalate: skip
-        # the next classify call and go directly to the full rewrite path,
-        # seeding it with the verifier's explanation as the initial prev_error.
+        # When the verify step identifies a required change the classify path
+        # cannot produce, escalate: skip the next classify call and go directly
+        # to the full rewrite path, seeding it with the verifier's explanation.
         _rewrite_escalation_error: Optional[str] = None
+        _rewrite_escalation_reason: str = ""
         r = None  # may be skipped when escalating
         _outcome: Optional[str] = None  # "no_change", "rename", or "rewrite"
 
@@ -2194,14 +2212,15 @@ def _process_file_source(
             attempts_left -= 1
 
             if _rewrite_escalation_error is not None:
-                # Bypass classify; the no-change verify already identified the
-                # problem — hand the explanation straight to the rewrite path.
+                # Bypass classify; the verifier identified a required change
+                # the classify path could not produce — hand the explanation
+                # straight to the rewrite path.
                 needs_rewrite = True
                 if verbose:
                     print(
                         f"crispen: patch_rewriter: escalating to rewrite for"
                         f" '{func.function_name}' in {file_desc}"
-                        f" (no-change verify retries exhausted)",
+                        f" ({_rewrite_escalation_reason})",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -2636,23 +2655,13 @@ def _process_file_source(
                         break
                     # Corrections verify rejected; update issue for retry/escalation.
                     issue = vc.tool_input.get("issue", "") or issue
-                if rename_verify_retries_left > 0:
-                    rename_verify_retries_left -= 1
-                    prev_issue = issue
-                    no_change_paths = ", ".join(f"`{p}`" for p in func.old_patch_paths)
-                    prev_proposed = (
-                        str(corrections_renames)
-                        if corrections_renames
-                        else f"no change (kept {no_change_paths} unchanged)"
-                    )
-                    attempts_left += 1  # don't burn classify retry budget
-                    continue
-                # Retries exhausted.  When verify_retries were enabled the
-                # verify step consistently identified a required change that
-                # the classify path could not produce — escalate to the full
-                # rewrite path, seeding it with the verifier's explanation.
+                # A no-change verify rejection (with or without corrections) means
+                # we've lost confidence in the no-change path — escalate immediately
+                # rather than retrying classify, which is likely to produce no-change
+                # again and waste a verify call.
                 if config.llm_verify_retries > 0:
                     _rewrite_escalation_error = issue
+                    _rewrite_escalation_reason = "no-change verify rejected"
                     attempts_left += 1  # allow one more outer iteration
                     continue
                 _outcome = "no_change"
@@ -2764,6 +2773,7 @@ def _process_file_source(
                     attempts_left += 1  # don't burn classify retry budget
                 elif config.llm_verify_retries > 0:
                     _rewrite_escalation_error = issue
+                    _rewrite_escalation_reason = "rename verify retries exhausted"
                     attempts_left += 1  # allow one more outer iteration
                 # else (llm_verify_retries=0): retries exhausted — skip
 

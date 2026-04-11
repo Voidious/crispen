@@ -1530,12 +1530,12 @@ def test_process_no_change_verify_none_accept(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_verify_rejects_then_accepts(mock_call):
-    # No-change verify rejects first; classify+verify accepted on retry.
+    # No-change verify rejects → immediately escalates to rewrite (sticky).
     mock_call.side_effect = [
         _ok(_CLASSIFY_NO_CHANGE),
         _ok(_VERIFY_REJECT),
-        _ok(_CLASSIFY_RENAME),
-        _ok(_VERIFY_OK),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
@@ -1560,16 +1560,14 @@ def test_process_no_change_verify_retries_exhausted(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_exhausted_escalates_to_rewrite(mock_call):
-    # When llm_verify_retries>0 and no-change retries are exhausted, escalate
-    # to the full rewrite path seeded with the verifier's explanation.
+    # When llm_verify_retries>0 and no-change verify rejects, immediately
+    # escalate to the full rewrite path seeded with the verifier's explanation.
     from crispen.config import CrispenConfig
 
     cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
     mock_call.side_effect = [
         _ok(_CLASSIFY_NO_CHANGE),  # classify → no change
-        _ok(_VERIFY_REJECT),  # verify → reject
-        _ok(_CLASSIFY_NO_CHANGE),  # classify (retry) → no change again
-        _ok(_VERIFY_REJECT),  # verify → reject (retries exhausted → escalate)
+        _ok(_VERIFY_REJECT),  # verify → reject → immediately escalate
         _ok({"rewritten_function": _VALID_REWRITE}),  # rewrite (escalated)
         _ok(_REWRITE_VERIFY_OK),  # verify rewrite → accept
     ]
@@ -1577,7 +1575,7 @@ def test_process_no_change_exhausted_escalates_to_rewrite(mock_call):
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), cfg, 3
     )
     assert changed is True
-    assert mock_call.call_count == 6
+    assert mock_call.call_count == 4
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -1587,8 +1585,6 @@ def test_process_no_change_exhausted_escalate_verbose(mock_call, capsys):
 
     cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
     mock_call.side_effect = [
-        _ok(_CLASSIFY_NO_CHANGE),
-        _ok(_VERIFY_REJECT),
         _ok(_CLASSIFY_NO_CHANGE),
         _ok(_VERIFY_REJECT),
         _ok({"rewritten_function": _VALID_REWRITE}),
@@ -1641,17 +1637,17 @@ def test_process_no_change_corrections_verify_none_accept(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_no_change_corrections_verify_fails_retry(mock_call):
-    # Corrections-verify rejects → retries left → retry classify which succeeds.
+def test_process_no_change_corrections_verify_fails_escalates(mock_call):
+    # Corrections-verify rejects → immediately escalates to rewrite (sticky).
     from crispen.config import CrispenConfig
 
     cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
     mock_call.side_effect = [
         _ok(_CLASSIFY_NO_CHANGE),  # classify → no change
         _ok(_VERIFY_REJECT_WITH_CORRECTIONS),  # verify → reject + corrections
-        _ok(_VERIFY_REJECT),  # corrections-verify → rejected
-        _ok(_CLASSIFY_RENAME),  # classify (retry) → rename
-        _ok(_VERIFY_OK),  # rename verify → accept
+        _ok(_VERIFY_REJECT),  # corrections-verify → rejected → escalate
+        _ok({"rewritten_function": _VALID_REWRITE}),  # rewrite (escalated)
+        _ok(_REWRITE_VERIFY_OK),  # rewrite verify → accept
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), cfg, 3
@@ -1694,8 +1690,8 @@ def test_process_no_change_corrections_verbose_reject(mock_call, capsys):
         _ok(_CLASSIFY_NO_CHANGE),
         _ok(_VERIFY_REJECT_WITH_CORRECTIONS),
         _ok({"correct": False, "issue": "correction still wrong", "corrections": {}}),
-        _ok(_CLASSIFY_RENAME),
-        _ok(_VERIFY_OK),
+        _ok({"rewritten_function": _VALID_REWRITE}),  # rewrite (escalated)
+        _ok(_REWRITE_VERIFY_OK),
     ]
     _process_file_source(
         _SRC_WITH_PATCH,
@@ -1809,8 +1805,7 @@ def test_process_no_change_corrections_no_splice(mock_call, tmp_path):
 def test_process_no_change_corrections_name_invariant_filtered(mock_call):
     # Verifier proposes corrections that rename the patched name itself
     # (e.g. X → Y).  These must be filtered out; with an empty corrections set
-    # the no-change result falls through to retry logic — here retries=1 so
-    # the second classify call is made and returns no-change confirmed by verify.
+    # the no-change verify rejection triggers immediate escalation to rewrite.
     verify_name_change_correction = {
         "correct": False,
         "issue": "module moved",
@@ -1819,8 +1814,8 @@ def test_process_no_change_corrections_name_invariant_filtered(mock_call):
     mock_call.side_effect = [
         _ok(_CLASSIFY_NO_CHANGE),
         _ok(verify_name_change_correction),
-        _ok(_CLASSIFY_NO_CHANGE),
-        _ok(_VERIFY_OK),
+        _ok({"rewritten_function": _VALID_REWRITE}),  # rewrite (escalated)
+        _ok(_REWRITE_VERIFY_OK),
     ]
     from crispen.config import CrispenConfig
 
@@ -1828,7 +1823,7 @@ def test_process_no_change_corrections_name_invariant_filtered(mock_call):
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), cfg, 3
     )
-    # Correction was filtered (name changed X→Y) — no change applied.
+    # Correction was filtered (name changed X→Y) and did not appear in output.
     assert "crispen.before.Y" not in result
     assert mock_call.call_count == 4
 
@@ -1837,7 +1832,7 @@ def test_process_no_change_corrections_name_invariant_filtered(mock_call):
 def test_process_no_change_corrections_still_imported_guard(mock_call):
     # Verifier proposes corrections that move a name listed as still-imported in
     # the context message.  The still-imported guard must drop these corrections;
-    # with empty corrections the retry loop resumes and accepts no-change on verify.
+    # with empty corrections the no-change rejection triggers immediate escalation.
     still_imported_ctx = (
         "Names still externally imported in the modified original (check):\n" "- `X`\n"
     )
@@ -1849,8 +1844,8 @@ def test_process_no_change_corrections_still_imported_guard(mock_call):
     mock_call.side_effect = [
         _ok(_CLASSIFY_NO_CHANGE),
         _ok(verify_still_imported_correction),
-        _ok(_CLASSIFY_NO_CHANGE),
-        _ok(_VERIFY_OK),
+        _ok({"rewritten_function": _VALID_REWRITE}),  # rewrite (escalated)
+        _ok(_REWRITE_VERIFY_OK),
     ]
     from crispen.config import CrispenConfig
 
@@ -1864,7 +1859,7 @@ def test_process_no_change_corrections_still_imported_guard(mock_call):
         3,
         still_imported={"X"},
     )
-    # Correction was filtered (X still imported) — no change applied.
+    # Correction was filtered (X still imported) and did not appear in output.
     assert "crispen.sub.X" not in result
     assert mock_call.call_count == 4
 
