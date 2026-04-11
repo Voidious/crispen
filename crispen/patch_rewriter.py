@@ -2152,12 +2152,14 @@ def _process_file_source(
     # Track string-swap funcs and their accepted renames for cross-file const handling.
     string_swap_results: List[Tuple[_TestFunctionInfo, Dict[str, str]]] = []
     # Same-file const definition proposals.
-    # Maps old_val → set of proposed new_vals.  Also tracks "passthrough" usages:
-    # tests that use the constant without renaming it.  When all renaming tests
-    # agree on ONE new value (even if some tests pass through unchanged), the
-    # constant definition is updated — passthrough functions continue using the
-    # const and implicitly get the new value.  Only when proposals disagree
-    # (multiple different new values) is each affected function inlined individually.
+    # Maps old_val → set of voted values.  Every test function that uses the
+    # constant casts a vote: a renamed test votes for its new_val; a test whose
+    # rename was blocked or absent votes for the old_val (keep-as-is).
+    # Only when ALL votes agree on ONE new value (and that value differs from the
+    # old value) is the constant definition updated — all tests then implicitly
+    # pick up the change.  Whenever any test casts a "keep old" vote alongside a
+    # rename vote, the proposals conflict (len > 1) → each affected function is
+    # inlined individually instead.
     same_file_proposals: Dict[str, Set[str]] = {}
     same_file_const_map: Dict[str, str] = {}  # populated after conflict resolution
 
@@ -2782,26 +2784,30 @@ def _process_file_source(
         for func, accepted in string_swap_results:
             for ref in func.const_refs:
                 new_val = accepted.get(ref.resolved_value)
-                if new_val is None or new_val == ref.resolved_value:
-                    continue
                 if ref.source_file == scan_file_abs:
-                    same_file_proposals.setdefault(ref.resolved_value, set()).add(
+                    # Every test casts a vote: rename → new_val; blocked/absent → old
+                    # value (keep-as-is).  This prevents a minority rename proposal
+                    # from silently winning when the majority of tests had their
+                    # rename blocked and thus implicitly prefer the old value.
+                    vote = (
                         new_val
+                        if new_val is not None and new_val != ref.resolved_value
+                        else ref.resolved_value
                     )
-                else:
+                    same_file_proposals.setdefault(ref.resolved_value, set()).add(vote)
+                elif new_val is not None and new_val != ref.resolved_value:
                     cross_file_patch_maps.setdefault(ref.source_file, {})[
                         ref.resolved_value
                     ] = new_val
 
         # Resolve same-file proposals into updates and per-function inlines.
-        # All renaming tests agree on ONE new value → update the constant definition,
-        # even when some tests pass through unchanged (they continue using the const
-        # and implicitly get the new value).  Only when proposals disagree (multiple
-        # different new values) → inline each affected function individually.
+        # All votes agree on ONE new value AND it differs from the old value →
+        # update the constant definition.  Any "keep old" vote alongside a rename
+        # vote produces len(new_set) > 1 → inline each affected function instead.
         same_file_const_map = {
             old: next(iter(new_set))
             for old, new_set in same_file_proposals.items()
-            if len(new_set) == 1
+            if len(new_set) == 1 and next(iter(new_set)) != old
         }
         conflicting_old_vals = {
             old for old, new_set in same_file_proposals.items() if len(new_set) > 1

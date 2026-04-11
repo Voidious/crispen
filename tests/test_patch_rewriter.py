@@ -3865,21 +3865,25 @@ def test_rewrite_cross_file_const_disk_acc(mock_key, mock_client, mock_call, tmp
 
 
 # ---------------------------------------------------------------------------
-# Same-file constant: passthrough + single proposal → const updated (no inline)
+# Same-file constant: passthrough votes "keep old" — conflicts with rename
 # ---------------------------------------------------------------------------
 
 
 @mock_patch(_PATCH_CALL_TOOL)
-def test_process_passthrough_single_proposal_updates_const(mock_call, tmp_path):
-    """One test passes through a constant (no rename), another proposes one value.
-    Expected: since all proposals agree on one new value, the constant definition
-    is updated — no per-function inlining needed.  The passthrough function
-    continues using the const ref (which now points to the updated value).
+def test_process_passthrough_votes_conflict_with_rename_proposal(mock_call, tmp_path):
+    """One test (A) renames Y but not X → casts "keep old" vote for X.
+    Another test (B) renames X → casts "rename" vote for X.
+    "keep old" + "rename" → conflicting proposals → inline test_b with new value;
+    test_a's decorator unchanged.  TARGET2 (Y) has a single rename vote → updated
+    via same_file_const_map.
 
     Covers:
-      - same_file_passthrough path (new_val is None → continue, no add)
-      - same_file_const_map populated for single-proposal (len==1) const
-        even when some tests pass through unchanged
+      - "keep old" vote (new_val is None) entered into same_file_proposals
+      - conflict detection (len > 1) → conflicting_old_vals
+      - per-function inline for test_b (existing_idx is None → append)
+      - test_a in conflicting inline loop with new_val=None → inline_subs empty
+        → continue
+      - single-proposal for TARGET2 (value != old) → same_file_const_map update
     """
     src = (
         'TARGET = "crispen.before.X"\n'
@@ -3895,9 +3899,10 @@ def test_process_passthrough_single_proposal_updates_const(mock_call, tmp_path):
         "    pass\n"
     )
     scan = str(tmp_path / "test_foo.py")
-    # test_a renames Y but NOT X  → X passthrough from test_a's perspective.
-    # test_b renames X            → single proposal for X (no disagreement).
-    # With passthrough no longer blocking: both X and Y go to same_file_const_map.
+    # test_a renames Y but NOT X → X gets a "keep old" vote, Y gets a rename vote.
+    # test_b renames X → X gets a "rename to after.X" vote.
+    # X proposals: {old, after.X} → conflicting → inline test_b, test_a unchanged.
+    # Y proposals: {after.Y}      → single, != old → same_file_const_map update.
     mock_call.side_effect = [
         _ok(
             {
@@ -3924,12 +3929,60 @@ def test_process_passthrough_single_proposal_updates_const(mock_call, tmp_path):
         scan_file=scan,
     )
     assert changed is True
-    # Both constants updated via same_file_const_map.
-    assert 'TARGET = "crispen.after.X"' in result
+    # X has conflicting votes → TARGET NOT updated globally.
+    assert 'TARGET = "crispen.before.X"' in result
+    # Y has single vote → TARGET2 updated via same_file_const_map.
     assert 'TARGET2 = "crispen.after.Y"' in result
-    # Decorators stay as const refs — no inlining of literals.
+    # test_b's X decorator is inlined individually.
+    assert '@patch("crispen.after.X")' in result
+    # test_a's decorator unchanged (its inline_subs were empty).
     assert "@patch(TARGET)" in result
-    assert '@patch("crispen.after.X")' not in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_passthrough_identity_proposal_skipped(mock_call, tmp_path):
+    """One test renames Y but not X.  X only receives a "keep old" identity vote.
+    Expected: TARGET not updated (identity guard: proposed == old); TARGET2 updated.
+
+    Covers the ``next(iter(new_set)) != old`` identity guard in same_file_const_map
+    that drops entries where the sole proposal equals the existing value.
+    """
+    src = (
+        'TARGET = "crispen.before.X"\n'
+        'TARGET2 = "crispen.before.Y"\n'
+        "\n"
+        "@patch(TARGET)\n"
+        "@patch(TARGET2)\n"
+        "def test_a(mock_y, mock_x):\n"
+        "    pass\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    # test_a: renames Y → after.Y, does not rename X.
+    # X proposals: {"crispen.before.X"} → len==1, value==old → identity skip.
+    # Y proposals: {"crispen.after.Y"}  → len==1, value!=old → const_map update.
+    mock_call.side_effect = [
+        _ok(
+            {
+                "needs_rewrite": False,
+                "patch_renames": {"crispen.before.Y": "crispen.after.Y"},
+            }
+        ),
+        _ok(_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        src,
+        {"crispen.before.X", "crispen.before.Y"},
+        "ctx",
+        MagicMock(),
+        _CFG,
+        1,
+        scan_file=scan,
+    )
+    assert changed is True
+    # X got only an identity vote → not in same_file_const_map → TARGET unchanged.
+    assert 'TARGET = "crispen.before.X"' in result
+    # Y got a rename vote → TARGET2 updated.
+    assert 'TARGET2 = "crispen.after.Y"' in result
 
 
 @mock_patch(_PATCH_CALL_TOOL)
