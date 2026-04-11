@@ -1384,6 +1384,7 @@ def run_engine(
             repo_root,
             verbose=verbose,
             candidates_out=_cg_candidates,
+            config=config,
         ):
             _stats.patch_update_edits += 1
             yield _cg_msg

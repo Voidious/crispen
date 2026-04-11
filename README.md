@@ -505,6 +505,8 @@ Configuration:
 - `file_limiter_pytest_conftest` — route fixtures split out of test files to `conftest.py` so pytest auto-discovers them without imports (avoids F401/F811 warnings). Set to `false` if not using pytest or using custom fixture decorators (default: `true`).
 - `file_limiter_reexports` — controls when re-export stubs are added to the original file for public names moved to new files: `"always"` (every public name), `"application"` (all non-test files, no test files), or `"imported"` (only when the name is imported from this module elsewhere in the project — the same rule used for private names). Default: `"imported"`.
 - `file_limiter_patch_update` — controls how `@patch` string literals are updated after FileLimiter moves entities: `"ignore"` (leave all patch strings as-is) or `"basic"` (scan every `*.py` file in the repo and update patch strings reliably — i.e. only when the entity is imported by exactly one new sub-module (non-forking); if imported by multiple new files the entity is skipped). Import aliases from the original file that appear in exactly one new file are also updated. Default: `"ignore"`.
+- `callgraph_max_depth` — maximum BFS hops from a test function to a target sub-module during call-graph traversal (`"basic"` and `"rewrite"` modes). When the limit is reached the path is left unresolved and a warning is printed to stderr. Increase for codebases with very deep call chains. Default: `12`.
+- `callgraph_max_modules` — maximum distinct modules visited per resolution attempt during call-graph traversal. When the limit is reached the path is left unresolved and a warning is printed to stderr. Increase for large codebases with wide import graphs. Default: `50`.
 
 ## Architecture
 

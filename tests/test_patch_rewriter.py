@@ -5581,6 +5581,43 @@ def test_callgraph_update_file_verbose(tmp_path, capsys):
     assert "patch_callgraph" in captured.err
 
 
+def test_callgraph_update_file_truncated_warns(tmp_path, capsys):
+    # Depth limit of 0 forces truncation for indirect calls; warning must be printed.
+    # Test calls an intermediate function (not a terminal); with max_depth=0 the
+    # first BFS hop immediately hits the limit before reaching the terminal.
+    test_src = (
+        "from pkg.middle import middle_fn\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(mock_use_fn):\n"
+        "    middle_fn()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    scan_abs = str((tmp_path / "test_foo.py").resolve())
+    # middle_fn → helper (terminal in pkg.placement), but BFS cuts off before that.
+    middle_src = "from pkg.placement import helper\ndef middle_fn(): helper()\n"
+    index = _CgIndex(
+        module_to_source={"pkg.test_mod": test_src, "pkg.middle": middle_src},
+        module_to_package={"pkg.test_mod": "pkg", "pkg.middle": "pkg"},
+        module_to_defs={
+            "pkg.test_mod": set(),
+            "pkg.middle": _cg_collect_defined_names(middle_src),
+        },
+        file_to_module={scan_abs: "pkg.test_mod"},
+    )
+    result, changed, _unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        _make_cuf_contexts(),
+        scan_file=scan,
+        index=index,
+        max_depth=0,
+    )
+    assert not changed
+    captured = capsys.readouterr()
+    assert "traversal limit reached" in captured.err
+    assert "pkg.orig.use_fn" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # _resolve_forking_path_candidates — full result (truncation / candidates)
 # ---------------------------------------------------------------------------

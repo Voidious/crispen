@@ -1299,6 +1299,8 @@ def _resolve_forking_path_candidates(
     ctx: _FLContext,
     index: _CgIndex,
     calling_module: str,
+    max_depth: int = _CG_MAX_DEPTH,
+    max_modules: int = _CG_MAX_MODULES,
 ) -> Tuple[Optional[str], List[str], bool, List[str]]:
     """BFS call-graph resolution returning the full candidate set.
 
@@ -1311,8 +1313,8 @@ def _resolve_forking_path_candidates(
     - ``sorted_candidates`` — BFS-reachable candidate paths (may be empty).
       Only meaningful when ``truncated`` is ``False``; when limits were hit the
       list may be incomplete so callers must not rely on it for validation.
-    - ``truncated`` — ``True`` when :data:`_CG_MAX_DEPTH` or
-      :data:`_CG_MAX_MODULES` was reached during traversal, indicating the
+    - ``truncated`` — ``True`` when *max_depth* or *max_modules* was reached
+      during traversal, indicating the
       candidate list may be incomplete.
     - ``static_candidates`` — all possible new paths derived from the terminal
       set (independent of BFS reachability).  When ``sorted_candidates`` is
@@ -1395,12 +1397,12 @@ def _resolve_forking_path_candidates(
             continue
         visited.add(key)
 
-        if depth >= _CG_MAX_DEPTH:
+        if depth >= max_depth:
             truncated = True
             continue
 
         if module not in modules_seen:
-            if len(modules_seen) >= _CG_MAX_MODULES:
+            if len(modules_seen) >= max_modules:
                 truncated = True
                 continue
             modules_seen.add(module)
@@ -1442,6 +1444,8 @@ def _resolve_forking_path_via_callgraph(
     ctx: _FLContext,
     index: _CgIndex,
     calling_module: str,
+    max_depth: int = _CG_MAX_DEPTH,
+    max_modules: int = _CG_MAX_MODULES,
 ) -> Optional[str]:
     """Resolve a forking @patch path by BFS across the repo call graph.
 
@@ -1455,11 +1459,17 @@ def _resolve_forking_path_via_callgraph(
     locally) are followed without consuming depth budget, so that the split
     original file does not artificially cap traversal depth.
 
-    Limits: :data:`_CG_MAX_DEPTH` hops and :data:`_CG_MAX_MODULES` distinct
-    modules per resolution attempt.
+    Limits: *max_depth* hops and *max_modules* distinct modules per resolution
+    attempt.
     """
     path, _, _, _ = _resolve_forking_path_candidates(
-        forking_name, func_text, ctx, index, calling_module
+        forking_name,
+        func_text,
+        ctx,
+        index,
+        calling_module,
+        max_depth=max_depth,
+        max_modules=max_modules,
     )
     return path
 
@@ -2841,6 +2851,8 @@ def _callgraph_update_file(
     repo_root: Optional[str] = None,
     index: Optional[_CgIndex] = None,
     verbose: bool = False,
+    max_depth: int = _CG_MAX_DEPTH,
+    max_modules: int = _CG_MAX_MODULES,
 ) -> Tuple[str, bool, Dict[str, Dict[str, List[str]]]]:
     """Apply call-graph-resolved @patch updates to *source*.
 
@@ -2891,7 +2903,13 @@ def _callgraph_update_file(
                 else:
                     new_path, cands, truncated, static_cands = (
                         _resolve_forking_path_candidates(
-                            name, func.full_text, ctx, index, calling_module
+                            name,
+                            func.full_text,
+                            ctx,
+                            index,
+                            calling_module,
+                            max_depth=max_depth,
+                            max_modules=max_modules,
                         )
                     )
                 if new_path is not None:
@@ -2903,11 +2921,20 @@ def _callgraph_update_file(
                         del unresolved_candidates[func.function_name]
                     break
                 # Multiple BFS candidates without truncation → save for rewrite mode.
-                if len(cands) > 1 and not truncated:
+                if truncated:
+                    print(
+                        f"crispen: patch_callgraph: traversal limit reached for"
+                        f" '{old_path}' in '{scan_file}'"
+                        f" (max_depth={max_depth}, max_modules={max_modules})"
+                        f" — resolution skipped",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                elif len(cands) > 1:
                     unresolved_candidates.setdefault(func.function_name, {})[
                         old_path
                     ] = cands
-                elif len(cands) == 0 and not truncated and static_cands:
+                elif len(cands) == 0 and static_cands:
                     # BFS found no reachable candidates; fall back to the full
                     # static terminal set (all new modules that use the entity).
                     if len(static_cands) == 1:
@@ -3014,6 +3041,7 @@ def apply_patch_callgraph(
     repo_root: Optional[str],
     verbose: bool = False,
     candidates_out: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None,
+    config: Optional["CrispenConfig"] = None,
 ) -> Iterator[str]:
     """Algorithmically resolve forking @patch paths via call-graph tracing.
 
@@ -3043,6 +3071,11 @@ def apply_patch_callgraph(
     if not all_forking_paths:
         return
 
+    max_depth = config.callgraph_max_depth if config is not None else _CG_MAX_DEPTH
+    max_modules = (
+        config.callgraph_max_modules if config is not None else _CG_MAX_MODULES
+    )
+
     # Build repo-wide index once; per_file in-memory sources override disk.
     per_file_sources = {
         str(Path(fp).resolve()): state["source"] for fp, state in per_file.items()
@@ -3068,6 +3101,8 @@ def apply_patch_callgraph(
             repo_root=repo_root,
             index=index,
             verbose=verbose,
+            max_depth=max_depth,
+            max_modules=max_modules,
         )
         if changed:
             state["source"] = new_src
@@ -3109,6 +3144,8 @@ def apply_patch_callgraph(
             repo_root=repo_root,
             index=index,
             verbose=verbose,
+            max_depth=max_depth,
+            max_modules=max_modules,
         )
         if changed:
             py_file.write_text(new_src, encoding="utf-8")

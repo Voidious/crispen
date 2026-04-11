@@ -153,6 +153,17 @@ class CrispenConfig:
     # LLM is skipped.  Default 2 = three total attempts (initial + two retries).
     patch_update_retries: int = 2
 
+    # Maximum BFS hops from a test function to a target sub-module during
+    # call-graph traversal (used by file_limiter_patch_update "basic" and
+    # "rewrite" modes).  When this limit is reached the path is left unresolved
+    # and a warning is printed to stderr.  Increase for very deep call chains.
+    callgraph_max_depth: int = 12
+    # Maximum distinct modules visited per resolution attempt during
+    # call-graph traversal.  When this limit is reached the path is left
+    # unresolved and a warning is printed to stderr.  Increase for very large
+    # codebases with wide import graphs.
+    callgraph_max_modules: int = 50
+
     # Refactor allow-list: if non-empty, only the named refactors are run.
     # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
     # "tuple_dataclass", "file_limiter", "match_function".

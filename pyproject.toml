@@ -44,6 +44,8 @@ file_limiter_pytest_conftest = true
 file_limiter_reexports = "imported"
 file_limiter_patch_update = "ignore"
 patch_update_retries = 2
+callgraph_max_depth = 12
+callgraph_max_modules = 50
 timing = "detailed"
 
 [tool.pytest.ini_options]
