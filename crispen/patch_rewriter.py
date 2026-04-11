@@ -1694,8 +1694,9 @@ def _build_context_message(fl_contexts: List[_FLContext]) -> str:
                             + ", ".join(sorted(home_annotations))
                             + "; if F was **migrated to that submodule** (check the"
                             " entity migration table), update the patch to"
-                            " `submodule.N` — F may call N directly or via a helper"
-                            " in the same module\n"
+                            " `submodule.N` — F may call N directly, or via another"
+                            " function also defined in M (not a migrated helper that"
+                            " receives N's result as a parameter)\n"
                         )
                     else:
                         parts.append(
@@ -1928,6 +1929,10 @@ def _build_no_change_verify_prompt(
         "module. Ground your analysis in the test's actual construction — if a "
         "branch is not triggered by the test's inputs (e.g. an empty list skips "
         "an `if` block), do not assume that branch executes.\n"
+        "If the patch target lookup shows N is 'used in original module by F', "
+        "and the test calls F directly, the original-module patch is correct "
+        "regardless of whether F internally delegates to a migrated helper — "
+        "parameter-passing does not change where N is called.\n"
         "When you reject (correct=false): populate `corrections` with "
         "{current_path: corrected_path} for each reviewed string that "
         "needs renaming — use the exact strings from the 'under review' list as keys. "
@@ -2655,13 +2660,24 @@ def _process_file_source(
                         break
                     # Corrections verify rejected; update issue for retry/escalation.
                     issue = vc.tool_input.get("issue", "") or issue
-                # A no-change verify rejection (with or without corrections) means
-                # we've lost confidence in the no-change path — escalate immediately
-                # rather than retrying classify, which is likely to produce no-change
-                # again and waste a verify call.
+                if rename_verify_retries_left > 0:
+                    rename_verify_retries_left -= 1
+                    prev_issue = issue
+                    no_change_paths = ", ".join(f"`{p}`" for p in func.old_patch_paths)
+                    prev_proposed = (
+                        str(corrections_renames)
+                        if corrections_renames
+                        else f"no change (kept {no_change_paths} unchanged)"
+                    )
+                    attempts_left += 1  # don't burn classify retry budget
+                    continue
+                # Retries exhausted.  When verify_retries were enabled the
+                # verify step consistently identified a required change that
+                # the classify path could not produce — escalate to the full
+                # rewrite path, seeding it with the verifier's explanation.
                 if config.llm_verify_retries > 0:
                     _rewrite_escalation_error = issue
-                    _rewrite_escalation_reason = "no-change verify rejected"
+                    _rewrite_escalation_reason = "no-change verify retries exhausted"
                     attempts_left += 1  # allow one more outer iteration
                     continue
                 _outcome = "no_change"
