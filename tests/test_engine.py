@@ -3670,6 +3670,67 @@ def test_add_fl_context_forked_import_alias_already_mapped_skipped(tmp_path):
     assert "mypkg.big.call_with_tool" in fl_list[0].forking_old_paths
 
 
+def test_add_fl_context_subdir_split_uses_init_as_modified_source(tmp_path):
+    """Non-test subdir split: modified_source comes from new_files[subdir/__init__.py].
+
+    runner.py restores fl_result.original_source to the pre-split source for
+    non-test, non-has_main subdir splits and places the post-split __init__.py
+    content in new_files.  _add_fl_context must use that __init__.py content as
+    modified_source so _build_rename_guard_sets and the BFS terminal builder see
+    the correct set of names still present in the module after the split.
+    """
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    pre_split = "from llm import call_with_tool\ndef F(): pass\ndef G(): pass\n"
+    # Post-split __init__.py re-exports F but call_with_tool is NOT re-exported.
+    init_src = "from .sub import F\ndef advise(): pass\n"
+    fl_result = FileLimiterResult(
+        # runner.py restored original_source to pre-split for non-test subdir.
+        original_source=pre_split,
+        new_files={
+            "advisor/__init__.py": init_src,
+            "advisor/sub.py": "from llm import call_with_tool\ndef F(): pass\n",
+        },
+        abort=False,
+        subdir_name="advisor",
+        entity_to_target={"F": "advisor/sub.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    _add_fl_context(fl_list, filepath, pre_split, fl_result, {})
+    assert len(fl_list) == 1
+    # modified_source must be the __init__.py content, not original_source.
+    assert fl_list[0].modified_source == init_src
+    assert fl_list[0].original_source == pre_split
+
+
+def test_add_fl_context_subdir_split_no_init_falls_back_to_original_source(tmp_path):
+    """Test/has_main subdir split: no __init__.py → falls back to original_source.
+
+    For test files and has_main files with subdir_name set, runner.py does NOT
+    add a subdir/__init__.py to new_files.  The modified_source should therefore
+    fall back to fl_result.original_source (the post-split original file).
+    """
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    (tmp_path / "mypkg").mkdir()
+    fl_list = []
+    pre_split = "from llm import call_with_tool\ndef F(): pass\n"
+    # No __init__.py in new_files; original_source is the post-split state.
+    post_split_original = "from llm import call_with_tool\ndef F(): pass\n# stubs\n"
+    fl_result = FileLimiterResult(
+        original_source=post_split_original,
+        new_files={"advisor/sub.py": "def G(): pass\n"},
+        abort=False,
+        subdir_name="advisor",
+        entity_to_target={"G": "advisor/sub.py"},
+    )
+    filepath = str(tmp_path / "mypkg" / "big.py")
+    _add_fl_context(fl_list, filepath, pre_split, fl_result, {})
+    assert len(fl_list) == 1
+    # Falls back to fl_result.original_source since no __init__.py in new_files.
+    assert fl_list[0].modified_source == post_split_original
+
+
 # ---------------------------------------------------------------------------
 # "rewrite" patch mode in Phase 4
 # ---------------------------------------------------------------------------

@@ -536,12 +536,23 @@ def _add_fl_context(
         rel: _module_path_for_file(str(orig_dir / rel)) or rel
         for rel in fl_result.new_files
     }
+    # For non-test subdir splits the original file stays on disk unchanged and
+    # fl_result.original_source is the pre-split source (runner.py restores it
+    # at line 704 so the original file is left untouched).  The post-split
+    # module state lives in new_files["{subdir_name}/__init__.py"].  Use that
+    # as modified_source so _build_rename_guard_sets and the BFS terminal
+    # builder both see the correct set of names still present in the module.
+    init_key = f"{fl_result.subdir_name}/__init__.py" if fl_result.subdir_name else None
+    if init_key and init_key in fl_result.new_files:
+        modified_src = fl_result.new_files[init_key] or fl_result.original_source or ""
+    else:
+        modified_src = fl_result.original_source or ""
     fl_all_contexts.append(
         _FLContext(
             filepath=filepath,
             old_module=old_mod,
             original_source=pre_split_src,
-            modified_source=fl_result.original_source or "",
+            modified_source=modified_src,
             new_files=dict(fl_result.new_files),
             new_module_paths=new_mod_paths,
             entity_to_target=dict(fl_result.entity_to_target),
