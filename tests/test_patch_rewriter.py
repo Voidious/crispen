@@ -2887,6 +2887,22 @@ def test_local_const_map_last_wins():
     assert _build_local_const_map(src)["X"] == "second"
 
 
+def test_local_const_map_annotated_assignment():
+    src = 'TARGET: str = "myapp.service.MyClass"\n'
+    assert _build_local_const_map(src) == {"TARGET": "myapp.service.MyClass"}
+
+
+def test_local_const_map_annotated_non_string_excluded():
+    src = "TARGET: int = 42\n"
+    assert _build_local_const_map(src) == {}
+
+
+def test_local_const_map_annotated_no_value_excluded():
+    # Bare annotation with no value: ``TARGET: str`` — ast.AnnAssign with value=None
+    src = "TARGET: str\n"
+    assert _build_local_const_map(src) == {}
+
+
 # ---------------------------------------------------------------------------
 # _resolve_import_to_file
 # ---------------------------------------------------------------------------

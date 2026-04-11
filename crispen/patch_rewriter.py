@@ -345,7 +345,11 @@ def _compiles(code: str) -> bool:
 
 
 def _build_local_const_map(source: str) -> Dict[str, str]:
-    """Return {name: string_value} for module-level ``NAME = "string"`` assignments."""
+    """Return {name: string_value} for module-level ``NAME = "string"`` assignments.
+
+    Handles both plain assignments (``NAME = "value"``) and annotated assignments
+    (``NAME: str = "value"``).
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -360,6 +364,13 @@ def _build_local_const_map(source: str) -> Dict[str, str]:
             and isinstance(node.value.value, str)
         ):
             result[node.targets[0].id] = node.value.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            result[node.target.id] = node.value.value
     return result
 
 
