@@ -1245,7 +1245,7 @@ def test_build_context_lookup_still_in_also_in_new_submodule_with_users():
     assert "used by" in ctx_msg
     assert "helper" in ctx_msg
     assert "migrated to that submodule" in ctx_msg
-    assert "via another function" in ctx_msg
+    assert "Name references" in ctx_msg
 
 
 def test_build_context_lookup_still_in_also_in_new_submodule_no_users():
