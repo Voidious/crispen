@@ -1444,16 +1444,36 @@ def _resolve_forking_path_candidates(
         module, func_name, depth = queue.popleft()
         key = (module, func_name)
 
-        if key in terminal:
-            candidates.add(terminal[key])
-            continue  # don't recurse further into new sub-modules
-
-        if module in new_module_set:
-            continue  # new sub-module but not a terminal function — skip
-
         if key in visited:
             continue
         visited.add(key)
+
+        if key in terminal:
+            candidates.add(terminal[key])
+            # After recording this candidate, scan the terminal function's body
+            # for cross-module calls to other new submodules.  An orchestrator
+            # in one new submodule (e.g. main.py) may delegate work to
+            # functions in a sibling submodule (e.g. llm_steps.py) that also
+            # use the forking name — each sibling is an independent candidate
+            # the test must patch separately.
+            if module in new_module_set:
+                src = index.module_to_source.get(module)
+                if src and func_name in index.module_to_defs.get(module, set()):
+                    body_calls = _cg_collect_func_body_calls(src, func_name)
+                    mod_imports = index.get_imports(module)
+                    for called_name in body_calls:
+                        resolved = _cg_resolve_call_to_import(called_name, mod_imports)
+                        if resolved is not None:
+                            next_mod, next_name = resolved
+                            if (
+                                next_mod in new_module_set
+                                and (next_mod, next_name) not in visited
+                            ):
+                                queue.append((next_mod, next_name, depth + 1))
+            continue
+
+        if module in new_module_set:
+            continue  # non-terminal; _expand_module_terminals handles local chains
 
         if depth >= max_depth:
             truncated = True
@@ -2113,8 +2133,8 @@ def _rewrite_candidates_check(
     that has candidates:
 
     - If the old path is still present → the path was not updated, but it must be.
-    - If the old path is absent and none of its candidates appear → updated to
-      an unknown target not sanctioned by the call-graph.
+    - If the old path is absent and none of its candidates appear → the patch was
+      removed entirely (possible dead-code removal); let the LLM verify step decide.
 
     Returns ``None`` when the rewrite is consistent with candidates, or an error
     string describing the first problem found.
@@ -2129,11 +2149,10 @@ def _rewrite_candidates_check(
                 f"`{old}` was not updated — call-graph found it moved to: "
                 + ", ".join(f"`{c}`" for c in cands)
             )
-        if not any(c in new_strings for c in cands):
-            return (
-                f"`{old}` was not updated to a valid call-graph candidate: "
-                + ", ".join(f"`{c}`" for c in cands)
-            )
+        # Old path was removed. If a known candidate now appears, it was correctly
+        # relocated. If no candidate appears, the decorator may have been removed
+        # entirely (e.g. the patch was dead code). Allow both through — the LLM
+        # verify step assesses correctness.
     return None
 
 

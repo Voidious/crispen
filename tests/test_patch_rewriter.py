@@ -6126,6 +6126,152 @@ def test_resolve_forking_path_candidates_intra_module_local_already_visited():
     assert not truncated
 
 
+def test_resolve_forking_path_candidates_new_module_intra_chain():
+    # BFS follows intra-module calls within a new submodule to reach a terminal.
+    # Chain: test_mod → pkg.placement.wrapper (new-module, not terminal)
+    #                        (local) ↓
+    #                   pkg.placement._inner  ← terminal (calls use_fn directly)
+    #
+    # Before the fix, the BFS hit pkg.placement in new_module_set and stopped at
+    # wrapper without following _inner — no candidate was found.  After the fix,
+    # it follows the local call to _inner and discovers pkg.placement.use_fn.
+    placement_src = (
+        "from external import use_fn\n"
+        "def _inner(): use_fn()\n"
+        "def wrapper(): _inner()\n"
+    )
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={"wrapper": "placement.py", "_inner": "placement.py"},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = "from pkg.placement import wrapper\n"
+    modules = {
+        "pkg.test_mod": test_src,
+        "pkg.placement": placement_src,
+    }
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
+        file_to_module={},
+    )
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
+        "use_fn",
+        "def test_f(): wrapper()\n",
+        ctx,
+        index,
+        "pkg.test_mod",
+    )
+    assert path == "pkg.placement.use_fn"
+    assert cands == ["pkg.placement.use_fn"]
+    assert not truncated
+
+
+def test_resolve_forking_path_candidates_new_module_intra_chain_cycle():
+    # Intra-module traversal inside a new submodule respects the visited guard:
+    # a mutually recursive pair (a calls b, b calls a) does not loop.
+    placement_src = (
+        "from external import use_fn\n"
+        "def _inner(): use_fn()\n"
+        "def a(): b()\n"
+        "def b(): a(); _inner()\n"  # b is terminal (uses use_fn via _inner)
+    )
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"placement.py": placement_src},
+        new_module_paths={"placement.py": "pkg.placement"},
+        entity_to_target={"a": "placement.py"},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = "from pkg.placement import a\n"
+    modules = {
+        "pkg.test_mod": test_src,
+        "pkg.placement": placement_src,
+    }
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
+        file_to_module={},
+    )
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
+        "use_fn",
+        "def test_f(): a()\n",
+        ctx,
+        index,
+        "pkg.test_mod",
+    )
+    assert path == "pkg.placement.use_fn"
+    assert not truncated
+
+
+def test_resolve_forking_path_candidates_new_module_cross_module_terminal():
+    # BFS follows cross-module calls FROM a terminal function inside a new submodule.
+    # Scenario:
+    #   pkg.main:  _run_step() calls use_fn() directly (terminal)
+    #              orchestrate() calls _run_step() [local] + do_step() [pkg.steps]
+    #              _expand_module_terminals makes orchestrate terminal for pkg.main.use_fn  # noqa: E501
+    #   pkg.steps: do_step() calls use_fn() (terminal for pkg.steps.use_fn)
+    #
+    # When BFS hits (pkg.main, orchestrate) — which IS in terminal — it should
+    # record pkg.main.use_fn AND then follow the cross-module call to
+    # (pkg.steps, do_step), discovering pkg.steps.use_fn as a second candidate.
+    # Line 1472 in the BFS is covered only by this cross-module append.
+    main_src = (
+        "from external import use_fn\n"
+        "from pkg.steps import do_step\n"
+        "def _run_step(): use_fn()\n"
+        "def orchestrate(): _run_step(); do_step()\n"
+    )
+    steps_src = "from external import use_fn\n" "def do_step(): use_fn()\n"
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source="from external import use_fn\n",
+        modified_source="",
+        new_files={"main.py": main_src, "steps.py": steps_src},
+        new_module_paths={"main.py": "pkg.main", "steps.py": "pkg.steps"},
+        entity_to_target={
+            "_run_step": "main.py",
+            "orchestrate": "main.py",
+            "do_step": "steps.py",
+        },
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = "from pkg.main import orchestrate\n"
+    modules = {
+        "pkg.test_mod": test_src,
+        "pkg.main": main_src,
+        "pkg.steps": steps_src,
+    }
+    index = _CgIndex(
+        module_to_source=modules,
+        module_to_package={m: "pkg" for m in modules},
+        module_to_defs={m: _cg_collect_defined_names(s) for m, s in modules.items()},
+        file_to_module={},
+    )
+    path, cands, truncated, _static = _resolve_forking_path_candidates(
+        "use_fn",
+        "def test_f(): orchestrate()\n",
+        ctx,
+        index,
+        "pkg.test_mod",
+    )
+    # Both submodules use use_fn — two candidates, no single resolved path.
+    assert path is None
+    assert sorted(cands) == ["pkg.main.use_fn", "pkg.steps.use_fn"]
+    assert not truncated
+
+
 # ---------------------------------------------------------------------------
 # BFS — import alias traversal
 # ---------------------------------------------------------------------------
@@ -6598,12 +6744,19 @@ def test_rewrite_candidates_check_old_still_present():
 
 
 def test_rewrite_candidates_check_renamed_to_unknown():
-    # Old path absent but none of the candidates appear → error.
+    # Old path absent, no known candidate appears — could be a wrong rename or a
+    # dead-code removal. Let the LLM verify step decide; no error returned here.
     text = '@patch("pkg.wrong.A")\ndef test_f(m): pass\n'
     cands = {"pkg.mod.A": ["pkg.placement.A", "pkg.other.A"]}
-    result = _rewrite_candidates_check(["pkg.mod.A"], text, cands)
-    assert result is not None
-    assert "pkg.placement.A" in result
+    assert _rewrite_candidates_check(["pkg.mod.A"], text, cands) is None
+
+
+def test_rewrite_candidates_check_deleted_patch():
+    # Old path absent and decorator was removed entirely → dead-code removal is
+    # allowed; let the LLM verify step confirm correctness.
+    text = "def test_f(): pass\n"
+    cands = {"pkg.mod.A": ["pkg.placement.A", "pkg.other.A"]}
+    assert _rewrite_candidates_check(["pkg.mod.A"], text, cands) is None
 
 
 def test_rewrite_candidates_check_path_without_candidates_ignored():
