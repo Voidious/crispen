@@ -563,6 +563,88 @@ def test_call_with_tool_openai_invalid_prompt_returns_none(capsys):
     assert "policy flag" in err
 
 
+def test_call_with_tool_openai_bad_request_other_code_raises_with_diag():
+    """BadRequestError with code != 'invalid_prompt' raises CrispenAPIError + diag."""
+
+    class _BadRequest(Exception):
+        code = None  # e.g. 'invalid_request_error' JSON-parse failure
+
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _BadRequest
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _BadRequest("invalid json body")
+        with pytest.raises(CrispenAPIError) as exc_info:
+            call_with_tool(
+                client,
+                "openai",
+                "gpt-5.2",
+                512,
+                _TOOL,
+                "evaluate_duplicate",
+                _MESSAGES,
+                caller="Test",
+            )
+    msg = str(exc_info.value)
+    assert "openai API error" in msg
+    assert "messages_chars=" in msg
+
+
+def test_call_with_tool_openai_bad_request_ctrl_chars_in_diag():
+    """BadRequestError diagnostic reports control characters found in messages."""
+
+    class _BadRequest(Exception):
+        code = None
+
+    ctrl_messages = [{"role": "user", "content": "hello\x00world"}]
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _BadRequest
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _BadRequest("bad")
+        with pytest.raises(CrispenAPIError) as exc_info:
+            call_with_tool(
+                client,
+                "openai",
+                "gpt-5.2",
+                512,
+                _TOOL,
+                "evaluate_duplicate",
+                ctrl_messages,
+                caller="Test",
+            )
+    msg = str(exc_info.value)
+    assert "ctrl=" in msg
+
+
+def test_call_with_tool_openai_bad_request_json_error_in_diag():
+    """BadRequestError diagnostic reports json_error when messages can't serialize."""
+
+    class _BadRequest(Exception):
+        code = None
+
+    # A set is not JSON-serializable → triggers the except branch in the diagnostic.
+    bad_messages = [{"role": "user", "content": {"not", "serializable"}}]
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _BadRequest
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _BadRequest("bad")
+        with pytest.raises(CrispenAPIError) as exc_info:
+            call_with_tool(
+                client,
+                "openai",
+                "gpt-5.2",
+                512,
+                _TOOL,
+                "evaluate_duplicate",
+                bad_messages,
+                caller="Test",
+            )
+    msg = str(exc_info.value)
+    assert "json_error=" in msg
+
+
 def test_call_with_tool_openai_non_bad_request_api_error_raises():
     """Non-BadRequestError openai.APIError is re-raised as CrispenAPIError."""
 

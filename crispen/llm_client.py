@@ -198,9 +198,22 @@ def call_with_tool(
                         input_tokens=0,
                         output_tokens=0,
                     )
+                # Collect diagnostic info to help root-cause 400 errors.
+                _diag: list[str] = []
+                try:
+                    _msg_json = json.dumps(messages)
+                    _diag.append(f"messages_chars={len(_msg_json)}")
+                    _ctrl = [
+                        f"\\u{i:04x}" for i in range(0x20) if f"\\u{i:04x}" in _msg_json
+                    ]
+                    if _ctrl:
+                        _diag.append(f"ctrl={_ctrl}")
+                except (TypeError, ValueError) as _je:
+                    _diag.append(f"json_error={_je!r}")
                 raise CrispenAPIError(
-                    f"{caller}: {provider} API error: {exc}\n"
-                    "Commit blocked. To skip all hooks: git commit --no-verify"
+                    f"{caller}: {provider} API error: {exc}"
+                    + (f"\n  diag: {', '.join(_diag)}" if _diag else "")
+                    + "\nCommit blocked. To skip all hooks: git commit --no-verify"
                 ) from exc
             except openai.APIError as exc:
                 if (
