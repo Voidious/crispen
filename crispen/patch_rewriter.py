@@ -2360,12 +2360,9 @@ def _process_file_source(
                     if not _compiles(new_func_text):
                         prev_error = "Rewritten function is not valid Python."
                         continue
-                    # Restore any @patch constant references the LLM left unchanged.
-                    if func.const_refs:
-                        new_func_text = _restore_const_refs(
-                            new_func_text, func.const_refs
-                        )
                     # Candidates pre-check: algorithmic validation before LLM verify.
+                    # Use the raw string-literal form (before constant restoration)
+                    # so the regex-based checker can match patch paths correctly.
                     if func_candidates:
                         rw_cand_issue = _rewrite_candidates_check(
                             func.old_patch_paths, new_func_text, func_candidates
@@ -2373,7 +2370,9 @@ def _process_file_source(
                         if rw_cand_issue:
                             prev_error = rw_cand_issue
                             continue
-                    # LLM verify step.
+                    # LLM verify step.  Pass the raw string-literal form for both
+                    # original and rewrite so the verifier can compare them without
+                    # needing to resolve named constants (e.g. _PATCH_CLIENT).
                     rewrite_verify_prompt = _build_rewrite_verify_prompt(
                         context_msg,
                         func.full_text,
@@ -2430,6 +2429,13 @@ def _process_file_source(
                                 flush=True,
                             )
                     if rv_correct:
+                        # Restore @patch constant references only after the
+                        # rewrite is accepted, so the verifier always compares
+                        # string-literal forms in both original and rewrite.
+                        if func.const_refs:
+                            new_func_text = _restore_const_refs(
+                                new_func_text, func.const_refs
+                            )
                         func_splices.append(
                             (func.start_line, func.end_line, new_func_text)
                         )
