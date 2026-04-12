@@ -178,6 +178,7 @@ def call_with_tool(
         }
         if provider == "moonshot":
             create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        _parse_retries_left = 2  # retries for transient 400 "cannot parse JSON" errors
         for _attempt in range(rate_limit_retries + 1):  # pragma: no branch
             try:
                 t0 = time.perf_counter()
@@ -198,6 +199,20 @@ def call_with_tool(
                         input_tokens=0,
                         output_tokens=0,
                     )
+                # Retry transient 400 "cannot parse JSON body" errors.
+                if (
+                    "parse" in str(exc).lower()
+                    and _parse_retries_left > 0
+                    and _attempt < rate_limit_retries
+                ):
+                    _parse_retries_left -= 1
+                    print(
+                        f"crispen: {caller}: {provider} API error"
+                        f" (400, retrying): {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 # Collect diagnostic info to help root-cause 400 errors.
                 _diag: list[str] = []
                 try:
@@ -208,6 +223,21 @@ def call_with_tool(
                     ]
                     if _ctrl:
                         _diag.append(f"ctrl={_ctrl}")
+                    # Check for lone surrogates (U+D800–U+DFFF); json.dumps
+                    # encodes them as \udXXX, which strict servers reject.
+                    _surr_pfx = [
+                        "\\ud8",
+                        "\\ud9",
+                        "\\uda",
+                        "\\udb",
+                        "\\udc",
+                        "\\udd",
+                        "\\ude",
+                        "\\udf",
+                    ]
+                    _surr = [p for p in _surr_pfx if p in _msg_json]
+                    if _surr:
+                        _diag.append(f"surrogates={_surr}")
                 except (TypeError, ValueError) as _je:
                     _diag.append(f"json_error={_je!r}")
                 raise CrispenAPIError(

@@ -645,6 +645,92 @@ def test_call_with_tool_openai_bad_request_json_error_in_diag():
     assert "json_error=" in msg
 
 
+def test_call_with_tool_openai_parse_error_400_retries_and_succeeds(capsys):
+    """BadRequestError with 'parse' in the message retries and succeeds."""
+
+    class _BadRequest(Exception):
+        code = None
+
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _BadRequest
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [
+            _BadRequest("cannot parse the JSON body"),
+            _make_openai_response("evaluate_duplicate", {"is_valid_duplicate": True}),
+        ]
+        result = call_with_tool(
+            client,
+            "openai",
+            "gpt-5.2",
+            512,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+            caller="Test",
+            rate_limit_retries=1,
+        )
+    err = capsys.readouterr().err
+    assert "(400, retrying)" in err
+    assert result.tool_input is not None
+
+
+def test_call_with_tool_openai_parse_error_400_no_retry_slots_raises():
+    """parse-error retry is blocked when rate_limit_retries=0."""
+
+    class _BadRequest(Exception):
+        code = None
+
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _BadRequest
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _BadRequest(
+            "cannot parse the JSON body"
+        )
+        with pytest.raises(CrispenAPIError) as exc_info:
+            call_with_tool(
+                client,
+                "openai",
+                "gpt-5.2",
+                512,
+                _TOOL,
+                "evaluate_duplicate",
+                _MESSAGES,
+                caller="Test",
+                rate_limit_retries=0,
+            )
+    msg = str(exc_info.value)
+    assert "messages_chars=" in msg
+
+
+def test_call_with_tool_openai_bad_request_surrogates_in_diag():
+    """BadRequestError diagnostic reports lone surrogates found in messages."""
+
+    class _BadRequest(Exception):
+        code = None
+
+    surr_messages = [{"role": "user", "content": "hello\ud800world"}]
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.BadRequestError = _BadRequest
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _BadRequest("bad request")
+        with pytest.raises(CrispenAPIError) as exc_info:
+            call_with_tool(
+                client,
+                "openai",
+                "gpt-5.2",
+                512,
+                _TOOL,
+                "evaluate_duplicate",
+                surr_messages,
+                caller="Test",
+            )
+    msg = str(exc_info.value)
+    assert "surrogates=" in msg
+
+
 def test_call_with_tool_openai_non_bad_request_api_error_raises():
     """Non-BadRequestError openai.APIError is re-raised as CrispenAPIError."""
 
