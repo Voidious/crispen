@@ -922,7 +922,7 @@ def test_build_rename_guard_sets_orig_users_map():
         ),
         new_files={},
     )
-    _, _, orig_users, _ = _build_rename_guard_sets([ctx])
+    _, _, orig_users, *_ = _build_rename_guard_sets([ctx])
     assert orig_users.get("make_client") == ["advise"]
 
 
@@ -933,7 +933,7 @@ def test_build_rename_guard_sets_no_users_not_in_map():
         modified_source="from ...llm_client import make_client\ndef advise(): pass\n",
         new_files={},
     )
-    _, _, orig_users, _ = _build_rename_guard_sets([ctx])
+    _, _, orig_users, *_ = _build_rename_guard_sets([ctx])
     assert "make_client" not in orig_users
 
 
@@ -957,7 +957,7 @@ def test_build_rename_guard_sets_merges_multiple_contexts():
         modified_source="from ...b import bar\ndef f2(): bar()\n",
         new_files={},
     )
-    _, still_in, orig_users, _ = _build_rename_guard_sets([ctx1, ctx2])
+    _, still_in, orig_users, *_ = _build_rename_guard_sets([ctx1, ctx2])
     assert "foo" in still_in
     assert "bar" in still_in
     assert orig_users["foo"] == ["f1"]
@@ -976,7 +976,7 @@ def test_build_rename_guard_sets_deduplicates_merged_users():
         modified_source="from ...a import foo\ndef f1(): foo()\n",
         new_files={},
     )
-    _, _, orig_users, _ = _build_rename_guard_sets([ctx1, ctx2])
+    _, _, orig_users, *_ = _build_rename_guard_sets([ctx1, ctx2])
     assert orig_users["foo"].count("f1") == 1
 
 
@@ -1836,8 +1836,9 @@ def test_process_no_change_corrections_name_invariant_filtered(mock_call):
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_corrections_still_imported_guard(mock_call):
     # Verifier proposes corrections that move a name listed as still-imported in
-    # the context message.  The still-imported guard must drop these corrections;
-    # with empty corrections the retry loop resumes and accepts no-change on verify.
+    # the context message to a non-submodule path.  The second still-imported
+    # filter drops the correction; with empty corrections the retry loop resumes
+    # and accepts no-change on verify.
     still_imported_ctx = (
         "Names still externally imported in the modified original (check):\n" "- `X`\n"
     )
@@ -1864,7 +1865,8 @@ def test_process_no_change_corrections_still_imported_guard(mock_call):
         3,
         still_imported={"X"},
     )
-    # Correction was filtered (X still imported) — no change applied.
+    # Correction was filtered (X still imported, non-submodule target) —
+    # no change applied; retry loop accepted no-change on subsequent verify.
     assert "crispen.sub.X" not in result
     assert mock_call.call_count == 4
 

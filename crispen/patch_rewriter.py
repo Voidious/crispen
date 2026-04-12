@@ -1563,7 +1563,12 @@ def _resolve_forking_path_via_callgraph(
 
 def _build_rename_guard_sets(
     fl_contexts: List[_FLContext],
-) -> Tuple[Set[str], Set[str], Dict[str, List[str]], Dict[str, Set[str]]]:
+) -> Tuple[
+    Set[str],
+    Set[str],
+    Dict[str, List[str]],
+    Dict[str, Set[str]],
+]:
     """Derive rename-guard data directly from the split contexts.
 
     Returns ``(moved_out_names, still_imported, orig_users_map,
@@ -1962,6 +1967,13 @@ def _build_no_change_verify_prompt(
         "and the test calls F directly, the original-module patch is correct "
         "regardless of whether F internally delegates to a migrated helper — "
         "parameter-passing does not change where N is called.\n"
+        "**Mandatory check for still-imported names:** Before concluding that a "
+        "still-imported name N needs relocating to submodule M: look up N in M's "
+        "**Name references** section. If F (the function under test) is NOT listed "
+        "as a caller of N in M, then F does not call N — it either receives the "
+        "resource as a parameter or doesn't use N at all. The mere fact that M "
+        "imports N and F lives in M is irrelevant. Patching at the original module "
+        "is correct. Proceed to flag it only if F IS listed.\n"
         "**No-op patch rule:** If N appears in 'Names still externally imported "
         "in the modified original' (meaning the name is still importable at the "
         "original path — no AttributeError at test time), AND neither F nor "
@@ -2617,12 +2629,13 @@ def _process_file_source(
                     )
                 }
                 # Guard: drop corrections that are known-incorrect hallucinations.
-                # _is_bad_rename blocks two patterns:
+                # _is_bad_rename blocks patterns A–C:
                 #   A) shallowing a moved-out name (would raise AttributeError)
                 #   B) deepening a still-in name when the test exercises the
                 #      original-module caller (wrong binding intercepted)
-                # The second filter retains the pre-existing guard: drop any
-                # still-in name that isn't being deepened into a true sub-module.
+                #   C) target module doesn't import the name
+                # The second filter retains a guard: drop any still-in name
+                # that isn't being deepened into a true sub-module.
                 if _still_imported or _moved_out_names or _new_module_imports:
                     corrections_renames = {
                         old: new
@@ -3383,9 +3396,12 @@ def apply_patch_rewrite(
             if any(path in file_src for path in ctx.forking_old_paths)
         ]
         context_msg = _build_context_message(relevant_contexts)
-        _moved_out, _still_in, _orig_users, _new_mod_imports = _build_rename_guard_sets(
-            relevant_contexts
-        )
+        (
+            _moved_out,
+            _still_in,
+            _orig_users,
+            _new_mod_imports,
+        ) = _build_rename_guard_sets(relevant_contexts)
         abs_fp = str(Path(filepath).resolve())
         file_cands = (cg_candidates or {}).get(abs_fp) or None
         new_src, changed, cross = _process_file_source(
@@ -3444,9 +3460,12 @@ def apply_patch_rewrite(
             if any(path in src for path in ctx.forking_old_paths)
         ]
         context_msg = _build_context_message(relevant_contexts)
-        _moved_out, _still_in, _orig_users, _new_mod_imports = _build_rename_guard_sets(
-            relevant_contexts
-        )
+        (
+            _moved_out,
+            _still_in,
+            _orig_users,
+            _new_mod_imports,
+        ) = _build_rename_guard_sets(relevant_contexts)
         file_cands = (cg_candidates or {}).get(str(py_file.resolve())) or None
         new_src, changed, cross = _process_file_source(
             src,
