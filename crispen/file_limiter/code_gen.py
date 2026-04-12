@@ -194,12 +194,14 @@ def _import_derived_names(source: str) -> Set[str]:
 
 
 def _collect_name_loads(source: str) -> Set[str]:
-    """Return Name loads in *source* that are not shadowed by function parameters.
+    """Return Name loads in *source* that are not shadowed by function parameters
+    or local variable assignments.
 
     For each function or async function, names that appear as parameters of that
-    function are excluded from Name loads within its body.  This prevents generating
-    spurious cross-file imports for names that are satisfied locally (e.g. pytest
-    fixture names that appear as test function parameters).
+    function or are assigned anywhere in the function body are excluded from Name
+    loads within its body.  This prevents generating spurious cross-file imports
+    for names that are satisfied locally (e.g. pytest fixture names that appear as
+    test function parameters, or local variables like ``helpers = tmp_path / ...``).
 
     Decorators, argument default values, and return/argument annotations are
     always evaluated in the outer scope and are never excluded.
@@ -209,6 +211,26 @@ def _collect_name_loads(source: str) -> Set[str]:
     except SyntaxError:
         return set()
     names: Set[str] = set()
+
+    def _body_stores(stmts) -> frozenset:
+        """Names stored/deleted at this scope level in *stmts*.
+
+        Recurses into control-flow nodes (if/for/while/with/try) but stops at
+        nested FunctionDef/AsyncFunctionDef/ClassDef scopes so only names that
+        are local to the current function are returned.
+        """
+        stores: Set[str] = set()
+        work = list(stmts)
+        while work:
+            node = work.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                stores.add(node.id)
+            work.extend(ast.iter_child_nodes(node))
+        return frozenset(stores)
 
     def _walk(node: ast.AST, excluded: frozenset) -> None:
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
@@ -244,8 +266,9 @@ def _collect_name_loads(source: str) -> Set[str]:
                 _walk(args.kwarg.annotation, excluded)
             if node.returns:
                 _walk(node.returns, excluded)
-            # Function body uses the combined excluded set.
-            new_excluded = excluded | own_params
+            # Function body uses params + local stores as the excluded set.
+            own_locals = _body_stores(node.body)
+            new_excluded = excluded | own_params | own_locals
             for child in node.body:
                 _walk(child, new_excluded)
             return

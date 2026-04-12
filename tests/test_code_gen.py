@@ -180,6 +180,38 @@ def test_collect_name_loads_annotated_vararg_kwarg():
     assert "KwType" in names
 
 
+def test_collect_name_loads_excludes_local_variable_assignments():
+    # A name assigned in the function body is a local variable — not an import.
+    # Loads of that name (e.g. attribute access) must not generate cross-file imports.
+    source = textwrap.dedent(
+        """\
+        def test_foo(tmp_path):
+            helpers = tmp_path / "helpers.py"
+            helpers.write_text("X = 1", encoding="utf-8")
+            assert str(helpers.resolve()) == "x"
+        """
+    )
+    names = _collect_name_loads(source)
+    assert "helpers" not in names
+    assert "tmp_path" not in names  # also a param — still excluded
+
+
+def test_collect_name_loads_local_store_does_not_suppress_outer_loads():
+    # A local assignment in an inner function must not suppress the outer scope's load.
+    source = textwrap.dedent(
+        """\
+        def outer():
+            use(helper)
+            def inner():
+                helper = 1
+                use(helper)
+        """
+    )
+    names = _collect_name_loads(source)
+    # outer() loads 'helper' (not locally defined there); inner() assigns it locally.
+    assert "helper" in names
+
+
 # ---------------------------------------------------------------------------
 # _collect_quoted_annotation_names
 # ---------------------------------------------------------------------------
