@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import io
 import re
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -66,6 +68,51 @@ _EXCESS_BLANK_RE = re.compile(r"\n{4,}")
 _EXCESS_BLANK_BODY_RE = re.compile(r"\n{3,}(?=[ \t])")
 
 
+def _multiline_string_ranges(source: str) -> List[Tuple[int, int]]:
+    """Return (start, end) character offsets for every multi-line string literal.
+
+    Uses the tokenizer so that triple-quoted strings containing blank lines
+    followed by indented content are not mistakenly collapsed by blank-line
+    normalization regexes.  Falls back to an empty list on tokenization error
+    (e.g. if the source is not yet valid Python), preserving original behavior.
+    """
+    ranges: List[Tuple[int, int]] = []
+    lines = source.splitlines(keepends=True)
+    # cumulative[i] = byte offset of the start of line i (0-indexed)
+    cumulative = [0]
+    for line in lines:
+        cumulative.append(cumulative[-1] + len(line))
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        for tok_type, tok_string, tok_start, tok_end, _ in tokens:
+            if tok_type == tokenize.STRING and "\n" in tok_string:
+                start = cumulative[tok_start[0] - 1] + tok_start[1]
+                end = cumulative[tok_end[0] - 1] + tok_end[1]
+                ranges.append((start, end))
+    except tokenize.TokenError:
+        pass
+    return ranges
+
+
+def _sub_skip_strings(pattern: re.Pattern, repl: str, source: str) -> str:
+    """Apply *pattern*.sub(*repl*, ...) to *source*, skipping string literals.
+
+    Blank-line normalization must not alter content inside string literals (e.g.
+    source code stored in a dedented triple-quoted string used in tests).
+    """
+    ranges = _multiline_string_ranges(source)
+    if not ranges:
+        return pattern.sub(repl, source)
+    parts: List[str] = []
+    last = 0
+    for start, end in ranges:
+        parts.append(pattern.sub(repl, source[last:start]))
+        parts.append(source[start:end])
+        last = end
+    parts.append(pattern.sub(repl, source[last:]))
+    return "".join(parts)
+
+
 def _normalize_blank_lines(source: str) -> str:
     """Collapse excess blank lines; ensure exactly one trailing newline.
 
@@ -80,9 +127,13 @@ def _normalize_blank_lines(source: str) -> str:
 
     Returns an empty string when *source* contains only whitespace, signalling
     that the file should be deleted rather than written with a lone blank line.
+
+    Multi-line string literals are protected: blank lines inside them are never
+    collapsed, so stored source-code snippets (e.g. in test fixtures) are not
+    mutated.
     """
-    source = _EXCESS_BLANK_RE.sub("\n\n\n", source)
-    source = _EXCESS_BLANK_BODY_RE.sub("\n\n", source)
+    source = _sub_skip_strings(_EXCESS_BLANK_RE, "\n\n\n", source)
+    source = _sub_skip_strings(_EXCESS_BLANK_BODY_RE, "\n\n", source)
     source = source.lstrip("\n")
     stripped = source.rstrip("\n")
     if not stripped.strip():

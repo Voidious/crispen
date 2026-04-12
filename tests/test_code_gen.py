@@ -51,7 +51,9 @@ from crispen.file_limiter.code_gen import (
     _split_cross_imports_by_test,
     _source_is_only_docstring,
     _strip_module_docstring,
+    _multiline_string_ranges,
     _normalize_blank_lines,
+    _sub_skip_strings,
     _strip_orphaned_indented_comments,
     _strip_orphaned_section_headers,
     _strip_top_level_import_lines,
@@ -6342,6 +6344,120 @@ def test_normalize_blank_lines_trailing_newline():
     result = _normalize_blank_lines(source)
     assert result.endswith("\n")
     assert not result.endswith("\n\n")
+
+
+def test_normalize_blank_lines_preserves_multiline_string_body_blanks():
+    """Blank lines inside a multi-line string literal are never collapsed.
+
+    Regression: _EXCESS_BLANK_BODY_RE matched \\n{3,}(?=[ \\t]) inside
+    triple-quoted strings, collapsing 2 blank lines before an indented line
+    to 1 (e.g. stored source-code fixtures in tests).
+    """
+    # The triple-quoted string contains 2 blank lines before an indented `def`.
+    # That produces the sequence \\n\\n\\n        def inside the raw source,
+    # which _EXCESS_BLANK_BODY_RE would collapse to \\n\\n        def.
+    source = textwrap.dedent(
+        """\
+        import textwrap
+        def foo():
+            src = textwrap.dedent(
+                \"\"\"\\
+                @dataclass
+                class _SplitTask:
+                    pass
+
+
+                def _find_free_vars():
+                    x = 1
+                \"\"\"
+            )
+        """
+    )
+    result = _normalize_blank_lines(source)
+    # Two blank lines before the indented `def` inside the string must survive.
+    # After outer textwrap.dedent the string content has 8-space indentation.
+    assert "\n\n\n        def _find_free_vars" in result
+
+
+def test_normalize_blank_lines_still_collapses_excess_outside_strings():
+    """Blank-line collapsing still fires for code outside string literals."""
+    source = "def foo():\n    x = 1\n\n\n    y = 2\n"
+    result = _normalize_blank_lines(source)
+    assert "\n\n\n    y" not in result
+    assert "\n\n    y" in result
+
+
+# ---------------------------------------------------------------------------
+# _multiline_string_ranges
+# ---------------------------------------------------------------------------
+
+
+def test_multiline_string_ranges_triple_quoted():
+    """Detects a triple-quoted string spanning multiple lines."""
+    source = 'x = """\nhello\n"""\n'
+    ranges = _multiline_string_ranges(source)
+    assert len(ranges) == 1
+    start, end = ranges[0]
+    assert source[start:end] == '"""\nhello\n"""'
+
+
+def test_multiline_string_ranges_single_line_string_ignored():
+    """Single-line strings (no literal newline) are not returned."""
+    source = 'x = "hello\\n"\n'
+    ranges = _multiline_string_ranges(source)
+    assert ranges == []
+
+
+def test_multiline_string_ranges_no_strings():
+    """Returns empty list when there are no string literals."""
+    source = "x = 1 + 2\n"
+    ranges = _multiline_string_ranges(source)
+    assert ranges == []
+
+
+def test_multiline_string_ranges_invalid_source():
+    """Falls back to empty list on tokenization error."""
+    # Unterminated string triggers TokenError.
+    source = 'x = """\nhello\n'
+    ranges = _multiline_string_ranges(source)
+    assert ranges == []
+
+
+# ---------------------------------------------------------------------------
+# _sub_skip_strings
+# ---------------------------------------------------------------------------
+
+
+def test_sub_skip_strings_does_not_touch_string_content():
+    """Pattern match inside a multi-line string is not substituted."""
+    import re
+
+    pattern = re.compile(r"\n{3,}(?=[ \t])")
+    source = 'def f():\n    s = """\n    a\n\n\n    b\n    """\n'
+    result = _sub_skip_strings(pattern, "\n\n", source)
+    # The sequence inside the string must survive unchanged.
+    assert "\n\n\n    b" in result
+
+
+def test_sub_skip_strings_applies_outside_strings():
+    """Pattern match outside string literals is substituted normally."""
+    import re
+
+    pattern = re.compile(r"\n{3,}(?=[ \t])")
+    source = "def f():\n    x = 1\n\n\n    y = 2\n"
+    result = _sub_skip_strings(pattern, "\n\n", source)
+    assert "\n\n\n    y" not in result
+    assert "\n\n    y" in result
+
+
+def test_sub_skip_strings_no_strings_falls_through():
+    """When there are no multi-line strings the plain .sub() path is taken."""
+    import re
+
+    pattern = re.compile(r"x")
+    source = "x = 1\n"
+    result = _sub_skip_strings(pattern, "y", source)
+    assert result == "y = 1\n"
 
 
 # ---------------------------------------------------------------------------
