@@ -1848,19 +1848,29 @@ def _build_classify_prompt(
                     parts.append(
                         f"- `{old}` → reachable in **multiple** sub-modules: "
                         f"{cands_str}.\n"
-                        f"  **Multi-submodule signal**: if the test's mock is "
-                        f"expected to handle calls from more than one of these "
-                        f"sub-modules (check side_effect count and call_count "
-                        f"assertions against what any single sub-module can "
-                        f"account for), set `needs_rewrite=True` — a single "
-                        f"@patch intercepts only its own module's binding, so "
-                        f"each sub-module needs its own @patch decorator. "
-                        f"Only pick a single sub-module if the test is structured "
-                        f"so that the other sub-modules are never reached "
-                        f"(e.g. an early-return guard).\n"
+                        f"  **IMPORTANT: the old path `{old}` no longer exists "
+                        f"at that location — patching it will raise `AttributeError` "
+                        f"at test runtime. Returning `patch_renames: {{}}` (no "
+                        f"change) is ALWAYS WRONG when this path appears in the "
+                        f"candidates list.**\n"
+                        f"  You MUST either rename it to one of the candidates or "
+                        f"set `needs_rewrite=True`.\n"
+                        f"  **Multi-submodule signal**: count the mock's "
+                        f"`side_effect` entries. If the total exceeds what any "
+                        f"single sub-module can account for, set "
+                        f"`needs_rewrite=True` — each sub-module needs its own "
+                        f"@patch. Only pick a single sub-module if the test is "
+                        f"structured so that the others are never reached "
+                        f"(e.g. an early-return guard, or a call_count==1 "
+                        f"assertion).\n"
                     )
                 else:
-                    parts.append(f"- `{old}` → must be: {cands_str}\n")
+                    parts.append(
+                        f"- `{old}` → must be: {cands_str}.\n"
+                        f"  **IMPORTANT: the old path `{old}` no longer exists "
+                        f"— patching it raises `AttributeError`. Returning "
+                        f"`patch_renames: {{}}` (no change) is WRONG.**\n"
+                    )
             parts.append("\n")
     if prev_issue:
         parts.append(
@@ -2112,12 +2122,14 @@ def _build_rewrite_verify_prompt(
         "Verify that the rewrite is correct:\n"
         "- All @patch strings point to where the name is looked up after the split.\n"
         "- **Multi-submodule completeness**: if the call-graph candidates show "
-        "a patched name is reachable in multiple sub-modules AND the test's "
-        "mock handles calls from more than one of them (side_effect count or "
-        "call_count assertions exceed what one sub-module accounts for), then "
-        "ALL exercised sub-modules must have their own @patch decorator for "
-        "that name. A missing sub-module is an error — set `correct=False` "
-        "naming the unpatched sub-module.\n"
+        "a patched name is reachable in multiple sub-modules, count the "
+        "mock's `side_effect` entries (or `call_count` assertions). If the "
+        "count is ≥2 and candidates span ≥2 sub-modules, each sub-module "
+        "call goes through its own binding — a single @patch only intercepts "
+        "its own module. All exercised sub-modules must have their own "
+        "@patch. A rewrite that patches only ONE sub-module for a mock with "
+        "side_effect count ≥2 across ≥2 candidate sub-modules is WRONG — "
+        "set `correct=False` naming the missing sub-module(s).\n"
         "- All mock parameters correspond correctly to their @patch decorators "
         "(order, count, and names).\n"
         "- All original test logic is preserved — no hallucinated code, no "
@@ -2593,8 +2605,21 @@ def _process_file_source(
                             file=sys.stderr,
                             flush=True,
                         )
-                    prev_issue = cand_issue
-                    prev_proposed = str(patch_renames) if patch_renames else "no change"
+                    if attempts_left == 0:
+                        # All classify retries exhausted with persistent candidates
+                        # check failure.  The old path is known-broken; escalate to
+                        # full rewrite so the function body can be analysed to
+                        # determine which sub-module(s) the test exercises.
+                        _rewrite_escalation_error = cand_issue
+                        _rewrite_escalation_reason = (
+                            "candidates check retries exhausted"
+                        )
+                        attempts_left += 1  # allow one more outer iteration
+                    else:
+                        prev_issue = cand_issue
+                        prev_proposed = (
+                            str(patch_renames) if patch_renames else "no change"
+                        )
                     continue
 
             if not patch_renames:
