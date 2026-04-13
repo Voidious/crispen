@@ -1838,13 +1838,29 @@ def _build_classify_prompt(
         if small_cands:
             parts.append(
                 "\n## Call-graph candidate paths (from static analysis):\n"
-                "Static call-graph analysis narrowed the possible new locations "
-                "for each path below. Your answer MUST use one of the listed "
-                "candidates as the new value:\n"
+                "Static call-graph analysis found which new sub-module(s) each "
+                "patched name is reachable in from this test:\n"
             )
             for old in sorted(small_cands):
-                cands_str = ", ".join(f"`{c}`" for c in small_cands[old])
-                parts.append(f"- `{old}` → must be one of: {cands_str}\n")
+                cands = small_cands[old]
+                cands_str = ", ".join(f"`{c}`" for c in cands)
+                if len(cands) > 1:
+                    parts.append(
+                        f"- `{old}` → reachable in **multiple** sub-modules: "
+                        f"{cands_str}.\n"
+                        f"  **Multi-submodule signal**: if the test's mock is "
+                        f"expected to handle calls from more than one of these "
+                        f"sub-modules (check side_effect count and call_count "
+                        f"assertions against what any single sub-module can "
+                        f"account for), set `needs_rewrite=True` — a single "
+                        f"@patch intercepts only its own module's binding, so "
+                        f"each sub-module needs its own @patch decorator. "
+                        f"Only pick a single sub-module if the test is structured "
+                        f"so that the other sub-modules are never reached "
+                        f"(e.g. an early-return guard).\n"
+                    )
+                else:
+                    parts.append(f"- `{old}` → must be: {cands_str}\n")
             parts.append("\n")
     if prev_issue:
         parts.append(
@@ -1905,6 +1921,17 @@ def _build_func_verify_prompt(
         "your analysis in the test's actual construction — if a branch is not "
         "triggered by the test's inputs (e.g. an empty list skips an `if` "
         "block), do not assume that branch executes.\n"
+        "**Multi-submodule completeness check**: if the call-graph candidates "
+        "(listed above) show the patched name is reachable in multiple "
+        "sub-modules AND the test's mock handles calls from more than one of "
+        "those sub-modules (the side_effect count or call_count assertion "
+        "exceeds what any single sub-module's functions can account for), then "
+        "a rename to only ONE sub-module is structurally incomplete — the other "
+        "sub-module's calls go unintercepted. Set `correct=False` with an issue "
+        "like: 'Incomplete: the mock covers calls from both X and Y; renaming "
+        "to X.N alone leaves Y.N unpatched. A full rewrite adding a second "
+        "@patch for Y.N is required.' This forces escalation to the full "
+        "rewrite path where an additional @patch decorator can be added.\n"
     )
     return "".join(parts)
 
@@ -2038,6 +2065,17 @@ def _build_rewrite_func_prompt(
         "You may add new @patch decorators with corresponding mock parameters "
         "and setup code. Preserve all original test logic. Return the complete "
         "function including all decorators and body.\n"
+        "**When to add a new @patch decorator**: add one when a patched name "
+        "was moved to multiple new sub-modules (visible in the call-graph "
+        "candidates above) AND the test's mock is expected to handle calls from "
+        "more than one of those sub-modules (visible from side_effect entries "
+        "or call_count assertions that exceed what any single sub-module "
+        "accounts for). Each sub-module that independently imports the name "
+        "needs its own @patch decorator — they do not share a binding. Add a "
+        "new parameter for each new decorator, placed immediately after the "
+        "existing parameters in the same decorator→parameter order (@patch "
+        "decorators stack bottom-up, so the last decorator's mock is the first "
+        "parameter after self/cls).\n"
     )
     return "".join(parts)
 
@@ -2073,6 +2111,13 @@ def _build_rewrite_verify_prompt(
     parts.append(
         "Verify that the rewrite is correct:\n"
         "- All @patch strings point to where the name is looked up after the split.\n"
+        "- **Multi-submodule completeness**: if the call-graph candidates show "
+        "a patched name is reachable in multiple sub-modules AND the test's "
+        "mock handles calls from more than one of them (side_effect count or "
+        "call_count assertions exceed what one sub-module accounts for), then "
+        "ALL exercised sub-modules must have their own @patch decorator for "
+        "that name. A missing sub-module is an error — set `correct=False` "
+        "naming the unpatched sub-module.\n"
         "- All mock parameters correspond correctly to their @patch decorators "
         "(order, count, and names).\n"
         "- All original test logic is preserved — no hallucinated code, no "
