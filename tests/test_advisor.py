@@ -1453,10 +1453,8 @@ def test_resolve_verbose_detailed_timing_print(
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_advise_set3_no_counter(mock_client, mock_call):
+def test_advise_set3_no_counter(mock_call):
     """_advise_set3 called without _counter covers the None-counter branch."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"decisions": [{"group_id": 0, "action": "migrate"}]}
     )
@@ -1464,15 +1462,13 @@ def test_advise_set3_no_counter(mock_client, mock_call):
         entities=[_make_entity("foo", 1, 5)],
         set_3_groups=[["foo"]],
     )
-    result = _advise_set3(c, "big.py", mock_client(), _CONFIG)
+    result = _advise_set3(c, "big.py", MagicMock(), _CONFIG)
     assert result == [["foo"]]
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_advise_set3_with_dep_graph(mock_client, mock_call):
+def test_advise_set3_with_dep_graph(mock_call):
     """_advise_set3 with inter-group dependencies includes mermaid graph in prompt."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"decisions": [{"group_id": 0, "action": "migrate"}]}
     )
@@ -1482,7 +1478,7 @@ def test_advise_set3_with_dep_graph(mock_client, mock_call):
         graph={"foo": {"bar"}},
         set_3_groups=[["foo"], ["bar"]],
     )
-    result = _advise_set3(c, "big.py", mock_client(), _CONFIG)
+    result = _advise_set3(c, "big.py", MagicMock(), _CONFIG)
     assert result == [["foo"]]
     # Verify the mermaid graph was injected into the prompt.
     prompt = mock_call.call_args[0][6][0]["content"]
@@ -1490,26 +1486,22 @@ def test_advise_set3_with_dep_graph(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_assign_placements_chunk_no_counter(mock_client, mock_call):
+def test_assign_placements_chunk_no_counter(mock_call):
     """_assign_placements_chunk without _counter covers the None-counter branch."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"placements": [{"group_id": 0, "target_file": "utils.py"}]}
     )
     c = _classified(entities=[_make_entity("foo", 1, 5)])
     result = _assign_placements_chunk(
-        [["foo"]], c, "big.py", frozenset(), mock_client(), _CONFIG
+        [["foo"]], c, "big.py", frozenset(), MagicMock(), _CONFIG
     )
     assert result is not None
     assert result[0].target_file == "utils.py"
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_assign_placements_chunk_subdir_name(mock_client, mock_call):
+def test_assign_placements_chunk_subdir_name(mock_call):
     """subdir_name is included in the prompt and suppresses the plain directory rule."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"placements": [{"group_id": 0, "target_file": "detection_flow.py"}]}
     )
@@ -1519,7 +1511,7 @@ def test_assign_placements_chunk_subdir_name(mock_client, mock_call):
         c,
         "tests/test_duplicate_extractor.py",
         frozenset(),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         subdir_name="duplicate_extractor",
     )
@@ -1532,10 +1524,8 @@ def test_assign_placements_chunk_subdir_name(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_assign_placements_chunk_strips_subdir_prefix(mock_client, mock_call):
+def test_assign_placements_chunk_strips_subdir_prefix(mock_call):
     """LLM returns 'subdir/file.py' — the leading subdir/ should be stripped."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {
             "placements": [
@@ -1549,7 +1539,7 @@ def test_assign_placements_chunk_strips_subdir_prefix(mock_client, mock_call):
         c,
         "tests/test_duplicate_extractor.py",
         frozenset(),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         subdir_name="duplicate_extractor",
     )
@@ -1563,10 +1553,8 @@ def test_assign_placements_chunk_strips_subdir_prefix(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_assign_placements_chunk_constrained_success(mock_client, mock_call):
+def test_assign_placements_chunk_constrained_success(mock_call):
     """Constrained mode: target in proposed_filenames → placement accepted."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"placements": [{"group_id": 0, "target_file": "utils.py"}]}
     )
@@ -1577,7 +1565,7 @@ def test_assign_placements_chunk_constrained_success(mock_client, mock_call):
         c,
         "src/big.py",
         frozenset(),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         proposed_files=proposed,
     )
@@ -1591,10 +1579,8 @@ def test_assign_placements_chunk_constrained_success(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_assign_placements_chunk_constrained_invalid_target(mock_client, mock_call):
+def test_assign_placements_chunk_constrained_invalid_target(mock_call):
     """Constrained mode: target not in proposed_filenames → immediate None return."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"placements": [{"group_id": 0, "target_file": "rogue_file.py"}]}
     )
@@ -1605,7 +1591,7 @@ def test_assign_placements_chunk_constrained_invalid_target(mock_client, mock_ca
         c,
         "src/big.py",
         frozenset(),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         proposed_files=proposed,
     )
@@ -1618,10 +1604,8 @@ def test_assign_placements_chunk_constrained_invalid_target(mock_client, mock_ca
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_success(mock_client, mock_call):
+def test_propose_files_step_success(mock_call):
     """Basic success: valid filenames are returned."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {
             "files": [
@@ -1632,7 +1616,7 @@ def test_propose_files_step_success(mock_client, mock_call):
     )
     c = _classified(entities=[_make_entity("foo", 1, 50)])
     result = _propose_files_step(
-        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+        [["foo"]], c, "src/big.py", 2, frozenset(), MagicMock(), _CONFIG
     )
     assert result is not None
     assert len(result) == 2
@@ -1641,36 +1625,30 @@ def test_propose_files_step_success(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_llm_none(mock_client, mock_call):
+def test_propose_files_step_llm_none(mock_call):
     """call_with_tool returns None → _propose_files_step returns None."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(None)
     c = _classified()
     result = _propose_files_step(
-        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+        [["foo"]], c, "src/big.py", 2, frozenset(), MagicMock(), _CONFIG
     )
     assert result is None
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_empty_files_list(mock_client, mock_call):
+def test_propose_files_step_empty_files_list(mock_call):
     """LLM returns empty files list → returns None (not proposed)."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result({"files": []})
     c = _classified()
     result = _propose_files_step(
-        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+        [["foo"]], c, "src/big.py", 2, frozenset(), MagicMock(), _CONFIG
     )
     assert result is None
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_strips_existing_files(mock_client, mock_call):
+def test_propose_files_step_strips_existing_files(mock_call):
     """Filename in existing_files is stripped; remaining valid ones returned."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {
             "files": [
@@ -1686,7 +1664,7 @@ def test_propose_files_step_strips_existing_files(mock_client, mock_call):
         "src/big.py",
         2,
         frozenset({"taken.py"}),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
     )
     assert result is not None
@@ -1695,10 +1673,8 @@ def test_propose_files_step_strips_existing_files(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_all_in_existing_files(mock_client, mock_call):
+def test_propose_files_step_all_in_existing_files(mock_call):
     """All proposed filenames are in existing_files → stripped → returns None."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"files": [{"filename": "taken.py", "description": "existing"}]}
     )
@@ -1709,17 +1685,15 @@ def test_propose_files_step_all_in_existing_files(mock_client, mock_call):
         "src/big.py",
         2,
         frozenset({"taken.py"}),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
     )
     assert result is None
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_strips_duplicates(mock_client, mock_call):
+def test_propose_files_step_strips_duplicates(mock_call):
     """Duplicate filenames are stripped; only first occurrence kept."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {
             "files": [
@@ -1730,7 +1704,7 @@ def test_propose_files_step_strips_duplicates(mock_client, mock_call):
     )
     c = _classified()
     result = _propose_files_step(
-        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+        [["foo"]], c, "src/big.py", 2, frozenset(), MagicMock(), _CONFIG
     )
     assert result is not None
     assert len(result) == 1
@@ -1738,10 +1712,8 @@ def test_propose_files_step_strips_duplicates(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_strips_empty_filename(mock_client, mock_call):
+def test_propose_files_step_strips_empty_filename(mock_call):
     """Empty filename string is skipped; valid ones returned."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {
             "files": [
@@ -1752,7 +1724,7 @@ def test_propose_files_step_strips_empty_filename(mock_client, mock_call):
     )
     c = _classified()
     result = _propose_files_step(
-        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+        [["foo"]], c, "src/big.py", 2, frozenset(), MagicMock(), _CONFIG
     )
     assert result is not None
     assert len(result) == 1
@@ -1760,10 +1732,8 @@ def test_propose_files_step_strips_empty_filename(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_verbose(mock_client, mock_call, capsys):
+def test_propose_files_step_verbose(mock_call, capsys):
     """verbose=True prints propose message to stderr and increments counter."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"files": [{"filename": "utils.py", "description": "utilities"}]}
     )
@@ -1775,7 +1745,7 @@ def test_propose_files_step_verbose(mock_client, mock_call, capsys):
         "src/big.py",
         2,
         frozenset(),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         verbose=True,
         _acc=acc,
@@ -1787,25 +1757,21 @@ def test_propose_files_step_verbose(mock_client, mock_call, capsys):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_no_counter(mock_client, mock_call):
+def test_propose_files_step_no_counter(mock_call):
     """_counter=None covers the None-counter branch (no increment)."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"files": [{"filename": "utils.py", "description": "utilities"}]}
     )
     c = _classified()
     result = _propose_files_step(
-        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+        [["foo"]], c, "src/big.py", 2, frozenset(), MagicMock(), _CONFIG
     )
     assert result is not None
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_subdir_name(mock_client, mock_call):
+def test_propose_files_step_subdir_name(mock_call):
     """subdir_name triggers the subdir placement_rule branch in the prompt."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"files": [{"filename": "handlers.py", "description": "request handlers"}]}
     )
@@ -1816,7 +1782,7 @@ def test_propose_files_step_subdir_name(mock_client, mock_call):
         "src/service.py",
         2,
         frozenset(),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         subdir_name="service",
     )
@@ -1826,16 +1792,14 @@ def test_propose_files_step_subdir_name(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_no_existing_files(mock_client, mock_call):
+def test_propose_files_step_no_existing_files(mock_call):
     """existing_files=frozenset() → exclude_section empty (branch False)."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"files": [{"filename": "utils.py", "description": "utilities"}]}
     )
     c = _classified()
     result = _propose_files_step(
-        [["foo"]], c, "src/big.py", 2, frozenset(), mock_client(), _CONFIG
+        [["foo"]], c, "src/big.py", 2, frozenset(), MagicMock(), _CONFIG
     )
     prompt = mock_call.call_args[0][6][0]["content"]
     assert "already exist" not in prompt
@@ -1843,10 +1807,8 @@ def test_propose_files_step_no_existing_files(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_with_existing_files(mock_client, mock_call):
+def test_propose_files_step_with_existing_files(mock_call):
     """existing_files non-empty → exclude_section added to prompt (branch True)."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"files": [{"filename": "utils.py", "description": "utilities"}]}
     )
@@ -1857,7 +1819,7 @@ def test_propose_files_step_with_existing_files(mock_client, mock_call):
         "src/big.py",
         2,
         frozenset({"other.py"}),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
     )
     prompt = mock_call.call_args[0][6][0]["content"]
@@ -1866,10 +1828,8 @@ def test_propose_files_step_with_existing_files(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_propose_files_step_prev_failure(mock_client, mock_call):
+def test_propose_files_step_prev_failure(mock_call):
     """prev_failure is appended to the propose prompt."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"files": [{"filename": "utils.py", "description": "utilities"}]}
     )
@@ -1880,7 +1840,7 @@ def test_propose_files_step_prev_failure(mock_client, mock_call):
         "src/big.py",
         2,
         frozenset(),
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         prev_failure="sentinel_propose_failure",
     )
@@ -1967,10 +1927,8 @@ def test_refine_merge_tiny_no_ok_proposed():
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_refine_merge_tiny_success(mock_client, mock_call):
+def test_refine_merge_tiny_success(mock_call):
     """Tiny file group is merged into a larger file successfully."""
-    mock_client.return_value = MagicMock()
     # LLM reassigns the tiny group to the large file.
     mock_call.return_value = _make_llm_result(
         {"placements": [{"group_id": 0, "target_file": "large.py"}]}
@@ -1989,7 +1947,7 @@ def test_refine_merge_tiny_success(mock_client, mock_call):
     # ok_proposed = [("large.py", "large")]; refinement merges small.py into large.py.
 
     result = _refine_merge_tiny(
-        placements, proposed_files, c, "src/big.py", mock_client(), _CONFIG
+        placements, proposed_files, c, "src/big.py", MagicMock(), _CONFIG
     )
     assert len(result) == 2
     # small_func should now be in large.py.
@@ -2001,10 +1959,8 @@ def test_refine_merge_tiny_success(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_refine_merge_tiny_llm_fails(mock_client, mock_call):
+def test_refine_merge_tiny_llm_fails(mock_call):
     """Reassignment LLM returns None → original placements returned (best-effort)."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(None)  # LLM fails
 
     entity_small = _make_entity("small_func", 1, 10)
@@ -2018,7 +1974,7 @@ def test_refine_merge_tiny_llm_fails(mock_client, mock_call):
     proposed_files = [("small.py", "small"), ("large.py", "large")]
 
     result = _refine_merge_tiny(
-        placements, proposed_files, c, "src/big.py", mock_client(), _CONFIG
+        placements, proposed_files, c, "src/big.py", MagicMock(), _CONFIG
     )
     # Best-effort: return original placements unchanged.
     assert len(result) == 2
@@ -2027,10 +1983,8 @@ def test_refine_merge_tiny_llm_fails(mock_client, mock_call):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_refine_merge_tiny_verbose(mock_client, mock_call, capsys):
+def test_refine_merge_tiny_verbose(mock_call, capsys):
     """verbose=True prints the refining message to stderr."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"placements": [{"group_id": 0, "target_file": "large.py"}]}
     )
@@ -2050,7 +2004,7 @@ def test_refine_merge_tiny_verbose(mock_client, mock_call, capsys):
         proposed_files,
         c,
         "src/big.py",
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         verbose=True,
     )
@@ -2064,10 +2018,8 @@ def test_refine_merge_tiny_verbose(mock_client, mock_call, capsys):
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_assign_placements_chunk_existing_files_exclude_section(mock_client, mock_call):
+def test_assign_placements_chunk_existing_files_exclude_section(mock_call):
     """Free-form mode with non-empty existing_files builds the exclude section."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"placements": [{"group_id": 0, "target_file": "helpers.py"}]}
     )
@@ -2078,7 +2030,7 @@ def test_assign_placements_chunk_existing_files_exclude_section(mock_client, moc
         c,
         "src/big.py",
         frozenset({"existing.py"}),  # non-empty existing_files
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         proposed_files=None,  # free-form mode
     )
@@ -2087,12 +2039,8 @@ def test_assign_placements_chunk_existing_files_exclude_section(mock_client, moc
 
 
 @patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-def test_assign_placements_chunk_target_in_existing_files_returns_none(
-    mock_client, mock_call
-):
+def test_assign_placements_chunk_target_in_existing_files_returns_none(mock_call):
     """Free-form mode: target_file in existing_files → return None (line 589)."""
-    mock_client.return_value = MagicMock()
     mock_call.return_value = _make_llm_result(
         {"placements": [{"group_id": 0, "target_file": "existing.py"}]}
     )
@@ -2103,7 +2051,7 @@ def test_assign_placements_chunk_target_in_existing_files_returns_none(
         c,
         "src/big.py",
         frozenset({"existing.py"}),  # target collides with existing file
-        mock_client(),
+        MagicMock(),
         _CONFIG,
         proposed_files=None,  # free-form mode
     )
