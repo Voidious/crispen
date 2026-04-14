@@ -2062,11 +2062,29 @@ def _build_rewrite_func_prompt(
         if small_cands:
             parts.append(
                 "## Call-graph candidate paths (from static analysis):\n"
-                "Static analysis narrowed the valid new locations for each path:\n"
+                "Static analysis traced which new sub-module(s) each patched name "
+                "is reachable in from this test:\n"
             )
             for old in sorted(small_cands):
-                cands_str = ", ".join(f"`{c}`" for c in small_cands[old])
-                parts.append(f"- `{old}` → must be one of: {cands_str}\n")
+                cands = small_cands[old]
+                cands_str = ", ".join(f"`{c}`" for c in cands)
+                if len(cands) == 1:
+                    parts.append(f"- `{old}` → must be: {cands_str}\n")
+                else:
+                    parts.append(
+                        f"- `{old}` → reachable in multiple sub-modules: "
+                        f"{cands_str}.\n"
+                        f"  **One @patch per sub-module is required** — each "
+                        f"sub-module has an independent binding of the patched "
+                        f"name that the original single patch no longer covers. "
+                        f"This typically means the function under test is an "
+                        f"orchestrator: even though the test only calls it "
+                        f"directly, it internally delegates to helpers in each "
+                        f"listed sub-module, and every such sub-module needs its "
+                        f"own @patch. Omit a candidate only if the test's inputs "
+                        f"provably prevent that sub-module from being reached "
+                        f"(e.g. an early-return guard before the delegating call).\n"
+                    )
             parts.append("\n")
     parts.append(
         "Rewrite the complete function, updating ONLY the patch strings listed "
@@ -2075,15 +2093,18 @@ def _build_rewrite_func_prompt(
         "You may add or remove @patch decorators only when specifically required "
         "by the rules below. Preserve all original test logic. Return the "
         "complete function including all decorators and body.\n"
-        "**When to add a new @patch decorator**: add one only when the test "
-        "**directly exercises** code in multiple sub-modules that independently "
-        "import the same name — for example, the function under test explicitly "
-        "calls both `module_a.process()` and `module_b.validate()`, and both "
-        "import `fetch_data`. Do NOT add a second @patch based solely on the "
-        "mock's side_effect count or call_count: multiple calls may all route "
-        "through the same sub-module. Each sub-module that is provably exercised "
-        "needs its own @patch. Add a new parameter for each new decorator in the "
-        "same decorator→parameter order (@patch decorators stack bottom-up).\n"
+        "**When to add a new @patch decorator**: add one for each sub-module that "
+        "independently imports the patched name and is provably reached during "
+        "the test. This covers both the direct case (the test calls functions in "
+        "multiple sub-modules explicitly) and the orchestrator case (the test "
+        "calls a single function that internally delegates to helpers across "
+        "multiple sub-modules — each sub-module's import must be patched "
+        "separately). Do NOT add a second @patch based solely on the mock's "
+        "side_effect count or call_count when the call-graph shows only a single "
+        "candidate: multiple calls may all route through the same sub-module. "
+        "Each sub-module that is provably exercised needs its own @patch. Add a "
+        "new parameter for each new decorator in the same decorator→parameter "
+        "order (@patch decorators stack bottom-up).\n"
         "**When to remove a @patch decorator**: remove one when the patched "
         "name N is not imported in the module where the function under test is "
         "defined AND the function receives the corresponding dependency as a "
