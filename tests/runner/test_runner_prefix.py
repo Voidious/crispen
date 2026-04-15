@@ -116,8 +116,8 @@ def test_runner_init_not_renamed_by_test_prefix_logic(
         abort=False,
     )
 
-    # tests/runner/ has no __init__.py so it won't appear in existing_files.
-    result = run_file_limiter("tests/runner/test_big.py", "", source, [], _CONFIG)
+    # tests/noexist/ has no __init__.py so it won't appear in existing_files.
+    result = run_file_limiter("tests/noexist/test_big.py", "", source, [], _CONFIG)
 
     assert result.abort is False
     # cases.py → test_cases.py (has test_foo in group)
