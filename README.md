@@ -138,6 +138,31 @@ rate_limit_backoff = 20.0
 # under the limit, aborted (cannot be split), or produces no further oversized files.
 file_limiter_recursive = true
 
+# FileLimiter: how to update @patch string literals in test files after
+# FileLimiter moves entities to new sub-modules (default: "basic").
+#
+# "ignore"  — Leave all @patch strings as-is.
+# "basic"   — Scan every *.py file and update patch strings that are
+#             unambiguous (entity imported by exactly one new sub-module).
+#             Import aliases from the original file that land in exactly one
+#             new file are also updated.
+# "rewrite" — Performs "basic" first, then uses an LLM to resolve forking
+#             cases (entities imported by multiple new files). A verify step
+#             checks each proposal; failed chunks are retried up to
+#             patch_update_retries additional times before being skipped.
+#             Also handles @patch(module.CONSTANT) and with patch(...) forms.
+# file_limiter_patch_update = "basic"
+
+# FileLimiter: additional LLM verify+retry attempts per function chunk in
+# "rewrite" mode (default: 2 = three total attempts; 0 = no retry).
+# patch_update_retries = 2
+
+# BFS call-graph traversal limits for patch_update "basic" and "rewrite" modes.
+# Increase callgraph_max_depth for codebases with deep call chains.
+# Increase callgraph_max_modules for large codebases with wide import graphs.
+# callgraph_max_depth = 12
+# callgraph_max_modules = 50
+
 # Timing output printed at the end of each run (default: "detailed").
 # "off"      — no timing output.
 # "basic"    — total run time, total LLM time, and total token counts.
@@ -504,7 +529,11 @@ Configuration:
 - `file_limiter_recursive` — recursively split newly-created files that are still over the limit (default: `true`).
 - `file_limiter_pytest_conftest` — route fixtures split out of test files to `conftest.py` so pytest auto-discovers them without imports (avoids F401/F811 warnings). Set to `false` if not using pytest or using custom fixture decorators (default: `true`).
 - `file_limiter_reexports` — controls when re-export stubs are added to the original file for public names moved to new files: `"always"` (every public name), `"application"` (all non-test files, no test files), or `"imported"` (only when the name is imported from this module elsewhere in the project — the same rule used for private names). Default: `"imported"`.
-- `file_limiter_patch_update` — controls how `@patch` string literals are updated after FileLimiter moves entities: `"ignore"` (leave all patch strings as-is) or `"basic"` (scan every `*.py` file in the repo and update patch strings reliably — i.e. only when the entity is imported by exactly one new sub-module (non-forking); if imported by multiple new files the entity is skipped). Import aliases from the original file that appear in exactly one new file are also updated. Default: `"basic"`.
+- `file_limiter_patch_update` — controls how `@patch` string literals are updated after FileLimiter moves entities to new sub-modules:
+  - `"ignore"` — leave all patch strings as-is.
+  - `"basic"` — scan every `*.py` file in the repo and update patch strings that are unambiguous (non-forking): only when the entity is imported by exactly one new sub-module. Import aliases from the original file that appear in exactly one new file are also updated. Default.
+  - `"rewrite"` — performs `"basic"` updates first, then uses an LLM to resolve the remaining forking cases (entities imported by multiple new files). The LLM receives the original file, the diff, all new sub-files, and a chunk of test functions and proposes updated `@patch` strings. A second LLM verify step checks each proposal; failed chunks are retried up to `patch_update_retries` additional times before being skipped. Also handles `@patch(module.CONSTANT)` attribute-access and `with patch(...)` context-manager forms.
+- `patch_update_retries` — additional LLM verify+retry attempts for each function chunk in `"rewrite"` mode. `0` means no retry: a chunk rejected by the verify LLM is skipped. Default: `2` (three total attempts).
 - `callgraph_max_depth` — maximum BFS hops from a test function to a target sub-module during call-graph traversal (`"basic"` and `"rewrite"` modes). When the limit is reached the path is left unresolved and a warning is printed to stderr. Increase for codebases with very deep call chains. Default: `12`.
 - `callgraph_max_modules` — maximum distinct modules visited per resolution attempt during call-graph traversal. When the limit is reached the path is left unresolved and a warning is printed to stderr. Increase for large codebases with wide import graphs. Default: `50`.
 
@@ -528,13 +557,16 @@ crispen/cli.py         # Entry point: reads stdin, calls parse_diff then run_eng
                 │       ├── duplicate_extractor.py # Extract duplicate blocks
                 │       └── function_splitter.py   # Split oversized functions
                 │
-                └── crispen/file_limiter/
-                        ├── runner.py              # Orchestrates FileLimiter phases
-                        ├── classifier.py          # Classify entities (Set 1/2/3)
-                        ├── advisor.py             # LLM placement planner
-                        ├── code_gen.py            # Generate split file contents
-                        ├── entity_parser.py       # Parse top-level entities
-                        └── dep_graph.py           # Dependency graph + SCC finder
+                ├── crispen/file_limiter/
+                │       ├── runner.py              # Orchestrates FileLimiter phases
+                │       ├── classifier.py          # Classify entities (Set 1/2/3)
+                │       ├── advisor.py             # LLM placement planner
+                │       ├── code_gen.py            # Generate split file contents
+                │       ├── entity_parser.py       # Parse top-level entities
+                │       └── dep_graph.py           # Dependency graph + SCC finder
+                │
+                ├── crispen/patch_updater.py       # Basic (non-forking) @patch string updater
+                └── crispen/patch_rewriter.py      # LLM-powered @patch rewriter (rewrite mode)
 ```
 
 ### Adding a new refactor
