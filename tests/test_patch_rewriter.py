@@ -74,6 +74,13 @@ def _ok(tool_input=None) -> LLMCallResult:
     )
 
 
+def _truncated_ok() -> LLMCallResult:
+    """Simulate a truncated verify response (tool_input=None, truncated=True)."""
+    return LLMCallResult(
+        tool_input=None, elapsed=0.0, input_tokens=0, output_tokens=0, truncated=True
+    )
+
+
 def _make_fl_ctx(**kwargs) -> _FLContext:
     defaults = dict(
         filepath="/proj/pkg/big.py",
@@ -1529,6 +1536,18 @@ def test_process_no_change_verify_none_accept(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_verify_truncated_reject(mock_call):
+    # No-change verify truncated → treated as rejection, not accepted as no-change.
+    mock_call.side_effect = [_ok(_CLASSIFY_NO_CHANGE), _truncated_ok()]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG_NO_LLM_VERIFY, 1
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 2
+
+
+@mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_verify_rejects_then_accepts(mock_call):
     # No-change verify rejects first; classify+verify accepted on retry.
     mock_call.side_effect = [
@@ -1637,6 +1656,22 @@ def test_process_no_change_corrections_verify_none_accept(mock_call):
     )
     assert changed is True
     assert "crispen.after.X" in result
+    assert mock_call.call_count == 3
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_no_change_corrections_verify_truncated_reject(mock_call):
+    # Corrections-verify truncated → treated as rejection, corrections not applied.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_NO_CHANGE),
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),
+        _truncated_ok(),  # corrections-verify truncated → reject
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG_NO_LLM_VERIFY, 2
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
     assert mock_call.call_count == 3
 
 
@@ -2087,6 +2122,21 @@ def test_process_verify_none_accept(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
+def test_process_verify_truncated_reject(mock_call):
+    # Verify call truncated → treated as rejection, renames not applied.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_RENAME),
+        _truncated_ok(),  # verify truncated → reject
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG_NO_LLM_VERIFY, 1
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 2
+
+
+@mock_patch(_PATCH_CALL_TOOL)
 def test_process_verify_none_accept_no_splice(mock_call, tmp_path):
     # Verify returns None; function uses const ref → new_text == orig_text → no splice.
     src = (
@@ -2266,6 +2316,22 @@ def test_process_needs_rewrite_verify_none_accept(mock_call):
     )
     assert changed is True
     assert "crispen.after.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_verify_truncated_reject(mock_call):
+    # Rewrite verify truncated → treated as rejection, rewrite not accepted.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _truncated_ok(),  # verify truncated → reject
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG_NO_LLM_VERIFY, 1
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 3
 
 
 @mock_patch(_PATCH_CALL_TOOL)

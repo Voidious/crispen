@@ -228,6 +228,7 @@ def test_call_with_tool_anthropic_stop_reason_max_tokens_logs_warning(capsys):
         _MESSAGES,
     )
     assert result.tool_input is None
+    assert result.truncated is True
     assert "stop_reason=max_tokens" in capsys.readouterr().err
 
 
@@ -832,6 +833,7 @@ def test_call_with_tool_openai_finish_reason_length_logs_warning(capsys):
             _MESSAGES,
         )
     assert result.tool_input is None
+    assert result.truncated is True
     assert "finish_reason=length" in capsys.readouterr().err
 
 

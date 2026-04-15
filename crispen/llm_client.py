@@ -29,6 +29,7 @@ class LLMCallResult:
     elapsed: float
     input_tokens: int
     output_tokens: int
+    truncated: bool = False  # True when the response was cut off by the token limit
 
 
 # Maps provider name to its required environment variable.
@@ -145,6 +146,7 @@ def call_with_tool(
             if block.type == "tool_use" and block.name == tool_name:
                 tool_input = block.input
                 break
+        _truncated = False
         if tool_input is None and response.stop_reason == "max_tokens":
             print(
                 f"crispen: {caller}: anthropic response truncated"
@@ -152,6 +154,7 @@ def call_with_tool(
                 file=sys.stderr,
                 flush=True,
             )
+            _truncated = True
         try:
             in_tok = int(response.usage.input_tokens)
             out_tok = int(response.usage.output_tokens)
@@ -162,6 +165,7 @@ def call_with_tool(
             elapsed=time.perf_counter() - t0,
             input_tokens=in_tok,
             output_tokens=out_tok,
+            truncated=_truncated,
         )
     else:
         openai_tool = {
@@ -278,6 +282,7 @@ def call_with_tool(
                 tool_input = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 tool_input = None
+        _truncated = False
         if tool_input is None and response.choices:
             if response.choices[0].finish_reason == "length":
                 print(
@@ -286,6 +291,7 @@ def call_with_tool(
                     file=sys.stderr,
                     flush=True,
                 )
+                _truncated = True
         try:
             in_tok = int(response.usage.prompt_tokens)
             out_tok = int(response.usage.completion_tokens)
@@ -296,4 +302,5 @@ def call_with_tool(
             elapsed=time.perf_counter() - t0,
             input_tokens=in_tok,
             output_tokens=out_tok,
+            truncated=_truncated,
         )

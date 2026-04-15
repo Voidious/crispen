@@ -2533,8 +2533,8 @@ def _process_file_source(
                             file=sys.stderr,
                             flush=True,
                         )
-                    rv_correct = rv.tool_input is None or rv.tool_input.get(
-                        "correct", False
+                    rv_correct = not rv.truncated and (
+                        rv.tool_input is None or rv.tool_input.get("correct", False)
                     )
                     if verbose and rv.tool_input is not None:
                         rv_status = "ACCEPTED" if rv_correct else "REJECTED"
@@ -2699,11 +2699,15 @@ def _process_file_source(
                         file=sys.stderr,
                         flush=True,
                     )
-                if v.tool_input is None:
+                if v.tool_input is None and not v.truncated:
                     _outcome = "no_change"
                     break  # verify call failed; accept no-change
-                verify_correct = v.tool_input.get("correct", False)
-                issue = v.tool_input.get("issue", "")
+                verify_correct = (
+                    False
+                    if v.tool_input is None
+                    else v.tool_input.get("correct", False)
+                )
+                issue = "" if v.tool_input is None else v.tool_input.get("issue", "")
                 if verbose:
                     v_status = "ACCEPTED" if verify_correct else "REJECTED"
                     print(
@@ -2721,7 +2725,7 @@ def _process_file_source(
                     _outcome = "no_change"
                     break  # confirmed: no change needed
                 # Check if verifier provided corrections for a direct apply.
-                corrections = v.tool_input.get("corrections") or {}
+                corrections = (v.tool_input or {}).get("corrections") or {}
                 corrections_renames: Dict[str, str] = {
                     old: new
                     for old, new in corrections.items()
@@ -2802,8 +2806,8 @@ def _process_file_source(
                             file=sys.stderr,
                             flush=True,
                         )
-                    vc_correct = vc.tool_input is None or vc.tool_input.get(
-                        "correct", False
+                    vc_correct = not vc.truncated and (
+                        vc.tool_input is None or vc.tool_input.get("correct", False)
                     )
                     if verbose and vc.tool_input is not None:
                         vc_status = "ACCEPTED" if vc_correct else "REJECTED"
@@ -2832,7 +2836,11 @@ def _process_file_source(
                         _outcome = "rename"
                         break
                     # Corrections verify rejected; update issue for retry/escalation.
-                    issue = vc.tool_input.get("issue", "") or issue
+                    issue = (
+                        vc.tool_input.get("issue", "")
+                        if vc.tool_input is not None
+                        else ""
+                    ) or issue
                 if rename_verify_retries_left > 0:
                     rename_verify_retries_left -= 1
                     prev_issue = issue
@@ -2895,7 +2903,7 @@ def _process_file_source(
                     file=sys.stderr,
                     flush=True,
                 )
-            if v.tool_input is None:
+            if v.tool_input is None and not v.truncated:
                 # Verify failed; accept renames — but still filter bad ones.
                 patch_renames_safe = {
                     old: new
@@ -2917,9 +2925,10 @@ def _process_file_source(
                 string_swap_results.append((func, patch_renames_safe))
                 _outcome = "rename"
                 break
-
-            verify_correct = v.tool_input.get("correct", False)
-            issue = v.tool_input.get("issue", "")
+            verify_correct = (
+                False if v.tool_input is None else v.tool_input.get("correct", False)
+            )
+            issue = "" if v.tool_input is None else v.tool_input.get("issue", "")
             if verbose:
                 v_status = "ACCEPTED" if verify_correct else "REJECTED"
                 print(
