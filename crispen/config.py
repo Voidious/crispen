@@ -184,7 +184,7 @@ class CrispenConfig:
 
 def format_header(config: "CrispenConfig") -> List[str]:
     """Return config lines printed to stderr before the first LLM call."""
-    w = 22
+    w = 28
     lines = ["--- crispen ---"]
     lines.append(f"  {'provider:':<{w}}{config.provider}")
     lines.append(f"  {'model:':<{w}}{config.model}")
