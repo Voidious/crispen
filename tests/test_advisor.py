@@ -136,7 +136,7 @@ def test_plan_api_key_error_propagates(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
@@ -168,7 +168,7 @@ def test_plan_set2_only_skips_set3_call(mock_key, mock_client, mock_call):
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_all_stay_no_placement(mock_key, mock_client, mock_call):
@@ -191,7 +191,7 @@ def test_plan_set3_all_stay_no_placement(mock_key, mock_client, mock_call):
     assert mock_call.call_count == 1  # only set3 advice call
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_migrate(mock_key, mock_client, mock_call):
@@ -219,7 +219,7 @@ def test_plan_set3_migrate(mock_key, mock_client, mock_call):
     assert mock_call.call_count == 3
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_test_subdir_skips_advise_call(mock_key, mock_client, mock_call):
@@ -246,7 +246,7 @@ def test_plan_set3_test_subdir_skips_advise_call(mock_key, mock_client, mock_cal
     assert mock_call.call_count == 2  # no set3-advice call
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set2_and_set3_migrate(mock_key, mock_client, mock_call):
@@ -284,7 +284,7 @@ def test_plan_set2_and_set3_migrate(mock_key, mock_client, mock_call):
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_call_returns_none_aborts(mock_key, mock_client, mock_call):
@@ -301,7 +301,7 @@ def test_plan_set3_call_returns_none_aborts(mock_key, mock_client, mock_call):
     assert plan.abort is True
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_placement_call_returns_none_aborts(mock_key, mock_client, mock_call):
@@ -327,7 +327,7 @@ def test_plan_placement_call_returns_none_aborts(mock_key, mock_client, mock_cal
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_invalid_group_id_treated_as_stay(mock_key, mock_client, mock_call):
@@ -352,7 +352,7 @@ def test_plan_set3_invalid_group_id_treated_as_stay(mock_key, mock_client, mock_
     assert plan.placements == []
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_non_int_group_id_treated_as_stay(mock_key, mock_client, mock_call):
@@ -370,7 +370,7 @@ def test_plan_set3_non_int_group_id_treated_as_stay(mock_key, mock_client, mock_
     assert plan.set3_migrate == []
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_unknown_action_treated_as_stay(mock_key, mock_client, mock_call):
@@ -393,7 +393,7 @@ def test_plan_set3_unknown_action_treated_as_stay(mock_key, mock_client, mock_ca
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_placement_incomplete_aborts(mock_key, mock_client, mock_call):
@@ -413,7 +413,7 @@ def test_plan_placement_incomplete_aborts(mock_key, mock_client, mock_call):
     assert plan.abort is True
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_placement_duplicate_group_id_aborts(mock_key, mock_client, mock_call):
@@ -439,7 +439,7 @@ def test_plan_placement_duplicate_group_id_aborts(mock_key, mock_client, mock_ca
     assert plan.abort is True
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_placement_empty_target_aborts(mock_key, mock_client, mock_call):
@@ -458,7 +458,7 @@ def test_plan_placement_empty_target_aborts(mock_key, mock_client, mock_call):
     assert plan.abort is True
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_placement_out_of_range_group_id_aborts(mock_key, mock_client, mock_call):
@@ -477,7 +477,7 @@ def test_plan_placement_out_of_range_group_id_aborts(mock_key, mock_client, mock
     assert plan.abort is True
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_placement_non_int_group_id_aborts(mock_key, mock_client, mock_call):
@@ -503,7 +503,7 @@ def test_plan_placement_non_int_group_id_aborts(mock_key, mock_client, mock_call
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_placement_targets_outside_proposed_aborts(
@@ -537,7 +537,7 @@ def test_plan_placement_targets_outside_proposed_aborts(
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_entity_not_in_entity_map(mock_key, mock_client, mock_call):
@@ -563,7 +563,7 @@ def test_plan_entity_not_in_entity_map(mock_key, mock_client, mock_call):
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_set3_prev_failure_appended_to_prompt(mock_key, mock_client, mock_call):
@@ -585,7 +585,7 @@ def test_plan_set3_prev_failure_appended_to_prompt(mock_key, mock_client, mock_c
     assert "sentinel text" in messages[0]["content"]
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_placement_prev_failure_appended_to_prompt(
@@ -618,7 +618,7 @@ def test_plan_placement_prev_failure_appended_to_prompt(
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_chunked_placement_makes_multiple_calls(mock_key, mock_client, mock_call):
@@ -665,7 +665,7 @@ def test_plan_chunked_placement_makes_multiple_calls(mock_key, mock_client, mock
     assert mock_call.call_count == 4
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_chunked_placement_second_chunk_fails_aborts(
@@ -706,7 +706,7 @@ def test_plan_chunked_placement_second_chunk_fails_aborts(
     assert "failed to assign file placements" in capsys.readouterr().err
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_chunked_placement_chunk_retry_succeeds(mock_key, mock_client, mock_call):
@@ -752,7 +752,7 @@ def test_plan_chunked_placement_chunk_retry_succeeds(mock_key, mock_client, mock
     assert mock_call.call_count == 5
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_plan_chunked_placement_zero_total_lines(mock_key, mock_client, mock_call):
@@ -882,9 +882,9 @@ def test_resolve_api_key_error_propagates(monkeypatch):
         )
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_success(mock_key, mock_client, mock_call):
     """Happy path: forbidden_dir_stems and existing_file_stems both non-empty;
     prev_failure is False on the first (successful) attempt."""
@@ -916,9 +916,9 @@ def test_resolve_success(mock_key, mock_client, mock_call):
     assert mock_call.call_count == 1
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_llm_none_returns_none(mock_key, mock_client, mock_call):
     """LLM returns None → resolve returns None."""
     mock_key.return_value = "key"
@@ -936,9 +936,9 @@ def test_resolve_llm_none_returns_none(mock_key, mock_client, mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_forbidden_target_returns_none(mock_key, mock_client, mock_call):
     """LLM picks a target that is in forbidden_files → resolve returns None."""
     mock_key.return_value = "key"
@@ -964,9 +964,9 @@ def test_resolve_forbidden_target_returns_none(mock_key, mock_client, mock_call)
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_incomplete_response_returns_none(mock_key, mock_client, mock_call):
     """LLM returns fewer placements than groups → len mismatch → None."""
     mock_key.return_value = "key"
@@ -986,9 +986,9 @@ def test_resolve_incomplete_response_returns_none(mock_key, mock_client, mock_ca
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_retry_succeeds(mock_key, mock_client, mock_call):
     """First attempt None, second succeeds; covers if prev_failure: True branch."""
     mock_key.return_value = "key"
@@ -1018,9 +1018,9 @@ def test_resolve_retry_succeeds(mock_key, mock_client, mock_call):
     assert mock_call.call_count == 2
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_empty_forbidden_dir_stems(mock_key, mock_client, mock_call):
     """existing_dirs empty → forbidden_dir_stems empty → branch False."""
     mock_key.return_value = "key"
@@ -1045,9 +1045,9 @@ def test_resolve_empty_forbidden_dir_stems(mock_key, mock_client, mock_call):
     assert result is not None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_empty_existing_file_stems(mock_key, mock_client, mock_call):
     """existing_files=frozenset() → file_stems empty → if existing_file_stems: False."""
     mock_key.return_value = "key"
@@ -1072,9 +1072,9 @@ def test_resolve_empty_existing_file_stems(mock_key, mock_client, mock_call):
     assert result is not None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_non_int_group_id(mock_key, mock_client, mock_call):
     """Non-integer group_id → isinstance check fails → skipped → len mismatch → None."""
     mock_key.return_value = "key"
@@ -1099,9 +1099,9 @@ def test_resolve_non_int_group_id(mock_key, mock_client, mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_out_of_range_group_id(mock_key, mock_client, mock_call):
     """Out-of-range group_id → range check fails → skipped → len mismatch → None."""
     mock_key.return_value = "key"
@@ -1126,9 +1126,9 @@ def test_resolve_out_of_range_group_id(mock_key, mock_client, mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_duplicate_group_id(mock_key, mock_client, mock_call):
     """Duplicate group_id → second entry skipped → len mismatch → None."""
     mock_key.return_value = "key"
@@ -1153,9 +1153,9 @@ def test_resolve_duplicate_group_id(mock_key, mock_client, mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_empty_target(mock_key, mock_client, mock_call):
     """Empty target_file → falsy check fails → skipped → len mismatch → None."""
     mock_key.return_value = "key"
@@ -1278,7 +1278,7 @@ def test_build_group_mermaid_intra_group_dep():
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_placement_prompt_includes_mermaid_when_deps_exist(
@@ -1316,7 +1316,7 @@ def test_placement_prompt_includes_mermaid_when_deps_exist(
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_advise_verbose_set3_and_placement(mock_key, mock_client, mock_call, capsys):
@@ -1343,9 +1343,9 @@ def test_advise_verbose_set3_and_placement(mock_key, mock_client, mock_call, cap
     assert "file placements" in err
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_verbose(mock_key, mock_client, mock_call, capsys):
     """verbose=True exercises the print + _counter branches in
     _rename_conflicting_chunk (with _counter passed to cover the increment)."""
@@ -1384,7 +1384,7 @@ def test_resolve_verbose(mock_key, mock_client, mock_call, capsys):
     assert "naming conflicts" in err
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_advise_verbose_detailed_timing_prints(
@@ -1412,9 +1412,9 @@ def test_advise_verbose_detailed_timing_prints(
     assert "→ done [" in err
 
 
-@patch(_PATCH_CALL)
-@patch(_PATCH_CLIENT)
-@patch(_PATCH_KEY)
+@patch("crispen.file_limiter.advisor.naming_conflicts.call_with_tool")
+@patch("crispen.file_limiter.advisor.naming_conflicts.make_client")
+@patch("crispen.file_limiter.advisor.naming_conflicts.get_api_key")
 def test_resolve_verbose_detailed_timing_print(
     mock_key, mock_client, mock_call, capsys
 ):
@@ -1452,7 +1452,7 @@ def test_resolve_verbose_detailed_timing_print(
     assert "→ done [" in err
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_advise_set3_no_counter(mock_call):
     """_advise_set3 called without _counter covers the None-counter branch."""
     mock_call.return_value = _make_llm_result(
@@ -1466,7 +1466,7 @@ def test_advise_set3_no_counter(mock_call):
     assert result == [["foo"]]
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_advise_set3_with_dep_graph(mock_call):
     """_advise_set3 with inter-group dependencies includes mermaid graph in prompt."""
     mock_call.return_value = _make_llm_result(
@@ -1485,7 +1485,7 @@ def test_advise_set3_with_dep_graph(mock_call):
     assert "graph TD" in prompt
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_assign_placements_chunk_no_counter(mock_call):
     """_assign_placements_chunk without _counter covers the None-counter branch."""
     mock_call.return_value = _make_llm_result(
@@ -1499,7 +1499,7 @@ def test_assign_placements_chunk_no_counter(mock_call):
     assert result[0].target_file == "utils.py"
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_assign_placements_chunk_subdir_name(mock_call):
     """subdir_name is included in the prompt and suppresses the plain directory rule."""
     mock_call.return_value = _make_llm_result(
@@ -1523,7 +1523,7 @@ def test_assign_placements_chunk_subdir_name(mock_call):
     assert "do not repeat" in prompt.lower()
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_assign_placements_chunk_strips_subdir_prefix(mock_call):
     """LLM returns 'subdir/file.py' — the leading subdir/ should be stripped."""
     mock_call.return_value = _make_llm_result(
@@ -1552,7 +1552,7 @@ def test_assign_placements_chunk_strips_subdir_prefix(mock_call):
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_assign_placements_chunk_constrained_success(mock_call):
     """Constrained mode: target in proposed_filenames → placement accepted."""
     mock_call.return_value = _make_llm_result(
@@ -1578,7 +1578,7 @@ def test_assign_placements_chunk_constrained_success(mock_call):
     assert "models.py" in prompt
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_assign_placements_chunk_constrained_invalid_target(mock_call):
     """Constrained mode: target not in proposed_filenames → immediate None return."""
     mock_call.return_value = _make_llm_result(
@@ -1603,7 +1603,7 @@ def test_assign_placements_chunk_constrained_invalid_target(mock_call):
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_success(mock_call):
     """Basic success: valid filenames are returned."""
     mock_call.return_value = _make_llm_result(
@@ -1624,7 +1624,7 @@ def test_propose_files_step_success(mock_call):
     assert result[1] == ("models.py", "data models")
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_llm_none(mock_call):
     """call_with_tool returns None → _propose_files_step returns None."""
     mock_call.return_value = _make_llm_result(None)
@@ -1635,7 +1635,7 @@ def test_propose_files_step_llm_none(mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_empty_files_list(mock_call):
     """LLM returns empty files list → returns None (not proposed)."""
     mock_call.return_value = _make_llm_result({"files": []})
@@ -1646,7 +1646,7 @@ def test_propose_files_step_empty_files_list(mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_strips_existing_files(mock_call):
     """Filename in existing_files is stripped; remaining valid ones returned."""
     mock_call.return_value = _make_llm_result(
@@ -1672,7 +1672,7 @@ def test_propose_files_step_strips_existing_files(mock_call):
     assert result[0][0] == "utils.py"
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_all_in_existing_files(mock_call):
     """All proposed filenames are in existing_files → stripped → returns None."""
     mock_call.return_value = _make_llm_result(
@@ -1691,7 +1691,7 @@ def test_propose_files_step_all_in_existing_files(mock_call):
     assert result is None
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_strips_duplicates(mock_call):
     """Duplicate filenames are stripped; only first occurrence kept."""
     mock_call.return_value = _make_llm_result(
@@ -1711,7 +1711,7 @@ def test_propose_files_step_strips_duplicates(mock_call):
     assert result[0] == ("utils.py", "first")
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_strips_empty_filename(mock_call):
     """Empty filename string is skipped; valid ones returned."""
     mock_call.return_value = _make_llm_result(
@@ -1731,7 +1731,7 @@ def test_propose_files_step_strips_empty_filename(mock_call):
     assert result[0][0] == "utils.py"
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_verbose(mock_call, capsys):
     """verbose=True prints propose message to stderr and increments counter."""
     mock_call.return_value = _make_llm_result(
@@ -1756,7 +1756,7 @@ def test_propose_files_step_verbose(mock_call, capsys):
     assert "propose" in err.lower()
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_no_counter(mock_call):
     """_counter=None covers the None-counter branch (no increment)."""
     mock_call.return_value = _make_llm_result(
@@ -1769,7 +1769,7 @@ def test_propose_files_step_no_counter(mock_call):
     assert result is not None
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_subdir_name(mock_call):
     """subdir_name triggers the subdir placement_rule branch in the prompt."""
     mock_call.return_value = _make_llm_result(
@@ -1791,7 +1791,7 @@ def test_propose_files_step_subdir_name(mock_call):
     assert "service/" in prompt
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_no_existing_files(mock_call):
     """existing_files=frozenset() → exclude_section empty (branch False)."""
     mock_call.return_value = _make_llm_result(
@@ -1806,7 +1806,7 @@ def test_propose_files_step_no_existing_files(mock_call):
     assert result is not None
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_with_existing_files(mock_call):
     """existing_files non-empty → exclude_section added to prompt (branch True)."""
     mock_call.return_value = _make_llm_result(
@@ -1827,7 +1827,7 @@ def test_propose_files_step_with_existing_files(mock_call):
     assert result is not None
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_propose_files_step_prev_failure(mock_call):
     """prev_failure is appended to the propose prompt."""
     mock_call.return_value = _make_llm_result(
@@ -1926,7 +1926,7 @@ def test_refine_merge_tiny_no_ok_proposed():
     assert result == placements
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_refine_merge_tiny_success(mock_call):
     """Tiny file group is merged into a larger file successfully."""
     # LLM reassigns the tiny group to the large file.
@@ -1958,7 +1958,7 @@ def test_refine_merge_tiny_success(mock_call):
     assert large_placement.target_file == "large.py"
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_refine_merge_tiny_llm_fails(mock_call):
     """Reassignment LLM returns None → original placements returned (best-effort)."""
     mock_call.return_value = _make_llm_result(None)  # LLM fails
@@ -1982,7 +1982,7 @@ def test_refine_merge_tiny_llm_fails(mock_call):
     assert result[1].target_file == "large.py"
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_refine_merge_tiny_verbose(mock_call, capsys):
     """verbose=True prints the refining message to stderr."""
     mock_call.return_value = _make_llm_result(
@@ -2017,7 +2017,7 @@ def test_refine_merge_tiny_verbose(mock_call, capsys):
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_assign_placements_chunk_existing_files_exclude_section(mock_call):
     """Free-form mode with non-empty existing_files builds the exclude section."""
     mock_call.return_value = _make_llm_result(
@@ -2038,7 +2038,7 @@ def test_assign_placements_chunk_existing_files_exclude_section(mock_call):
     assert result[0].target_file == "helpers.py"
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 def test_assign_placements_chunk_target_in_existing_files_returns_none(mock_call):
     """Free-form mode: target_file in existing_files → return None (line 589)."""
     mock_call.return_value = _make_llm_result(
@@ -2063,7 +2063,7 @@ def test_assign_placements_chunk_target_in_existing_files_returns_none(mock_call
 # ---------------------------------------------------------------------------
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_propose_retry_succeeds_on_second_attempt(mock_key, mock_client, mock_call):
@@ -2089,7 +2089,7 @@ def test_propose_retry_succeeds_on_second_attempt(mock_key, mock_client, mock_ca
     assert plan.placements[0].target_file == "helpers.py"
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_propose_all_retries_exhausted_aborts(mock_key, mock_client, mock_call):
@@ -2107,7 +2107,7 @@ def test_propose_all_retries_exhausted_aborts(mock_key, mock_client, mock_call):
     assert plan.abort is True
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_propose_no_tool_call_verbose(mock_key, mock_client, mock_call, capsys):
@@ -2124,7 +2124,7 @@ def test_propose_no_tool_call_verbose(mock_key, mock_client, mock_call, capsys):
     assert "no tool call" in capsys.readouterr().err
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_propose_empty_files_list_verbose(mock_key, mock_client, mock_call, capsys):
@@ -2141,7 +2141,7 @@ def test_propose_empty_files_list_verbose(mock_key, mock_client, mock_call, caps
     assert "empty files list" in capsys.readouterr().err
 
 
-@patch(_PATCH_CALL)
+@patch("crispen.file_limiter.advisor.planning.call_with_tool")
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
 def test_propose_all_filenames_filtered_verbose(
