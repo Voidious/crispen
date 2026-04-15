@@ -145,6 +145,13 @@ def call_with_tool(
             if block.type == "tool_use" and block.name == tool_name:
                 tool_input = block.input
                 break
+        if tool_input is None and response.stop_reason == "max_tokens":
+            print(
+                f"crispen: {caller}: anthropic response truncated"
+                f" (stop_reason=max_tokens, max_tokens={max_tokens})",
+                file=sys.stderr,
+                flush=True,
+            )
         try:
             in_tok = int(response.usage.input_tokens)
             out_tok = int(response.usage.output_tokens)
@@ -271,6 +278,14 @@ def call_with_tool(
                 tool_input = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 tool_input = None
+        if tool_input is None and response.choices:
+            if response.choices[0].finish_reason == "length":
+                print(
+                    f"crispen: {caller}: {provider} response truncated"
+                    f" (finish_reason=length, max_tokens={max_tokens})",
+                    file=sys.stderr,
+                    flush=True,
+                )
         try:
             in_tok = int(response.usage.prompt_tokens)
             out_tok = int(response.usage.completion_tokens)
