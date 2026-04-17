@@ -615,6 +615,73 @@ def _restore_const_refs(func_text: str, const_refs: List["_ConstRef"]) -> str:
     return tree.visit(_ConstReverter(reverse_map)).code
 
 
+def _get_const_votes_from_rewrite(
+    func_text: str,
+    const_refs: List["_ConstRef"],
+) -> Dict[str, str]:
+    """Extract constant-update votes from a successfully rewritten function.
+
+    After ``_restore_const_refs`` has run, the function text contains either
+    ``@patch(NAME)`` (LLM left the constant unchanged) or ``@patch("new_val")``
+    (LLM replaced it with a literal string).  This function maps each constant's
+    old resolved value to the new value when it was changed.  Constants still
+    present as ``@patch(NAME)`` are omitted; callers treat their absence as a
+    keep-old vote (``{old_val: old_val}``).
+    """
+    if not const_refs:
+        return {}
+    try:
+        tree = ast.parse(func_text)
+    except SyntaxError:
+        return {}
+    func_node: Optional[Union[ast.FunctionDef, ast.AsyncFunctionDef]] = None
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_node = stmt
+            break
+    if func_node is None:
+        return {}
+
+    const_names_present: Set[str] = set()
+    new_patch_strings: Set[str] = set()
+    for deco in func_node.decorator_list:
+        if not isinstance(deco, ast.Call):
+            continue
+        f = deco.func
+        if not (
+            (isinstance(f, ast.Name) and f.id == "patch")
+            or (isinstance(f, ast.Attribute) and f.attr == "patch")
+        ):
+            continue
+        if not deco.args:
+            continue
+        arg0 = deco.args[0]
+        if isinstance(arg0, ast.Name):
+            const_names_present.add(arg0.id)
+        elif isinstance(arg0, ast.Attribute) and isinstance(arg0.value, ast.Name):
+            const_names_present.add(f"{arg0.value.id}.{arg0.attr}")
+        elif isinstance(arg0, ast.Constant) and isinstance(arg0.value, str):
+            new_patch_strings.add(arg0.value)
+
+    votes: Dict[str, str] = {}
+    for ref in const_refs:
+        if ref.const_name in const_names_present:
+            continue  # const unchanged → no vote entry (caller adds keep-old)
+        # Const replaced: find the new string by matching same entity name and
+        # same module prefix (old = "pkg.mod.name", new = "pkg.mod.sub.name").
+        old_name = ref.resolved_value.rsplit(".", 1)[-1]
+        old_base = ref.resolved_value.rsplit(".", 1)[0] + "."
+        for s in new_patch_strings:
+            if (
+                s.endswith("." + old_name)
+                and s.startswith(old_base)
+                and s != ref.resolved_value
+            ):
+                votes[ref.resolved_value] = s
+                break
+    return votes
+
+
 # ---------------------------------------------------------------------------
 # Body scan: collect patch() paths from ``with patch(...)`` context managers
 # ---------------------------------------------------------------------------
@@ -2085,6 +2152,18 @@ def _build_rewrite_func_prompt(
             if cands and len(cands) <= _CG_CANDIDATES_LLM_THRESHOLD
         }
         if small_cands:
+            if prev_error:
+                parts.append(
+                    "**NOTE — verifier correction takes precedence over candidates:**\n"
+                    "The previous-rewrite-rejected message above identifies the "
+                    "correct target(s) and the correct number of @patch decorators. "
+                    "If it says to use only one @patch or to remove a specific "
+                    "decorator, follow that instruction even when the candidates "
+                    "list below shows multiple sub-modules. The candidates list "
+                    "shows what is *statically reachable*; the verifier analyzed "
+                    "this specific test's inputs and call path — its conclusion on "
+                    "patch count overrides the candidates list.\n\n"
+                )
             parts.append(
                 "## Call-graph candidate paths (from static analysis):\n"
                 "Static analysis traced which new sub-module(s) each patched name "
@@ -2099,16 +2178,18 @@ def _build_rewrite_func_prompt(
                     parts.append(
                         f"- `{old}` → reachable in multiple sub-modules: "
                         f"{cands_str}.\n"
-                        f"  **One @patch per sub-module is required** — each "
-                        f"sub-module has an independent binding of the patched "
-                        f"name that the original single patch no longer covers. "
-                        f"This typically means the function under test is an "
-                        f"orchestrator: even though the test only calls it "
+                        f"  **An additional @patch per sub-module may be needed** "
+                        f"— each sub-module has an independent binding of the "
+                        f"patched name that the original single patch no longer "
+                        f"covers. This typically means the function under test is "
+                        f"an orchestrator: even though the test only calls it "
                         f"directly, it internally delegates to helpers in each "
-                        f"listed sub-module, and every such sub-module needs its "
-                        f"own @patch. Omit a candidate only if the test's inputs "
-                        f"provably prevent that sub-module from being reached "
-                        f"(e.g. an early-return guard before the delegating call).\n"
+                        f"listed sub-module, and every such sub-module that is "
+                        f"provably reached typically needs its own @patch. Omit a "
+                        f"candidate if the test's inputs provably prevent that "
+                        f"sub-module from being reached (e.g. an early-return "
+                        f"guard or an empty input list that skips the delegating "
+                        f"call).\n"
                     )
             parts.append("\n")
     parts.append(
@@ -2140,6 +2221,19 @@ def _build_rewrite_func_prompt(
         "remove it and remove its corresponding mock parameter. Do not keep "
         "no-op patches to 'preserve test logic'; removing them IS preserving "
         "the logic since they had no effect.\n"
+        "**Distributing side_effect entries when splitting one mock into "
+        "multiple:** If you add N mocks for the same name (one per sub-module), "
+        "assign the original side_effect entries in call order — first K entries "
+        "to the mock for the FIRST sub-module called, next J entries to the "
+        "SECOND, and so on. Determine call order from the test's input data "
+        "(e.g. if a flag or list is empty, the branch that exercises a given "
+        "sub-module is skipped entirely). Do NOT put all entries in one mock "
+        "unless only that sub-module is reached. Do NOT set "
+        "mock_X.return_value = None for a sub-module mock whose code path IS "
+        "exercised — the code accesses attributes (such as .elapsed) on the "
+        "return value and will raise AttributeError. Use return_value = None "
+        "only when that sub-module's code path is provably skipped by the "
+        "test's inputs.\n"
     )
     return "".join(parts)
 
@@ -2193,6 +2287,13 @@ def _build_rewrite_verify_prompt(
         "`correct=False` for removals of genuinely no-op patches.\n"
         "- All mock parameters correspond correctly to their @patch decorators "
         "(order, count, and names).\n"
+        "- **Mock return_value = None check**: if the rewrite sets "
+        "`mock_X.return_value = None` for a sub-module mock, verify that "
+        "sub-module is provably never called in this test. Check the test's "
+        "setup data (e.g. a non-empty list or flag means the corresponding "
+        "branch IS exercised). A None return causes AttributeError when the "
+        "code accesses attributes of the result (such as .elapsed) — this is "
+        "an incorrect rewrite that must be rejected.\n"
         "- All original test logic is preserved — no hallucinated code, no "
         "missing assertions or setup.\n"
         "Set `correct` to True only if all of the above are satisfied. "
@@ -2589,6 +2690,13 @@ def _process_file_source(
                         func_splices.append(
                             (func.start_line, func.end_line, new_func_text)
                         )
+                        # Record the rewrite's const votes so the constant
+                        # definition can be updated (or conflict-detected)
+                        # the same way rename-path functions do.
+                        rewrite_votes = _get_const_votes_from_rewrite(
+                            new_func_text, func.const_refs
+                        )
+                        string_swap_results.append((func, rewrite_votes))
                         if verbose:
                             print(
                                 f"crispen: patch_rewriter: rewrote"
@@ -3056,6 +3164,19 @@ def _process_file_source(
                         ref.resolved_value
                     ] = new_val
 
+        # Functions that didn't reach string_swap_results (failed rewrites,
+        # edit failures) cast a keep-old vote.  This prevents a constant from
+        # being globally updated when any using function went through the
+        # rewrite path and either failed or produced a different target.
+        swap_func_ids = {id(f) for f, _ in string_swap_results}
+        for func in functions:
+            if id(func) not in swap_func_ids:
+                for ref in func.const_refs:
+                    if ref.source_file == scan_file_abs:
+                        same_file_proposals.setdefault(ref.resolved_value, set()).add(
+                            ref.resolved_value
+                        )
+
         # Resolve same-file proposals into updates and per-function inlines.
         # All votes agree on ONE new value AND it differs from the old value →
         # update the constant definition.  Any "keep old" vote alongside a rename
@@ -3294,6 +3415,17 @@ def _callgraph_update_file(
                         unresolved_candidates.setdefault(func.function_name, {})[
                             old_path
                         ] = static_cands
+
+        # Const-backed paths where BFS found multiple candidates (ambiguous)
+        # must cast a keep-old vote so a constant shared with resolved functions
+        # isn't silently updated to a value that is wrong for this function.
+        # Paths with NO BFS candidates (function genuinely doesn't reach the name)
+        # don't vote — they correctly let single-resolution sibling functions win.
+        if scan_file_abs:
+            func_ambiguous = unresolved_candidates.get(func.function_name, {})
+            for old_val in const_ref_vals:
+                if old_val not in resolved and old_val in func_ambiguous:
+                    same_file_proposals.setdefault(old_val, set()).add(old_val)
 
         if not resolved:
             continue
