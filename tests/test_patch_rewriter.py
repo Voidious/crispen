@@ -1450,7 +1450,7 @@ def test_build_rewrite_func_prompt_with_error():
         ["crispen.before.X"],
         prev_error="SyntaxError on line 3",
     )
-    assert "Previous rewrite was invalid" in prompt
+    assert "Previous rewrite was rejected" in prompt
     assert "SyntaxError on line 3" in prompt
 
 
@@ -1549,12 +1549,11 @@ def test_process_no_change_verify_truncated_reject(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL)
 def test_process_no_change_verify_rejects_then_accepts(mock_call):
-    # No-change verify rejects first; classify+verify accepted on retry.
+    # No-change verify rejects with corrections; corrections-verify accepts.
     mock_call.side_effect = [
         _ok(_CLASSIFY_NO_CHANGE),
-        _ok(_VERIFY_REJECT),
-        _ok(_CLASSIFY_RENAME),
-        _ok(_VERIFY_OK),
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),
+        _ok(_VERIFY_OK),  # corrections-verify accepts
     ]
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
@@ -1584,11 +1583,19 @@ def test_process_no_change_exhausted_escalates_to_rewrite(mock_call):
     from crispen.config import CrispenConfig
 
     cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
+    # Corrections that rename the function itself (X→Y) are filtered out by the
+    # name-invariant guard, so corrections_renames ends up empty, causing the
+    # retry to exhaust and escalate to rewrite (covers lines 2897-2901).
+    name_change_correction = {
+        "correct": False,
+        "issue": "wrong path",
+        "corrections": {"crispen.before.X": "crispen.before.Y"},
+    }
     mock_call.side_effect = [
         _ok(_CLASSIFY_NO_CHANGE),  # classify → no change
-        _ok(_VERIFY_REJECT),  # verify → reject
+        _ok(name_change_correction),  # verify → reject (filtered corrections)
         _ok(_CLASSIFY_NO_CHANGE),  # classify (retry) → no change again
-        _ok(_VERIFY_REJECT),  # verify → reject (retries exhausted → escalate)
+        _ok(name_change_correction),  # verify → reject (retries exhausted → escalate)
         _ok({"rewritten_function": _VALID_REWRITE}),  # rewrite (escalated)
         _ok(_REWRITE_VERIFY_OK),  # verify rewrite → accept
     ]
@@ -1605,11 +1612,16 @@ def test_process_no_change_exhausted_escalate_verbose(mock_call, capsys):
     from crispen.config import CrispenConfig
 
     cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
+    name_change_correction = {
+        "correct": False,
+        "issue": "wrong path",
+        "corrections": {"crispen.before.X": "crispen.before.Y"},
+    }
     mock_call.side_effect = [
         _ok(_CLASSIFY_NO_CHANGE),
-        _ok(_VERIFY_REJECT),
+        _ok(name_change_correction),
         _ok(_CLASSIFY_NO_CHANGE),
-        _ok(_VERIFY_REJECT),
+        _ok(name_change_correction),
         _ok({"rewritten_function": _VALID_REWRITE}),
         _ok(_REWRITE_VERIFY_OK),
     ]
@@ -2160,7 +2172,7 @@ def test_process_verify_rejected_then_accept(mock_call):
     # First verify rejects; second classify+verify is accepted.
     mock_call.side_effect = [
         _ok(_CLASSIFY_RENAME),
-        _ok(_VERIFY_REJECT),
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),
         _ok(_CLASSIFY_RENAME),
         _ok(_VERIFY_OK),
     ]
@@ -2193,9 +2205,11 @@ def test_process_verify_rejected_exhausted_escalates_to_rewrite(mock_call):
     cfg = CrispenConfig(patch_update_retries=3, llm_verify_retries=1)
     mock_call.side_effect = [
         _ok(_CLASSIFY_RENAME),  # classify → rename
-        _ok(_VERIFY_REJECT),  # verify → reject
+        _ok(_VERIFY_REJECT_WITH_CORRECTIONS),  # verify → reject (retries left)
         _ok(_CLASSIFY_RENAME),  # classify (retry) → rename again
-        _ok(_VERIFY_REJECT),  # verify → reject (retries exhausted → escalate)
+        _ok(
+            _VERIFY_REJECT_WITH_CORRECTIONS
+        ),  # verify → reject (retries exhausted → escalate)
         _ok({"rewritten_function": _VALID_REWRITE}),  # rewrite (escalated)
         _ok(_REWRITE_VERIFY_OK),  # verify rewrite → accept
     ]
@@ -2600,7 +2614,13 @@ def test_process_verbose_verify_rejected_prints_issue(mock_call, capsys):
     """verbose=True prints 'REJECTED' and the issue when verify rejects."""
     mock_call.side_effect = [
         _ok(_CLASSIFY_RENAME),
-        _ok({"correct": False, "issue": "wrong module path"}),
+        _ok(
+            {
+                "correct": False,
+                "issue": "wrong module path",
+                "corrections": {"crispen.before.X": "crispen.after.X"},
+            }
+        ),
         _ok(_CLASSIFY_RENAME),
         _ok(_VERIFY_OK),
     ]

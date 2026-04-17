@@ -264,13 +264,15 @@ _PATCH_REWRITE_VERIFY_TOOL: dict = {
                 "description": (
                     "True if the rewritten function correctly updates all @patch "
                     "strings, the mock parameters match their decorators, and all "
-                    "original test logic is preserved without hallucinated code."
+                    "original test logic is preserved without hallucinated code. "
+                    "Set True if and only if your analysis finds a concrete error "
+                    "— do not set False out of general uncertainty."
                 ),
             },
             "issue": {
                 "type": "string",
                 "description": (
-                    "What is wrong with the rewritten function. "
+                    "One sentence describing the specific error. "
                     "Empty string when correct."
                 ),
             },
@@ -291,7 +293,11 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
         "properties": {
             "correct": {
                 "type": "boolean",
-                "description": "True if all proposed updates are correct.",
+                "description": (
+                    "True if all proposed updates are correct. Set True if and "
+                    "only if your analysis finds a concrete error — do not set "
+                    "False out of general uncertainty."
+                ),
             },
             "corrections": {
                 "type": "object",
@@ -1827,7 +1833,11 @@ def _build_classify_prompt(
         "A rewrite is also needed when the split routes mock calls through more "
         "than one sub-module that each import the patched name independently — "
         "a single @patch path can only intercept calls in its own module, so a "
-        "new @patch decorator must be added for each sub-module involved.\n"
+        "new @patch decorator must be added for each sub-module involved. "
+        "When uncertain whether structural changes are needed (for example when "
+        "the patched name appears in multiple new sub-modules), prefer "
+        "`needs_rewrite=True` — an unnecessary rewrite is recoverable, but a "
+        "wrong rename fails silently at test time.\n"
     )
     if candidates_per_path:
         small_cands = {
@@ -1942,6 +1952,10 @@ def _build_func_verify_prompt(
         "patching `handlers.send_request` alone covers both). Set "
         "`correct=False` with a multi-submodule issue only when the test's "
         "setup or inputs provably trigger the other sub-module's code path.\n"
+        "**Verdict rule**: if your analysis concludes the patches are correct, "
+        "you MUST set `correct=True`. Only set `correct=False` when you can "
+        "name the specific wrong path. Be concise — one sentence in `issue` "
+        "is enough.\n"
     )
     return "".join(parts)
 
@@ -2027,6 +2041,10 @@ def _build_no_change_verify_prompt(
         "not for describing the fix. "
         "Only leave `corrections` empty if the fix requires an entirely new "
         "@patch decorator.\n"
+        "**Verdict rule**: if your analysis concludes the patches are correct, "
+        "you MUST set `correct=True`. Only set `correct=False` when you can "
+        "name the specific wrong path. Be concise — one sentence in `issue` "
+        "is enough.\n"
     )
     return "".join(parts)
 
@@ -2043,7 +2061,14 @@ def _build_rewrite_func_prompt(
     paths_list = "\n".join(f"- `{p}`" for p in old_patch_paths)
     parts = [context_msg, _PATCH_RULES]
     if prev_error:
-        parts.append(f"\n## Previous rewrite was invalid:\n" f"- Error: {prev_error}\n")
+        parts.append(
+            f"\n## Previous rewrite was rejected:\n"
+            f"- Reason: {prev_error}\n"
+            "Fix ONLY the specific error described above. If it says a @patch "
+            "decorator was unnecessary or added incorrectly, remove it entirely "
+            "and remove its corresponding mock parameter — do not keep it or "
+            "replace it with a different path.\n"
+        )
     parts.append(
         f"\n## Test function to rewrite:\n```python\n{function_text}\n```\n\n"
         f"## Patch strings that need updating:\n{paths_list}\n\n"
@@ -2170,7 +2195,10 @@ def _build_rewrite_verify_prompt(
         "(order, count, and names).\n"
         "- All original test logic is preserved — no hallucinated code, no "
         "missing assertions or setup.\n"
-        "Set `correct` to True only if all of the above are satisfied.\n",
+        "Set `correct` to True only if all of the above are satisfied. "
+        "Only set `correct=False` when you can identify a concrete, specific "
+        "error — do not reject on general uncertainty. Be concise: one "
+        "sentence in `issue` is sufficient.\n",
     )
     return "".join(parts)
 
@@ -2726,6 +2754,16 @@ def _process_file_source(
                     break  # confirmed: no change needed
                 # Check if verifier provided corrections for a direct apply.
                 corrections = (v.tool_input or {}).get("corrections") or {}
+                if not corrections and config.llm_verify_retries > 0:
+                    # Verifier rejected with no rename corrections: the fix
+                    # requires a structural change (e.g. a new @patch decorator).
+                    # Escalate immediately to rewrite instead of burning retries.
+                    _rewrite_escalation_error = issue
+                    _rewrite_escalation_reason = (
+                        "no-change verify rejected with empty corrections"
+                    )
+                    attempts_left += 1
+                    continue
                 corrections_renames: Dict[str, str] = {
                     old: new
                     for old, new in corrections.items()
@@ -2964,7 +3002,17 @@ def _process_file_source(
                 _outcome = "rename"
                 break
             else:
-                if rename_verify_retries_left > 0:
+                raw_corrections = (v.tool_input or {}).get("corrections") or {}
+                if not raw_corrections and config.llm_verify_retries > 0:
+                    # Verifier rejected the rename but provided no alternative
+                    # corrections: the fix requires a structural change (new
+                    # @patch decorator). Escalate immediately to rewrite.
+                    _rewrite_escalation_error = issue
+                    _rewrite_escalation_reason = (
+                        "rename verify rejected with empty corrections"
+                    )
+                    attempts_left += 1  # allow one more outer iteration
+                elif rename_verify_retries_left > 0:
                     rename_verify_retries_left -= 1
                     prev_issue = issue
                     prev_proposed = str(patch_renames)
