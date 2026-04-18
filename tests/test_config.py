@@ -217,7 +217,17 @@ def test_format_header_defaults():
     assert "extraction_retries:" in text
     assert "llm_verify_retries:" in text
     assert "file_limiter_retries:" in text
+    assert "file_limiter_reexports:" in text
+    assert "file_limiter_patch_update:" in text
+    assert "patch_update_retries:" not in text
     assert "base_url" not in text
+
+
+def test_format_header_patch_update_rewrite():
+    cfg = CrispenConfig(file_limiter_patch_update="rewrite")
+    lines = format_header(cfg)
+    text = "\n".join(lines)
+    assert "patch_update_retries:" in text
 
 
 def test_format_header_with_base_url():

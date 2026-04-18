@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import io
 import re
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -27,6 +29,7 @@ class ImportInfo:
     names: List[str]  # names made available by this import
     source: str  # the import statement text (no trailing newline)
     is_future: bool  # True if `from __future__ import ...`
+    is_type_checking: bool = False  # True if inside `if TYPE_CHECKING:` block
 
 
 @dataclass
@@ -65,6 +68,51 @@ _EXCESS_BLANK_RE = re.compile(r"\n{4,}")
 _EXCESS_BLANK_BODY_RE = re.compile(r"\n{3,}(?=[ \t])")
 
 
+def _multiline_string_ranges(source: str) -> List[Tuple[int, int]]:
+    """Return (start, end) character offsets for every multi-line string literal.
+
+    Uses the tokenizer so that triple-quoted strings containing blank lines
+    followed by indented content are not mistakenly collapsed by blank-line
+    normalization regexes.  Falls back to an empty list on tokenization error
+    (e.g. if the source is not yet valid Python), preserving original behavior.
+    """
+    ranges: List[Tuple[int, int]] = []
+    lines = source.splitlines(keepends=True)
+    # cumulative[i] = byte offset of the start of line i (0-indexed)
+    cumulative = [0]
+    for line in lines:
+        cumulative.append(cumulative[-1] + len(line))
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        for tok_type, tok_string, tok_start, tok_end, _ in tokens:
+            if tok_type == tokenize.STRING and "\n" in tok_string:
+                start = cumulative[tok_start[0] - 1] + tok_start[1]
+                end = cumulative[tok_end[0] - 1] + tok_end[1]
+                ranges.append((start, end))
+    except tokenize.TokenError:
+        pass
+    return ranges
+
+
+def _sub_skip_strings(pattern: re.Pattern, repl: str, source: str) -> str:
+    """Apply *pattern*.sub(*repl*, ...) to *source*, skipping string literals.
+
+    Blank-line normalization must not alter content inside string literals (e.g.
+    source code stored in a dedented triple-quoted string used in tests).
+    """
+    ranges = _multiline_string_ranges(source)
+    if not ranges:
+        return pattern.sub(repl, source)
+    parts: List[str] = []
+    last = 0
+    for start, end in ranges:
+        parts.append(pattern.sub(repl, source[last:start]))
+        parts.append(source[start:end])
+        last = end
+    parts.append(pattern.sub(repl, source[last:]))
+    return "".join(parts)
+
+
 def _normalize_blank_lines(source: str) -> str:
     """Collapse excess blank lines; ensure exactly one trailing newline.
 
@@ -79,9 +127,13 @@ def _normalize_blank_lines(source: str) -> str:
 
     Returns an empty string when *source* contains only whitespace, signalling
     that the file should be deleted rather than written with a lone blank line.
+
+    Multi-line string literals are protected: blank lines inside them are never
+    collapsed, so stored source-code snippets (e.g. in test fixtures) are not
+    mutated.
     """
-    source = _EXCESS_BLANK_RE.sub("\n\n\n", source)
-    source = _EXCESS_BLANK_BODY_RE.sub("\n\n", source)
+    source = _sub_skip_strings(_EXCESS_BLANK_RE, "\n\n\n", source)
+    source = _sub_skip_strings(_EXCESS_BLANK_BODY_RE, "\n\n", source)
     source = source.lstrip("\n")
     stripped = source.rstrip("\n")
     if not stripped.strip():
@@ -193,12 +245,14 @@ def _import_derived_names(source: str) -> Set[str]:
 
 
 def _collect_name_loads(source: str) -> Set[str]:
-    """Return Name loads in *source* that are not shadowed by function parameters.
+    """Return Name loads in *source* that are not shadowed by function parameters
+    or local variable assignments.
 
     For each function or async function, names that appear as parameters of that
-    function are excluded from Name loads within its body.  This prevents generating
-    spurious cross-file imports for names that are satisfied locally (e.g. pytest
-    fixture names that appear as test function parameters).
+    function or are assigned anywhere in the function body are excluded from Name
+    loads within its body.  This prevents generating spurious cross-file imports
+    for names that are satisfied locally (e.g. pytest fixture names that appear as
+    test function parameters, or local variables like ``helpers = tmp_path / ...``).
 
     Decorators, argument default values, and return/argument annotations are
     always evaluated in the outer scope and are never excluded.
@@ -208,6 +262,26 @@ def _collect_name_loads(source: str) -> Set[str]:
     except SyntaxError:
         return set()
     names: Set[str] = set()
+
+    def _body_stores(stmts) -> frozenset:
+        """Names stored/deleted at this scope level in *stmts*.
+
+        Recurses into control-flow nodes (if/for/while/with/try) but stops at
+        nested FunctionDef/AsyncFunctionDef/ClassDef scopes so only names that
+        are local to the current function are returned.
+        """
+        stores: Set[str] = set()
+        work = list(stmts)
+        while work:
+            node = work.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                stores.add(node.id)
+            work.extend(ast.iter_child_nodes(node))
+        return frozenset(stores)
 
     def _walk(node: ast.AST, excluded: frozenset) -> None:
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
@@ -243,8 +317,9 @@ def _collect_name_loads(source: str) -> Set[str]:
                 _walk(args.kwarg.annotation, excluded)
             if node.returns:
                 _walk(node.returns, excluded)
-            # Function body uses the combined excluded set.
-            new_excluded = excluded | own_params
+            # Function body uses params + local stores as the excluded set.
+            own_locals = _body_stores(node.body)
+            new_excluded = excluded | own_params | own_locals
             for child in node.body:
                 _walk(child, new_excluded)
             return
@@ -369,6 +444,63 @@ def _inject_module_level_imports(source: str, imports: List[str]) -> str:
     return "".join(lines[:insert_after] + import_lines + lines[insert_after:])
 
 
+def _inject_type_checking_imports(source: str, imports: List[str]) -> str:
+    """Add *imports* under a module-level ``if TYPE_CHECKING:`` guard in *source*.
+
+    If a TYPE_CHECKING block already exists, new imports are appended to it
+    (skipping any already present).  Otherwise a new block is inserted after
+    the last top-level import statement, along with ``from typing import
+    TYPE_CHECKING`` when that name is not already imported.
+    """
+    if not imports:
+        return source
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    # Determine which imports are not already in an existing TC block.
+    existing_tc = {i.source for i in _extract_import_info(source) if i.is_type_checking}
+    new_imports = [imp for imp in imports if imp not in existing_tc]
+    if not new_imports:
+        return source
+
+    lines = source.splitlines(keepends=True)
+
+    # Append to an existing TYPE_CHECKING block if one is present.
+    for node in tree.body:
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
+            insert_line = node.end_lineno
+            new_lines = ["    " + imp + "\n" for imp in sorted(new_imports)]
+            return "".join(lines[:insert_line] + new_lines + lines[insert_line:])
+
+    # No existing block: insert one after the last top-level import.
+    last_import_line = 0
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            last_import_line = max(last_import_line, node.end_lineno)
+    insert_after = last_import_line
+
+    tc_already_imported = any(
+        isinstance(n, ast.ImportFrom)
+        and n.module == "typing"
+        and any((a.asname or a.name) == "TYPE_CHECKING" for a in n.names)
+        for n in tree.body
+    )
+    new_lines = []
+    if not tc_already_imported:
+        new_lines.append("from typing import TYPE_CHECKING\n")
+    new_lines.append("if TYPE_CHECKING:\n")
+    for imp in sorted(new_imports):
+        new_lines.append("    " + imp + "\n")
+    new_lines.append("\n")
+    return "".join(lines[:insert_after] + new_lines + lines[insert_after:])
+
+
 def _test_names_in_decorators(source: str, names: Set[str]) -> Set[str]:
     """Return the subset of *names* that appear as Name loads inside a decorator.
 
@@ -397,7 +529,13 @@ def _test_names_in_decorators(source: str, names: Set[str]) -> Set[str]:
 
 
 def _extract_import_info(source: str) -> List[ImportInfo]:
-    """Return :class:`ImportInfo` for each top-level import in *source*."""
+    """Return :class:`ImportInfo` for each top-level import in *source*.
+
+    Also includes imports found inside module-level ``if TYPE_CHECKING:``
+    blocks, marked with ``is_type_checking=True``.  These are used by
+    :func:`_find_type_checking_needed_imports` to distribute forward-reference
+    imports to the correct sub-files after a split.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -430,6 +568,48 @@ def _extract_import_info(source: str) -> List[ImportInfo]:
             src = f"from {dots}{mod} import {', '.join(alias_strs)}"
             is_future = node.module == "__future__"
             result.append(ImportInfo(names=names, source=src, is_future=is_future))
+        elif (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
+            for child in node.body:
+                if isinstance(child, ast.Import):
+                    tc_names = [
+                        alias.asname if alias.asname else alias.name.split(".")[0]
+                        for alias in child.names
+                    ]
+                    tc_src = "".join(
+                        lines[child.lineno - 1 : child.end_lineno]
+                    ).rstrip()
+                    result.append(
+                        ImportInfo(
+                            names=tc_names,
+                            source=tc_src,
+                            is_future=False,
+                            is_type_checking=True,
+                        )
+                    )
+                elif isinstance(child, ast.ImportFrom):
+                    tc_names = [
+                        alias.asname if alias.asname else alias.name
+                        for alias in child.names
+                    ]
+                    tc_dots = "." * (child.level or 0)
+                    tc_mod = child.module or ""
+                    tc_alias_strs = [
+                        f"{a.name} as {a.asname}" if a.asname else a.name
+                        for a in child.names
+                    ]
+                    tc_src = f"from {tc_dots}{tc_mod} import {', '.join(tc_alias_strs)}"
+                    result.append(
+                        ImportInfo(
+                            names=tc_names,
+                            source=tc_src,
+                            is_future=False,
+                            is_type_checking=True,
+                        )
+                    )
 
     return result
 
@@ -456,6 +636,8 @@ def _find_needed_imports(
     for info in import_infos:
         if info.source in seen:
             continue
+        if info.is_type_checking:
+            continue  # handled by _find_type_checking_needed_imports
         if info.is_future or any(n in referenced for n in info.names):
             needed.append(info.source)
             seen.add(info.source)
@@ -463,18 +645,43 @@ def _find_needed_imports(
     return needed
 
 
+def _narrow_import_source(import_src: str, keep_names: Set[str]) -> str:
+    """Return a copy of *import_src* keeping only the exposed names in *keep_names*.
+
+    For ``from X import A, B, C`` with ``keep_names={A}``, returns
+    ``from X import A``.  Non-ImportFrom statements are returned unchanged.
+    """
+    try:
+        node = ast.parse(import_src).body[0]
+    except (SyntaxError, IndexError):
+        return import_src
+    if not isinstance(node, ast.ImportFrom):
+        return import_src
+    dots = "." * (node.level or 0)
+    mod = node.module or ""
+    alias_strs = [
+        f"{a.name} as {a.asname}" if a.asname else a.name
+        for a in node.names
+        if (a.asname or a.name) in keep_names
+    ]
+    if not alias_strs:
+        return import_src
+    return f"from {dots}{mod} import {', '.join(alias_strs)}"
+
+
 def _find_type_checking_needed_imports(
     entity_names: List[str],
     entity_source_map: Dict[str, str],
     import_infos: List[ImportInfo],
-    regular_needed_sources: Set[str],
 ) -> List[str]:
     """Return import statements needed only for quoted type annotations.
 
     These should be placed under ``if TYPE_CHECKING:`` because the names are
     only referenced inside string-valued annotations (forward references) and
-    are not needed at runtime.  *regular_needed_sources* is the set of import
-    source strings already emitted as regular imports (to avoid duplicates).
+    are not needed at runtime.  Names that appear in regular (non-annotation)
+    loads are excluded via ``annotation_only = quoted - runtime``, which
+    guarantees that any name emitted here will be pruned from regular imports
+    by ``_prune_unused_imports`` — so no duplicate imports can arise.
     ``__future__`` imports are always excluded since they are handled by
     ``_find_needed_imports``.
     """
@@ -492,13 +699,25 @@ def _find_type_checking_needed_imports(
     needed: List[str] = []
     seen: Set[str] = set()
     for info in import_infos:
-        if info.source in regular_needed_sources or info.source in seen:
+        if info.source in seen:
             continue
         if info.is_future:
             continue
-        if any(n in annotation_only for n in info.names):
-            needed.append(info.source)
-            seen.add(info.source)
+        tc_names = {n for n in info.names if n in annotation_only}
+        if not tc_names:
+            continue
+        # Narrow the import to only the names actually needed for type checking,
+        # avoiding unused-import warnings for names from multi-name imports that
+        # are not referenced in this file.
+        src = (
+            info.source
+            if len(tc_names) == len(info.names)
+            else _narrow_import_source(info.source, tc_names)
+        )
+        if src in seen:
+            continue
+        needed.append(src)
+        seen.add(src)
     return needed
 
 
@@ -896,6 +1115,13 @@ def _collect_external_imported_names(original_path: str) -> Set[str]:
     # project_root is an ancestor of orig (derived by walking up from orig.parent),
     # so _module_path_from_file always returns a non-None string here.
     target_module = _module_path_from_file(project_root, orig)
+    # __init__.py defines the package itself; external callers import from the
+    # package path (e.g. "pkg.sub"), not "pkg.sub.__init__".
+    if orig.name == "__init__.py":
+        dot = target_module.rfind(".")
+        if dot == -1:
+            return set()  # bare __init__.py at project root; no external callers
+        target_module = target_module[:dot]
     result: Set[str] = set()
     for py_file in project_root.rglob("*.py"):
         if py_file.resolve() == orig:
@@ -1043,7 +1269,17 @@ def _add_re_exports(
                     or defined_name in external_loads
                 ):
                     to_import.append(defined_name)
-                    if defined_name not in still_loaded:
+                    # Add noqa when the name is not referenced in the remaining
+                    # source (pure re-export stub), OR when it is in external_loads
+                    # — in the latter case a non-migrated entity may currently use
+                    # the name, but if that entity is itself migrated in a later
+                    # recursive split the stub would become unreferenced and
+                    # _prune_unused_imports would silently drop it, breaking the
+                    # external caller.  The noqa marker protects against that.
+                    if (
+                        defined_name not in still_loaded
+                        or defined_name in external_loads
+                    ):
                         noqa_names.add(defined_name)
         if to_import:
             re_exports.setdefault(import_prefix, []).extend(to_import)
@@ -1428,6 +1664,14 @@ def _prune_unused_imports(source: str) -> str:
         if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
             continue
 
+        # Preserve intentional re-export stubs added by _add_re_exports.
+        # These carry "# noqa: F401" and must not be pruned even when the
+        # name is no longer referenced in the file body — they exist solely
+        # to keep the module's public/private API intact for external callers.
+        import_lines = lines[node.lineno - 1 : node.end_lineno]
+        if any("noqa: F401" in line for line in import_lines):
+            continue
+
         kept = [
             a
             for a in node.names
@@ -1470,6 +1714,11 @@ def _prune_unused_imports(source: str) -> str:
 def _strip_top_level_import_lines(src: str) -> str:
     """Return *src* with all top-level import statements removed.
 
+    Also removes module-level ``if TYPE_CHECKING:`` blocks, since their
+    imports are now redistributed to each sub-file via the import-info
+    system and emitting the block verbatim would produce the wrong relative
+    import path and/or an unused import in the wrong sub-file.
+
     Uses AST to locate the exact line range of each import node, correctly
     handling multi-line imports.  Returns *src* unchanged when it cannot be
     parsed as Python.
@@ -1481,6 +1730,13 @@ def _strip_top_level_import_lines(src: str) -> str:
     remove: Set[int] = set()
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for ln in range(node.lineno, node.end_lineno + 1):
+                remove.add(ln)
+        elif (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
             for ln in range(node.lineno, node.end_lineno + 1):
                 remove.add(ln)
     if not remove:
@@ -2460,7 +2716,7 @@ def generate_file_splits(
             ent_names, entity_source_map, import_infos, all_entity_names
         )
         needed_tc = _find_type_checking_needed_imports(
-            ent_names, entity_source_map, import_infos, set(needed)
+            ent_names, entity_source_map, import_infos
         )
         if subdir_name is not None:
             depth = len(Path(target_file).parts) - 1
@@ -2561,6 +2817,35 @@ def generate_file_splits(
                         top_cross.append(imp)
             entity_srcs.append(_src)
         entity_srcs = [s for s in entity_srcs if s]
+        # Dedup: remove TC imports for names already covered by regular imports.
+        # This can happen when one entity uses a name at runtime (→ top_cross)
+        # while another entity in the same file only uses it in a quoted
+        # annotation (→ all_tc_imports), producing duplicate import statements.
+        if all_tc_imports and (needed or top_cross):
+            _regular_names: Set[str] = set()
+            for _imp in needed + top_cross:
+                _m = _FROM_IMPORT_RE.match(_imp)
+                if _m:
+                    _regular_names.update(
+                        n.strip() for n in _m.group(2).split(",") if n.strip()
+                    )
+            _deduped_tc: List[str] = []
+            for _tc in all_tc_imports:
+                _m = _FROM_IMPORT_RE.match(_tc)
+                if _m:
+                    _tc_names = {
+                        _n.strip() for _n in _m.group(2).split(",") if _n.strip()
+                    }
+                    _leftover = _tc_names - _regular_names
+                    if _leftover:
+                        _deduped_tc.append(
+                            _tc
+                            if _leftover == _tc_names
+                            else _narrow_import_source(_tc, _leftover)
+                        )
+                else:
+                    _deduped_tc.append(_tc)
+            all_tc_imports = _deduped_tc
         parts: List[str] = []
         imports_for_sort = list(needed + top_cross)
         if all_tc_imports:
@@ -2598,6 +2883,20 @@ def generate_file_splits(
         post_source, migrated_names - copy_not_migrate, entity_map, entity_source_map
     )
     updated = _prune_unused_imports(updated)
+    # Compute TYPE_CHECKING imports needed by non-migrated entities that had
+    # their import guard block removed as part of a migrated TOP_LEVEL entity.
+    # Injection happens AFTER the relative-import bump below so that bumped
+    # import strings are passed to _inject_type_checking_imports rather than
+    # relying on the bump (which only matches unindented ``from .`` lines and
+    # therefore misses indented imports inside an ``if TYPE_CHECKING:`` block).
+    _non_migrated_names = [
+        e.name for e in classified.entities if e.name not in migrated_names
+    ]
+    _tc_to_inject: List[str] = []
+    if _non_migrated_names:
+        _tc_to_inject = _find_type_checking_needed_imports(
+            _non_migrated_names, entity_source_map, import_infos
+        )
     # For non-test subdir splits, re-exports from the __init__.py use relative
     # import prefixes computed from inside the package (e.g. ".utils" not
     # ".service.utils").  For test files the original keeps existing abs_pkg
@@ -2610,6 +2909,9 @@ def generate_file_splits(
     # are already computed from the __init__.py's perspective and are correct.
     if subdir_name is not None and not is_test_file and not has_main:
         updated = _bump_relative_imports(updated)
+        _tc_to_inject = [_bump_relative_imports(imp) for imp in _tc_to_inject]
+    if _tc_to_inject:
+        updated = _inject_type_checking_imports(updated, _tc_to_inject)
     if subdir_name is not None:
         # If the original file had a module docstring and it was migrated away,
         # place it in subdir/__init__.py in both cases: for non-test splits

@@ -16,6 +16,17 @@ class RunStats:
     duplicate_matched: int = 0
     function_split: int = 0
     file_limiter_edits: int = 0  # new files written by FileLimiter
+    patch_update_edits: int = 0  # files updated by @patch string updates
+
+    # Patch update change-type breakdown
+    patch_single_candidate: int = 0  # non-forking path mappings (basic mode)
+    patch_cg_resolved: int = 0  # forking paths resolved by callgraph
+    patch_llm_no_change: int = 0  # functions LLM confirmed need no change
+    patch_llm_rename: int = 0  # functions LLM renamed via string-swap
+    patch_llm_rewrite: int = 0  # functions LLM fully rewrote
+    patch_edit_failures: int = (
+        0  # functions where retries exhausted without a verified update
+    )
 
     # Rejection counts
     algorithmic_rejected: int = 0
@@ -26,6 +37,7 @@ class RunStats:
     llm_edit_calls: int = 0
     llm_verify_calls: int = 0
     file_limiter_llm_calls: int = 0
+    patch_rewrite_llm_calls: int = 0  # LLM calls for rewrite-mode patch updates
 
     # File and line tracking
     files_edited: List[str] = field(default_factory=list)
@@ -111,12 +123,20 @@ class RunStats:
         self.duplicate_matched += other.duplicate_matched
         self.function_split += other.function_split
         self.file_limiter_edits += other.file_limiter_edits
+        self.patch_update_edits += other.patch_update_edits
+        self.patch_single_candidate += other.patch_single_candidate
+        self.patch_cg_resolved += other.patch_cg_resolved
+        self.patch_llm_no_change += other.patch_llm_no_change
+        self.patch_llm_rename += other.patch_llm_rename
+        self.patch_llm_rewrite += other.patch_llm_rewrite
+        self.patch_edit_failures += other.patch_edit_failures
         self.algorithmic_rejected += other.algorithmic_rejected
         self.llm_rejected += other.llm_rejected
         self.llm_veto_calls += other.llm_veto_calls
         self.llm_edit_calls += other.llm_edit_calls
         self.llm_verify_calls += other.llm_verify_calls
         self.file_limiter_llm_calls += other.file_limiter_llm_calls
+        self.patch_rewrite_llm_calls += other.patch_rewrite_llm_calls
         self.lines_added += other.lines_added
         self.lines_deleted += other.lines_deleted
         self.file_limiter_functions_verified += other.file_limiter_functions_verified
@@ -171,6 +191,7 @@ class RunStats:
             + self.duplicate_matched
             + self.function_split
             + self.file_limiter_edits
+            + self.patch_update_edits
         )
 
     @property
@@ -184,6 +205,7 @@ class RunStats:
             + self.llm_edit_calls
             + self.llm_verify_calls
             + self.file_limiter_llm_calls
+            + self.patch_rewrite_llm_calls
         )
 
     def count_lines_changed(self, original: str, new: str) -> None:
@@ -207,6 +229,7 @@ class RunStats:
         lines.append(f"  match existing:      {self.duplicate_matched}")
         lines.append(f"  function split:      {self.function_split}")
         lines.append(f"  file limiter:        {self.file_limiter_edits}")
+        lines.append(f"  patch update:        {self.patch_update_edits}")
         lines.append(f"  total:               {self.total_edits}")
         lines.append("rejected:")
         lines.append(f"  algorithmic:         {self.algorithmic_rejected}")
@@ -217,6 +240,7 @@ class RunStats:
         lines.append(f"  edit:                {self.llm_edit_calls}")
         lines.append(f"  verify:              {self.llm_verify_calls}")
         lines.append(f"  file limiter:        {self.file_limiter_llm_calls}")
+        lines.append(f"  patch rewrite:       {self.patch_rewrite_llm_calls}")
         lines.append(f"  total:               {self.total_llm_calls}")
         if self.files_edited:
             flist = ", ".join(self.files_edited)
@@ -229,6 +253,23 @@ class RunStats:
         lines.append(f"  functions:           {self.file_limiter_functions_verified}")
         lines.append(f"  classes:             {self.file_limiter_classes_verified}")
         lines.append(f"  lines:               {self.file_limiter_lines_verified}")
+        if any(
+            [
+                self.patch_single_candidate,
+                self.patch_cg_resolved,
+                self.patch_llm_no_change,
+                self.patch_llm_rename,
+                self.patch_llm_rewrite,
+                self.patch_edit_failures,
+            ]
+        ):
+            lines.append("patch update changes:")
+            lines.append(f"  single candidate:    {self.patch_single_candidate}")
+            lines.append(f"  callgraph resolved:  {self.patch_cg_resolved}")
+            lines.append(f"  LLM no-change:       {self.patch_llm_no_change}")
+            lines.append(f"  LLM rename:          {self.patch_llm_rename}")
+            lines.append(f"  LLM rewrite:         {self.patch_llm_rewrite}")
+            lines.append(f"  edit failures:       {self.patch_edit_failures}")
         if timing != "off":
             lines.append("timing:")
             lines.append(f"  total:               {self.total_elapsed:.2f}s")

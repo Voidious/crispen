@@ -585,6 +585,8 @@ def _llm_veto(
     provider: str = "anthropic",
     tool_choice_override: Optional[str] = None,
     _timing_out=None,
+    rate_limit_retries: int = 6,
+    rate_limit_backoff: float = 20.0,
 ) -> Tuple[bool, str, str]:
     blocks_text = "\n\n".join(
         f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
@@ -612,6 +614,8 @@ def _llm_veto(
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
+        rate_limit_retries=rate_limit_retries,
+        rate_limit_backoff=rate_limit_backoff,
     )
     if _timing_out is not None:
         _timing_out.append(result)
@@ -638,6 +642,8 @@ def _llm_extract(
     prev_output: Optional[dict] = None,
     tool_choice_override: Optional[str] = None,
     _timing_out=None,
+    rate_limit_retries: int = 6,
+    rate_limit_backoff: float = 20.0,
 ) -> Optional[dict]:
     src_lines = full_source.splitlines(keepends=True)
     block_entries = []
@@ -748,6 +754,8 @@ def _llm_extract(
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
+        rate_limit_retries=rate_limit_retries,
+        rate_limit_backoff=rate_limit_backoff,
     )
     if _timing_out is not None:
         _timing_out.append(result)
@@ -763,6 +771,8 @@ def _llm_veto_func_match(
     provider: str = "anthropic",
     tool_choice_override: Optional[str] = None,
     _timing_out=None,
+    rate_limit_retries: int = 6,
+    rate_limit_backoff: float = 20.0,
 ) -> Tuple[bool, str, str]:
     """Ask the LLM whether *seq* performs the same operation as *func*'s body."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -788,6 +798,8 @@ def _llm_veto_func_match(
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
+        rate_limit_retries=rate_limit_retries,
+        rate_limit_backoff=rate_limit_backoff,
     )
     if _timing_out is not None:
         _timing_out.append(result)
@@ -816,6 +828,8 @@ def _llm_generate_call(
     provider: str = "anthropic",
     tool_choice_override: Optional[str] = None,
     _timing_out=None,
+    rate_limit_retries: int = 6,
+    rate_limit_backoff: float = 20.0,
 ) -> Optional[str]:
     """Ask the LLM to generate a call expression replacing *seq* with *func*."""
     snippet = full_source[:4000] if len(full_source) > 4000 else full_source
@@ -840,6 +854,8 @@ def _llm_generate_call(
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
+        rate_limit_retries=rate_limit_retries,
+        rate_limit_backoff=rate_limit_backoff,
     )
     if _timing_out is not None:
         _timing_out.append(result)
@@ -858,6 +874,8 @@ def _llm_verify_extraction(
     provider: str = "anthropic",
     tool_choice_override: Optional[str] = None,
     _timing_out=None,
+    rate_limit_retries: int = 6,
+    rate_limit_backoff: float = 20.0,
 ) -> Tuple[bool, List[str]]:
     """Ask the LLM to verify the extraction is semantically correct.
 
@@ -925,6 +943,8 @@ def _llm_verify_extraction(
         [{"role": "user", "content": prompt}],
         caller="DuplicateExtractor",
         tool_choice_override=tool_choice_override,
+        rate_limit_retries=rate_limit_retries,
+        rate_limit_backoff=rate_limit_backoff,
     )
     if _timing_out is not None:
         _timing_out.append(result)
@@ -2193,6 +2213,8 @@ class DuplicateExtractor(Refactor):
         match_functions: bool = True,
         timing: str = "detailed",
         current_file: str = "",
+        rate_limit_retries: int = 6,
+        rate_limit_backoff: float = 20.0,
     ) -> None:
         super().__init__(changed_ranges, source=source, verbose=verbose)
         self.current_file = current_file
@@ -2209,6 +2231,8 @@ class DuplicateExtractor(Refactor):
         self._api_timeout = api_timeout
         self._hard_timeout = api_timeout + 30
         self._match_functions = match_functions
+        self._rate_limit_retries = rate_limit_retries
+        self._rate_limit_backoff = rate_limit_backoff
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
@@ -2308,6 +2332,8 @@ class DuplicateExtractor(Refactor):
                         self._provider,
                         tool_choice_override=self._tool_choice,
                         _timing_out=timing,
+                        rate_limit_retries=self._rate_limit_retries,
+                        rate_limit_backoff=self._rate_limit_backoff,
                     )
                     if timing:
                         lr = timing[0]
@@ -2361,6 +2387,8 @@ class DuplicateExtractor(Refactor):
                             self._provider,
                             tool_choice_override=self._tool_choice,
                             _timing_out=timing2,
+                            rate_limit_retries=self._rate_limit_retries,
+                            rate_limit_backoff=self._rate_limit_backoff,
                         )
                         if timing2:
                             lr = timing2[0]
@@ -2466,6 +2494,8 @@ class DuplicateExtractor(Refactor):
                     self._provider,
                     tool_choice_override=self._tool_choice,
                     _timing_out=timing3,
+                    rate_limit_retries=self._rate_limit_retries,
+                    rate_limit_backoff=self._rate_limit_backoff,
                 )
                 if timing3:
                     lr = timing3[0]
@@ -2531,6 +2561,8 @@ class DuplicateExtractor(Refactor):
                         prev_output=prev_output,
                         tool_choice_override=self._tool_choice,
                         _timing_out=timing4,
+                        rate_limit_retries=self._rate_limit_retries,
+                        rate_limit_backoff=self._rate_limit_backoff,
                     )
                     if timing4:
                         lr = timing4[0]
@@ -3007,6 +3039,8 @@ class DuplicateExtractor(Refactor):
                         self._provider,
                         tool_choice_override=self._tool_choice,
                         _timing_out=timing5,
+                        rate_limit_retries=self._rate_limit_retries,
+                        rate_limit_backoff=self._rate_limit_backoff,
                     )
                     if timing5:
                         lr = timing5[0]

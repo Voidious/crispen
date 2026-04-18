@@ -66,6 +66,15 @@ class CrispenConfig:
     # total attempts.  Deterministic failures (single-SCC abort) are not retried.
     file_limiter_retries: int = 2
 
+    # Number of additional attempts after an HTTP 429 (rate limit) response.
+    # 0 means no retry: the error is raised immediately on the first 429.
+    # Default 6 = seven total attempts.
+    rate_limit_retries: int = 6
+    # Initial wait time in seconds before the first retry after a 429 response.
+    # Each subsequent retry doubles the delay (exponential backoff).
+    # E.g. with the default 20s: 20, 40, 80, 160, 320, 640 seconds.
+    rate_limit_backoff: float = 20.0
+
     # When True, any new file created by FileLimiter that still exceeds
     # max_file_lines is passed through FileLimiter again recursively.  The
     # recursion terminates naturally: each pass either reduces the file below
@@ -116,6 +125,45 @@ class CrispenConfig:
     #                 ``module.name`` is not scanned.
     file_limiter_reexports: str = "imported"
 
+    # Controls how @patch string literals in test files are updated after
+    # FileLimiter moves entities to new sub-modules.
+    #
+    # "ignore"  — Do nothing (default).  @patch strings are left as-is.
+    # "basic"   — Scan every *.py file in the repo and replace string
+    #             literals referencing a moved entity's old dotted path
+    #             (e.g. "pkg.old_module.func") with the new path, but only
+    #             when the update is unambiguous (non-forking).  For each
+    #             entity, the patch target is the single new sub-module that
+    #             imports it (the "caller"); if multiple new files import
+    #             the entity (forking) it is skipped.  Import aliases from
+    #             the original file that appear in exactly one new file are
+    #             also updated.
+    # "rewrite" — Performs "basic" updates first, then uses an LLM to
+    #             resolve the remaining cases that basic mode skipped
+    #             (entities that forked into multiple callers).  The LLM
+    #             receives the original file, the diff, all new sub-files,
+    #             and a chunk of test functions and proposes updated @patch
+    #             strings.  A second LLM verify step checks each proposal;
+    #             failed chunks are retried up to patch_update_retries
+    #             additional times before being skipped.
+    file_limiter_patch_update: str = "basic"
+
+    # Number of additional LLM verify+retry attempts for each function chunk
+    # in "rewrite" mode.  0 means no retry: a chunk rejected by the verify
+    # LLM is skipped.  Default 2 = three total attempts (initial + two retries).
+    patch_update_retries: int = 2
+
+    # Maximum BFS hops from a test function to a target sub-module during
+    # call-graph traversal (used by file_limiter_patch_update "basic" and
+    # "rewrite" modes).  When this limit is reached the path is left unresolved
+    # and a warning is printed to stderr.  Increase for very deep call chains.
+    callgraph_max_depth: int = 12
+    # Maximum distinct modules visited per resolution attempt during
+    # call-graph traversal.  When this limit is reached the path is left
+    # unresolved and a warning is printed to stderr.  Increase for very large
+    # codebases with wide import graphs.
+    callgraph_max_modules: int = 50
+
     # Refactor allow-list: if non-empty, only the named refactors are run.
     # Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
     # "tuple_dataclass", "file_limiter", "match_function".
@@ -136,7 +184,7 @@ class CrispenConfig:
 
 def format_header(config: "CrispenConfig") -> List[str]:
     """Return config lines printed to stderr before the first LLM call."""
-    w = 22
+    w = 28
     lines = ["--- crispen ---"]
     lines.append(f"  {'provider:':<{w}}{config.provider}")
     lines.append(f"  {'model:':<{w}}{config.model}")
@@ -144,6 +192,14 @@ def format_header(config: "CrispenConfig") -> List[str]:
     lines.append(f"  {'extraction_retries:':<{w}}{config.extraction_retries}")
     lines.append(f"  {'llm_verify_retries:':<{w}}{config.llm_verify_retries}")
     lines.append(f"  {'file_limiter_retries:':<{w}}{config.file_limiter_retries}")
+    lines.append(f"  {'rate_limit_retries:':<{w}}{config.rate_limit_retries}")
+    lines.append(f"  {'rate_limit_backoff:':<{w}}{config.rate_limit_backoff}s")
+    lines.append(f"  {'file_limiter_reexports:':<{w}}{config.file_limiter_reexports}")
+    lines.append(
+        f"  {'file_limiter_patch_update:':<{w}}{config.file_limiter_patch_update}"
+    )
+    if config.file_limiter_patch_update == "rewrite":
+        lines.append(f"  {'patch_update_retries:':<{w}}{config.patch_update_retries}")
     if config.base_url is not None:
         lines.append(f"  {'base_url:':<{w}}{config.base_url}")
     return lines

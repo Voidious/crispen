@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -28,6 +29,7 @@ class LLMCallResult:
     elapsed: float
     input_tokens: int
     output_tokens: int
+    truncated: bool = False  # True when the response was cut off by the token limit
 
 
 # Maps provider name to its required environment variable.
@@ -96,32 +98,63 @@ def call_with_tool(
     messages: list,
     caller: str = "crispen",
     tool_choice_override: Optional[str] = None,
+    rate_limit_retries: int = 6,
+    rate_limit_backoff: float = 20.0,
 ) -> LLMCallResult:
     """Call the LLM with forced tool use; return an LLMCallResult.
 
     ``tool_input`` is None when the model did not invoke the tool.
     Raises CrispenAPIError on API errors.
+
+    HTTP 429 rate-limit responses are retried up to *rate_limit_retries* times
+    with exponential backoff starting at *rate_limit_backoff* seconds.
     """
-    t0 = time.perf_counter()
+    _rl_delay = rate_limit_backoff
     if provider == "anthropic":
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                tools=[tool],
-                tool_choice={"type": "tool", "name": tool_name},
-                messages=messages,
-            )
-        except anthropic.APIError as exc:
-            raise CrispenAPIError(
-                f"{caller}: Anthropic API error: {exc}\n"
-                "Commit blocked. To skip all hooks: git commit --no-verify"
-            ) from exc
+        for _attempt in range(rate_limit_retries + 1):  # pragma: no branch
+            try:
+                t0 = time.perf_counter()
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    tools=[tool],
+                    tool_choice={"type": "tool", "name": tool_name},
+                    messages=messages,
+                )
+                break
+            except anthropic.APIError as exc:
+                if (
+                    getattr(exc, "status_code", None) == 429
+                    and _attempt < rate_limit_retries
+                ):
+                    print(
+                        f"crispen: {caller}: rate limit (429), retrying in"
+                        f" {_rl_delay:.0f}s"
+                        f" (attempt {_attempt + 2}/{rate_limit_retries + 1})...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(_rl_delay)
+                    _rl_delay *= 2
+                    continue
+                raise CrispenAPIError(
+                    f"{caller}: Anthropic API error: {exc}\n"
+                    "Commit blocked. To skip all hooks: git commit --no-verify"
+                ) from exc
         tool_input = None
         for block in response.content:
             if block.type == "tool_use" and block.name == tool_name:
                 tool_input = block.input
                 break
+        _truncated = False
+        if tool_input is None and response.stop_reason == "max_tokens":
+            print(
+                f"crispen: {caller}: anthropic response truncated"
+                f" (stop_reason=max_tokens, max_tokens={max_tokens})",
+                file=sys.stderr,
+                flush=True,
+            )
+            _truncated = True
         try:
             in_tok = int(response.usage.input_tokens)
             out_tok = int(response.usage.output_tokens)
@@ -132,6 +165,7 @@ def call_with_tool(
             elapsed=time.perf_counter() - t0,
             input_tokens=in_tok,
             output_tokens=out_tok,
+            truncated=_truncated,
         )
     else:
         openai_tool = {
@@ -155,13 +189,92 @@ def call_with_tool(
         }
         if provider == "moonshot":
             create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        try:
-            response = client.chat.completions.create(**create_kwargs)
-        except openai.APIError as exc:
-            raise CrispenAPIError(
-                f"{caller}: {provider} API error: {exc}\n"
-                "Commit blocked. To skip all hooks: git commit --no-verify"
-            ) from exc
+        _parse_retries_left = 2  # retries for transient 400 "cannot parse JSON" errors
+        for _attempt in range(rate_limit_retries + 1):  # pragma: no branch
+            try:
+                t0 = time.perf_counter()
+                response = client.chat.completions.create(**create_kwargs)
+                break
+            except openai.BadRequestError as exc:
+                if getattr(exc, "code", None) == "invalid_prompt":
+                    # Content policy flag — print warning and return None gracefully
+                    # so callers skip the function rather than crashing the pipeline.
+                    print(
+                        f"crispen: {caller}: {provider} API error: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return LLMCallResult(
+                        tool_input=None,
+                        elapsed=time.perf_counter() - t0,
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
+                # Retry transient 400 "cannot parse JSON body" errors.
+                if (
+                    "parse" in str(exc).lower()
+                    and _parse_retries_left > 0
+                    and _attempt < rate_limit_retries
+                ):
+                    _parse_retries_left -= 1
+                    print(
+                        f"crispen: {caller}: {provider} API error"
+                        f" (400, retrying): {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                # Collect diagnostic info to help root-cause 400 errors.
+                _diag: list[str] = []
+                try:
+                    _msg_json = json.dumps(messages)
+                    _diag.append(f"messages_chars={len(_msg_json)}")
+                    _ctrl = [
+                        f"\\u{i:04x}" for i in range(0x20) if f"\\u{i:04x}" in _msg_json
+                    ]
+                    if _ctrl:
+                        _diag.append(f"ctrl={_ctrl}")
+                    # Check for lone surrogates (U+D800–U+DFFF); json.dumps
+                    # encodes them as \udXXX, which strict servers reject.
+                    _surr_pfx = [
+                        "\\ud8",
+                        "\\ud9",
+                        "\\uda",
+                        "\\udb",
+                        "\\udc",
+                        "\\udd",
+                        "\\ude",
+                        "\\udf",
+                    ]
+                    _surr = [p for p in _surr_pfx if p in _msg_json]
+                    if _surr:
+                        _diag.append(f"surrogates={_surr}")
+                except (TypeError, ValueError) as _je:
+                    _diag.append(f"json_error={_je!r}")
+                raise CrispenAPIError(
+                    f"{caller}: {provider} API error: {exc}"
+                    + (f"\n  diag: {', '.join(_diag)}" if _diag else "")
+                    + "\nCommit blocked. To skip all hooks: git commit --no-verify"
+                ) from exc
+            except openai.APIError as exc:
+                if (
+                    getattr(exc, "status_code", None) == 429
+                    and _attempt < rate_limit_retries
+                ):
+                    print(
+                        f"crispen: {caller}: rate limit (429), retrying in"
+                        f" {_rl_delay:.0f}s"
+                        f" (attempt {_attempt + 2}/{rate_limit_retries + 1})...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(_rl_delay)
+                    _rl_delay *= 2
+                    continue
+                raise CrispenAPIError(
+                    f"{caller}: {provider} API error: {exc}\n"
+                    "Commit blocked. To skip all hooks: git commit --no-verify"
+                ) from exc
         tool_input = None
         if response.choices and response.choices[0].message.tool_calls:
             tc = response.choices[0].message.tool_calls[0]
@@ -169,6 +282,16 @@ def call_with_tool(
                 tool_input = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 tool_input = None
+        _truncated = False
+        if tool_input is None and response.choices:
+            if response.choices[0].finish_reason == "length":
+                print(
+                    f"crispen: {caller}: {provider} response truncated"
+                    f" (finish_reason=length, max_tokens={max_tokens})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _truncated = True
         try:
             in_tok = int(response.usage.prompt_tokens)
             out_tok = int(response.usage.completion_tokens)
@@ -179,4 +302,5 @@ def call_with_tool(
             elapsed=time.perf_counter() - t0,
             input_tokens=in_tok,
             output_tokens=out_tok,
+            truncated=_truncated,
         )

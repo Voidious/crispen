@@ -308,7 +308,7 @@ def _advise_set3(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 20 + n_groups * 15)
+    max_tokens = max(512, 20 + n_groups * 25)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM whether to migrate"
@@ -328,6 +328,8 @@ def _advise_set3(
         messages,
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
+        rate_limit_retries=config.rate_limit_retries,
+        rate_limit_backoff=config.rate_limit_backoff,
     )
     if _acc is not None:
         _acc.elapsed += result.elapsed
@@ -441,7 +443,7 @@ def _propose_files_step(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 30 + target_files * 40)
+    max_tokens = max(512, 100 + target_files * 100)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to propose output file set"
@@ -461,6 +463,8 @@ def _propose_files_step(
         messages,
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
+        rate_limit_retries=config.rate_limit_retries,
+        rate_limit_backoff=config.rate_limit_backoff,
     )
     if _acc is not None:
         _acc.elapsed += result.elapsed
@@ -474,18 +478,44 @@ def _propose_files_step(
             flush=True,
         )
     if result.tool_input is None:
+        if verbose:
+            print(
+                "crispen: FileLimiter:   propose failed: no tool call in response",
+                file=sys.stderr,
+                flush=True,
+            )
         return None
 
+    raw_files = result.tool_input.get("files", [])
     proposed: List[Tuple[str, str]] = []
     seen: set = set()
-    for item in result.tool_input.get("files", []):
+    filtered_names: List[str] = []
+    for item in raw_files:
         filename = item.get("filename", "")
         description = item.get("description", "")
         if filename and filename not in seen and filename not in existing_files:
             proposed.append((filename, description))
             seen.add(filename)
+        elif filename:
+            filtered_names.append(filename)
 
     if not proposed:
+        if verbose:
+            if not raw_files:
+                print(
+                    "crispen: FileLimiter:   propose failed: LLM returned empty"
+                    " files list",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"crispen: FileLimiter:   propose failed: all"
+                    f" {len(filtered_names)} filename(s) filtered"
+                    f" (existing or duplicate): {filtered_names}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         return None
     return proposed
 
@@ -606,7 +636,7 @@ def _assign_placements_chunk(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 20 + n_groups * 20)
+    max_tokens = max(512, 100 + n_groups * 40)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to assign file placements"
@@ -626,6 +656,8 @@ def _assign_placements_chunk(
         messages,
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
+        rate_limit_retries=config.rate_limit_retries,
+        rate_limit_backoff=config.rate_limit_backoff,
     )
     if _acc is not None:
         _acc.elapsed += result.elapsed
@@ -851,7 +883,7 @@ def _rename_conflicting_chunk(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 20 + n_groups * 20)
+    max_tokens = max(512, 100 + n_groups * 40)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to resolve naming conflicts"
@@ -871,6 +903,8 @@ def _rename_conflicting_chunk(
         messages,
         caller="FileLimiter",
         tool_choice_override=config.tool_choice,
+        rate_limit_retries=config.rate_limit_retries,
+        rate_limit_backoff=config.rate_limit_backoff,
     )
     if _acc is not None:
         _acc.elapsed += result.elapsed
@@ -963,8 +997,10 @@ def _assign_placements(
         if proposed_files is not None:
             break
         prev_propose_failure = (
-            "Your previous response was incomplete or contained no valid filenames. "
-            "Please return a non-empty list of proposed output files."
+            "Your previous response returned no valid filenames — either the"
+            " files list was empty or every name was already in use. "
+            "You MUST return a non-empty files list with new, unique filenames"
+            " that are not on the exclusion list."
         )
     if proposed_files is None:
         return None
@@ -974,6 +1010,7 @@ def _assign_placements(
     for chunk_start in range(0, len(groups_to_place), _PLACEMENT_CHUNK_SIZE):
         chunk = groups_to_place[chunk_start : chunk_start + _PLACEMENT_CHUNK_SIZE]
         chunk_placements: Optional[List[GroupPlacement]] = None
+        chunk_prev_failure = prev_failure
         for _ in range(1 + config.file_limiter_retries):
             chunk_placements = _assign_placements_chunk(
                 chunk,
@@ -982,7 +1019,7 @@ def _assign_placements(
                 existing_files,
                 client,
                 config,
-                prev_failure,
+                chunk_prev_failure,
                 min_files=2,
                 verbose=verbose,
                 timing=timing,
@@ -992,7 +1029,19 @@ def _assign_placements(
             )
             if chunk_placements is not None:
                 break
+            chunk_prev_failure = (
+                f"Your previous response did not include placements for all "
+                f"{len(chunk)} group(s). You MUST return a target_file for "
+                f"every group_id from 0 to {len(chunk) - 1}."
+            )
         if chunk_placements is None:
+            if verbose:
+                print(
+                    f"crispen: FileLimiter: failed to assign file placements"
+                    f" after {1 + config.file_limiter_retries} attempt(s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
             return None
         all_placements.extend(chunk_placements)
 

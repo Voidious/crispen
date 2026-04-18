@@ -15,7 +15,14 @@ from libcst.metadata import FullRepoManager, MetadataWrapper, QualifiedNameProvi
 
 from .config import CrispenConfig, format_header, load_config
 from .errors import CrispenAPIError
-from .file_limiter.runner import run_file_limiter
+from .file_limiter.runner import FileLimiterResult, run_file_limiter
+from .patch_rewriter import (
+    _FLContext,
+    RewriteAccumulator,
+    apply_patch_callgraph,
+    apply_patch_rewrite,
+)
+from .patch_updater import apply_patch_strings
 from .refactors.caller_updater import CallerUpdater
 from .refactors.duplicate_extractor import DuplicateExtractor
 from .refactors.function_splitter import FunctionSplitter
@@ -109,12 +116,113 @@ def _blocked_private_scopes(source: str, ranges: List[Tuple[int, int]]) -> Set[s
 _PROJECT_MARKERS = frozenset({"pyproject.toml", "setup.py", "setup.cfg", ".git"})
 
 
+def _collect_top_level_names(source: str) -> Set[str]:
+    """Return all names defined or imported at the module top level of *source*.
+
+    Covers functions, classes, module-level variable assignments, and all
+    import styles.  Returns an empty set when *source* cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name.split(".")[-1])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname if alias.asname else alias.name)
+    return names
+
+
+def _collect_assignment_names(source: str) -> Set[str]:
+    """Return names from top-level variable assignments in *source*.
+
+    Covers ``X = …``, ``X: T = …``, and ``X += …`` where the target is a
+    plain ``ast.Name``.  Functions, classes, and imports are excluded (they
+    are handled elsewhere).  Returns an empty set on parse failure.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+    return names
+
+
+def _collect_imported_names(source: str) -> Set[str]:
+    """Return names imported at the top level of *source*.
+
+    Handles ``import X``, ``import X as Y``, ``from X import Y``, and
+    ``from X import Y as Z``.  Star imports (``from X import *``) are skipped.
+    Returns an empty set when *source* cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name.split(".")[-1])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname if alias.asname else alias.name)
+    return names
+
+
+def _collect_code_referenced_names(source: str) -> Set[str]:
+    """Return names referenced in code as *Load* expressions.
+
+    Walks the AST looking for ``ast.Name`` nodes with ``Load`` context —
+    actual uses of a name in code (calls, attribute targets, right-hand-side
+    expressions).  Pure re-export stubs (``from .sub import X  # noqa: F401``)
+    produce no such nodes because the import alias itself is an ``ast.alias``,
+    not an ``ast.Name``.  Returns an empty set on parse failure.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+
+
 def _module_path_for_file(file_path: str) -> Optional[str]:
     """Return the dotted Python module path of *file_path*.
 
     Walks up from the file's directory to find the project root (the first
     ancestor containing pyproject.toml, setup.py, setup.cfg, or .git), then
     computes the dotted path relative to that root.
+
+    ``__init__.py`` files are mapped to their package name (e.g.
+    ``mypkg/__init__.py`` → ``mypkg``) so that patch paths always use the
+    public package namespace rather than the internal ``.__init__`` segment.
 
     Returns ``None`` when the project root cannot be determined or when the
     resolved path is not under the project root.
@@ -124,7 +232,10 @@ def _module_path_for_file(file_path: str) -> Optional[str]:
     while True:
         if any((current / m).exists() for m in _PROJECT_MARKERS):
             rel = abs_path.relative_to(current)
-            return ".".join(rel.with_suffix("").parts)
+            module = ".".join(rel.with_suffix("").parts)
+            if module.endswith(".__init__"):
+                module = module[:-9]
+            return module
         parent = current.parent
         if parent == current:
             return None
@@ -249,6 +360,205 @@ def _patch_inline_imports_after_test_deletion(
         if updated != content:
             fl_new_file_final[path] = updated
             Path(path).write_text(updated, encoding="utf-8")
+
+
+def _build_patch_map(
+    filepath: str,
+    fl_result: "FileLimiterResult",
+    original_dir: Path,
+    pre_split_source: str = "",
+) -> Dict[str, str]:
+    """Build old_dotted_path.EntityName → new_dotted_path.EntityName map.
+
+    Uses "basic" mode logic: for each entity, maps to the single new file that
+    imports it (the "caller") rather than its definition file.  If multiple new
+    files import the entity (forking), the entity is skipped.  Import aliases
+    present in *pre_split_source* that appear in exactly one new file are also
+    included.
+
+    Returns an empty dict when the module path cannot be determined or when no
+    entities were moved.
+    """
+    old_module = _module_path_for_file(filepath)
+    if old_module is None:
+        return {}
+
+    # Build import index: name → list of new-file rel_paths that import it.
+    # Build usage index: name → set of new-file rel_paths that reference it in
+    # code (ast.Name Load nodes — actual calls or expressions, not re-exports).
+    import_index: Dict[str, List[str]] = {}
+    usage_index: Dict[str, Set[str]] = {}
+    for rel_path, src in fl_result.new_files.items():
+        if not src:
+            continue
+        for name in _collect_imported_names(src):
+            import_index.setdefault(name, []).append(rel_path)
+        for name in _collect_code_referenced_names(src):
+            usage_index.setdefault(name, set()).add(rel_path)
+
+    patch_map: Dict[str, str] = {}
+    for entity_name, def_rel_target in fl_result.entity_to_target.items():
+        # Callers = new files that both import this entity and reference it in
+        # code, excluding its definer.  Pure re-export stubs import the name
+        # but produce no ast.Name Load nodes, so they are naturally excluded.
+        callers = [
+            p
+            for p in import_index.get(entity_name, [])
+            if p != def_rel_target and p in usage_index.get(entity_name, set())
+        ]
+        if len(callers) > 1:
+            continue  # forking: multiple callers, skip
+        target_rel = callers[0] if callers else def_rel_target
+        new_module = _module_path_for_file(str(original_dir / target_rel))
+        if new_module is None:
+            continue
+        patch_map[f"{old_module}.{entity_name}"] = f"{new_module}.{entity_name}"
+
+    # Import aliases: names imported by the original file that appear in
+    # exactly one new sub-file (and are not already moved entities).
+    # Only count files that actually reference the alias in code, not stubs.
+    for alias_name in _collect_imported_names(pre_split_source):
+        if alias_name in fl_result.entity_to_target:
+            continue  # already handled above
+        importers = [
+            p
+            for p in import_index.get(alias_name, [])
+            if p in usage_index.get(alias_name, set())
+        ]
+        if len(importers) != 1:
+            continue  # zero or multiple: skip
+        new_module = _module_path_for_file(str(original_dir / importers[0]))
+        if new_module is None:
+            continue
+        patch_map[f"{old_module}.{alias_name}"] = f"{new_module}.{alias_name}"
+
+    # Variable assignments: names assigned at the module level that were present
+    # in the original file and are not already tracked as entities or import
+    # aliases.  Uses the same caller logic as named entities: 0 callers → only
+    # used in its defining file; 1 caller → migrated and consumed by exactly one
+    # other file; 2+ → forking.  Only names from the original file are considered
+    # to avoid spurious entries for helper variables introduced by code generation.
+    # Names defined in multiple new files are skipped (ambiguous origin).
+    orig_assignments = _collect_assignment_names(pre_split_source)
+    def_index: Dict[str, List[str]] = {}
+    for rel_path, src in fl_result.new_files.items():
+        if not src:
+            continue
+        for name in _collect_assignment_names(src):
+            if name in orig_assignments and name not in fl_result.entity_to_target:
+                def_index.setdefault(name, []).append(rel_path)
+
+    for assign_name, def_rel_targets in def_index.items():
+        if len(def_rel_targets) != 1:
+            continue  # defined in multiple files → ambiguous
+        old_path = f"{old_module}.{assign_name}"
+        if old_path in patch_map:
+            continue  # already handled by entity or import-alias section
+        def_rel_target = def_rel_targets[0]
+        callers = [
+            p
+            for p in import_index.get(assign_name, [])
+            if p != def_rel_target and p in usage_index.get(assign_name, set())
+        ]
+        if len(callers) > 1:
+            continue  # forking: multiple consumers, skip
+        target_rel = callers[0] if callers else def_rel_target
+        new_module = _module_path_for_file(str(original_dir / target_rel))
+        if new_module is None:
+            continue
+        patch_map[old_path] = f"{new_module}.{assign_name}"
+
+    return patch_map
+
+
+def _add_fl_context(
+    fl_all_contexts: List["_FLContext"],
+    filepath: str,
+    pre_split_src: str,
+    fl_result: "FileLimiterResult",
+    combined_patch_map: Dict[str, str],
+) -> None:
+    """Append an _FLContext to *fl_all_contexts* for "rewrite" patch mode.
+
+    Computes the forking old paths (entities in entity_to_target that basic
+    mode skipped because they appeared in multiple callers) and builds the
+    new module path map for all sub-files.  Does nothing when no forking
+    entities exist or when the module path cannot be determined.
+
+    When no forking entities exist but TOP_LEVEL blocks (_block_N) were
+    moved, also scans the new target files to find names that came from
+    those blocks (module-level vars, constants, imported aliases) but are
+    not individually tracked in entity_to_target.  Each such name is added
+    as a specific old path (``old_module.name``) so the LLM can find any
+    ``with patch(old_module.name)`` calls without matching already-updated
+    paths like ``old_module.sub.name`` that basic mode already rewrote.
+
+    Import aliases from the original file that basic mode skipped (forked
+    into multiple new sub-files) are also added so the LLM rewrite step
+    can determine the correct per-function patch target.
+    """
+    old_mod = _module_path_for_file(filepath)
+    if old_mod is None:
+        return
+    forking_old_paths = {
+        f"{old_mod}.{name}"
+        for name in fl_result.entity_to_target
+        if f"{old_mod}.{name}" not in combined_patch_map
+    }
+    # Also collect names from moved _block_N entities that are NOT individually
+    # tracked (i.e., not in entity_to_target).  These are block-internal names
+    # (vars, constants, imported aliases) that basic mode never maps, regardless
+    # of whether forking entities were also found above.
+    all_entity_names = set(fl_result.entity_to_target)
+    for entity_name, target_rel in fl_result.entity_to_target.items():
+        if not entity_name.startswith("_block_"):
+            continue
+        new_src = fl_result.new_files.get(target_rel, "")
+        for name in _collect_top_level_names(new_src):
+            old_path = f"{old_mod}.{name}"
+            if name not in all_entity_names and old_path not in combined_patch_map:
+                forking_old_paths.add(old_path)
+    # Also add import aliases from the original file that basic mode skipped
+    # because they appeared in multiple new sub-files (forking).  These
+    # aliases are absent from combined_patch_map but may still appear as
+    # @patch string targets in test files — the LLM rewrite step can resolve
+    # the correct sub-module for each test function individually.
+    for alias_name in _collect_imported_names(pre_split_src):
+        if alias_name in all_entity_names:
+            continue
+        old_path = f"{old_mod}.{alias_name}"
+        if old_path not in combined_patch_map:
+            forking_old_paths.add(old_path)
+    if not forking_old_paths:
+        return
+    orig_dir = Path(filepath).parent
+    new_mod_paths = {
+        rel: _module_path_for_file(str(orig_dir / rel)) or rel
+        for rel in fl_result.new_files
+    }
+    # For non-test subdir splits the original file stays on disk unchanged and
+    # fl_result.original_source is the pre-split source (runner.py restores it
+    # at line 704 so the original file is left untouched).  The post-split
+    # module state lives in new_files["{subdir_name}/__init__.py"].  Use that
+    # as modified_source so _build_rename_guard_sets and the BFS terminal
+    # builder both see the correct set of names still present in the module.
+    init_key = f"{fl_result.subdir_name}/__init__.py" if fl_result.subdir_name else None
+    if init_key and init_key in fl_result.new_files:
+        modified_src = fl_result.new_files[init_key] or fl_result.original_source or ""
+    else:
+        modified_src = fl_result.original_source or ""
+    fl_all_contexts.append(
+        _FLContext(
+            filepath=filepath,
+            old_module=old_mod,
+            original_source=pre_split_src,
+            modified_source=modified_src,
+            new_files=dict(fl_result.new_files),
+            new_module_paths=new_mod_paths,
+            entity_to_target=dict(fl_result.entity_to_target),
+            forking_old_paths=forking_old_paths,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +890,8 @@ def run_engine(
                         match_functions=_should_run("match_function", config),
                         timing=config.timing,
                         current_file=filepath,
+                        rate_limit_retries=config.rate_limit_retries,
+                        rate_limit_backoff=config.rate_limit_backoff,
                     )
                 elif RefactorClass is FunctionSplitter:
                     transformer = FunctionSplitter(
@@ -594,6 +906,8 @@ def run_engine(
                         tool_choice=config.tool_choice,
                         api_timeout=config.api_timeout,
                         current_file=filepath,
+                        rate_limit_retries=config.rate_limit_retries,
+                        rate_limit_backoff=config.rate_limit_backoff,
                     )
                 else:
                     transformer = RefactorClass(
@@ -810,6 +1124,8 @@ def run_engine(
     # ------------------------------------------------------------------ #
     # Phase 3 — FileLimiter: split files exceeding max_file_lines        #
     # ------------------------------------------------------------------ #
+    combined_patch_map: Dict[str, str] = {}
+    _fl_all_contexts: List[_FLContext] = []
     if config.max_file_lines > 0 and _should_run("file_limiter", config):
         # Pending queue for recursive FileLimiter processing: (filepath, source)
         # pairs for newly-created files that are still over the limit.
@@ -878,7 +1194,23 @@ def run_engine(
                 ):
                     _fl_recursive.append((str(new_path), new_source))
 
+            pre_split_src = state["source"]
             state["source"] = fl_result.original_source
+
+            if fl_result.entity_to_target:
+                combined_patch_map.update(
+                    _build_patch_map(
+                        filepath, fl_result, Path(filepath).parent, pre_split_src
+                    )
+                )
+                if config.file_limiter_patch_update in ("basic", "rewrite"):
+                    _add_fl_context(
+                        _fl_all_contexts,
+                        filepath,
+                        pre_split_src,
+                        fl_result,
+                        combined_patch_map,
+                    )
 
             # For non-test whole-file subdir splits (without __main__), delete
             # the original file now that service/__init__.py takes its place as
@@ -950,6 +1282,19 @@ def run_engine(
                 if len(new_source.splitlines()) > config.max_file_lines:
                     _fl_recursive.append((str(new_path), new_source))
 
+            if r_result.entity_to_target and not r_result.abort:
+                combined_patch_map.update(
+                    _build_patch_map(r_path, r_result, Path(r_path).parent, r_source)
+                )
+                if config.file_limiter_patch_update in ("basic", "rewrite"):
+                    _add_fl_context(
+                        _fl_all_contexts,
+                        r_path,
+                        r_source,
+                        r_result,
+                        combined_patch_map,
+                    )
+
             # Subdir split of a recursively-processed file: delete the file
             # that was replaced by a package __init__.py.  Handle before the
             # rewrite check so we don't write-then-delete (and double-count lines).
@@ -989,6 +1334,102 @@ def run_engine(
         _stats.file_limiter_classes_verified = len(_fl_verified_class_names)
         _stats.file_limiter_lines_verified = sum(_fl_verified_entity_lines.values())
         yield from _recursive_msgs
+
+    # Flatten transitive chains in combined_patch_map.  When recursive splits
+    # run, round 1 may produce A→B and round 2 may produce B→C.  Without
+    # flattening, apply_patch_strings (single-pass) would leave consumers of
+    # A pointing at the intermediate path B instead of the final path C.
+    if combined_patch_map:
+        changed = True
+        while changed:
+            changed = False
+            for k in list(combined_patch_map):
+                v = combined_patch_map[k]
+                if v in combined_patch_map and combined_patch_map[v] != v:
+                    combined_patch_map[k] = combined_patch_map[v]
+                    changed = True
+
+    # ------------------------------------------------------------------ #
+    # Phase 4 — Update @patch strings after FileLimiter entity moves     #
+    # ------------------------------------------------------------------ #
+    _patch_acc = RewriteAccumulator()
+    if (
+        config.file_limiter_patch_update in ("basic", "rewrite")
+        and combined_patch_map
+        and repo_root
+    ):
+        _stats.patch_single_candidate += len(combined_patch_map)
+        # Update per_file sources still in memory (not yet written to disk).
+        for filepath, state in per_file.items():
+            new_src = apply_patch_strings(state["source"], combined_patch_map)
+            if new_src != state["source"]:
+                state["source"] = new_src
+                state["msgs"].append(
+                    f"{filepath}: patch_update: updated @patch strings"
+                )
+                _stats.patch_update_edits += 1
+        # Scan every other *.py file in the repo and update on disk.
+        per_file_abs = {str(Path(f).resolve()) for f in per_file}
+        repo_root_path = Path(repo_root)
+        for py_file in sorted(repo_root_path.rglob("*.py")):
+            if str(py_file.resolve()) in per_file_abs:
+                continue
+            if any(
+                part in _EXCLUDED_DIR_NAMES
+                for part in py_file.relative_to(repo_root_path).parts[:-1]
+            ):
+                continue
+            try:
+                src = py_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            new_src = apply_patch_strings(src, combined_patch_map)
+            if new_src != src:
+                py_file.write_text(new_src, encoding="utf-8")
+                _stats.patch_update_edits += 1
+                yield f"{py_file}: patch_update: updated @patch strings"
+
+    _cg_candidates: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
+    if config.file_limiter_patch_update in ("basic", "rewrite") and _fl_all_contexts:
+        for _cg_msg in apply_patch_callgraph(
+            _fl_all_contexts,
+            per_file,
+            repo_root,
+            verbose=verbose,
+            candidates_out=_cg_candidates,
+            config=config,
+            _acc=_patch_acc,
+        ):
+            _stats.patch_update_edits += 1
+            yield _cg_msg
+
+    if config.file_limiter_patch_update == "rewrite" and _fl_all_contexts:
+        yield from apply_patch_rewrite(
+            _fl_all_contexts,
+            per_file,
+            repo_root,
+            config,
+            verbose=verbose,
+            _acc=_patch_acc,
+            cg_candidates=_cg_candidates or None,
+        )
+        _stats.patch_rewrite_llm_calls += _patch_acc.calls
+        if _patch_acc.elapsed > 0 or _patch_acc.input_tokens > 0:
+            _stats.record_llm_call(
+                _patch_acc.elapsed,
+                _patch_acc.input_tokens,
+                _patch_acc.output_tokens,
+                "file_limiter",
+                "patch_rewriter",
+                "",
+            )
+        _stats.patch_update_edits += _patch_acc.files_updated
+
+    _stats.patch_cg_resolved += _patch_acc.cg_resolved
+    _stats.patch_llm_no_change += _patch_acc.no_change
+    _stats.patch_llm_rename += _patch_acc.rename
+    _stats.patch_llm_rewrite += _patch_acc.rewrite
+    _stats.patch_edit_failures += _patch_acc.edit_failures
 
     # ------------------------------------------------------------------ #
     # Write modified files and yield all messages                         #

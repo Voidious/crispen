@@ -288,6 +288,92 @@ def test_verify_async_def_entity_passes():
     assert vr.verified_lines == 2
 
 
+def test_verify_blank_line_collapse_after_pruning_passes():
+    # Regression: when multiple consecutive inline imports are all pruned to
+    # top-level, the resulting consecutive blank lines (3+ newlines before
+    # indented content) are collapsed by _normalize_blank_lines in code_gen.
+    # Verification must apply the same normalization to entity_no_imports so
+    # the substring match doesn't fail due to a blank-line count mismatch.
+    post_source = (
+        "def test_seq():\n"
+        '    """Docstring."""\n'
+        "    import libcst as cst\n"
+        "\n"
+        "    from libcst.metadata import MetadataWrapper\n"
+        "\n"
+        "    from foo import Bar\n"
+        "\n"
+        "    x = cst.parse_module('')\n"
+        "    w = MetadataWrapper(x)\n"
+        "    b = Bar()\n"
+    )
+    entity = _make_entity("test_seq", 1, 13)
+    # New file has all 3 inline imports hoisted to top-level and pruned from
+    # the function body; _normalize_blank_lines collapsed the 3+ consecutive
+    # blank lines down to 1.
+    new_file_src = (
+        "import libcst as cst\n"
+        "from libcst.metadata import MetadataWrapper\n"
+        "from foo import Bar\n"
+        "\n"
+        "def test_seq():\n"
+        '    """Docstring."""\n'
+        "\n"
+        "    x = cst.parse_module('')\n"
+        "    w = MetadataWrapper(x)\n"
+        "    b = Bar()\n"
+    )
+    split = SplitResult(
+        new_files={"test_collectors.py": new_file_src},
+        original_source="# original\n",
+        abort=False,
+    )
+    placements = [GroupPlacement(group=["test_seq"], target_file="test_collectors.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    assert vr.verified_functions == 1
+
+
+def test_verify_inline_import_not_pruned_with_surrounding_blanks_passes():
+    # Regression: entity has an inline import surrounded by blank lines that is
+    # NOT pruned to a top-level import in the new file.  After
+    # _strip_imports_by_line removes the import from the new file's content, the
+    # two surrounding blank lines merge into 3+ consecutive newlines before
+    # indented code — which _normalize_blank_lines in the new file did NOT
+    # collapse (it only runs before the import was stripped in verification).
+    # Verification must apply the same _EXCESS_BLANK_BODY_RE normalization to
+    # combined_no_imports so the blank-line count matches entity_no_imports.
+    post_source = (
+        "def test_foo():\n"
+        "    x = 1\n"
+        "\n"
+        "    import pathlib\n"
+        "\n"
+        "    y = pathlib.Path('.')\n"
+        "    return y\n"
+    )
+    entity = _make_entity("test_foo", 1, 8)
+    # New file keeps the inline import (not pruned — no module-level pathlib).
+    new_file_src = (
+        "def test_foo():\n"
+        "    x = 1\n"
+        "\n"
+        "    import pathlib\n"
+        "\n"
+        "    y = pathlib.Path('.')\n"
+        "    return y\n"
+    )
+    split = SplitResult(
+        new_files={"test_patch.py": new_file_src},
+        original_source="# original\n",
+        abort=False,
+    )
+    placements = [GroupPlacement(group=["test_foo"], target_file="test_patch.py")]
+    vr = _verify_preservation([entity], split, post_source, placements)
+    assert vr.failures == []
+    assert vr.verified_functions == 1
+
+
 def test_verify_entity_with_name_rewrites_passes():
     # The original entity references SAFE_MODE; after splitting it becomes
     # conversion.SAFE_MODE in the new file.  Verification must apply the
@@ -1921,3 +2007,67 @@ def test_runner_init_py_skips_subdir_split(mock_classify, tmp_path):
     assert result.abort is True
     assert result.subdir_name is None
     assert "already exists" not in " ".join(result.messages)
+
+
+# ---------------------------------------------------------------------------
+# run_file_limiter — entity_to_target
+# ---------------------------------------------------------------------------
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_entity_to_target_populated_on_success(mock_classify, mock_advise, mock_gen):
+    """On a successful run, entity_to_target maps entity names to target files."""
+    source = "def foo():\n    pass\ndef bar():\n    pass\n"
+    entity_foo = _make_entity("foo", 1, 2)
+    entity_bar = _make_entity("bar", 3, 4)
+    mock_classify.return_value = _make_classified(entities=[entity_foo, entity_bar])
+    # Plan: foo → utils.py, bar → helpers.py
+    from crispen.file_limiter.advisor import FileLimiterPlan, GroupPlacement
+
+    mock_advise.return_value = FileLimiterPlan(
+        set3_migrate=[],
+        placements=[
+            GroupPlacement(group=["foo"], target_file="utils.py"),
+            GroupPlacement(group=["bar"], target_file="helpers.py"),
+        ],
+        abort=False,
+    )
+    mock_gen.return_value = SplitResult(
+        new_files={
+            "utils.py": "def foo():\n    pass",
+            "helpers.py": "def bar():\n    pass",
+        },
+        original_source="# original updated\n",
+        abort=False,
+    )
+
+    result = run_file_limiter("big.py", "", source, [], _CONFIG)
+
+    assert result.abort is False
+    assert result.entity_to_target == {
+        "foo": "utils.py",
+        "bar": "helpers.py",
+    }
+
+
+@patch(_PATCH_GEN)
+@patch(_PATCH_ADVISE)
+@patch(_PATCH_CLASSIFY)
+def test_entity_to_target_empty_on_abort(mock_classify, mock_advise, mock_gen):
+    """Abort result has empty entity_to_target."""
+    mock_classify.return_value = ClassifiedEntities(
+        entities=[],
+        entity_class={},
+        graph={},
+        set_1=[],
+        set_2_groups=[],
+        set_3_groups=[],
+        abort=True,
+    )
+
+    result = run_file_limiter("big.py", "", "x = 1\n", [], _CONFIG_NO_RETRY)
+
+    assert result.abort is True
+    assert result.entity_to_target == {}

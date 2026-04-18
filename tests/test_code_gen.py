@@ -18,6 +18,7 @@ from crispen.file_limiter.code_gen import (
     _collect_quoted_annotation_names,
     _collect_name_stores,
     _inject_module_level_imports,
+    _inject_type_checking_imports,
     _test_names_in_decorators,
     _extract_import_info,
     _extract_module_docstring,
@@ -31,6 +32,7 @@ from crispen.file_limiter.code_gen import (
     _find_main_direct_callees,
     _find_needed_imports,
     _find_type_checking_needed_imports,
+    _narrow_import_source,
     _find_project_root,
     _import_derived_names,
     _import_line_numbers,
@@ -49,7 +51,9 @@ from crispen.file_limiter.code_gen import (
     _split_cross_imports_by_test,
     _source_is_only_docstring,
     _strip_module_docstring,
+    _multiline_string_ranges,
     _normalize_blank_lines,
+    _sub_skip_strings,
     _strip_orphaned_indented_comments,
     _strip_orphaned_section_headers,
     _strip_top_level_import_lines,
@@ -176,6 +180,38 @@ def test_collect_name_loads_annotated_vararg_kwarg():
     names = _collect_name_loads(source)
     assert "VarType" in names
     assert "KwType" in names
+
+
+def test_collect_name_loads_excludes_local_variable_assignments():
+    # A name assigned in the function body is a local variable — not an import.
+    # Loads of that name (e.g. attribute access) must not generate cross-file imports.
+    source = textwrap.dedent(
+        """\
+        def test_foo(tmp_path):
+            helpers = tmp_path / "helpers.py"
+            helpers.write_text("X = 1", encoding="utf-8")
+            assert str(helpers.resolve()) == "x"
+        """
+    )
+    names = _collect_name_loads(source)
+    assert "helpers" not in names
+    assert "tmp_path" not in names  # also a param — still excluded
+
+
+def test_collect_name_loads_local_store_does_not_suppress_outer_loads():
+    # A local assignment in an inner function must not suppress the outer scope's load.
+    source = textwrap.dedent(
+        """\
+        def outer():
+            use(helper)
+            def inner():
+                helper = 1
+                use(helper)
+        """
+    )
+    names = _collect_name_loads(source)
+    # outer() loads 'helper' (not locally defined there); inner() assigns it locally.
+    assert "helper" in names
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +397,84 @@ def test_inject_module_level_imports_syntax_error_prepends():
 
 
 # ---------------------------------------------------------------------------
+# _inject_type_checking_imports
+# ---------------------------------------------------------------------------
+
+
+def test_inject_type_checking_imports_empty_list():
+    src = "import os\n"
+    assert _inject_type_checking_imports(src, []) == src
+
+
+def test_inject_type_checking_imports_syntax_error():
+    src = "def (broken:\n"
+    assert _inject_type_checking_imports(src, ["from .config import Cfg"]) == src
+
+
+def test_inject_type_checking_imports_all_already_present():
+    # If every requested import is already in an existing TC block, no change.
+    src = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .config import Cfg\n"
+        "\n"
+        "x = 1\n"
+    )
+    result = _inject_type_checking_imports(src, ["from .config import Cfg"])
+    assert result == src
+
+
+def test_inject_type_checking_imports_appends_to_existing_block():
+    # New import should be appended inside the existing TYPE_CHECKING block.
+    src = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .config import Cfg\n"
+        "\n"
+        "x = 1\n"
+    )
+    result = _inject_type_checking_imports(src, ["from .models import MyModel"])
+    assert "from .models import MyModel" in result
+    tc_start = result.index("if TYPE_CHECKING:")
+    assert result.index("from .models import MyModel") > tc_start
+    assert "x = 1" in result
+
+
+def test_inject_type_checking_imports_creates_block_with_typing_import():
+    # No existing TC block and TYPE_CHECKING not imported → add both.
+    src = "from typing import List\n\ndef foo(x: 'Cfg') -> None:\n    pass\n"
+    result = _inject_type_checking_imports(src, ["from .config import Cfg"])
+    assert "from typing import TYPE_CHECKING" in result
+    assert "if TYPE_CHECKING:" in result
+    assert "    from .config import Cfg" in result
+
+
+def test_inject_type_checking_imports_creates_block_type_checking_already_imported():
+    # TYPE_CHECKING already in typing import → don't add it again.
+    src = (
+        "from typing import List, TYPE_CHECKING\n"
+        "\n"
+        "def foo(x: 'Cfg') -> None:\n"
+        "    pass\n"
+    )
+    result = _inject_type_checking_imports(src, ["from .config import Cfg"])
+    assert result.count("TYPE_CHECKING") == 2  # one in import, one in if-block
+    assert "if TYPE_CHECKING:" in result
+    assert "    from .config import Cfg" in result
+
+
+def test_inject_type_checking_imports_block_after_last_import():
+    # The new block should appear after the last import, before other code.
+    src = "import os\nimport sys\n\nx = 1\n"
+    result = _inject_type_checking_imports(src, ["from .config import Cfg"])
+    lines = result.splitlines()
+    sys_line = next(i for i, l in enumerate(lines) if "import sys" in l)
+    if_line = next(i for i, l in enumerate(lines) if "if TYPE_CHECKING" in l)
+    x_line = next(i for i, l in enumerate(lines) if "x = 1" in l)
+    assert sys_line < if_line < x_line
+
+
+# ---------------------------------------------------------------------------
 # _test_names_in_decorators
 # ---------------------------------------------------------------------------
 
@@ -452,6 +566,49 @@ def test_extract_import_info_multiline_parens_normalized():
     assert "PurePath" in infos[0].names
 
 
+def test_extract_import_info_type_checking_from_import():
+    # Imports inside `if TYPE_CHECKING:` are extracted with is_type_checking=True.
+    source = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .config import MyConfig\n"
+    )
+    infos = _extract_import_info(source)
+    tc = [i for i in infos if i.is_type_checking]
+    assert len(tc) == 1
+    assert "MyConfig" in tc[0].names
+    assert tc[0].source == "from .config import MyConfig"
+    assert tc[0].is_future is False
+
+
+def test_extract_import_info_type_checking_plain_import():
+    # Plain `import` inside `if TYPE_CHECKING:` is also captured.
+    source = "if TYPE_CHECKING:\n    import sys\n"
+    infos = _extract_import_info(source)
+    tc = [i for i in infos if i.is_type_checking]
+    assert len(tc) == 1
+    assert "sys" in tc[0].names
+    assert tc[0].is_type_checking is True
+
+
+def test_extract_import_info_type_checking_not_is_future():
+    # TYPE_CHECKING block imports must not be marked as is_future.
+    source = "if TYPE_CHECKING:\n    from .foo import Bar\n"
+    infos = _extract_import_info(source)
+    tc = [i for i in infos if i.is_type_checking]
+    assert all(not i.is_future for i in tc)
+
+
+def test_extract_import_info_type_checking_skips_non_import_children():
+    # Non-import statements inside a TYPE_CHECKING block (rare but valid)
+    # must not cause errors and must be silently skipped.
+    source = "if TYPE_CHECKING:\n    from .foo import Bar\n    x = 1\n"
+    infos = _extract_import_info(source)
+    tc = [i for i in infos if i.is_type_checking]
+    assert len(tc) == 1
+    assert "Bar" in tc[0].names
+
+
 # ---------------------------------------------------------------------------
 # _find_needed_imports
 # ---------------------------------------------------------------------------
@@ -505,6 +662,21 @@ def test_find_needed_imports_entity_not_in_map():
     assert result == []
 
 
+def test_find_needed_imports_skips_type_checking():
+    # is_type_checking imports must not appear as regular imports.
+    entity_src_map = {"foo": 'def foo(x: "MyConfig") -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["MyConfig"],
+            source="from .config import MyConfig",
+            is_future=False,
+            is_type_checking=True,
+        )
+    ]
+    result = _find_needed_imports(["foo"], entity_src_map, infos, {"foo"})
+    assert result == []
+
+
 # ---------------------------------------------------------------------------
 # _find_type_checking_needed_imports
 # ---------------------------------------------------------------------------
@@ -518,23 +690,21 @@ def test_find_type_checking_needed_imports_quoted_only():
             names=["MyType"], source="from models import MyType", is_future=False
         )
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert "from models import MyType" in result
 
 
 def test_find_type_checking_needed_imports_runtime_excluded():
     # When the name is used at runtime (not just in a quoted annotation),
     # it should NOT appear in the TYPE_CHECKING-only list.
+    # annotation_only = quoted - runtime excludes runtime names directly.
     entity_src_map = {"foo": "def foo():\n    return MyType()\n"}
     infos = [
         ImportInfo(
             names=["MyType"], source="from models import MyType", is_future=False
         )
     ]
-    # Pass the import as already in regular_needed_sources.
-    result = _find_type_checking_needed_imports(
-        ["foo"], entity_src_map, infos, {"from models import MyType"}
-    )
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert result == []
 
 
@@ -546,7 +716,7 @@ def test_find_type_checking_needed_imports_no_annotations():
             names=["MyType"], source="from models import MyType", is_future=False
         )
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert result == []
 
 
@@ -563,7 +733,7 @@ def test_find_type_checking_needed_imports_future_excluded():
             names=["MyType"], source="from models import MyType", is_future=False
         ),
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert "from __future__ import annotations" not in result
     assert "from models import MyType" in result
 
@@ -579,21 +749,126 @@ def test_find_type_checking_needed_imports_deduplicates():
             names=["MyType"], source="from models import MyType", is_future=False
         ),
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert result.count("from models import MyType") == 1
 
 
 def test_find_type_checking_needed_imports_import_names_no_match():
     # annotation_only has "MyType" but the ImportInfo names do not include it →
-    # the any() check on line 499 returns False → import is skipped.
+    # the tc_names check returns False → import is skipped.
     entity_src_map = {"foo": 'def foo(x: "MyType") -> None:\n    pass\n'}
     infos = [
         ImportInfo(
             names=["OtherType"], source="from models import OtherType", is_future=False
         )
     ]
-    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos, set())
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
     assert result == []
+
+
+def test_find_type_checking_needed_imports_partial_multi_name_import():
+    # From a multi-name import, only the annotation-only name should appear in
+    # the TYPE_CHECKING block; the other name (not referenced at all) must not.
+    entity_src_map = {
+        "foo": 'def foo(x: "MyResult") -> None:\n    pass\n',
+    }
+    infos = [
+        ImportInfo(
+            names=["MyResult", "run_thing"],
+            source="from mymod import MyResult, run_thing",
+            is_future=False,
+        )
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
+    assert len(result) == 1
+    assert "MyResult" in result[0]
+    assert "run_thing" not in result[0]
+
+
+def test_find_type_checking_needed_imports_narrowed_src_dedup():
+    # When two ImportInfo entries produce the same narrowed source after
+    # filtering, only one copy should appear in the result (line 535 branch).
+    entity_src_map = {"foo": 'def foo(x: "MyResult") -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["MyResult", "run_thing"],
+            source="from mymod import MyResult, run_thing",
+            is_future=False,
+        ),
+        # A second entry with the same source (e.g. two entities requested it).
+        ImportInfo(
+            names=["MyResult", "run_thing"],
+            source="from mymod import MyResult, run_thing",
+            is_future=False,
+        ),
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
+    assert result.count("from mymod import MyResult") == 1
+
+
+def test_find_type_checking_needed_imports_shared_import_with_runtime_peer():
+    # Regression: when an import line covers both a runtime name and an
+    # annotation-only name, the annotation-only name must still get a
+    # TYPE_CHECKING import even though the import source appears in the
+    # regular imports (where _prune_unused_imports will later drop it).
+    entity_src_map = {
+        "foo": (
+            'def foo(_acc: Optional["_LLMAccumulator"] = None) -> None:\n'
+            "    call_with_tool(_PLACEMENT_TOOL)\n"
+        )
+    }
+    infos = [
+        ImportInfo(
+            names=["_LLMAccumulator", "_PLACEMENT_TOOL"],
+            source="from .llm_schemas import _LLMAccumulator, _PLACEMENT_TOOL",
+            is_future=False,
+        )
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
+    # _LLMAccumulator is only in a quoted annotation → must be in TC block
+    assert any("_LLMAccumulator" in r for r in result)
+    # _PLACEMENT_TOOL is a runtime reference → must NOT be in TC block
+    assert not any("_PLACEMENT_TOOL" in r for r in result)
+
+
+def test_find_type_checking_needed_imports_uses_is_type_checking_infos():
+    # is_type_checking=True ImportInfo entries are used for TC distribution;
+    # the function should return them for entities that use the name in a
+    # quoted annotation.
+    entity_src_map = {"foo": 'def foo(config: "MyConfig") -> None:\n    pass\n'}
+    infos = [
+        ImportInfo(
+            names=["MyConfig"],
+            source="from .config import MyConfig",
+            is_future=False,
+            is_type_checking=True,
+        )
+    ]
+    result = _find_type_checking_needed_imports(["foo"], entity_src_map, infos)
+    assert "from .config import MyConfig" in result
+
+
+# ---------------------------------------------------------------------------
+# _narrow_import_source
+# ---------------------------------------------------------------------------
+
+
+def test_narrow_import_source_syntax_error():
+    # Invalid Python → original string returned unchanged.
+    bad = "from ??? import Foo"
+    assert _narrow_import_source(bad, {"Foo"}) == bad
+
+
+def test_narrow_import_source_plain_import():
+    # Non-ImportFrom statement (bare `import X`) → returned unchanged.
+    src = "import os"
+    assert _narrow_import_source(src, {"os"}) == src
+
+
+def test_narrow_import_source_empty_keep():
+    # keep_names matches nothing → alias_strs is empty → return original.
+    src = "from mymod import A, B"
+    assert _narrow_import_source(src, {"C"}) == src
 
 
 # ---------------------------------------------------------------------------
@@ -2114,6 +2389,86 @@ def test_generate_file_splits_type_checking_deduplication():
     assert placements_src.count("from .models import _LLMAccumulator") == 1
 
 
+def test_generate_file_splits_tc_dedup_drops_when_already_in_regular():
+    # Entity A uses _Acc at runtime (unquoted annotation → regular cross-file import).
+    # Entity B uses _Acc only in a quoted annotation → would normally get a TC import.
+    # Both go to workers.py.  The dedup step must remove the TC import entirely since
+    # _Acc is already covered by the regular import.
+    source = textwrap.dedent(
+        """\
+        from typing import Optional
+
+        class _Acc:
+            pass
+
+        def fn_runtime(x) -> None:
+            a: _Acc = x
+
+        def fn_quoted(x: Optional["_Acc"]) -> None:
+            pass
+        """
+    )
+    e_acc = Entity(EntityKind.CLASS, "_Acc", 3, 4, ["_Acc"])
+    e_rt = Entity(EntityKind.FUNCTION, "fn_runtime", 6, 7, ["fn_runtime"])
+    e_qt = Entity(EntityKind.FUNCTION, "fn_quoted", 9, 10, ["fn_quoted"])
+    c = _classified(entities=[e_acc, e_rt, e_qt])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_Acc"], target_file="models.py"),
+            GroupPlacement(group=["fn_runtime", "fn_quoted"], target_file="workers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "advisor.py")
+
+    workers_src = result.new_files["workers.py"]
+    # Regular import must be present, TYPE_CHECKING block must NOT be.
+    assert "from .models import _Acc" in workers_src
+    assert "if TYPE_CHECKING:" not in workers_src
+
+
+def test_generate_file_splits_tc_dedup_plain_import_branches():
+    # Covers the non-from-import branches in the dedup loop:
+    #   • "import sys" in needed → _FROM_IMPORT_RE does not match (2633->2631 branch)
+    #   • "import typing_extensions" in needed_tc (annotation-only) → TC import is a
+    #     plain import statement, not a from-import (2655 branch)
+    source = textwrap.dedent(
+        """\
+        import sys
+        import typing_extensions
+        from typing import Optional
+
+        class _Acc:
+            pass
+
+        def fn(x: Optional["_Acc"]) -> None:
+            sys.exit(0)
+
+        def fn2() -> "typing_extensions.Literal":
+            pass
+        """
+    )
+    e_acc = Entity(EntityKind.CLASS, "_Acc", 5, 6, ["_Acc"])
+    e_fn = Entity(EntityKind.FUNCTION, "fn", 8, 9, ["fn"])
+    e_fn2 = Entity(EntityKind.FUNCTION, "fn2", 11, 12, ["fn2"])
+    c = _classified(entities=[e_acc, e_fn, e_fn2])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_Acc"], target_file="models.py"),
+            GroupPlacement(group=["fn", "fn2"], target_file="workers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "advisor.py")
+
+    workers_src = result.new_files["workers.py"]
+    # TC import for _Acc (cross-file, quoted annotation) must still be present.
+    assert "if TYPE_CHECKING:" in workers_src
+    assert "_Acc" in workers_src
+    # Plain import for typing_extensions preserved in TC block.
+    assert "typing_extensions" in workers_src
+
+
 # ---------------------------------------------------------------------------
 # _extract_shared_helpers
 # ---------------------------------------------------------------------------
@@ -2752,6 +3107,26 @@ def test_prune_unused_imports_relative_import_narrowed():
     assert "bar" not in result
 
 
+def test_prune_unused_imports_preserves_noqa_f401():
+    # Imports marked "# noqa: F401" are intentional re-export stubs and must
+    # never be pruned, even when the name is unused in the file body.
+    source = (
+        "from .utils import _helper  # fmt: skip # noqa: F401, E501\n"
+        "\n"
+        "def f():\n"
+        "    pass\n"
+    )
+    result = _prune_unused_imports(source)
+    assert "from .utils import _helper" in result
+
+
+def test_prune_unused_imports_prunes_unused_without_noqa():
+    # Without noqa, unused imports are still removed.
+    source = "from .utils import _helper\n\ndef f():\n    pass\n"
+    result = _prune_unused_imports(source)
+    assert "from .utils import _helper" not in result
+
+
 # ---------------------------------------------------------------------------
 # generate_file_splits — import pruning integration
 # ---------------------------------------------------------------------------
@@ -3001,6 +3376,44 @@ def test_collect_external_imported_names_deep_relative_import(tmp_path):
     sub.parent.mkdir(parents=True)
     sub.write_text("from ...utils import _helper\n")
     result = _collect_external_imported_names(str(mod))
+    assert "_helper" in result
+
+
+def test_collect_external_imported_names_init_py_at_root(tmp_path):
+    # A bare __init__.py at the project root has no package prefix, so no
+    # external caller can import from it by package path — returns empty set.
+    (tmp_path / "pyproject.toml").write_text("")
+    init_py = tmp_path / "__init__.py"
+    init_py.write_text("class Foo: pass\n")
+    result = _collect_external_imported_names(str(init_py))
+    assert result == set()
+
+
+def test_collect_external_imported_names_init_py(tmp_path):
+    # When original_path is an __init__.py, callers import from the package
+    # name (e.g. "mypkg.sub"), not "mypkg.sub.__init__".
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg" / "sub"
+    pkg.mkdir(parents=True)
+    init_py = pkg / "__init__.py"
+    init_py.write_text("class Foo: pass\n")
+    caller = tmp_path / "caller.py"
+    caller.write_text("from mypkg.sub import Foo\n")
+    result = _collect_external_imported_names(str(init_py))
+    assert "Foo" in result
+
+
+def test_collect_external_imported_names_init_py_relative_caller(tmp_path):
+    # Relative import from sibling module targeting a package __init__.py.
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    sub = pkg / "sub"
+    sub.mkdir()
+    (sub / "__init__.py").write_text("def _helper(): pass\n")
+    sibling = pkg / "other.py"
+    sibling.write_text("from .sub import _helper\n")
+    result = _collect_external_imported_names(str(sub / "__init__.py"))
     assert "_helper" in result
 
 
@@ -3291,13 +3704,28 @@ def test_add_re_exports_private_external_only_gets_noqa():
 
 
 def test_add_re_exports_private_in_still_loaded_no_noqa():
-    # Private name referenced in remaining source → re-export without noqa.
+    # Private name referenced in remaining source but NOT in external_loads
+    # → re-export without noqa (it is actively used; no future-pruning risk).
     source = "import os\n\n_helper()\n"
     entity = _make_entity("_helper", 3, 3)
     placement = GroupPlacement(group=["_helper"], target_file="utils.py")
     result = _add_re_exports(source, [placement], {"_helper": entity}, {})
     assert "from .utils import _helper\n" in result
     assert "# noqa" not in result
+
+
+def test_add_re_exports_private_in_still_loaded_and_external_loads_gets_noqa():
+    # Private name referenced in remaining source AND in external_loads → noqa
+    # marker is added even though it is currently "used", because the non-migrated
+    # entity that uses it may itself be migrated in a later recursive split, at
+    # which point _prune_unused_imports would silently drop an un-annotated stub.
+    source = "import os\n\n_helper()\n"
+    entity = _make_entity("_helper", 3, 3)
+    placement = GroupPlacement(group=["_helper"], target_file="utils.py")
+    result = _add_re_exports(
+        source, [placement], {"_helper": entity}, {}, external_loads={"_helper"}
+    )
+    assert "from .utils import _helper  # fmt: skip # noqa: F401, E501" in result
 
 
 def test_add_re_exports_public_not_in_still_loaded_gets_noqa():
@@ -3340,7 +3768,9 @@ def test_add_re_exports_multiple_noqa_each_on_own_line():
 
 def test_add_re_exports_mixed_splits_into_two_lines():
     # One entity defines two names: one in still_loaded, one purely re-exported.
-    # They must appear on separate lines so noqa doesn't suppress used-name warnings.
+    # Both are in external_loads, so both get # noqa: F401 to protect them from
+    # being pruned if the non-migrated entity that currently uses _used is itself
+    # migrated in a later recursive split.
     source = "import os\n\n_used()\n"
     entity = _make_entity("_block", 3, 4, ["_used", "_reexport"])
     placement = GroupPlacement(group=["_block"], target_file="utils.py")
@@ -3353,16 +3783,31 @@ def test_add_re_exports_mixed_splits_into_two_lines():
     )
     lines = result.splitlines()
     noqa_lines = [line for line in lines if "# fmt: skip # noqa: F401, E501" in line]
-    plain_lines = [
-        line
-        for line in lines
-        if "from .utils import" in line and "# fmt: skip" not in line
-    ]
+    assert len(noqa_lines) == 2
+    names = {line.split("import")[1].split("#")[0].strip() for line in noqa_lines}
+    assert names == {"_used", "_reexport"}
+
+
+def test_add_re_exports_mixed_only_still_loaded_in_external_loads_gets_noqa():
+    # When only the used name is in external_loads (not the purely re-exported one),
+    # verify external_loads membership drives noqa independently of still_loaded.
+    source = "import os\n\n_used()\n"
+    entity = _make_entity("_block", 3, 4, ["_used", "_reexport"])
+    placement = GroupPlacement(group=["_block"], target_file="utils.py")
+    result = _add_re_exports(
+        source,
+        [placement],
+        {"_block": entity},
+        {},
+        external_loads={"_used"},  # only _used is externally imported
+    )
+    lines = result.splitlines()
+    noqa_lines = [line for line in lines if "# fmt: skip # noqa: F401, E501" in line]
+    # _used is in still_loaded AND external_loads → gets noqa
     assert len(noqa_lines) == 1
-    assert "_reexport" in noqa_lines[0]
-    assert "_used" not in noqa_lines[0]
-    assert len(plain_lines) == 1
-    assert "_used" in plain_lines[0]
+    assert "_used" in noqa_lines[0]
+    # _reexport is not in still_loaded and not in external_loads → not re-exported
+    assert "_reexport" not in result
 
 
 def test_add_re_exports_is_test_file_adds_comment_before_first_noqa():
@@ -4076,6 +4521,44 @@ def test_generate_file_splits_subdir_bumps_two_levels_deep():
     assert "from ... import llm_client" not in core_src
 
 
+def test_generate_file_splits_subdir_injects_tc_import_for_nonmigrated_entity():
+    # When a _block_N TOP_LEVEL entity that holds the `if TYPE_CHECKING:` block
+    # is migrated to a sub-file, any non-migrated entity that references the
+    # guarded name in a quoted annotation must receive the TYPE_CHECKING import
+    # in the updated original (__init__.py).
+    #
+    # The original file has three entities:
+    #   _block_1 — the TYPE_CHECKING block (migrated to sub.py)
+    #   helper   — migrated to sub.py
+    #   entry    — stays in __init__.py, references "MyConfig" in annotation
+    source = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .config import MyConfig\n"
+        "\n"
+        "def helper():\n"
+        "    pass\n"
+        "\n"
+        "def entry(cfg: 'MyConfig') -> None:\n"
+        "    helper()\n"
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, [])
+    e_helper = _make_entity("helper", 5, 6)
+    e_entry = _make_entity("entry", 8, 9)
+    c = _classified(entities=[e_block, e_helper, e_entry])
+    plan = _plan(
+        [GroupPlacement(group=["_block_1", "helper"], target_file="pkg/sub.py")]
+    )
+
+    result = generate_file_splits(c, plan, source, "pkg.py", subdir_name="pkg")
+
+    assert not result.abort
+    init_src = result.original_source
+    # The TYPE_CHECKING import must be injected and bumped for the new depth.
+    assert "if TYPE_CHECKING:" in init_src
+    assert "from ..config import MyConfig" in init_src
+
+
 # ---------------------------------------------------------------------------
 # _strip_top_level_import_lines
 # ---------------------------------------------------------------------------
@@ -4097,6 +4580,16 @@ def test_strip_top_level_import_lines_no_imports():
 def test_strip_top_level_import_lines_syntax_error():
     src = "def (\n"
     assert _strip_top_level_import_lines(src) == src
+
+
+def test_strip_top_level_import_lines_strips_type_checking_block():
+    # `if TYPE_CHECKING:` blocks must be stripped so that their imports are
+    # not emitted verbatim in sub-files (wrong path, wrong file).
+    src = "if TYPE_CHECKING:\n" "    from .config import MyConfig\n" "\n" "_CONST = 1\n"
+    result = _strip_top_level_import_lines(src)
+    assert "TYPE_CHECKING" not in result
+    assert "MyConfig" not in result
+    assert "_CONST = 1" in result
 
 
 # ---------------------------------------------------------------------------
@@ -5851,6 +6344,120 @@ def test_normalize_blank_lines_trailing_newline():
     result = _normalize_blank_lines(source)
     assert result.endswith("\n")
     assert not result.endswith("\n\n")
+
+
+def test_normalize_blank_lines_preserves_multiline_string_body_blanks():
+    """Blank lines inside a multi-line string literal are never collapsed.
+
+    Regression: _EXCESS_BLANK_BODY_RE matched \\n{3,}(?=[ \\t]) inside
+    triple-quoted strings, collapsing 2 blank lines before an indented line
+    to 1 (e.g. stored source-code fixtures in tests).
+    """
+    # The triple-quoted string contains 2 blank lines before an indented `def`.
+    # That produces the sequence \\n\\n\\n        def inside the raw source,
+    # which _EXCESS_BLANK_BODY_RE would collapse to \\n\\n        def.
+    source = textwrap.dedent(
+        """\
+        import textwrap
+        def foo():
+            src = textwrap.dedent(
+                \"\"\"\\
+                @dataclass
+                class _SplitTask:
+                    pass
+
+
+                def _find_free_vars():
+                    x = 1
+                \"\"\"
+            )
+        """
+    )
+    result = _normalize_blank_lines(source)
+    # Two blank lines before the indented `def` inside the string must survive.
+    # After outer textwrap.dedent the string content has 8-space indentation.
+    assert "\n\n\n        def _find_free_vars" in result
+
+
+def test_normalize_blank_lines_still_collapses_excess_outside_strings():
+    """Blank-line collapsing still fires for code outside string literals."""
+    source = "def foo():\n    x = 1\n\n\n    y = 2\n"
+    result = _normalize_blank_lines(source)
+    assert "\n\n\n    y" not in result
+    assert "\n\n    y" in result
+
+
+# ---------------------------------------------------------------------------
+# _multiline_string_ranges
+# ---------------------------------------------------------------------------
+
+
+def test_multiline_string_ranges_triple_quoted():
+    """Detects a triple-quoted string spanning multiple lines."""
+    source = 'x = """\nhello\n"""\n'
+    ranges = _multiline_string_ranges(source)
+    assert len(ranges) == 1
+    start, end = ranges[0]
+    assert source[start:end] == '"""\nhello\n"""'
+
+
+def test_multiline_string_ranges_single_line_string_ignored():
+    """Single-line strings (no literal newline) are not returned."""
+    source = 'x = "hello\\n"\n'
+    ranges = _multiline_string_ranges(source)
+    assert ranges == []
+
+
+def test_multiline_string_ranges_no_strings():
+    """Returns empty list when there are no string literals."""
+    source = "x = 1 + 2\n"
+    ranges = _multiline_string_ranges(source)
+    assert ranges == []
+
+
+def test_multiline_string_ranges_invalid_source():
+    """Falls back to empty list on tokenization error."""
+    # Unterminated string triggers TokenError.
+    source = 'x = """\nhello\n'
+    ranges = _multiline_string_ranges(source)
+    assert ranges == []
+
+
+# ---------------------------------------------------------------------------
+# _sub_skip_strings
+# ---------------------------------------------------------------------------
+
+
+def test_sub_skip_strings_does_not_touch_string_content():
+    """Pattern match inside a multi-line string is not substituted."""
+    import re
+
+    pattern = re.compile(r"\n{3,}(?=[ \t])")
+    source = 'def f():\n    s = """\n    a\n\n\n    b\n    """\n'
+    result = _sub_skip_strings(pattern, "\n\n", source)
+    # The sequence inside the string must survive unchanged.
+    assert "\n\n\n    b" in result
+
+
+def test_sub_skip_strings_applies_outside_strings():
+    """Pattern match outside string literals is substituted normally."""
+    import re
+
+    pattern = re.compile(r"\n{3,}(?=[ \t])")
+    source = "def f():\n    x = 1\n\n\n    y = 2\n"
+    result = _sub_skip_strings(pattern, "\n\n", source)
+    assert "\n\n\n    y" not in result
+    assert "\n\n    y" in result
+
+
+def test_sub_skip_strings_no_strings_falls_through():
+    """When there are no multi-line strings the plain .sub() path is taken."""
+    import re
+
+    pattern = re.compile(r"x")
+    source = "x = 1\n"
+    result = _sub_skip_strings(pattern, "y", source)
+    assert result == "y = 1\n"
 
 
 # ---------------------------------------------------------------------------

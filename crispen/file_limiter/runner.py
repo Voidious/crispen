@@ -16,7 +16,13 @@ from .advisor import (
     resolve_naming_conflicts,
 )
 from .classifier import classify_entities
-from .code_gen import SplitResult, _rewrite_module_var_names, generate_file_splits
+from .code_gen import (
+    SplitResult,
+    _EXCESS_BLANK_BODY_RE,
+    _EXCESS_BLANK_RE,
+    _rewrite_module_var_names,
+    generate_file_splits,
+)
 from .entity_parser import Entity, EntityKind
 
 
@@ -40,6 +46,9 @@ class FileLimiterResult:
     verified_function_names: set = field(default_factory=set)
     verified_class_names: set = field(default_factory=set)
     verified_entity_line_counts: dict = field(default_factory=dict)
+    entity_to_target: Dict[str, str] = field(
+        default_factory=dict
+    )  # entity_name → rel_path
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +166,10 @@ def _verify_preservation(
     lines = post_source.splitlines(keepends=True)
     combined_no_imports = _strip_imports_by_line(split.original_source)
     for content in split.new_files.values():
-        combined_no_imports += _strip_imports_by_line(content)
+        stripped = _strip_imports_by_line(content)
+        stripped = _EXCESS_BLANK_RE.sub("\n\n\n", stripped)
+        stripped = _EXCESS_BLANK_BODY_RE.sub("\n\n", stripped)
+        combined_no_imports += stripped
     name_to_file: Dict[str, str] = {
         name: p.target_file for p in placements for name in p.group
     }
@@ -179,7 +191,13 @@ def _verify_preservation(
         entity_no_imports_orig = _strip_imports_by_line(entity_src)
         if entity_rewrites:
             entity_src = _rewrite_module_var_names(entity_src, entity_rewrites)
-        entity_no_imports = _strip_imports_by_line(entity_src)
+        entity_no_imports_stripped = _strip_imports_by_line(entity_src)
+        entity_no_imports_stripped = _EXCESS_BLANK_RE.sub(
+            "\n\n\n", entity_no_imports_stripped
+        )
+        entity_no_imports = _EXCESS_BLANK_BODY_RE.sub(
+            "\n\n", entity_no_imports_stripped
+        )
         if entity_no_imports not in combined_no_imports:
             preview_lines = entity_src.splitlines()[:3]
             preview = "\n    ".join(preview_lines)
@@ -714,6 +732,11 @@ def run_file_limiter(
         f"{filepath}: FileLimiter: moved {', '.join(p.group)} \u2192 {p.target_file}"
         for p in _report_placements
     ]
+    entity_to_target: Dict[str, str] = {
+        entity_name: p.target_file
+        for p in _report_placements
+        for entity_name in p.group
+    }
     return FileLimiterResult(
         original_source=split.original_source,
         new_files=split.new_files,
@@ -731,4 +754,5 @@ def run_file_limiter(
         verified_function_names=vr.verified_function_names,
         verified_class_names=vr.verified_class_names,
         verified_entity_line_counts=vr.verified_entity_line_counts,
+        entity_to_target=entity_to_target,
     )
