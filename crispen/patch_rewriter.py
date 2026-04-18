@@ -265,7 +265,7 @@ _PATCH_REWRITE_VERIFY_TOOL: dict = {
                     "True if the rewritten function correctly updates all @patch "
                     "strings, the mock parameters match their decorators, and all "
                     "original test logic is preserved without hallucinated code. "
-                    "Set True if and only if your analysis finds a concrete error "
+                    "Set False if and only if your analysis finds a concrete error "
                     "— do not set False out of general uncertainty."
                 ),
             },
@@ -294,7 +294,7 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
             "correct": {
                 "type": "boolean",
                 "description": (
-                    "True if all proposed updates are correct. Set True if and "
+                    "True if all proposed updates are correct. Set False if and "
                     "only if your analysis finds a concrete error — do not set "
                     "False out of general uncertainty."
                 ),
@@ -2277,6 +2277,14 @@ def _build_rewrite_verify_prompt(
         "the same sub-module. Accept a single @patch when there is no direct "
         "evidence in the test (from the function under test's code or the "
         "test's setup/inputs) that the other sub-module's path is reached.\n"
+        "  **Test-input-first rule**: when reasoning about whether a code path "
+        "executes, examine the test's ACTUAL INPUT DATA before consulting the "
+        "static call graph. If a parameter controlling a branch is empty, None, "
+        "or absent (e.g. no `set_3_groups` argument, or `set_3_groups=[]`), and "
+        "the production function guards that branch on that parameter (e.g. "
+        "`if not set_3_groups: return`), that branch does NOT execute in this "
+        "test — do not require a @patch for it regardless of what the call "
+        "graph shows is statically reachable.\n"
         "- **Removed @patch decorators**: accept a rewrite that removes a "
         "@patch for name N when N is not imported in the module where the "
         "function under test is defined AND the function receives the "
