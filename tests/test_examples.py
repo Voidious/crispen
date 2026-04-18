@@ -305,7 +305,7 @@ def test_match_existing_function_no_arg_helper(monkeypatch):
     with (
         patch("crispen.llm_client.anthropic.Anthropic"),
         patch(
-            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            "crispen.refactors.duplicate_extractor.extractor._run_with_timeout",
             return_value=(True, "identical logging setup", ""),
         ),
     ):

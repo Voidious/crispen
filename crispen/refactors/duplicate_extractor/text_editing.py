@@ -1,0 +1,174 @@
+from __future__ import annotations
+from typing import List, Tuple
+import re
+
+
+def _build_helper_insertion(
+    source_lines: List[str],
+    insert_pos: int,
+    helper_source: str,
+    placement: str,
+) -> Tuple[int, int, str]:
+    """Build an edit tuple that inserts helper_source with correct surrounding blanks.
+
+    Always returns a pure insertion (start == end) so that two groups inserting
+    before the same scope are never in conflict: pure insertions are not subject
+    to the overlap-skip logic in _apply_edits.
+
+    The insertion point is placed after all blank lines that already exist
+    around insert_pos (right before the def/decorator line).  Leading blank
+    lines are prepended only to make up the difference so the result always
+    has exactly ``blank_lines`` blank lines before the helper.
+    """
+    blank_lines = 1 if placement.startswith("staticmethod:") else 2
+
+    # Count consecutive blank lines immediately before insert_pos.
+    before_blanks = 0
+    i = insert_pos - 1
+    while i >= 0 and not source_lines[i].strip():
+        before_blanks += 1
+        i -= 1
+
+    # Count consecutive blank lines at and immediately after insert_pos.
+    after_blanks = 0
+    i = insert_pos
+    while i < len(source_lines) and not source_lines[i].strip():
+        after_blanks += 1
+        i += 1
+
+    # Insert right before the def/decorator (after all surrounding blanks).
+    insert_at = insert_pos + after_blanks
+    # Prepend only as many blank lines as are still missing.
+    leading = max(0, blank_lines - (before_blanks + after_blanks))
+    clean = helper_source.strip("\n") + "\n"
+    text = "\n" * leading + clean + "\n" * blank_lines
+    return (insert_at, insert_at, text)
+
+
+def _apply_edits(source: str, edits: List[Tuple[int, int, str]]) -> str:
+    """Apply (start_0, end_0, text) edits bottom-to-top.
+
+    Indices are 0-based; lines[start_0:end_0] is replaced with text.
+    An insertion before line N uses start_0 == end_0 == N.
+    Overlapping replacement ranges are skipped.
+    """
+    lines = source.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    applied: List[Tuple[int, int]] = []
+    for start, end, text in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        is_insertion = start == end
+        if not is_insertion:
+            if any(a_start < end and a_end > start for a_start, a_end in applied):
+                continue
+            applied.append((start, end))
+        new_lines = text.splitlines(keepends=True)
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] += "\n"
+        lines[start:end] = new_lines
+
+    return "".join(lines)
+
+
+def _skip_class_docstring(source_lines: List[str], after_class_line: int) -> int:
+    """Return the 0-based line index after the class docstring, if any.
+
+    Given the line immediately after ``class Foo:`` (or its colon line),
+    advance past any leading blank lines and then past a string-literal
+    docstring (single- or triple-quoted).  If no docstring is present,
+    returns ``after_class_line`` unchanged.
+    """
+    i = after_class_line
+    n = len(source_lines)
+    # Skip blank lines inside the class body.
+    while i < n and not source_lines[i].strip():
+        i += 1
+    if i >= n:
+        return after_class_line
+    stripped = source_lines[i].lstrip()
+    # Check for a triple-quoted docstring.
+    for q in ('"""', "'''"):
+        if stripped.startswith(q):
+            # Check whether the closing quote is on the same line (after the
+            # opening).
+            rest = stripped[len(q) :]
+            if q in rest:
+                # Single-line triple-quoted docstring.
+                return i + 1
+            # Multi-line: scan forward for the closing triple-quote.
+            i += 1
+            while i < n:
+                if q in source_lines[i]:
+                    return i + 1
+                i += 1
+            return i  # malformed, best-effort
+    # Single-quoted docstring (rare but valid).
+    for q in ('"', "'"):
+        if stripped.startswith(q) and not stripped.startswith(q * 2):
+            return i + 1
+    return after_class_line
+
+
+def _find_insertion_point(source: str, scope: str) -> int:
+    """Return 0-based line index to insert before.
+
+    For module scope, inserts after the last import.
+    For a named scope, inserts before the def/class line.
+
+    If the named scope resolves to an indented ``def`` (i.e. a class method),
+    inserting a module-level helper immediately before it would end the class
+    definition prematurely — the remaining class methods would be silently
+    re-parsed as nested functions of the helper, producing valid-syntax but
+    broken code that ``compile()`` does not catch.  In that case we walk
+    backwards to the enclosing class definition and insert before it instead.
+    """
+    source_lines = source.splitlines()
+    if scope == "<module>":
+        last_import = -1
+        for i, line in enumerate(source_lines):
+            stripped = line.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                last_import = i
+        return last_import + 1
+
+    pattern = re.compile(rf"^\s*(?:async\s+def|def|class)\s+{re.escape(scope)}\s*[\(:]")
+    for i, line in enumerate(source_lines):
+        if pattern.match(line):
+            method_indent = len(line) - len(line.lstrip())
+            if method_indent > 0:
+                # The def is inside a class body.  Walk backwards to find the
+                # enclosing class definition and insert before that instead.
+                # If the first lower-indent non-blank line is NOT a class
+                # definition (i.e. the def is a nested function inside a
+                # regular function), stop immediately so we don't mis-identify
+                # an unrelated class above the outer function as the enclosing
+                # class.
+                for j in range(i - 1, -1, -1):
+                    prev = source_lines[j]
+                    if not prev.strip():
+                        continue
+                    prev_indent = len(prev) - len(prev.lstrip())
+                    if prev_indent < method_indent:
+                        if re.match(r"\s*class\s+\w+", prev):
+                            return j
+                        break  # nested function — fall through to decorator walk
+            # Walk backwards over any preceding decorator lines (including
+            # multi-line decorator arguments) so the helper is inserted
+            # before the decorator block, not between decorators and the def.
+            j = i - 1
+            paren_depth = 0
+            while j >= 0:
+                stripped = source_lines[j].strip()
+                if not stripped:
+                    break
+                for ch in stripped:
+                    if ch == ")":
+                        paren_depth += 1
+                    elif ch == "(":
+                        paren_depth -= 1
+                if paren_depth == 0 and not stripped.startswith("@"):
+                    break
+                j -= 1
+            return j + 1
+    return 0
