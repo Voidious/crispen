@@ -594,6 +594,27 @@ def test_find_valid_splits_empty_body():
     assert result == []
 
 
+def test_find_valid_splits_docstring_never_produces_trivial_proxy():
+    # With a docstring, split_idx=1 would leave the head with only the docstring
+    # plus the injected return call — a trivial proxy.  The guard ensures
+    # split_idx=1 is excluded when has_doc=True.
+    src = textwrap.dedent(
+        """\
+        def foo():
+            \"\"\"doc\"\"\"
+            a = 1
+            b = 2
+            c = 3
+    """
+    )
+    stmts, positions, lines = _parse_func(src)
+    # body_stmts: [docstring, a=1, b=2, c=3]
+    # min_split = 2 → range(3, 1, -1) = [3, 2]; split_idx=1 is excluded
+    result = _find_valid_splits(stmts, positions, max_lines=1000)
+    assert 1 not in result
+    assert len(result) >= 1  # valid splits still exist at idx 2 and 3
+
+
 def test_find_valid_splits_nested_funcdef_restricts_upper():
     # First nested funcdef at index 2 → valid splits only at indices ≤ 2.
     src = textwrap.dedent(
