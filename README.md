@@ -143,17 +143,18 @@ file_limiter_recursive = true
 #
 # "ignore"  — Leave all @patch strings as-is.
 # "basic"   — Scan every *.py file and update patch strings that are
-#             unambiguous (entity imported by exactly one new sub-module).
+#             unambiguous: entity imported by exactly one new sub-module,
+#             or resolved via call-graph traversal to a single sub-module.
 #             Import aliases from the original file that land in exactly one
 #             new file are also updated.
 # "rewrite" — Performs "basic" first, then uses an LLM to resolve forking
 #             cases (entities imported by multiple new files). A verify step
-#             checks each proposal; failed chunks are retried up to
+#             checks each proposal; failed functions are retried up to
 #             patch_update_retries additional times before being skipped.
 #             Also handles @patch(module.CONSTANT) and with patch(...) forms.
 # file_limiter_patch_update = "basic"
 
-# FileLimiter: additional LLM verify+retry attempts per function chunk in
+# FileLimiter: additional LLM verify+retry attempts per function in
 # "rewrite" mode (default: 2 = three total attempts; 0 = no retry).
 # patch_update_retries = 2
 
@@ -210,248 +211,7 @@ No API key is required — LM Studio does not authenticate requests.
 
 ## Refactors
 
-### 1. Flip negated if/else
-
-**Flips negated `if/else` conditions to eliminate the `not`.**
-
-When an `if not condition:` has an `else` clause, crispen rewrites it to `if condition:` and swaps the two branches. This eliminates a layer of logical indirection and makes intent clearer.
-
-**Before:**
-```python
-if not is_valid(data):
-    handle_error(data)
-else:
-    process(data)
-```
-
-**After:**
-```python
-if is_valid(data):
-    process(data)
-else:
-    handle_error(data)
-```
-
-Skipped when there is no `else` clause, or when the `else` is an `elif` chain.
-
----
-
-### 2. Tuple Return to Dataclass
-
-**Replaces large tuple return values with `@dataclass` instances and updates call sites.**
-
-Functions that return large tuples (4+ elements by default) are difficult to read at call sites — callers must remember which index means what. Crispen replaces the tuple literal with a named `@dataclass` constructor call, automatically generates the dataclass definition, and rewrites every tuple-unpacking call site to use the dataclass's named attributes.
-
-Only fires when:
-- The tuple is inside a `return` statement (not a function argument).
-- Every in-file caller of the function uses tuple-unpacking assignment (`a, b = func()`).
-- The tuple has at least `min_tuple_size` elements (default 4).
-
-**Before:**
-```python
-def get_metrics(data):
-    count = len(data)
-    total = sum(data)
-    average = total / count
-    peak = max(data)
-    return count, total, average, peak
-
-# elsewhere:
-count, total, average, peak = get_metrics(data)
-```
-
-**After:**
-```python
-from dataclasses import dataclass
-from typing import Any
-
-@dataclass
-class GetMetricsResult:
-    count: Any
-    total: Any
-    average: Any
-    peak: Any
-
-
-def get_metrics(data):
-    count = len(data)
-    total = sum(data)
-    average = total / count
-    peak = max(data)
-    return GetMetricsResult(count=count, total=total, average=average, peak=peak)
-
-# elsewhere:
-_ = get_metrics(data)
-count = _.count
-total = _.total
-average = _.average
-peak = _.peak
-```
-
-Field names are inferred from unpacking assignments at call sites (e.g., `count, total, average, peak = get_metrics(data)`), from the variable names in the tuple itself, or defaulted to `field_0`, `field_1`, etc. The intermediate variable name (`_`, `_result`, or the snake_case dataclass name) is chosen to avoid collisions with existing names in the file.
-
-Configuration:
-- `min_tuple_size` — minimum tuple element count to trigger replacement (default: 4).
-
----
-
-### 3. Duplicate code extraction
-
-**Extracts duplicate code blocks into shared helper functions using an LLM.**
-
-Crispen scans the changed functions for repeated sequences of statements. When a duplicate group is found, it calls the LLM to produce a single extracted helper function with an appropriate name, and replaces each occurrence with a call to that helper.
-
-The algorithm:
-1. Hashes each statement in a function by its AST structure (ignoring whitespace and comments).
-2. Finds repeated subsequences above a minimum weight threshold.
-3. Asks the LLM if the matching sections of code are a semantic match ("veto check"), and requests any pitfalls to note for the extraction step. These notes are passed to every subsequent extraction attempt.
-4. If accepted, asks the LLM to write the helper, determine its parameters, and update the call sites.
-5. Runs a series of algorithmic checks to verify the code change. A failure triggers a retry (step 4, up to `extraction_retries`), including a note to the LLM about the verification failure.
-6. After passing the algorithmic checks, asks the LLM to verify the output. A failure triggers a retry (step 4, up to `llm_verify_retries`), including both the previous code change and detailed feedback from the LLM verification step.
-7. If accepted, validates the output syntactically and with pyflakes before applying it.
-
-**Before:**
-```python
-def process_users(users, archived_users):
-    for user in users:
-        name = user["name"].strip().lower()
-        email = user["email"].strip().lower()
-        db.save(name, email)
-
-    for person in archived_users:
-        full_name = person["name"].strip().lower()
-        contact = person["email"].strip().lower()
-        archive.save(full_name, contact)
-```
-
-Note that the two blocks use different variable names (`name`/`email` vs `full_name`/`contact`, `user` vs `person`). The algorithm detects the structural match regardless, and the LLM generalises the variable names into appropriate parameter names.
-
-**After:**
-```python
-def _normalize_contact(record):
-    name = record["name"].strip().lower()
-    email = record["email"].strip().lower()
-    return name, email
-
-def process_users(users, archived_users):
-    for user in users:
-        name, email = _normalize_contact(user)
-        db.save(name, email)
-
-    for person in archived_users:
-        full_name, contact = _normalize_contact(person)
-        archive.save(full_name, contact)
-```
-
-Configuration:
-- `min_duplicate_weight` — minimum "weight" (sum of statement sizes) a repeated group must have to be extracted (default: 3).
-- `max_duplicate_seq_len` — maximum number of statements in a duplicate sequence (default: 8).
-- `extraction_retries` — how many times to retry after an algorithmic check fails (default: 2).
-- `llm_verify_retries` — how many times to retry after the LLM verification step rejects the output (default: 2).
-
----
-
-### 4. Match existing function
-
-**Replaces a code block with a call to an existing function that performs the same operation.**
-
-When a block of code in the diff is semantically equivalent to the body of an existing function in the same file, crispen replaces the inline block with a call to that function. This is the complement of DuplicateExtractor: instead of creating a new helper, it recognises that one already exists.
-
-The algorithm:
-1. Fingerprints every function body in the file by its normalised AST structure (ignoring variable names, whitespace, and comments).
-2. For each statement sequence in the diff, checks whether its fingerprint matches any function body.
-3. Asks the LLM to verify the match is semantically valid and not a coincidental structural similarity.
-4. If confirmed, asks the LLM to generate the correct call expression (mapping arguments as needed) and replaces the block.
-
-**Before:**
-```python
-def _fetch_json(url, headers):
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    return response.json()
-
-def sync_orders():
-    # Inline copy of _fetch_json's body with different variable names:
-    resp = requests.get(orders_url, headers=api_headers)
-    resp.raise_for_status()
-    orders = resp.json()
-    process(orders)
-```
-
-**After:**
-```python
-def _fetch_json(url, headers):
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    return response.json()
-
-def sync_orders():
-    orders = _fetch_json(orders_url, api_headers)
-    process(orders)
-```
-
-The LLM veto step ensures the replacement is only applied when the semantics genuinely match — structural similarity alone is not enough.
-
----
-
-### 5. Function splitter
-
-**Splits functions that exceed the line-count limit into smaller helpers.**
-
-When a function in the changed region is too long (more than `max_function_length` body lines, default 75), crispen splits it. It identifies the best split point — the one that minimises the number of free variables passed to the helper — and asks the LLM to name the extracted helper function.
-
-The extracted tail becomes a private helper (`_helper_name`) placed immediately after the original function. If the tail references `self`, the helper is extracted as a regular instance method; otherwise it is extracted as a `@staticmethod` (for class methods) or a module-level function.
-
-**Before:**
-```python
-def build_report(config, data):
-    # ... 40 lines of setup ...
-    headers = compute_headers(config)
-    rows = []
-    for item in data:
-        row = format_row(item, headers)
-        validate_row(row)
-        rows.append(row)
-    totals = compute_totals(rows)
-    footer = format_footer(totals)
-    return assemble(headers, rows, footer)
-```
-
-**After:**
-```python
-def build_report(config, data):
-    # ... 40 lines of setup ...
-    headers = compute_headers(config)
-    return _format_rows_and_assemble(headers, data)
-
-
-def _format_rows_and_assemble(headers, data):
-    rows = []
-    for item in data:
-        row = format_row(item, headers)
-        validate_row(row)
-        rows.append(row)
-    totals = compute_totals(rows)
-    footer = format_footer(totals)
-    return assemble(headers, rows, footer)
-```
-
-Functions are skipped if they are:
-- `async` functions
-- Generator functions (contain `yield`)
-- Functions with nested `def` statements (closures)
-
-Safety checks applied before writing:
-- The rewritten source must compile without `SyntaxError`.
-- pyflakes must not report any new `UndefinedName` warnings after the split.
-
-Configuration:
-- `max_function_length` — maximum allowed body lines (default: 75).
-- `helper_docstrings` — whether to include a docstring in extracted helper functions (default: `false`).
-
----
-
-### 6. File limiter
+### 1. File limiter
 
 **Splits files that exceed the line-count limit into smaller sibling modules.**
 
@@ -531,11 +291,252 @@ Configuration:
 - `file_limiter_reexports` — controls when re-export stubs are added to the original file for public names moved to new files: `"always"` (every public name), `"application"` (all non-test files, no test files), or `"imported"` (only when the name is imported from this module elsewhere in the project — the same rule used for private names). Default: `"imported"`.
 - `file_limiter_patch_update` — controls how `@patch` string literals are updated after FileLimiter moves entities to new sub-modules:
   - `"ignore"` — leave all patch strings as-is.
-  - `"basic"` — scan every `*.py` file in the repo and update patch strings that are unambiguous (non-forking): only when the entity is imported by exactly one new sub-module. Import aliases from the original file that appear in exactly one new file are also updated. Default.
-  - `"rewrite"` — performs `"basic"` updates first, then uses an LLM to resolve the remaining forking cases (entities imported by multiple new files). The LLM receives the original file, the diff, all new sub-files, and a chunk of test functions and proposes updated `@patch` strings. A second LLM verify step checks each proposal; failed chunks are retried up to `patch_update_retries` additional times before being skipped. Also handles `@patch(module.CONSTANT)` attribute-access and `with patch(...)` context-manager forms.
-- `patch_update_retries` — additional LLM verify+retry attempts for each function chunk in `"rewrite"` mode. `0` means no retry: a chunk rejected by the verify LLM is skipped. Default: `2` (three total attempts).
+  - `"basic"` — scan every `*.py` file in the repo and update patch strings that are unambiguous (non-forking): when the entity is imported by exactly one new sub-module, or resolved via call-graph traversal to a single sub-module. Import aliases from the original file that appear in exactly one new file are also updated. Default.
+  - `"rewrite"` — performs `"basic"` updates first, then uses an LLM to resolve the remaining forking cases (entities imported by multiple new files). The LLM receives the original file, the diff, all new sub-files, and one test function at a time and proposes updated `@patch` strings. A second LLM verify step checks each proposal; failed functions are retried up to `patch_update_retries` additional times before being skipped. Also handles `@patch(module.CONSTANT)` attribute-access and `with patch(...)` context-manager forms.
+- `patch_update_retries` — additional LLM verify+retry attempts per function in `"rewrite"` mode. `0` means no retry: a function rejected by the verify LLM is skipped. Default: `2` (three total attempts).
 - `callgraph_max_depth` — maximum BFS hops from a test function to a target sub-module during call-graph traversal (`"basic"` and `"rewrite"` modes). When the limit is reached the path is left unresolved and a warning is printed to stderr. Increase for codebases with very deep call chains. Default: `12`.
 - `callgraph_max_modules` — maximum distinct modules visited per resolution attempt during call-graph traversal. When the limit is reached the path is left unresolved and a warning is printed to stderr. Increase for large codebases with wide import graphs. Default: `50`.
+
+---
+
+### 2. Duplicate code extraction
+
+**Extracts duplicate code blocks into shared helper functions using an LLM.**
+
+Crispen scans the changed functions for repeated sequences of statements. When a duplicate group is found, it calls the LLM to produce a single extracted helper function with an appropriate name, and replaces each occurrence with a call to that helper.
+
+The algorithm:
+1. Hashes each statement in a function by its AST structure (ignoring whitespace and comments).
+2. Finds repeated subsequences above a minimum weight threshold.
+3. Asks the LLM if the matching sections of code are a semantic match ("veto check"), and requests any pitfalls to note for the extraction step. These notes are passed to every subsequent extraction attempt.
+4. If accepted, asks the LLM to write the helper, determine its parameters, and update the call sites.
+5. Runs a series of algorithmic checks to verify the code change. A failure triggers a retry (step 4, up to `extraction_retries`), including a note to the LLM about the verification failure.
+6. After passing the algorithmic checks, asks the LLM to verify the output. A failure triggers a retry (step 4, up to `llm_verify_retries`), including both the previous code change and detailed feedback from the LLM verification step.
+7. If accepted, validates the output syntactically and with pyflakes before applying it.
+
+**Before:**
+```python
+def process_users(users, archived_users):
+    for user in users:
+        name = user["name"].strip().lower()
+        email = user["email"].strip().lower()
+        db.save(name, email)
+
+    for person in archived_users:
+        full_name = person["name"].strip().lower()
+        contact = person["email"].strip().lower()
+        archive.save(full_name, contact)
+```
+
+Note that the two blocks use different variable names (`name`/`email` vs `full_name`/`contact`, `user` vs `person`). The algorithm detects the structural match regardless, and the LLM generalises the variable names into appropriate parameter names.
+
+**After:**
+```python
+def _normalize_contact(record):
+    name = record["name"].strip().lower()
+    email = record["email"].strip().lower()
+    return name, email
+
+def process_users(users, archived_users):
+    for user in users:
+        name, email = _normalize_contact(user)
+        db.save(name, email)
+
+    for person in archived_users:
+        full_name, contact = _normalize_contact(person)
+        archive.save(full_name, contact)
+```
+
+Configuration:
+- `min_duplicate_weight` — minimum "weight" (sum of statement sizes) a repeated group must have to be extracted (default: 3).
+- `max_duplicate_seq_len` — maximum number of statements in a duplicate sequence (default: 8).
+- `extraction_retries` — how many times to retry after an algorithmic check fails (default: 2).
+- `llm_verify_retries` — how many times to retry after the LLM verification step rejects the output (default: 2).
+
+---
+
+### 3. Match existing function
+
+**Replaces a code block with a call to an existing function that performs the same operation.**
+
+When a block of code in the diff is semantically equivalent to the body of an existing function in the same file, crispen replaces the inline block with a call to that function. This is the complement of DuplicateExtractor: instead of creating a new helper, it recognises that one already exists.
+
+The algorithm:
+1. Fingerprints every function body in the file by its normalised AST structure (ignoring variable names, whitespace, and comments).
+2. For each statement sequence in the diff, checks whether its fingerprint matches any function body.
+3. Asks the LLM to verify the match is semantically valid and not a coincidental structural similarity.
+4. If confirmed, asks the LLM to generate the correct call expression (mapping arguments as needed) and replaces the block.
+
+**Before:**
+```python
+def _fetch_json(url, headers):
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+def sync_orders():
+    # Inline copy of _fetch_json's body with different variable names:
+    resp = requests.get(orders_url, headers=api_headers)
+    resp.raise_for_status()
+    orders = resp.json()
+    process(orders)
+```
+
+**After:**
+```python
+def _fetch_json(url, headers):
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+def sync_orders():
+    orders = _fetch_json(orders_url, api_headers)
+    process(orders)
+```
+
+The LLM veto step ensures the replacement is only applied when the semantics genuinely match — structural similarity alone is not enough.
+
+---
+
+### 4. Function splitter
+
+**Splits functions that exceed the line-count limit into smaller helpers.**
+
+When a function in the changed region is too long (more than `max_function_length` body lines, default 75), crispen splits it. It identifies the best split point — the one that minimises the number of free variables passed to the helper — and asks the LLM to name the extracted helper function.
+
+The extracted tail becomes a private helper (`_helper_name`) placed immediately after the original function. If the tail references `self`, the helper is extracted as a regular instance method; otherwise it is extracted as a `@staticmethod` (for class methods) or a module-level function.
+
+**Before:**
+```python
+def build_report(config, data):
+    # ... 40 lines of setup ...
+    headers = compute_headers(config)
+    rows = []
+    for item in data:
+        row = format_row(item, headers)
+        validate_row(row)
+        rows.append(row)
+    totals = compute_totals(rows)
+    footer = format_footer(totals)
+    return assemble(headers, rows, footer)
+```
+
+**After:**
+```python
+def build_report(config, data):
+    # ... 40 lines of setup ...
+    headers = compute_headers(config)
+    return _format_rows_and_assemble(headers, data)
+
+
+def _format_rows_and_assemble(headers, data):
+    rows = []
+    for item in data:
+        row = format_row(item, headers)
+        validate_row(row)
+        rows.append(row)
+    totals = compute_totals(rows)
+    footer = format_footer(totals)
+    return assemble(headers, rows, footer)
+```
+
+Functions are skipped if they are:
+- `async` functions
+- Generator functions (contain `yield`)
+- Functions with nested `def` statements (closures)
+
+Safety checks applied before writing:
+- The rewritten source must compile without `SyntaxError`.
+- pyflakes must not report any new `UndefinedName` warnings after the split.
+
+Configuration:
+- `max_function_length` — maximum allowed body lines (default: 75).
+- `helper_docstrings` — whether to include a docstring in extracted helper functions (default: `false`).
+
+---
+
+### 5. Tuple Return to Dataclass
+
+**Replaces large tuple return values with `@dataclass` instances and updates call sites.**
+
+Functions that return large tuples (4+ elements by default) are difficult to read at call sites — callers must remember which index means what. Crispen replaces the tuple literal with a named `@dataclass` constructor call, automatically generates the dataclass definition, and rewrites every tuple-unpacking call site to use the dataclass's named attributes.
+
+Only fires when:
+- The tuple is inside a `return` statement (not a function argument).
+- Every in-file caller of the function uses tuple-unpacking assignment (`a, b = func()`).
+- The tuple has at least `min_tuple_size` elements (default 4).
+
+**Before:**
+```python
+def get_metrics(data):
+    count = len(data)
+    total = sum(data)
+    average = total / count
+    peak = max(data)
+    return count, total, average, peak
+
+# elsewhere:
+count, total, average, peak = get_metrics(data)
+```
+
+**After:**
+```python
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass
+class GetMetricsResult:
+    count: Any
+    total: Any
+    average: Any
+    peak: Any
+
+
+def get_metrics(data):
+    count = len(data)
+    total = sum(data)
+    average = total / count
+    peak = max(data)
+    return GetMetricsResult(count=count, total=total, average=average, peak=peak)
+
+# elsewhere:
+_ = get_metrics(data)
+count = _.count
+total = _.total
+average = _.average
+peak = _.peak
+```
+
+Field names are inferred from unpacking assignments at call sites (e.g., `count, total, average, peak = get_metrics(data)`), from the variable names in the tuple itself, or defaulted to `field_0`, `field_1`, etc. The intermediate variable name (`_`, `_result`, or the snake_case dataclass name) is chosen to avoid collisions with existing names in the file.
+
+Configuration:
+- `min_tuple_size` — minimum tuple element count to trigger replacement (default: 4).
+
+---
+
+### 6. Flip negated if/else
+
+**Flips negated `if/else` conditions to eliminate the `not`.**
+
+When an `if not condition:` has an `else` clause, crispen rewrites it to `if condition:` and swaps the two branches. This eliminates a layer of logical indirection and makes intent clearer.
+
+**Before:**
+```python
+if not is_valid(data):
+    handle_error(data)
+else:
+    process(data)
+```
+
+**After:**
+```python
+if is_valid(data):
+    process(data)
+else:
+    handle_error(data)
+```
+
+Skipped when there is no `else` clause, or when the `else` is an `elif` chain.
 
 ## Architecture
 
