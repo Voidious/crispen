@@ -606,7 +606,7 @@ def _llm_name_helpers(
         client,
         provider,
         model,
-        256,
+        1024,
         _NAME_TOOL,
         "name_helper_functions",
         [{"role": "user", "content": prompt}],
