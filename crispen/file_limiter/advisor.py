@@ -308,7 +308,7 @@ def _advise_set3(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 20 + n_groups * 25)
+    max_tokens = max(512, 20 + n_groups * 50)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM whether to migrate"
