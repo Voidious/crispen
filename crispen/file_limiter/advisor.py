@@ -308,7 +308,7 @@ def _advise_set3(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 20 + n_groups * 50)
+    max_tokens = max(512, 20 + n_groups * 100)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM whether to migrate"
@@ -443,7 +443,7 @@ def _propose_files_step(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 100 + target_files * 100)
+    max_tokens = max(1024, 100 + target_files * 200)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to propose output file set"
