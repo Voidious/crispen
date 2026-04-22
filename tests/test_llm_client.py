@@ -57,6 +57,43 @@ def test_get_api_key_lmstudio_no_key_needed():
     assert get_api_key("lmstudio") == "lm-studio"
 
 
+def test_get_api_key_ollama_no_key_needed():
+    assert get_api_key("ollama") == "ollama"
+
+
+def test_get_api_key_gemini_present(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-key")
+    assert get_api_key("gemini") == "gem-key"
+
+
+def test_get_api_key_gemini_missing(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(CrispenAPIError, match="GEMINI_API_KEY"):
+        get_api_key("gemini", caller="Test")
+
+
+def test_get_api_key_zai_present(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "zai-key")
+    assert get_api_key("zai") == "zai-key"
+
+
+def test_get_api_key_zai_missing(monkeypatch):
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)
+    with pytest.raises(CrispenAPIError, match="ZAI_API_KEY"):
+        get_api_key("zai", caller="Test")
+
+
+def test_get_api_key_mistral_present(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "mist-key")
+    assert get_api_key("mistral") == "mist-key"
+
+
+def test_get_api_key_mistral_missing(monkeypatch):
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    with pytest.raises(CrispenAPIError, match="MISTRAL_API_KEY"):
+        get_api_key("mistral", caller="Test")
+
+
 # ---------------------------------------------------------------------------
 # _token_param
 # ---------------------------------------------------------------------------
@@ -128,6 +165,38 @@ def test_make_client_base_url_override():
         make_client("lmstudio", "lm-studio", base_url="http://custom:8080/v1")
         call_kwargs = mock_oai.OpenAI.call_args[1]
         assert call_kwargs["base_url"] == "http://custom:8080/v1"
+
+
+def test_make_client_ollama_uses_default_url():
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.OpenAI.return_value = MagicMock()
+        make_client("ollama", "ollama", timeout=30.0)
+        call_kwargs = mock_oai.OpenAI.call_args[1]
+        assert "11434" in call_kwargs["base_url"]
+
+
+def test_make_client_gemini_uses_default_url():
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.OpenAI.return_value = MagicMock()
+        make_client("gemini", "gem-key", timeout=30.0)
+        call_kwargs = mock_oai.OpenAI.call_args[1]
+        assert "generativelanguage.googleapis.com" in call_kwargs["base_url"]
+
+
+def test_make_client_zai_uses_default_url():
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.OpenAI.return_value = MagicMock()
+        make_client("zai", "zai-key", timeout=30.0)
+        call_kwargs = mock_oai.OpenAI.call_args[1]
+        assert "z.ai" in call_kwargs["base_url"]
+
+
+def test_make_client_mistral_uses_default_url():
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.OpenAI.return_value = MagicMock()
+        make_client("mistral", "mist-key", timeout=30.0)
+        call_kwargs = mock_oai.OpenAI.call_args[1]
+        assert "mistral.ai" in call_kwargs["base_url"]
 
 
 # ---------------------------------------------------------------------------

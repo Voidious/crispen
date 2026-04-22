@@ -18,6 +18,16 @@ _PROVIDER_BASE_URLS: dict[str, str] = {
     "moonshot": "https://api.moonshot.ai/v1",
     "deepseek": "https://api.deepseek.com/v1",
     "lmstudio": "http://localhost:1234/v1",
+    "ollama": "http://localhost:11434/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "zai": "https://api.z.ai/api/paas/v4",
+    "mistral": "https://api.mistral.ai/v1",
+}
+
+# Placeholder API keys returned for local providers that require no authentication.
+_PROVIDER_PLACEHOLDERS: dict[str, str] = {
+    "lmstudio": "lm-studio",
+    "ollama": "ollama",
 }
 
 
@@ -49,6 +59,10 @@ _PROVIDER_ENV_VARS: dict[str, Optional[str]] = {
     "openai": "OPENAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "lmstudio": None,
+    "ollama": None,
+    "gemini": "GEMINI_API_KEY",
+    "zai": "ZAI_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
 }
 
 
@@ -56,11 +70,12 @@ def get_api_key(provider: str, caller: str = "crispen") -> str:
     """Return the API key for *provider* from the environment.
 
     Raises CrispenAPIError if the required environment variable is not set.
-    LM Studio does not require an API key and always returns a placeholder.
+    Local providers (LM Studio, Ollama) do not require an API key and return a
+    provider-specific placeholder string.
     """
     env_var = _PROVIDER_ENV_VARS.get(provider, "ANTHROPIC_API_KEY")
     if env_var is None:
-        return "lm-studio"
+        return _PROVIDER_PLACEHOLDERS.get(provider, "no-key")
     api_key = os.environ.get(env_var)
     if not api_key:
         raise CrispenAPIError(
@@ -78,9 +93,10 @@ def make_client(
 ) -> Any:
     """Create and return an LLM client for *provider*.
 
-    For OpenAI-compatible providers (moonshot, openai, deepseek, lmstudio), the
-    base URL is resolved from *base_url* (if given) or the built-in default for the
-    provider.  Pass *base_url* to override the default (e.g. a custom LM Studio port).
+    For OpenAI-compatible providers (moonshot, openai, deepseek, lmstudio, ollama,
+    gemini, zai, mistral), the base URL is resolved from *base_url* (if given) or
+    the built-in default for the provider.  Pass *base_url* to override the default
+    (e.g. a custom Ollama port, or a self-hosted endpoint).
     """
     if provider == "anthropic":
         return anthropic.Anthropic(api_key=api_key, timeout=timeout)
