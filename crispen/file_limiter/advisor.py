@@ -308,7 +308,7 @@ def _advise_set3(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 20 + n_groups * 200)
+    max_tokens = max(1024, 20 + n_groups * 400)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM whether to migrate"
@@ -443,7 +443,7 @@ def _propose_files_step(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(1024, 100 + n_groups * 100 + target_files * 200)
+    max_tokens = max(2048, 100 + n_groups * 200 + target_files * 400)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to propose output file set"
@@ -636,7 +636,7 @@ def _assign_placements_chunk(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 100 + n_groups * 40)
+    max_tokens = max(1024, 200 + n_groups * 80)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to assign file placements"
@@ -883,7 +883,7 @@ def _rename_conflicting_chunk(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 100 + n_groups * 40)
+    max_tokens = max(1024, 200 + n_groups * 80)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to resolve naming conflicts"
