@@ -2535,7 +2535,7 @@ def _process_file_source(
                     client,
                     config.provider,
                     config.model,
-                    4096,
+                    10000,
                     _PATCH_CLASSIFY_TOOL,
                     "classify_patch_updates",
                     [{"role": "user", "content": classify_prompt}],
