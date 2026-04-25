@@ -5546,6 +5546,189 @@ def test_callgraph_update_file_multi_context_second_matches(tmp_path):
     assert '@patch("pkg.placement.use_fn")' in result
 
 
+def test_callgraph_update_file_new_path_equals_old_path_continues(tmp_path):
+    # Context 1 (outer subdir split): terminal includes intermediate __init__.py
+    # which still has helper() calling use_fn → BFS returns old path as single
+    # candidate.  The fix skips that "resolution" and tries context 2.
+    # Context 2 (inner split): terminal maps helper → pkg.sub.use_fn (new path).
+    intermediate_init = "from external import use_fn\ndef helper(): use_fn()\n"
+    final_init = "from .sub import helper\n"
+    sub_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx1 = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source=intermediate_init,
+        modified_source=intermediate_init,
+        new_files={
+            "orig/__init__.py": intermediate_init,
+            "orig/models.py": "class M: pass\n",
+        },
+        new_module_paths={
+            "orig/__init__.py": "pkg.orig",
+            "orig/models.py": "pkg.orig.models",
+        },
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    ctx2 = _FLContext(
+        filepath="/proj/pkg/orig/__init__.py",
+        old_module="pkg.orig",
+        original_source=intermediate_init,
+        modified_source=final_init,
+        new_files={"sub.py": sub_src},
+        new_module_paths={"sub.py": "pkg.orig.sub"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.orig import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(m):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_f.py")
+    index = _CgIndex(
+        module_to_source={
+            "pkg.orig": final_init,
+            "pkg.orig.sub": sub_src,
+            "pkg.test_mod": test_src,
+        },
+        module_to_package={
+            "pkg.orig": "pkg.orig",
+            "pkg.orig.sub": "pkg.orig",
+            "pkg.test_mod": "pkg",
+        },
+        module_to_defs={
+            "pkg.orig": set(),
+            "pkg.orig.sub": {"helper"},
+            "pkg.test_mod": set(),
+        },
+        file_to_module={scan: "pkg.test_mod"},
+    )
+    result, changed, _unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx1, ctx2],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.orig.sub.use_fn")' in result
+
+
+def test_callgraph_update_file_static_fallback_old_path_continues(tmp_path):
+    # BFS finds 0 reachable candidates in context 1, static_cands = [old_path].
+    # The fix skips that no-op resolution and tries context 2, where
+    # static_cands = [new_path] → auto-resolves to the new path.
+    intermediate_init = "from external import use_fn\ndef helper(): use_fn()\n"
+    sub_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx1 = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source=intermediate_init,
+        modified_source=intermediate_init,
+        new_files={"orig/__init__.py": intermediate_init},
+        new_module_paths={"orig/__init__.py": "pkg.orig"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    ctx2 = _FLContext(
+        filepath="/proj/pkg/orig/__init__.py",
+        old_module="pkg.orig",
+        original_source=intermediate_init,
+        modified_source="from .sub import helper\n",
+        new_files={"sub.py": sub_src},
+        new_module_paths={"sub.py": "pkg.orig.sub"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    # Test calls unrelated() — BFS finds 0 reachable candidates in both contexts.
+    test_src = '@patch("pkg.orig.use_fn")\n' "def test_f(m):\n" "    unrelated()\n"
+    scan = str(tmp_path / "test_f.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed, _unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx1, ctx2],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.orig.sub.use_fn")' in result
+
+
+def test_callgraph_update_file_old_path_valid_casts_keep_old_vote(tmp_path):
+    # worker stayed in pkg.orig (uses use_fn) → BFS returns old_path for test_a.
+    # helper moved to pkg.sub (uses use_fn) → BFS returns pkg.sub.use_fn for test_b.
+    # Both share _PATCH_USE const.  The keep-old vote from test_a must create a
+    # conflict so the const definition is NOT silently rewritten to pkg.sub.use_fn
+    # (which would break test_a).  test_b should be inlined instead.
+    orig_src = (
+        "from external import use_fn\ndef helper(): use_fn()\ndef worker(): use_fn()\n"
+    )
+    # After split: worker stayed, helper moved.
+    modified_orig = (
+        "from external import use_fn\n"
+        "from .sub import helper\n"
+        "def worker(): use_fn()\n"
+    )
+    sub_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source=orig_src,
+        modified_source=modified_orig,
+        new_files={"sub.py": sub_src},
+        new_module_paths={"sub.py": "pkg.sub"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.orig import worker, helper\n"
+        '_PATCH_USE = "pkg.orig.use_fn"\n'
+        "@patch(_PATCH_USE)\n"
+        "def test_a(m):\n"
+        "    worker()\n"
+        "\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_b(m):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    # Index: pkg.orig = modified source (re-exports helper from sub), pkg.sub = sub_src.
+    index = _CgIndex(
+        module_to_source={
+            "pkg.orig": modified_orig,
+            "pkg.sub": sub_src,
+            "pkg.test_mod": test_src,
+        },
+        module_to_package={
+            "pkg.orig": "pkg",
+            "pkg.sub": "pkg",
+            "pkg.test_mod": "pkg",
+        },
+        module_to_defs={
+            "pkg.orig": {"worker"},
+            "pkg.sub": {"helper"},
+            "pkg.test_mod": set(),
+        },
+        file_to_module={scan: "pkg.test_mod"},
+    )
+    result, changed, _unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert (
+        '_PATCH_USE = "pkg.orig.use_fn"' in result
+    )  # const def NOT updated (conflict)
+    assert "@patch(_PATCH_USE)" in result  # test_a still uses const (not inlined)
+    assert '@patch("pkg.sub.use_fn")' in result  # test_b inlined to new path
+
+
 def test_callgraph_update_file_const_ref_no_resolution_passthrough(tmp_path):
     test_src = (
         '_PATCH_USE = "pkg.orig.use_fn"\n'

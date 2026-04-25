@@ -3365,6 +3365,10 @@ def _callgraph_update_file(
         # Attempt call-graph resolution for each forking old path.
         # old_patch_paths contains only forking paths by construction.
         resolved: Dict[str, str] = {}
+        # Paths where BFS confirmed the old location is still valid (function
+        # stayed in the original module after the split).  Tracked so keep-old
+        # votes can be cast even though no new path is committed to `resolved`.
+        _old_path_valid: Set[str] = set()
         for old_path in func.old_patch_paths:
             name = old_path.rsplit(".", 1)[-1]
             for ctx in fl_contexts:
@@ -3385,6 +3389,14 @@ def _callgraph_update_file(
                         )
                     )
                 if new_path is not None:
+                    if new_path == old_path:
+                        # BFS found only the old path itself — either a genuine
+                        # "function stayed in the original module" or the stale
+                        # intermediate state of a subdir-split __init__.py.
+                        # Record it as a valid candidate and try later contexts
+                        # for a more specific (sub-module) resolution.
+                        _old_path_valid.add(old_path)
+                        continue
                     resolved[old_path] = new_path
                     # Clear any previously saved candidates for this path.
                     func_cands = unresolved_candidates.get(func.function_name, {})
@@ -3410,6 +3422,10 @@ def _callgraph_update_file(
                     # BFS found no reachable candidates; fall back to the full
                     # static terminal set (all new modules that use the entity).
                     if len(static_cands) == 1:
+                        if static_cands[0] == old_path:
+                            # Only candidate is the old path; try next context.
+                            _old_path_valid.add(old_path)
+                            continue
                         resolved[old_path] = static_cands[0]
                         func_cands = unresolved_candidates.get(func.function_name, {})
                         func_cands.pop(old_path, None)
@@ -3427,12 +3443,17 @@ def _callgraph_update_file(
         # Const-backed paths where BFS found multiple candidates (ambiguous)
         # must cast a keep-old vote so a constant shared with resolved functions
         # isn't silently updated to a value that is wrong for this function.
+        # Paths confirmed as still-valid in the old module (_old_path_valid) also
+        # cast a keep-old vote — those functions are tested against the original
+        # location and must not be silently re-patched to a new sub-module.
         # Paths with NO BFS candidates (function genuinely doesn't reach the name)
         # don't vote — they correctly let single-resolution sibling functions win.
         if scan_file_abs:
             func_ambiguous = unresolved_candidates.get(func.function_name, {})
             for old_val in const_ref_vals:
-                if old_val not in resolved and old_val in func_ambiguous:
+                if old_val not in resolved and (
+                    old_val in func_ambiguous or old_val in _old_path_valid
+                ):
                     same_file_proposals.setdefault(old_val, set()).add(old_val)
 
         if not resolved:
@@ -3489,7 +3510,7 @@ def _callgraph_update_file(
                     and ref.resolved_value in accepted
                 ):
                     new_val = accepted[ref.resolved_value]
-                    if new_val != ref.resolved_value:
+                    if new_val != ref.resolved_value:  # pragma: no branch
                         inline_subs[ref.const_name] = new_val
             if not inline_subs:
                 continue
