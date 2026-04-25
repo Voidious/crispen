@@ -2535,7 +2535,7 @@ def _process_file_source(
                     client,
                     config.provider,
                     config.model,
-                    2048,
+                    4096,
                     _PATCH_CLASSIFY_TOOL,
                     "classify_patch_updates",
                     [{"role": "user", "content": classify_prompt}],
@@ -2557,7 +2557,7 @@ def _process_file_source(
                         flush=True,
                     )
                 if r.tool_input is None:
-                    break
+                    continue
 
                 needs_rewrite = r.tool_input.get("needs_rewrite", False)
 

@@ -1505,12 +1505,48 @@ def test_process_no_functions(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL, return_value=_ok(None))
 def test_process_classify_tool_none(mock_call):
-    # Classify returns tool_input=None → break, no update.
+    # Classify returns tool_input=None with one attempt → retries exhausted, no update.
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert result == _SRC_WITH_PATCH
     assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_classify_none_retries(mock_call):
+    # Classify returns tool_input=None → retry; second attempt succeeds with no change.
+    mock_call.side_effect = [_ok(None), _ok(_CLASSIFY_NO_CHANGE), _ok(_VERIFY_OK)]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 3  # failed classify + classify + verify
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_classify_truncated_retries(mock_call):
+    # Classify response truncated → retry; second attempt succeeds with no change.
+    mock_call.side_effect = [_truncated_ok(), _ok(_CLASSIFY_NO_CHANGE), _ok(_VERIFY_OK)]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 3  # truncated classify + classify + verify
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_classify_truncated_exhausted(mock_call):
+    # All attempts truncated → retries exhausted, no update.
+    mock_call.side_effect = [_truncated_ok(), _truncated_ok()]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 2
 
 
 @mock_patch(_PATCH_CALL_TOOL)
