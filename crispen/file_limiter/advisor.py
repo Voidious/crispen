@@ -636,7 +636,7 @@ def _assign_placements_chunk(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(1024, 200 + n_groups * 80)
+    max_tokens = max(2048, 200 + n_groups * 160)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to assign file placements"
