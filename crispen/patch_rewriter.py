@@ -2603,7 +2603,7 @@ def _process_file_source(
                         client,
                         config.provider,
                         config.model,
-                        4096,
+                        8192,
                         _PATCH_REWRITE_FUNC_TOOL,
                         "rewrite_test_function",
                         [{"role": "user", "content": rewrite_prompt}],
@@ -2625,6 +2625,12 @@ def _process_file_source(
                             flush=True,
                         )
                     if rw.tool_input is None:
+                        if rw.truncated:
+                            prev_error = (
+                                "Rewrite response was truncated (hit the output"
+                                " token limit). Produce a shorter rewrite."
+                            )
+                            continue
                         break
                     new_func_text = rw.tool_input.get("rewritten_function", "")
                     if not isinstance(new_func_text, str) or not new_func_text.strip():

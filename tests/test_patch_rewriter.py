@@ -2325,6 +2325,37 @@ def test_process_needs_rewrite_non_string(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_truncated_retry(mock_call):
+    # First rewrite call is truncated; second attempt succeeds.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _truncated_ok(),  # rewrite truncated → retry
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "crispen.after.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_truncated_exhausted(mock_call):
+    # Rewrite call truncated on every attempt → no update.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _truncated_ok(),
+        _truncated_ok(),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL)
 def test_process_needs_rewrite_compile_error_retry(mock_call):
     # First rewrite has syntax error; second is valid.
     mock_call.side_effect = [
