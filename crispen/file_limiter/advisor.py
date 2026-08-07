@@ -347,6 +347,8 @@ def _advise_set3(
 
     migrate_ids = set()
     for decision in result.tool_input.get("decisions", []):
+        if not isinstance(decision, dict):
+            continue
         gid = decision.get("group_id")
         action = decision.get("action")
         if isinstance(gid, int) and 0 <= gid < len(classified.set_3_groups):
@@ -680,6 +682,8 @@ def _assign_placements_chunk(
     placements: List[GroupPlacement] = []
     placed_ids: set = set()
     for item in result.tool_input.get("placements", []):
+        if not isinstance(item, dict):
+            continue
         gid = item.get("group_id")
         target = item.get("target_file", "")
         if subdir_name and target.startswith(subdir_name + "/"):
@@ -923,6 +927,8 @@ def _rename_conflicting_chunk(
     placements: List[GroupPlacement] = []
     placed_ids: set = set()
     for item in result.tool_input.get("placements", []):
+        if not isinstance(item, dict):
+            continue
         gid = item.get("group_id")
         target = item.get("target_file", "")
         if (

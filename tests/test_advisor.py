@@ -919,6 +919,39 @@ def test_resolve_success(mock_key, mock_client, mock_call):
 @patch(_PATCH_CALL)
 @patch(_PATCH_CLIENT)
 @patch(_PATCH_KEY)
+def test_resolve_non_dict_placement_item_skipped(mock_key, mock_client, mock_call):
+    """A non-dict item in the LLM's placements list is skipped, not a crash.
+
+    Skipping it leaves only 1 of the 2 conflicting groups placed, so the
+    chunk is treated as a failure (count mismatch) rather than crashing.
+    """
+    mock_key.return_value = "key"
+    mock_client.return_value = MagicMock()
+    mock_call.return_value = _make_llm_result(
+        {
+            "placements": [
+                "not-a-dict",
+                {"group_id": 1, "target_file": "services.py"},
+            ]
+        }
+    )
+    c = _classified(
+        entities=[_make_entity("foo", 1, 5), _make_entity("bar", 6, 10)],
+    )
+    result = resolve_naming_conflicts(
+        _CONFLICTING_PLACEMENTS,
+        c,
+        "src/big.py",
+        existing_files=frozenset(),
+        existing_dirs=frozenset(),
+        config=CrispenConfig(file_limiter_retries=0),
+    )
+    assert result is None
+
+
+@patch(_PATCH_CALL)
+@patch(_PATCH_CLIENT)
+@patch(_PATCH_KEY)
 def test_resolve_llm_none_returns_none(mock_key, mock_client, mock_call):
     """LLM returns None → resolve returns None."""
     mock_key.return_value = "key"
@@ -1486,6 +1519,25 @@ def test_advise_set3_with_dep_graph(mock_call):
 
 
 @patch(_PATCH_CALL)
+def test_advise_set3_non_dict_decision_skipped(mock_call):
+    """A non-dict item in the LLM's decisions list is skipped, not a crash.
+
+    Some models occasionally return a list item that doesn't match the
+    declared object schema; treat it the same as a decision without a
+    usable group_id rather than raising AttributeError.
+    """
+    mock_call.return_value = _make_llm_result(
+        {"decisions": ["not-a-dict", {"group_id": 0, "action": "migrate"}]}
+    )
+    c = _classified(
+        entities=[_make_entity("foo", 1, 5)],
+        set_3_groups=[["foo"]],
+    )
+    result = _advise_set3(c, "big.py", MagicMock(), _CONFIG)
+    assert result == [["foo"]]
+
+
+@patch(_PATCH_CALL)
 def test_assign_placements_chunk_no_counter(mock_call):
     """_assign_placements_chunk without _counter covers the None-counter branch."""
     mock_call.return_value = _make_llm_result(
@@ -1545,6 +1597,20 @@ def test_assign_placements_chunk_strips_subdir_prefix(mock_call):
     )
     assert result is not None
     assert result[0].target_file == "detection_flow.py"
+
+
+@patch(_PATCH_CALL)
+def test_assign_placements_chunk_non_dict_item_skipped(mock_call):
+    """A non-dict item in the LLM's placements list is skipped, not a crash."""
+    mock_call.return_value = _make_llm_result(
+        {"placements": ["not-a-dict", {"group_id": 0, "target_file": "utils.py"}]}
+    )
+    c = _classified(entities=[_make_entity("foo", 1, 5)])
+    result = _assign_placements_chunk(
+        [["foo"]], c, "big.py", frozenset(), MagicMock(), _CONFIG
+    )
+    assert result is not None
+    assert result[0].target_file == "utils.py"
 
 
 # ---------------------------------------------------------------------------
