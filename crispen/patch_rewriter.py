@@ -2630,11 +2630,20 @@ def _process_file_source(
                                 "Rewrite response was truncated (hit the output"
                                 " token limit). Produce a shorter rewrite."
                             )
-                            continue
-                        break
+                        else:
+                            prev_error = (
+                                "No tool call was made. You must call"
+                                " rewrite_test_function with the rewritten"
+                                " function."
+                            )
+                        continue
                     new_func_text = rw.tool_input.get("rewritten_function", "")
                     if not isinstance(new_func_text, str) or not new_func_text.strip():
-                        break
+                        prev_error = (
+                            "rewritten_function was empty. You must return the"
+                            " complete rewritten function text."
+                        )
+                        continue
                     if not _compiles(new_func_text):
                         prev_error = "Rewritten function is not valid Python."
                         continue

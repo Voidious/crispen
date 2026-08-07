@@ -2349,6 +2349,38 @@ def test_process_needs_rewrite_non_string(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_no_tool_call_retry(mock_call):
+    # First rewrite call makes no tool call (not truncated); second succeeds.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok(None),  # no tool call, not truncated → retry
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "crispen.after.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_empty_text_retry(mock_call):
+    # First rewrite call returns an empty rewritten_function; second succeeds.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": ""}),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "crispen.after.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
 def test_process_needs_rewrite_truncated_retry(mock_call):
     # First rewrite call is truncated; second attempt succeeds.
     mock_call.side_effect = [
