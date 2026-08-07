@@ -596,6 +596,27 @@ def test_call_with_tool_openai_success():
     assert "max_tokens" not in call_kwargs
 
 
+def test_call_with_tool_openai_gpt5_sets_reasoning_effort_none():
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.return_value = _make_openai_response(
+            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+        )
+        result = call_with_tool(
+            client,
+            "openai",
+            "gpt-5.6-terra",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+        )
+    assert result.tool_input == {"is_valid_duplicate": True, "reason": "same"}
+    call_kwargs = client.chat.completions.create.call_args[1]
+    assert call_kwargs["reasoning_effort"] == "none"
+
+
 def test_call_with_tool_openai_returns_timing_and_tokens():
     with patch("crispen.llm_client.openai") as mock_oai:
         mock_oai.APIError = Exception

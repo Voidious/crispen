@@ -205,6 +205,10 @@ def call_with_tool(
         }
         if provider == "moonshot":
             create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        elif provider == "openai" and model.startswith("gpt-5"):
+            # gpt-5.x rejects forced function tool_choice combined with its
+            # default (non-"none") reasoning_effort on /v1/chat/completions.
+            create_kwargs["reasoning_effort"] = "none"
         _parse_retries_left = 2  # retries for transient 400 "cannot parse JSON" errors
         for _attempt in range(rate_limit_retries + 1):  # pragma: no branch
             try:
