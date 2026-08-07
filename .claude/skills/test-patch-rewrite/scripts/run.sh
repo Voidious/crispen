@@ -147,13 +147,24 @@ while [ "$attempt" -le "$MAX_RETRIES" ]; do
   git add -A
 
   # Scope flake8 to exactly the files this attempt touched (staged above),
-  # same as the pre-commit hook would, but with an extra --extend-ignore=E501:
+  # same as the pre-commit hook would, but with an extra E501 exception:
   # long lines are a known, often-unavoidable false positive on LLM-rewritten
-  # code, not a real bug signal.
+  # code, not a real bug signal. flake8's --extend-ignore on the command line
+  # REPLACES (not merges with) .flake8's own `extend-ignore` setting, so a
+  # naive `--extend-ignore=E501` here would silently re-enable whatever the
+  # repo's config already exempts (e.g. E203, black's known slice-whitespace
+  # disagreement with flake8) and produce false failures unrelated to this
+  # run. Read the repo's existing extend-ignore and append E501 to it instead.
+  repo_extend_ignore=$(sed -n 's/^extend-ignore[[:space:]]*=[[:space:]]*//p' .flake8 2>/dev/null | tr -d ' \r')
+  if [ -n "$repo_extend_ignore" ]; then
+    extend_ignore="${repo_extend_ignore},E501"
+  else
+    extend_ignore="E501"
+  fi
   py_files=$(git diff --cached --name-only --diff-filter=ACM -- '*.py' | grep -v '^examples/' || true)
   if [ -n "$py_files" ]; then
-    echo "==> flake8 (--extend-ignore=E501) on changed files"
-    if ! echo "$py_files" | xargs uv run flake8 --extend-ignore=E501; then
+    echo "==> flake8 (--extend-ignore=$extend_ignore) on changed files"
+    if ! echo "$py_files" | xargs uv run flake8 --extend-ignore="$extend_ignore"; then
       echo "!! flake8 failed — stopping (real bug signal, not retrying)"
       outcome="flake8_failed"
       break
