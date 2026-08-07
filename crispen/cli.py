@@ -11,6 +11,17 @@ from .stats import RunStats
 
 
 def main() -> None:
+    # Some progress/summary lines contain non-ASCII characters (e.g. "→").
+    # On Windows the default console codepage (cp1252) can't encode these,
+    # which raises UnicodeEncodeError and crashes mid-run after real LLM
+    # calls have already been made. Replacing unencodable characters instead
+    # of crashing costs nothing on platforms (Linux/macOS) that already
+    # default to a UTF-8 stdout/stderr.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(errors="replace")
+
     diff_text = sys.stdin.read()
     if not diff_text.strip():
         print("crispen: no diff provided on stdin", file=sys.stderr)

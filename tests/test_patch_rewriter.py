@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import MagicMock, patch as mock_patch
 
 import libcst as cst
@@ -95,6 +97,28 @@ def _make_fl_ctx(**kwargs) -> _FLContext:
     )
     defaults.update(kwargs)
     return _FLContext(**defaults)
+
+
+@contextmanager
+def _simulate_unreadable(target_path):
+    """Make reads of *target_path* raise OSError, portably across platforms.
+
+    ``Path.chmod(0o000)`` only toggles the read-only attribute on Windows and
+    does not block reads there (unlike POSIX permission bits), so tests that
+    need to exercise an "OSError while reading a file" code path patch
+    ``Path.read_text`` for that one path instead of relying on real
+    filesystem permissions.
+    """
+    target = Path(target_path).resolve()
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self.resolve() == target:
+            raise OSError(13, "Permission denied", str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    with mock_patch.object(Path, "read_text", fake_read_text):
+        yield
 
 
 _CFG = CrispenConfig(patch_update_retries=1)
@@ -2924,13 +2948,10 @@ def test_rewrite_skip_per_file_abs(mock_key, mock_client, mock_call, tmp_path):
 def test_rewrite_oserror_skipped(mock_key, mock_client, mock_call, tmp_path):
     test_file = tmp_path / "test_big.py"
     test_file.write_text('@patch("pkg.big.A")\ndef test_f(): pass\n', encoding="utf-8")
-    test_file.chmod(0o000)
-    try:
+    with _simulate_unreadable(test_file):
         msgs = list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG))
-        assert msgs == []
-        mock_call.assert_not_called()
-    finally:
-        test_file.chmod(0o644)
+    assert msgs == []
+    mock_call.assert_not_called()
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -3200,14 +3221,11 @@ def test_build_const_map_import_file_not_found(tmp_path):
 def test_build_const_map_import_oserror(tmp_path):
     helpers = tmp_path / "helpers.py"
     helpers.write_text('TARGET = "val"\n', encoding="utf-8")
-    helpers.chmod(0o000)
-    try:
+    with _simulate_unreadable(helpers):
         src = "from .helpers import TARGET\n"
         scan = str(tmp_path / "test_foo.py")
         result = _build_const_map(src, scan, None)
-        assert result == {}
-    finally:
-        helpers.chmod(0o644)
+    assert result == {}
 
 
 def test_build_const_map_syntax_error():
@@ -3267,14 +3285,11 @@ def test_build_attr_const_map_oserror(tmp_path):
     """Module file exists but is unreadable → skipped."""
     constants_file = tmp_path / "constants.py"
     constants_file.write_text('TARGET = "val"\n', encoding="utf-8")
-    constants_file.chmod(0o000)
-    try:
+    with _simulate_unreadable(constants_file):
         src = "import constants\n"
         scan = str(tmp_path / "test_foo.py")
         result = _build_attr_const_map(src, scan, str(tmp_path))
-        assert result == {}
-    finally:
-        constants_file.chmod(0o644)
+    assert result == {}
 
 
 def test_build_attr_const_map_syntax_error():
@@ -3909,13 +3924,10 @@ def test_cross_file_disk_oserror(tmp_path):
     """OSError reading disk file → skipped silently."""
     f = tmp_path / "helpers.py"
     f.write_text('TARGET = "old.val"\n', encoding="utf-8")
-    f.chmod(0o000)
-    try:
+    with _simulate_unreadable(f):
         proposals = {str(f.resolve()): {"old.val": {"new.val"}}}
         msgs = list(_apply_cross_file_const_updates(proposals, {}))
-        assert msgs == []
-    finally:
-        f.chmod(0o644)
+    assert msgs == []
 
 
 # ---------------------------------------------------------------------------
@@ -4710,12 +4722,9 @@ def test_cg_build_index_oserror(tmp_path):
     pkg.mkdir()
     bad = pkg / "bad.py"
     bad.write_text("def foo(): pass\n", encoding="utf-8")
-    bad.chmod(0o000)
-    try:
+    with _simulate_unreadable(bad):
         index = _cg_build_index(str(tmp_path), {}, [])
-        assert "pkg.bad" not in index.module_to_source
-    finally:
-        bad.chmod(0o644)
+    assert "pkg.bad" not in index.module_to_source
 
 
 def test_cg_build_index_missing_module_path():
@@ -7647,12 +7656,9 @@ def test_apply_patch_callgraph_repo_scan_oserror(tmp_path):
     bad_file.write_text(
         '@patch("pkg.orig.use_fn")\ndef test_f(): helper()\n', encoding="utf-8"
     )
-    bad_file.chmod(0o000)
-    try:
+    with _simulate_unreadable(bad_file):
         msgs = list(apply_patch_callgraph([ctx], {}, str(tmp_path)))
-        assert msgs == []
-    finally:
-        bad_file.chmod(0o644)
+    assert msgs == []
 
 
 def test_apply_patch_callgraph_repo_scan_file_no_change(tmp_path):
