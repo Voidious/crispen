@@ -2,7 +2,7 @@
 
 Crispen is a Python code refactoring CLI tool. It reads a unified diff from stdin, identifies which lines changed, and applies a set of automated refactors only to the changed regions of affected files, writing the modified files back in place.
 
-It uses [libcst](https://github.com/Instagram/LibCST) for format-preserving AST transformations and an LLM for intelligent, context-aware changes. Supported providers: Anthropic Claude, OpenAI, DeepSeek, Moonshot/Kimi, and LM Studio (local).
+It uses [libcst](https://github.com/Instagram/LibCST) for format-preserving AST transformations and an LLM for intelligent, context-aware changes. Supported providers: Anthropic Claude, OpenAI, DeepSeek, Moonshot/Kimi, Gemini, Mistral, z.ai (GLM), and LM Studio or Ollama (local).
 
 ## Overview
 
@@ -48,7 +48,8 @@ Crispen reads configuration from `[tool.crispen]` in `pyproject.toml`, with opti
 
 ```toml
 [tool.crispen]
-# LLM provider: "anthropic" (default), "openai", "deepseek", "moonshot", or "lmstudio"
+# LLM provider: "anthropic" (default), "openai", "deepseek", "moonshot", "gemini",
+# "mistral", "zai", "lmstudio", or "ollama"
 provider = "anthropic"
 
 # LLM model to use (default: "claude-sonnet-4-6")
@@ -192,7 +193,11 @@ export ANTHROPIC_API_KEY=sk-ant-...   # for provider = "anthropic"
 export OPENAI_API_KEY=sk-...          # for provider = "openai"
 export DEEPSEEK_API_KEY=sk-...        # for provider = "deepseek"
 export MOONSHOT_API_KEY=sk-...        # for provider = "moonshot"
-# LM Studio (provider = "lmstudio") runs locally and requires no API key.
+export GEMINI_API_KEY=...             # for provider = "gemini"
+export MISTRAL_API_KEY=...            # for provider = "mistral"
+export ZAI_API_KEY=...                # for provider = "zai"
+# LM Studio (provider = "lmstudio") and Ollama (provider = "ollama") run
+# locally and require no API key.
 ```
 
 ### LM Studio
@@ -208,6 +213,20 @@ model = "your-loaded-model-name"
 ```
 
 No API key is required — LM Studio does not authenticate requests.
+
+### Ollama
+
+Point crispen at a running [Ollama](https://ollama.com) local server. Ollama exposes an OpenAI-compatible API, which crispen uses directly:
+
+```toml
+[tool.crispen]
+provider = "ollama"
+model = "your-pulled-model-name"
+# base_url defaults to "http://localhost:11434/v1"; override if needed:
+# base_url = "http://localhost:11435/v1"
+```
+
+No API key is required — Ollama does not authenticate requests.
 
 ## Refactors
 
