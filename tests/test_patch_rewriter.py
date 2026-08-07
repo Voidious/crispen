@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import MagicMock, patch as mock_patch
 
 import libcst as cst
@@ -95,6 +97,28 @@ def _make_fl_ctx(**kwargs) -> _FLContext:
     )
     defaults.update(kwargs)
     return _FLContext(**defaults)
+
+
+@contextmanager
+def _simulate_unreadable(target_path):
+    """Make reads of *target_path* raise OSError, portably across platforms.
+
+    ``Path.chmod(0o000)`` only toggles the read-only attribute on Windows and
+    does not block reads there (unlike POSIX permission bits), so tests that
+    need to exercise an "OSError while reading a file" code path patch
+    ``Path.read_text`` for that one path instead of relying on real
+    filesystem permissions.
+    """
+    target = Path(target_path).resolve()
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self.resolve() == target:
+            raise OSError(13, "Permission denied", str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    with mock_patch.object(Path, "read_text", fake_read_text):
+        yield
 
 
 _CFG = CrispenConfig(patch_update_retries=1)
@@ -1505,12 +1529,48 @@ def test_process_no_functions(mock_call):
 
 @mock_patch(_PATCH_CALL_TOOL, return_value=_ok(None))
 def test_process_classify_tool_none(mock_call):
-    # Classify returns tool_input=None → break, no update.
+    # Classify returns tool_input=None with one attempt → retries exhausted, no update.
     result, changed, cross = _process_file_source(
         _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 1
     )
     assert result == _SRC_WITH_PATCH
     assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_classify_none_retries(mock_call):
+    # Classify returns tool_input=None → retry; second attempt succeeds with no change.
+    mock_call.side_effect = [_ok(None), _ok(_CLASSIFY_NO_CHANGE), _ok(_VERIFY_OK)]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 3  # failed classify + classify + verify
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_classify_truncated_retries(mock_call):
+    # Classify response truncated → retry; second attempt succeeds with no change.
+    mock_call.side_effect = [_truncated_ok(), _ok(_CLASSIFY_NO_CHANGE), _ok(_VERIFY_OK)]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 3  # truncated classify + classify + verify
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_classify_truncated_exhausted(mock_call):
+    # All attempts truncated → retries exhausted, no update.
+    mock_call.side_effect = [_truncated_ok(), _truncated_ok()]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+    assert mock_call.call_count == 2
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -2289,6 +2349,69 @@ def test_process_needs_rewrite_non_string(mock_call):
 
 
 @mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_no_tool_call_retry(mock_call):
+    # First rewrite call makes no tool call (not truncated); second succeeds.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok(None),  # no tool call, not truncated → retry
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "crispen.after.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_empty_text_retry(mock_call):
+    # First rewrite call returns an empty rewritten_function; second succeeds.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _ok({"rewritten_function": ""}),
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "crispen.after.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_truncated_retry(mock_call):
+    # First rewrite call is truncated; second attempt succeeds.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _truncated_ok(),  # rewrite truncated → retry
+        _ok({"rewritten_function": _VALID_REWRITE}),
+        _ok(_REWRITE_VERIFY_OK),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert changed is True
+    assert "crispen.after.X" in result
+
+
+@mock_patch(_PATCH_CALL_TOOL)
+def test_process_needs_rewrite_truncated_exhausted(mock_call):
+    # Rewrite call truncated on every attempt → no update.
+    mock_call.side_effect = [
+        _ok(_CLASSIFY_REWRITE),
+        _truncated_ok(),
+        _truncated_ok(),
+    ]
+    result, changed, cross = _process_file_source(
+        _SRC_WITH_PATCH, _FORKING_PATHS, "ctx", MagicMock(), _CFG, 2
+    )
+    assert result == _SRC_WITH_PATCH
+    assert changed is False
+
+
+@mock_patch(_PATCH_CALL_TOOL)
 def test_process_needs_rewrite_compile_error_retry(mock_call):
     # First rewrite has syntax error; second is valid.
     mock_call.side_effect = [
@@ -2857,13 +2980,10 @@ def test_rewrite_skip_per_file_abs(mock_key, mock_client, mock_call, tmp_path):
 def test_rewrite_oserror_skipped(mock_key, mock_client, mock_call, tmp_path):
     test_file = tmp_path / "test_big.py"
     test_file.write_text('@patch("pkg.big.A")\ndef test_f(): pass\n', encoding="utf-8")
-    test_file.chmod(0o000)
-    try:
+    with _simulate_unreadable(test_file):
         msgs = list(apply_patch_rewrite([_make_fl_ctx()], {}, str(tmp_path), _CFG))
-        assert msgs == []
-        mock_call.assert_not_called()
-    finally:
-        test_file.chmod(0o644)
+    assert msgs == []
+    mock_call.assert_not_called()
 
 
 @mock_patch(_PATCH_CALL_TOOL)
@@ -3133,14 +3253,11 @@ def test_build_const_map_import_file_not_found(tmp_path):
 def test_build_const_map_import_oserror(tmp_path):
     helpers = tmp_path / "helpers.py"
     helpers.write_text('TARGET = "val"\n', encoding="utf-8")
-    helpers.chmod(0o000)
-    try:
+    with _simulate_unreadable(helpers):
         src = "from .helpers import TARGET\n"
         scan = str(tmp_path / "test_foo.py")
         result = _build_const_map(src, scan, None)
-        assert result == {}
-    finally:
-        helpers.chmod(0o644)
+    assert result == {}
 
 
 def test_build_const_map_syntax_error():
@@ -3200,14 +3317,11 @@ def test_build_attr_const_map_oserror(tmp_path):
     """Module file exists but is unreadable → skipped."""
     constants_file = tmp_path / "constants.py"
     constants_file.write_text('TARGET = "val"\n', encoding="utf-8")
-    constants_file.chmod(0o000)
-    try:
+    with _simulate_unreadable(constants_file):
         src = "import constants\n"
         scan = str(tmp_path / "test_foo.py")
         result = _build_attr_const_map(src, scan, str(tmp_path))
-        assert result == {}
-    finally:
-        constants_file.chmod(0o644)
+    assert result == {}
 
 
 def test_build_attr_const_map_syntax_error():
@@ -3842,13 +3956,10 @@ def test_cross_file_disk_oserror(tmp_path):
     """OSError reading disk file → skipped silently."""
     f = tmp_path / "helpers.py"
     f.write_text('TARGET = "old.val"\n', encoding="utf-8")
-    f.chmod(0o000)
-    try:
+    with _simulate_unreadable(f):
         proposals = {str(f.resolve()): {"old.val": {"new.val"}}}
         msgs = list(_apply_cross_file_const_updates(proposals, {}))
-        assert msgs == []
-    finally:
-        f.chmod(0o644)
+    assert msgs == []
 
 
 # ---------------------------------------------------------------------------
@@ -4643,12 +4754,9 @@ def test_cg_build_index_oserror(tmp_path):
     pkg.mkdir()
     bad = pkg / "bad.py"
     bad.write_text("def foo(): pass\n", encoding="utf-8")
-    bad.chmod(0o000)
-    try:
+    with _simulate_unreadable(bad):
         index = _cg_build_index(str(tmp_path), {}, [])
-        assert "pkg.bad" not in index.module_to_source
-    finally:
-        bad.chmod(0o644)
+    assert "pkg.bad" not in index.module_to_source
 
 
 def test_cg_build_index_missing_module_path():
@@ -5544,6 +5652,189 @@ def test_callgraph_update_file_multi_context_second_matches(tmp_path):
     )
     assert changed
     assert '@patch("pkg.placement.use_fn")' in result
+
+
+def test_callgraph_update_file_new_path_equals_old_path_continues(tmp_path):
+    # Context 1 (outer subdir split): terminal includes intermediate __init__.py
+    # which still has helper() calling use_fn → BFS returns old path as single
+    # candidate.  The fix skips that "resolution" and tries context 2.
+    # Context 2 (inner split): terminal maps helper → pkg.sub.use_fn (new path).
+    intermediate_init = "from external import use_fn\ndef helper(): use_fn()\n"
+    final_init = "from .sub import helper\n"
+    sub_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx1 = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source=intermediate_init,
+        modified_source=intermediate_init,
+        new_files={
+            "orig/__init__.py": intermediate_init,
+            "orig/models.py": "class M: pass\n",
+        },
+        new_module_paths={
+            "orig/__init__.py": "pkg.orig",
+            "orig/models.py": "pkg.orig.models",
+        },
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    ctx2 = _FLContext(
+        filepath="/proj/pkg/orig/__init__.py",
+        old_module="pkg.orig",
+        original_source=intermediate_init,
+        modified_source=final_init,
+        new_files={"sub.py": sub_src},
+        new_module_paths={"sub.py": "pkg.orig.sub"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.orig import helper\n"
+        '@patch("pkg.orig.use_fn")\n'
+        "def test_f(m):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_f.py")
+    index = _CgIndex(
+        module_to_source={
+            "pkg.orig": final_init,
+            "pkg.orig.sub": sub_src,
+            "pkg.test_mod": test_src,
+        },
+        module_to_package={
+            "pkg.orig": "pkg.orig",
+            "pkg.orig.sub": "pkg.orig",
+            "pkg.test_mod": "pkg",
+        },
+        module_to_defs={
+            "pkg.orig": set(),
+            "pkg.orig.sub": {"helper"},
+            "pkg.test_mod": set(),
+        },
+        file_to_module={scan: "pkg.test_mod"},
+    )
+    result, changed, _unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx1, ctx2],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.orig.sub.use_fn")' in result
+
+
+def test_callgraph_update_file_static_fallback_old_path_continues(tmp_path):
+    # BFS finds 0 reachable candidates in context 1, static_cands = [old_path].
+    # The fix skips that no-op resolution and tries context 2, where
+    # static_cands = [new_path] → auto-resolves to the new path.
+    intermediate_init = "from external import use_fn\ndef helper(): use_fn()\n"
+    sub_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx1 = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source=intermediate_init,
+        modified_source=intermediate_init,
+        new_files={"orig/__init__.py": intermediate_init},
+        new_module_paths={"orig/__init__.py": "pkg.orig"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    ctx2 = _FLContext(
+        filepath="/proj/pkg/orig/__init__.py",
+        old_module="pkg.orig",
+        original_source=intermediate_init,
+        modified_source="from .sub import helper\n",
+        new_files={"sub.py": sub_src},
+        new_module_paths={"sub.py": "pkg.orig.sub"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    # Test calls unrelated() — BFS finds 0 reachable candidates in both contexts.
+    test_src = '@patch("pkg.orig.use_fn")\n' "def test_f(m):\n" "    unrelated()\n"
+    scan = str(tmp_path / "test_f.py")
+    index = _make_cuf_index(scan, test_src)
+    result, changed, _unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx1, ctx2],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert '@patch("pkg.orig.sub.use_fn")' in result
+
+
+def test_callgraph_update_file_old_path_valid_casts_keep_old_vote(tmp_path):
+    # worker stayed in pkg.orig (uses use_fn) → BFS returns old_path for test_a.
+    # helper moved to pkg.sub (uses use_fn) → BFS returns pkg.sub.use_fn for test_b.
+    # Both share _PATCH_USE const.  The keep-old vote from test_a must create a
+    # conflict so the const definition is NOT silently rewritten to pkg.sub.use_fn
+    # (which would break test_a).  test_b should be inlined instead.
+    orig_src = (
+        "from external import use_fn\ndef helper(): use_fn()\ndef worker(): use_fn()\n"
+    )
+    # After split: worker stayed, helper moved.
+    modified_orig = (
+        "from external import use_fn\n"
+        "from .sub import helper\n"
+        "def worker(): use_fn()\n"
+    )
+    sub_src = "from external import use_fn\ndef helper(): use_fn()\n"
+    ctx = _FLContext(
+        filepath="/proj/pkg/orig.py",
+        old_module="pkg.orig",
+        original_source=orig_src,
+        modified_source=modified_orig,
+        new_files={"sub.py": sub_src},
+        new_module_paths={"sub.py": "pkg.sub"},
+        entity_to_target={},
+        forking_old_paths={"pkg.orig.use_fn"},
+    )
+    test_src = (
+        "from pkg.orig import worker, helper\n"
+        '_PATCH_USE = "pkg.orig.use_fn"\n'
+        "@patch(_PATCH_USE)\n"
+        "def test_a(m):\n"
+        "    worker()\n"
+        "\n"
+        "@patch(_PATCH_USE)\n"
+        "def test_b(m):\n"
+        "    helper()\n"
+    )
+    scan = str(tmp_path / "test_foo.py")
+    # Index: pkg.orig = modified source (re-exports helper from sub), pkg.sub = sub_src.
+    index = _CgIndex(
+        module_to_source={
+            "pkg.orig": modified_orig,
+            "pkg.sub": sub_src,
+            "pkg.test_mod": test_src,
+        },
+        module_to_package={
+            "pkg.orig": "pkg",
+            "pkg.sub": "pkg",
+            "pkg.test_mod": "pkg",
+        },
+        module_to_defs={
+            "pkg.orig": {"worker"},
+            "pkg.sub": {"helper"},
+            "pkg.test_mod": set(),
+        },
+        file_to_module={scan: "pkg.test_mod"},
+    )
+    result, changed, _unresolved = _callgraph_update_file(
+        test_src,
+        {"pkg.orig.use_fn"},
+        [ctx],
+        scan_file=scan,
+        index=index,
+    )
+    assert changed
+    assert (
+        '_PATCH_USE = "pkg.orig.use_fn"' in result
+    )  # const def NOT updated (conflict)
+    assert "@patch(_PATCH_USE)" in result  # test_a still uses const (not inlined)
+    assert '@patch("pkg.sub.use_fn")' in result  # test_b inlined to new path
 
 
 def test_callgraph_update_file_const_ref_no_resolution_passthrough(tmp_path):
@@ -7397,12 +7688,9 @@ def test_apply_patch_callgraph_repo_scan_oserror(tmp_path):
     bad_file.write_text(
         '@patch("pkg.orig.use_fn")\ndef test_f(): helper()\n', encoding="utf-8"
     )
-    bad_file.chmod(0o000)
-    try:
+    with _simulate_unreadable(bad_file):
         msgs = list(apply_patch_callgraph([ctx], {}, str(tmp_path)))
-        assert msgs == []
-    finally:
-        bad_file.chmod(0o644)
+    assert msgs == []
 
 
 def test_apply_patch_callgraph_repo_scan_file_no_change(tmp_path):

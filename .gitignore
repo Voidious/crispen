@@ -115,7 +115,8 @@ dmypy.json
 
 # AI Coding Editors
 .cursor/
-.claude/
+.claude/*
+!.claude/skills/
 .vscode/
 .roo/
 .kilocode/

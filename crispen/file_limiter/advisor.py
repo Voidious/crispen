@@ -308,7 +308,7 @@ def _advise_set3(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 20 + n_groups * 25)
+    max_tokens = max(1024, 20 + n_groups * 400)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM whether to migrate"
@@ -347,6 +347,8 @@ def _advise_set3(
 
     migrate_ids = set()
     for decision in result.tool_input.get("decisions", []):
+        if not isinstance(decision, dict):
+            continue
         gid = decision.get("group_id")
         action = decision.get("action")
         if isinstance(gid, int) and 0 <= gid < len(classified.set_3_groups):
@@ -443,7 +445,7 @@ def _propose_files_step(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 100 + target_files * 100)
+    max_tokens = max(2048, 100 + n_groups * 200 + target_files * 400)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to propose output file set"
@@ -636,7 +638,7 @@ def _assign_placements_chunk(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 100 + n_groups * 40)
+    max_tokens = max(4096, 400 + n_groups * 320)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to assign file placements"
@@ -680,6 +682,8 @@ def _assign_placements_chunk(
     placements: List[GroupPlacement] = []
     placed_ids: set = set()
     for item in result.tool_input.get("placements", []):
+        if not isinstance(item, dict):
+            continue
         gid = item.get("group_id")
         target = item.get("target_file", "")
         if subdir_name and target.startswith(subdir_name + "/"):
@@ -883,7 +887,7 @@ def _rename_conflicting_chunk(
     if prev_failure:
         content += f"\n\nFeedback from the previous attempt: {prev_failure}"
     messages = [{"role": "user", "content": content}]
-    max_tokens = max(512, 100 + n_groups * 40)
+    max_tokens = max(1024, 200 + n_groups * 80)
     if verbose:
         print(
             f"crispen: FileLimiter: asking LLM to resolve naming conflicts"
@@ -923,6 +927,8 @@ def _rename_conflicting_chunk(
     placements: List[GroupPlacement] = []
     placed_ids: set = set()
     for item in result.tool_input.get("placements", []):
+        if not isinstance(item, dict):
+            continue
         gid = item.get("group_id")
         target = item.get("target_file", "")
         if (

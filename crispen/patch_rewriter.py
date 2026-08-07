@@ -126,9 +126,22 @@ _PATCH_RULES = (
     "The new file whose imports include N is the new resolution point — "
     "update the patch string to `new_module_path.N`. Done.\n"
     "   - If N **IS imported** in the modified original file: go to step 3.\n"
-    "3. Identify the production function **F** being tested "
-    "(look at what the test calls or constructs).\n"
-    "4. Look up **F** in the entity migration table:\n"
+    "3. Identify **F**: the function that directly calls N in its own body. "
+    "**F is not always the function the test directly invokes or constructs** "
+    "— call that the entry point **E**. If E delegates to a helper before N "
+    "is actually called (e.g. `E()` calls `helper()`, and `helper()` — not "
+    "E — contains the literal call to N), trace the call chain from E through "
+    "as many delegation hops as needed until you reach the function whose own "
+    "body calls N. THAT function is F, even if it lives in a different new "
+    "module than E after the split. Do not default to using E as F just "
+    "because E is what the test calls — an orchestrator's migration "
+    "destination does not determine where a name resolves for calls made "
+    "inside a *different* function it merely delegates to. (Exception: see "
+    "step 7 for the parameter-passing case, where a helper receives N's "
+    "*result* as an argument rather than calling N itself — that helper is "
+    "never F.)\n"
+    "4. Look up **F** (from step 3, not necessarily the test's entry point) "
+    "in the entity migration table:\n"
     "   - If F was **not migrated**: N is still resolved in the original module "
     "when F runs. Leave the patch unchanged — even if the lookup section "
     "shows N is 'also imported in' a new submodule.\n"
@@ -163,7 +176,11 @@ _PATCH_RULES = (
     "7. **Parameter-passing helpers:** If F calls N to produce a resource and passes "
     "it to migrated helpers — e.g. `conn = build_conn(fetch_key(...))` then "
     "`_process(conn, data)` where `_process` was migrated — those helpers do NOT "
-    "call N; F does. Apply steps 3–4 using F (not the helpers) as the caller of N.\n\n"
+    "call N; F does. Apply steps 3–4 using F (not the helpers) as the caller of N. "
+    "This is the mirror image of step 3's delegation case: here the helper "
+    "receives N's *result* as a plain argument, so it is never F; in step 3, "
+    "the helper contains the literal *call* to N, so it IS F. Read the "
+    "helper's body to tell which case applies — do not guess from naming.\n\n"
     "**Package constraint:** A file split only moves entities within the same project "
     "package. The top-level package (first path component) NEVER changes in a rename. "
     "e.g. `crispen.engine.X` always renames to another `crispen.*` path — "
@@ -191,6 +208,32 @@ _PATCH_RULES = (
     "# Step 2: MetadataWrapper IS in __init__.py → step 3\n"
     "# Step 3/4: F=_apply_foo migrated to crispen.engine.helpers\n"
     "@patch('crispen.engine.helpers.MetadataWrapper')  # correct after split\n"
+    "```\n\n"
+    "**Example C — entry point E and caller F migrated to DIFFERENT modules "
+    "(step 3 delegation case):**\n"
+    "```python\n"
+    "# Before split, crispen/advisor.py:\n"
+    "def advise_file_limiter(...):       # E: the function the test calls\n"
+    "    ...\n"
+    "    result = _propose_files_step(...)  # E delegates; does not call N itself\n"
+    "\n"
+    "def _propose_files_step(...):       # F: this is the ACTUAL caller of N\n"
+    "    return call_with_tool(...)      # literal call to N lives here, not in E\n"
+    "\n"
+    "@patch('crispen.advisor.call_with_tool')  # correct before split\n"
+    "def test_advise_calls_propose(mock_call): ...\n"
+    "\n"
+    "# After split: advise_file_limiter moved to crispen.advisor.service (E's "
+    "new module); _propose_files_step moved to crispen.advisor.placement (F's "
+    "new module) — a DIFFERENT module than E.\n"
+    "# Step 3: the test calls advise_file_limiter (E), but E only delegates —\n"
+    "#         trace into _propose_files_step, which literally calls "
+    "call_with_tool. F = _propose_files_step.\n"
+    "# Step 4: look up F (_propose_files_step), not E — F migrated to "
+    "crispen.advisor.placement.\n"
+    "@patch('crispen.advisor.placement.call_with_tool')  # correct after split\n"
+    "# WRONG: @patch('crispen.advisor.service.call_with_tool')  "
+    "-- that's E's new module, but E never calls N directly\n"
     "```\n"
 )
 
@@ -2019,6 +2062,19 @@ def _build_func_verify_prompt(
         "patching `handlers.send_request` alone covers both). Set "
         "`correct=False` with a multi-submodule issue only when the test's "
         "setup or inputs provably trigger the other sub-module's code path.\n"
+        "**Indirect-call Name-references check**: For each proposed rename "
+        "`old → M.N`, look up N in M's **Name references** section. "
+        "If F (the function under test) IS listed there, patching M.N intercepts "
+        "F's direct call to N — this direction is correct. "
+        "If F is NOT listed under N in M's Name references, then M.N only "
+        "intercepts calls routed through the listed caller(s) L, not through F. "
+        "In that case: check M's **Name references** for any other imported name "
+        "H where F IS listed. If H is a sibling re-import (i.e., M's imports "
+        "show `from .S import H` for some submodule S), and H IS listed under N "
+        "in S's **Name references**, then the real call chain is "
+        "F → H (defined in S, re-imported into M) → N (in S), and the correct "
+        "patch is S.N — not M.N. Set `correct=False` and report the correct "
+        "target in `issue` when this pattern applies.\n"
         "**Verdict rule**: if your analysis concludes the patches are correct, "
         "you MUST set `correct=True`. Only set `correct=False` when you can "
         "name the specific wrong path. Be concise — one sentence in `issue` "
@@ -2535,7 +2591,7 @@ def _process_file_source(
                     client,
                     config.provider,
                     config.model,
-                    512,
+                    10000,
                     _PATCH_CLASSIFY_TOOL,
                     "classify_patch_updates",
                     [{"role": "user", "content": classify_prompt}],
@@ -2557,7 +2613,7 @@ def _process_file_source(
                         flush=True,
                     )
                 if r.tool_input is None:
-                    break
+                    continue
 
                 needs_rewrite = r.tool_input.get("needs_rewrite", False)
 
@@ -2590,7 +2646,7 @@ def _process_file_source(
                         client,
                         config.provider,
                         config.model,
-                        2048,
+                        8192,
                         _PATCH_REWRITE_FUNC_TOOL,
                         "rewrite_test_function",
                         [{"role": "user", "content": rewrite_prompt}],
@@ -2612,10 +2668,25 @@ def _process_file_source(
                             flush=True,
                         )
                     if rw.tool_input is None:
-                        break
+                        if rw.truncated:
+                            prev_error = (
+                                "Rewrite response was truncated (hit the output"
+                                " token limit). Produce a shorter rewrite."
+                            )
+                        else:
+                            prev_error = (
+                                "No tool call was made. You must call"
+                                " rewrite_test_function with the rewritten"
+                                " function."
+                            )
+                        continue
                     new_func_text = rw.tool_input.get("rewritten_function", "")
                     if not isinstance(new_func_text, str) or not new_func_text.strip():
-                        break
+                        prev_error = (
+                            "rewritten_function was empty. You must return the"
+                            " complete rewritten function text."
+                        )
+                        continue
                     if not _compiles(new_func_text):
                         prev_error = "Rewritten function is not valid Python."
                         continue
@@ -2649,7 +2720,7 @@ def _process_file_source(
                         client,
                         config.provider,
                         config.model,
-                        4096,
+                        8192,
                         _PATCH_REWRITE_VERIFY_TOOL,
                         "verify_rewrite",
                         [{"role": "user", "content": rewrite_verify_prompt}],
@@ -2822,7 +2893,7 @@ def _process_file_source(
                     client,
                     config.provider,
                     config.model,
-                    4096,
+                    8192,
                     _PATCH_SINGLE_VERIFY_TOOL,
                     "verify_patch_update",
                     [{"role": "user", "content": no_change_verify_prompt}],
@@ -2939,7 +3010,7 @@ def _process_file_source(
                         client,
                         config.provider,
                         config.model,
-                        4096,
+                        8192,
                         _PATCH_SINGLE_VERIFY_TOOL,
                         "verify_patch_update",
                         [{"role": "user", "content": vc_prompt}],
@@ -3036,7 +3107,7 @@ def _process_file_source(
                 client,
                 config.provider,
                 config.model,
-                4096,
+                8192,
                 _PATCH_SINGLE_VERIFY_TOOL,
                 "verify_patch_update",
                 [{"role": "user", "content": verify_prompt}],
@@ -3365,6 +3436,10 @@ def _callgraph_update_file(
         # Attempt call-graph resolution for each forking old path.
         # old_patch_paths contains only forking paths by construction.
         resolved: Dict[str, str] = {}
+        # Paths where BFS confirmed the old location is still valid (function
+        # stayed in the original module after the split).  Tracked so keep-old
+        # votes can be cast even though no new path is committed to `resolved`.
+        _old_path_valid: Set[str] = set()
         for old_path in func.old_patch_paths:
             name = old_path.rsplit(".", 1)[-1]
             for ctx in fl_contexts:
@@ -3385,6 +3460,14 @@ def _callgraph_update_file(
                         )
                     )
                 if new_path is not None:
+                    if new_path == old_path:
+                        # BFS found only the old path itself — either a genuine
+                        # "function stayed in the original module" or the stale
+                        # intermediate state of a subdir-split __init__.py.
+                        # Record it as a valid candidate and try later contexts
+                        # for a more specific (sub-module) resolution.
+                        _old_path_valid.add(old_path)
+                        continue
                     resolved[old_path] = new_path
                     # Clear any previously saved candidates for this path.
                     func_cands = unresolved_candidates.get(func.function_name, {})
@@ -3410,6 +3493,10 @@ def _callgraph_update_file(
                     # BFS found no reachable candidates; fall back to the full
                     # static terminal set (all new modules that use the entity).
                     if len(static_cands) == 1:
+                        if static_cands[0] == old_path:
+                            # Only candidate is the old path; try next context.
+                            _old_path_valid.add(old_path)
+                            continue
                         resolved[old_path] = static_cands[0]
                         func_cands = unresolved_candidates.get(func.function_name, {})
                         func_cands.pop(old_path, None)
@@ -3427,12 +3514,17 @@ def _callgraph_update_file(
         # Const-backed paths where BFS found multiple candidates (ambiguous)
         # must cast a keep-old vote so a constant shared with resolved functions
         # isn't silently updated to a value that is wrong for this function.
+        # Paths confirmed as still-valid in the old module (_old_path_valid) also
+        # cast a keep-old vote — those functions are tested against the original
+        # location and must not be silently re-patched to a new sub-module.
         # Paths with NO BFS candidates (function genuinely doesn't reach the name)
         # don't vote — they correctly let single-resolution sibling functions win.
         if scan_file_abs:
             func_ambiguous = unresolved_candidates.get(func.function_name, {})
             for old_val in const_ref_vals:
-                if old_val not in resolved and old_val in func_ambiguous:
+                if old_val not in resolved and (
+                    old_val in func_ambiguous or old_val in _old_path_valid
+                ):
                     same_file_proposals.setdefault(old_val, set()).add(old_val)
 
         if not resolved:
@@ -3489,7 +3581,7 @@ def _callgraph_update_file(
                     and ref.resolved_value in accepted
                 ):
                     new_val = accepted[ref.resolved_value]
-                    if new_val != ref.resolved_value:
+                    if new_val != ref.resolved_value:  # pragma: no branch
                         inline_subs[ref.const_name] = new_val
             if not inline_subs:
                 continue

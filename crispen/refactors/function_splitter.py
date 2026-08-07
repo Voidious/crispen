@@ -442,6 +442,10 @@ def _find_valid_splits(
     if not body_stmts:
         return []
     has_doc = _is_docstring_stmt(body_stmts[0])
+    first_non_doc_idx = 1 if has_doc else 0
+    # Require at least one real statement in the head to avoid trivial proxies
+    # (e.g. a function whose entire body is just `return _helper(...)`).
+    min_split = first_non_doc_idx + 1
     candidates: List[int] = []
 
     # Restrict split point to before the first nested function def in the body.
@@ -453,7 +457,7 @@ def _find_valid_splits(
             upper = k
             break
 
-    for i in range(upper, 0, -1):
+    for i in range(upper, min_split - 1, -1):
         head_lines = _head_effective_lines(body_stmts, i, positions, has_doc)
         if head_lines > max_lines:
             continue
@@ -602,7 +606,7 @@ def _llm_name_helpers(
         client,
         provider,
         model,
-        256,
+        1024,
         _NAME_TOOL,
         "name_helper_functions",
         [{"role": "user", "content": prompt}],

@@ -21,7 +21,7 @@ class CrispenConfig:
     min_tuple_size: int = 4
 
     # LLM provider to use: "anthropic" (default), "moonshot", "openai", "deepseek",
-    # or "lmstudio"
+    # "lmstudio", "ollama", "gemini", "zai", or "mistral"
     provider: str = "anthropic"
     # LLM model to use for all API calls
     model: str = "claude-sonnet-4-6"
