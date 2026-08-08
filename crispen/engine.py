@@ -28,6 +28,7 @@ from .refactors.duplicate_extractor import DuplicateExtractor
 from .refactors.function_splitter import FunctionSplitter
 from .refactors.if_not_else import IfNotElse
 from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
+from .repo_index import EXCLUDED_DIR_NAMES
 from .skip_comments import has_skip_file_marker
 
 # Single-file refactors applied in order before TupleDataclass.
@@ -58,9 +59,7 @@ def _should_run(name: str, config: CrispenConfig) -> bool:
 
 
 # Directory names excluded from the outside-caller scan (e.g. virtual environments).
-_EXCLUDED_DIR_NAMES = frozenset(
-    {".venv", "venv", "env", ".tox", "__pycache__", "node_modules"}
-)
+_EXCLUDED_DIR_NAMES = EXCLUDED_DIR_NAMES
 
 # Total wall-clock budget for all files in _find_outside_callers (seconds).
 _SCOPE_ANALYSIS_TIMEOUT = 10
@@ -842,6 +841,10 @@ def run_engine(
         for line in format_header(config):
             print(line, file=sys.stderr, flush=True)
 
+    # Computed up front (not just for Phase 2) so Phase 1 can also use it —
+    # e.g. DuplicateExtractor's repo-wide match-function mode.
+    repo_root = _repo_root if _repo_root is not None else _find_repo_root(changed)
+
     # ------------------------------------------------------------------ #
     # Phase 1 — single-file refactors + TupleDataclass (private only)     #
     # ------------------------------------------------------------------ #
@@ -1006,8 +1009,6 @@ def run_engine(
     # ------------------------------------------------------------------ #
     # Phase 2 — cross-file public-function transforms + caller updates    #
     # ------------------------------------------------------------------ #
-    repo_root = _repo_root if _repo_root is not None else _find_repo_root(changed)
-
     if repo_root and per_file:
         # Collect all public-function candidates with their qualified names.
         all_candidates: Dict[str, Tuple[TransformInfo, str]] = {}
