@@ -537,6 +537,36 @@ def run_cross_file_duplicate_extraction(
                         break
                     trial_sources[fp] = combined
 
+                # The per-file checks above only look at the call-site files.
+                # The helper itself also has to stand alone in its own new
+                # file — e.g. it must not reference a private module-level
+                # import or constant (like the original file's own
+                # `_llm_client` or a `_SOME_TOOL` dict) that has no import
+                # path from the target module. compile() alone can't catch
+                # this: a bare `def f(): ...body...` referencing an undefined
+                # name is syntactically valid, it only fails at *call* time.
+                if not failures:
+                    trial_helper_content = (
+                        (
+                            existing_helper_content.rstrip("\n") + "\n\n\n"
+                            if existing_helper_content
+                            else ""
+                        )
+                        + helper_source.rstrip("\n")
+                        + "\n"
+                    )
+                    helper_undef = _pyflakes_new_undefined_names(
+                        existing_helper_content, trial_helper_content
+                    )
+                    if helper_undef:
+                        failures.append(
+                            "helper module: undefined name(s) — the extracted "
+                            "helper can't stand alone in its own file (it "
+                            "likely references a private import or constant "
+                            "from the original file): "
+                            f"{', '.join(sorted(helper_undef))}"
+                        )
+
             if failures:
                 if alg_retries_left > 0:
                     alg_retries_left -= 1

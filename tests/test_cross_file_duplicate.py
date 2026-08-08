@@ -17,7 +17,18 @@ from crispen.stats import RunStats
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
 
-_DUP_BODY = "    x = compute(data)\n    y = transform(x)\n    z = finalize(y)\n"
+# Method calls on the `data` parameter only (no free-standing function
+# names) — realistic and self-contained, so an extracted helper doesn't
+# itself reference something undefined in its own new file. Exactly 3
+# statements (weight 3, matching min_duplicate_weight's default): any
+# smaller sub-window has weight < 3 and can't itself independently qualify
+# as a duplicate — important for skip-marker tests, where only a window
+# starting exactly on the marked line is protected.
+_DUP_BODY = (
+    "    stripped = data.strip()\n"
+    '    upper = stripped.replace(" ", "")\n'
+    "    return upper\n"
+)
 
 
 def _write_dup_pair(tmp_path: Path, body: str = _DUP_BODY):
@@ -79,10 +90,10 @@ _HAPPY_EXTRACT = {
     "function_name": "shared_helper",
     "helper_source": (
         "def shared_helper(data):\n"
-        "    x = compute(data)\n"
-        "    y = transform(x)\n"
-        "    z = finalize(y)\n"
-        "    return z\n"
+        "    stripped = data.strip()\n"
+        "    upper = stripped.upper()\n"
+        '    parts = upper.split(",")\n'
+        "    return parts\n"
     ),
     "call_site_replacements": [
         "    return shared_helper(data)\n",
@@ -162,9 +173,9 @@ def test_skip_marker_excludes_sequence(tmp_path, monkeypatch):
     f2 = pkg / "b.py"
     f1.write_text(
         "def foo():\n"
-        "    x = compute(data)  # crispen: skip=duplicate_extractor\n"
-        "    y = transform(x)\n"
-        "    z = finalize(y)\n",
+        "    stripped = data.strip()  # crispen: skip=duplicate_extractor\n"
+        '    upper = stripped.replace(" ", "")\n'
+        "    return upper\n",
         encoding="utf-8",
     )
     f2.write_text(f"def bar():\n{_DUP_BODY}", encoding="utf-8")
@@ -215,7 +226,7 @@ def test_happy_path_extracts_and_writes_helper(tmp_path, monkeypatch):
         new_src = per_file[str(f)]["source"]
         assert "from pkg.common import shared_helper" in new_src
         assert "shared_helper(data)" in new_src
-        assert "compute(data)" not in new_src  # original block replaced
+        assert "data.strip()" not in new_src  # original block replaced
 
     assert stats.duplicate_extracted == 1
     assert stats.llm_veto_calls == 1
@@ -813,6 +824,43 @@ def test_undefined_name_introduced(tmp_path, monkeypatch):
     assert stats.algorithmic_rejected == 1
 
 
+def test_helper_references_undefined_private_name(tmp_path, monkeypatch):
+    """Regression (found by a live self-check run against crispen's own
+    source): a helper_source referencing a name private to the *original*
+    file (e.g. a module-level `_llm_client` import or a `_SOME_TOOL`
+    constant) compiles fine standalone — compile() doesn't resolve names —
+    but crashes with NameError the moment it's actually called from its new,
+    separate helper file. Must be caught before writing, not just before
+    finding a compile-time syntax error."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_dup_pair(tmp_path)
+    per_file = _per_file_for(f1, f2)
+    bad_extract = dict(_HAPPY_EXTRACT)
+    bad_extract["helper_source"] = (
+        "def shared_helper(data):\n" "    return _some_private_module.do_thing(data)\n"
+    )
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(bad_extract),
+            _make_extract_response(bad_extract),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert msgs == []
+    assert stats.algorithmic_rejected == 1
+    assert not (tmp_path / "pkg" / "common.py").exists()
+
+
 def test_helper_docstrings_true_keeps_docstring(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     f1, f2 = _write_dup_pair(tmp_path)
@@ -821,10 +869,10 @@ def test_helper_docstrings_true_keeps_docstring(tmp_path, monkeypatch):
     docstring_extract["helper_source"] = (
         "def shared_helper(data):\n"
         '    """Do the shared thing."""\n'
-        "    x = compute(data)\n"
-        "    y = transform(x)\n"
-        "    z = finalize(y)\n"
-        "    return z\n"
+        "    stripped = data.strip()\n"
+        "    upper = stripped.upper()\n"
+        '    parts = upper.split(",")\n'
+        "    return parts\n"
     )
     with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
         mock_client = MagicMock()
