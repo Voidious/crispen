@@ -145,7 +145,9 @@ class CrispenConfig:
     #             and a chunk of test functions and proposes updated @patch
     #             strings.  A second LLM verify step checks each proposal;
     #             failed chunks are retried up to patch_update_retries
-    #             additional times before being skipped.
+    #             additional times before being skipped.  Also handles
+    #             @patch(module.CONSTANT), with patch(...) forms, and
+    #             patch.multiple(...) (including with patch.multiple(...)).
     file_limiter_patch_update: str = "basic"
 
     # Number of additional LLM verify+retry attempts for each function chunk

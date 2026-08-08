@@ -152,7 +152,8 @@ file_limiter_recursive = true
 #             cases (entities imported by multiple new files). A verify step
 #             checks each proposal; failed functions are retried up to
 #             patch_update_retries additional times before being skipped.
-#             Also handles @patch(module.CONSTANT) and with patch(...) forms.
+#             Also handles @patch(module.CONSTANT), with patch(...) forms,
+#             and patch.multiple(...) (including with patch.multiple(...)).
 # file_limiter_patch_update = "basic"
 
 # FileLimiter: additional LLM verify+retry attempts per function in
