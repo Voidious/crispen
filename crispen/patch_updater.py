@@ -46,17 +46,24 @@ def apply_patch_strings(source: str, patch_map: Dict[str, str]) -> str:
     suffix (e.g. ``"myapp.module.MyClass.method"`` →
     ``"myapp.module.helpers.MyClass.method"``).
 
-    Returns *source* unchanged when *patch_map* is empty or the file
-    cannot be parsed as Python.
+    Returns *source* unchanged when *patch_map* is empty, the file cannot be
+    parsed as Python, or no string literal actually matches *patch_map*.
     """
     if not patch_map:
         return source
+    # libcst's parser drops a leading BOM but its renderer does not restore
+    # it, so a no-op pass through parse_module()/.code would otherwise report
+    # a change (and, for files read back off disk, silently strip the BOM)
+    # even when no string literal in *patch_map* matches anything in *source*.
+    bom = "\ufeff" if source.startswith("\ufeff") else ""
+    body = source[len(bom) :]
     # Sort longest-first so "a.b.C" matches before "a.b" when both present.
     sorted_items = sorted(patch_map.items(), key=lambda x: len(x[0]), reverse=True)
     try:
-        tree = cst.parse_module(source)
+        tree = cst.parse_module(body)
     except cst.ParserSyntaxError:
         return source
     updater = _PatchStringUpdater(sorted_items)
     new_tree = tree.visit(updater)
-    return new_tree.code
+    new_body = new_tree.code
+    return source if new_body == body else bom + new_body
