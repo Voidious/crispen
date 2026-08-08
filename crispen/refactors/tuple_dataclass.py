@@ -303,6 +303,9 @@ class TupleDataclass(Refactor):
             return updated_node
         if not self._in_changed_range(original_node):
             return updated_node
+        pos = self.get_metadata(PositionProvider, original_node)
+        if self._is_skipped(pos.start.line, "tuple_dataclass"):
+            return updated_node
         if not self._is_safe_tuple(updated_node):
             return updated_node
 

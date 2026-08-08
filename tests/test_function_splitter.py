@@ -1770,3 +1770,43 @@ def test_function_splitter_detailed_timing_print(mock_anthropic, capsys):
 
     err = capsys.readouterr().err
     assert "→ naming [" in err
+
+
+# ---------------------------------------------------------------------------
+# `# crispen: skip` escape hatch
+# ---------------------------------------------------------------------------
+
+
+def test_skip_marker_alone_prevents_split():
+    src = (
+        "def long_func():  # crispen: skip\n"
+        + _make_long_func(80)[len("def long_func():\n") :]
+    )
+    splitter = FunctionSplitter([(1, 1000)], source=src, verbose=False, max_lines=10)
+    assert splitter.get_rewritten_source() is None
+
+
+@patch("crispen.llm_client.anthropic")
+def test_skip_marker_protects_one_function_not_another(mock_anthropic):
+    mock_anthropic.Anthropic.return_value.messages.create.return_value = (
+        _make_mock_response(["process_tail"])
+    )
+    marked_src = (
+        "def marked():  # crispen: skip\n"
+        + _make_long_func(80)[len("def long_func():\n") :]
+    )
+    src = marked_src + "\n" + _make_long_func(80, func_name="unmarked")
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        splitter = FunctionSplitter(
+            [(1, 1000)], source=src, verbose=False, max_lines=10
+        )
+
+    result = splitter.get_rewritten_source()
+    assert result is not None
+    compile(result, "<test>", "exec")
+    # marked() keeps every one of its 81 original body lines intact.
+    marked_block = result.split("def unmarked")[0]
+    assert marked_block.count(" = ") == 80
+    # unmarked() was actually split out into a helper.
+    assert "_process_tail" in result

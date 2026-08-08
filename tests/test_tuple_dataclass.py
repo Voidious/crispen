@@ -804,3 +804,19 @@ def test_blocked_scopes_does_not_affect_public_functions():
     assert "_f" not in td.get_private_transforms()
     # g is public → candidate
     assert "g" in td.get_candidate_public_transforms()
+
+
+# ---------------------------------------------------------------------------
+# `# crispen: skip` escape hatch
+# ---------------------------------------------------------------------------
+
+
+def test_skip_marker_trailing_comment_protects_tuple():
+    source = "def _f():\n    return (1, 2, 3)  # crispen: skip\n"
+    assert _apply(source) == source
+
+
+def test_skip_marker_scoped_to_other_refactor_does_not_protect():
+    source = "def _f():\n    return (1, 2, 3)  # crispen: skip=if_not_else\n"
+    result = _apply(source)
+    assert "@dataclass" in result

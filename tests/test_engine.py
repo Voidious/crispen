@@ -86,6 +86,30 @@ def test_skip_missing_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# `# crispen: skip-file` escape hatch
+# ---------------------------------------------------------------------------
+
+
+def test_skip_file_marker_leaves_file_untouched(tmp_path):
+    f = tmp_path / "legacy.py"
+    original = "# crispen: skip-file\nif not x:\n    a()\nelse:\n    b()\n"
+    f.write_text(original, encoding="utf-8")
+    msgs = _run({str(f): [(1, 10)]})
+    assert len(msgs) == 1
+    assert "SKIP" in msgs[0]
+    assert "skip-file" in msgs[0]
+    assert f.read_text(encoding="utf-8") == original
+
+
+def test_no_skip_file_marker_processes_normally(tmp_path):
+    f = tmp_path / "normal.py"
+    f.write_text("if not x:\n    a()\nelse:\n    b()\n", encoding="utf-8")
+    msgs = _run({str(f): [(1, 10)]})
+    assert not any("skip-file" in m for m in msgs)
+    assert "if x:" in f.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # No changes produced
 # ---------------------------------------------------------------------------
 

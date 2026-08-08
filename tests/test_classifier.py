@@ -373,3 +373,38 @@ def test_classify_mixed_block_not_forced_unmodified():
     )
     result = classify_entities(post, post, [(1, 2)])
     assert result.entity_class["_block_1"] == EntityClass.MODIFIED
+
+
+# ---------------------------------------------------------------------------
+# `# crispen: skip` escape hatch
+# ---------------------------------------------------------------------------
+
+
+def test_classify_skip_marker_forces_unmodified():
+    post = textwrap.dedent(
+        """\
+        def helper_a():  # crispen: skip
+            return 1
+
+        def helper_b():
+            return 2
+    """
+    )
+    result = classify_entities("", post, [(1, 5)])
+    assert result.entity_class["helper_a"] == EntityClass.UNMODIFIED
+    assert "helper_a" in result.set_1
+    # Unrelated new entity is unaffected and still free to migrate.
+    assert result.entity_class["helper_b"] == EntityClass.NEW
+    assert any("helper_b" in g for g in result.set_2_groups)
+
+
+def test_classify_skip_marker_scoped_to_other_refactor_no_effect():
+    post = textwrap.dedent(
+        """\
+        def helper_a():  # crispen: skip=if_not_else
+            return 1
+    """
+    )
+    result = classify_entities("", post, [(1, 2)])
+    # Not scoped to file_limiter → still free to migrate as NEW.
+    assert result.entity_class["helper_a"] == EntityClass.NEW

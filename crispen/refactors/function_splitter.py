@@ -14,6 +14,7 @@ import libcst as cst
 from libcst.metadata import MetadataWrapper, PositionProvider
 
 from .. import llm_client as _llm_client
+from ..skip_comments import extract_comments
 from .base import Refactor
 
 _MODEL = "claude-sonnet-4-6"
@@ -816,6 +817,12 @@ class FunctionSplitter(Refactor):
             wrapper = MetadataWrapper(tree)
             positions = wrapper.resolve(PositionProvider)
 
+            # Line numbers (and any comments) shift after each split below, so
+            # skip-marker detection is refreshed against the current source
+            # every iteration rather than relying on the constructor snapshot.
+            self._source_lines = current.splitlines()
+            self._comments_by_line = extract_comments(current)
+
             # 1. Collect all splittable functions
             collector = _FunctionCollector()
             wrapper.visit(collector)
@@ -825,6 +832,8 @@ class FunctionSplitter(Refactor):
             tasks: List[_SplitTask] = []
             for func_info in collector.functions:
                 if not _func_in_changed_range(func_info, self.changed_ranges):
+                    continue
+                if self._is_skipped(func_info.start_line, "function_splitter"):
                     continue
                 func_source = _extract_func_source(func_info, source_lines)
                 body_lines = _count_body_lines(func_source)

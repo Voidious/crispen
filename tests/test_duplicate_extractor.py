@@ -6372,3 +6372,44 @@ def test_extraction_detailed_timing_message(monkeypatch, capsys):
         )
     err = capsys.readouterr().err
     assert "→ extraction [" in err
+
+
+# ---------------------------------------------------------------------------
+# `# crispen: skip` escape hatch
+# ---------------------------------------------------------------------------
+
+
+def test_skip_marker_excludes_marked_occurrence_no_llm_call():
+    """A skip-marked occurrence is dropped before duplicate detection runs.
+
+    With only one unmarked occurrence left, no duplicate group exists and no
+    LLM call is ever attempted -- this exercises the real _analyze() pipeline
+    rather than mocking _find_duplicate_groups, and doubles as proof no API
+    key / network access is needed to verify the fix.
+    """
+    source = textwrap.dedent(
+        """\
+        def foo():
+            result = some_call(a, b, c, d, e)  # crispen: skip
+
+        def bar():
+            result = some_call(a, b, c, d, e)
+        """
+    )
+    de = DuplicateExtractor([(1, 6)], source=source, min_weight=1)
+    assert de.get_rewritten_source() is None
+
+
+def test_skip_marker_scoped_to_other_refactor_still_forms_group():
+    """A skip marker scoped to a different refactor does not protect this one."""
+    source = textwrap.dedent(
+        """\
+        def foo():
+            result = some_call(a, b, c, d, e)  # crispen: skip=if_not_else
+
+        def bar():
+            result = some_call(a, b, c, d, e)
+        """
+    )
+    with pytest.raises(CrispenAPIError):
+        DuplicateExtractor([(1, 6)], source=source, min_weight=1)

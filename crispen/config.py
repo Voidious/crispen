@@ -178,6 +178,11 @@ class CrispenConfig:
     # Ignored when enabled_refactors is non-empty.
     disabled_refactors: List[str] = field(default_factory=list)
 
+    # These are project-wide toggles. To protect one specific statement,
+    # function, or file instead, use a `# crispen: skip` (or
+    # `# crispen: skip=<name>`, same names as above) comment, or
+    # `# crispen: skip-file` for the whole file. See crispen.skip_comments.
+
     # Timing output level: "off" disables timing output entirely.
     # "basic" shows total run time, total LLM time, and total token counts.
     # "detailed" adds per-call-type, per-refactor, and per-file breakdowns.

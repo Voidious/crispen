@@ -229,6 +229,27 @@ model = "your-pulled-model-name"
 
 No API key is required — Ollama does not authenticate requests.
 
+### Escaping refactors
+
+Add a `# crispen: skip` comment to protect specific code from every refactor, or `# crispen: skip=<name>[,<name>...]` to protect it from only the named refactor(s) (same names as `enabled_refactors`/`disabled_refactors`: `if_not_else`, `duplicate_extractor`, `function_splitter`, `tuple_dataclass`, `file_limiter`). The marker attaches to whatever starts on its own line — either as a trailing comment on that exact line, or as a standalone comment on the line(s) directly above it (blank lines and decorator lines in between are transparent, so a marker above a stack of decorators still attaches to the `def`/`class` below them):
+
+```python
+if not user.is_active:  # crispen: skip
+    deactivate()
+else:
+    activate()
+
+# crispen: skip=file_limiter
+def load_legacy_config():
+    ...
+
+return (id, name, email, created_at)  # crispen: skip=tuple_dataclass
+```
+
+For `# crispen: skip` on a function or class, FileLimiter treats it the same as code that predates the diff — it never proposes moving it to a new file. `duplicate_extractor` and `tuple_dataclass` match sub-statement sequences and individual tuple literals respectively, so their marker must sit on the specific statement to protect, not just anywhere in the enclosing function.
+
+`# crispen: skip-file`, placed anywhere in the file, opts the whole file out of every refactor (including FileLimiter) before it's even read for changes. There is no region/block form (`skip-start` / `skip-end`) — each protected spot needs its own marker.
+
 ## Refactors
 
 ### 1. File limiter

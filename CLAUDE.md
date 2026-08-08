@@ -56,6 +56,7 @@ crispen/cli.py         # Entry point: reads stdin, calls parse_diff then run_eng
 ### Key design decisions
 
 - **Line-range scoping**: The diff parser converts added lines into `(start, end)` line ranges per file. Each refactor receives these ranges and calls `self._in_changed_range(node)` to skip nodes outside the diff.
+- **Skip-comment escape hatch**: `# crispen: skip` (optionally `skip=<refactor_name>`) protects a specific statement/function from a refactor; `# crispen: skip-file` protects a whole file. Detection lives in `crispen/skip_comments.py` and is exposed to CST-based refactors via `self._is_skipped(start_line, refactor_name)` on the `Refactor` base class — call it alongside `_in_changed_range` in any new refactor. FileLimiter (not a `Refactor` subclass) checks it separately in `file_limiter/classifier.py`.
 - **libcst**: All AST work uses `libcst` (not the stdlib `ast` module) because it preserves formatting and supports round-trip code generation. Every refactor is a `cst.CSTTransformer` using `MetadataWrapper` + `PositionProvider` for line number access.
 - **Sequential refactors**: `engine.py` applies refactors one at a time in the `_REFACTORS` list. Each refactor receives the output of the previous one as its input source.
 - **Verification step**: After each refactor, the engine compiles the output with `compile()` to confirm it is valid Python before writing it back.

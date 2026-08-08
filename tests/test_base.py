@@ -44,3 +44,27 @@ def test_get_changes_after_append():
 def test_get_rewritten_source_returns_none():
     r = Refactor([(1, 10)])
     assert r.get_rewritten_source() is None
+
+
+def test_is_skipped_no_source_never_skips():
+    r = Refactor([(1, 10)])
+    assert r._is_skipped(1, "if_not_else") is False
+
+
+def test_is_skipped_trailing_marker():
+    source = "def f():\n    pass  # crispen: skip\n"
+    r = Refactor([(1, 10)], source=source)
+    assert r._is_skipped(2, "if_not_else") is True
+
+
+def test_is_skipped_no_marker():
+    source = "def f():\n    pass\n"
+    r = Refactor([(1, 10)], source=source)
+    assert r._is_skipped(2, "if_not_else") is False
+
+
+def test_is_skipped_scoped_to_other_refactor():
+    source = "def f():\n    pass  # crispen: skip=tuple_dataclass\n"
+    r = Refactor([(1, 10)], source=source)
+    assert r._is_skipped(2, "if_not_else") is False
+    assert r._is_skipped(2, "tuple_dataclass") is True

@@ -28,6 +28,7 @@ from .refactors.duplicate_extractor import DuplicateExtractor
 from .refactors.function_splitter import FunctionSplitter
 from .refactors.if_not_else import IfNotElse
 from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
+from .skip_comments import has_skip_file_marker
 
 # Single-file refactors applied in order before TupleDataclass.
 _REFACTORS = [IfNotElse, DuplicateExtractor, FunctionSplitter]
@@ -853,6 +854,9 @@ def run_engine(
             continue
 
         original_source = path.read_text(encoding="utf-8")
+        if has_skip_file_marker(original_source):
+            yield f"SKIP {filepath}: crispen: skip-file marker"
+            continue
         current_source = original_source
         file_msgs: List[str] = []
         had_parse_error = False
