@@ -116,6 +116,13 @@ min_duplicate_weight = 3
 # DuplicateExtractor: max sequence length for duplicate search (default: 8)
 max_duplicate_seq_len = 8
 
+# DuplicateExtractor: module name for a new helper shared across files
+# (default: "common"). When a duplicate block is found in 2+ files in the
+# diff, the extracted helper is placed at <common-ancestor-package>/<this>.py
+# — the deepest package that is an ancestor of every call site, so importing
+# it back from any call site can never be circular.
+cross_file_helper_module = "common"
+
 # Whether to generate docstrings in extracted helper functions (default: false)
 helper_docstrings = false
 

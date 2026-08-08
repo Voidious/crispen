@@ -17,6 +17,15 @@ class CrispenConfig:
     # DuplicateExtractor: maximum sequence length for duplicate search
     max_duplicate_seq_len: int = 8
 
+    # DuplicateExtractor: module name for a new helper shared across files.
+    # When a duplicate block is found in 2+ files in the diff, the extracted
+    # helper is placed at <common-ancestor-package>/<this>.py — the deepest
+    # package that is an ancestor of every call site, so importing it back
+    # from any call site can never be circular. Deliberately boring/
+    # mechanical rather than LLM-chosen (see README for the placement
+    # options considered and why v1 stays mechanical).
+    cross_file_helper_module: str = "common"
+
     # TupleDataclass: minimum tuple element count to trigger replacement
     min_tuple_size: int = 4
 

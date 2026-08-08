@@ -646,6 +646,47 @@ def _find_cross_file_duplicate_groups(
 
 
 # ---------------------------------------------------------------------------
+# Cross-file helper placement
+# ---------------------------------------------------------------------------
+
+
+def _common_ancestor_dir(dirs: List[Path]) -> Path:
+    """Return the deepest directory that is an ancestor of (or equal to) every
+    directory in *dirs*, compared by path parts (never by string prefix, which
+    could false-match on partial directory-name overlaps)."""
+    parts_lists = [d.parts for d in dirs]
+    common: List[str] = []
+    for parts in zip(*parts_lists):
+        if len(set(parts)) != 1:
+            break
+        common.append(parts[0])
+    return Path(*common)
+
+
+def _cross_file_helper_target(
+    file_paths: List[str], repo_root: str, module_name: str
+) -> Tuple[Path, str]:
+    """Return ``(target_file, dotted_import_path)`` for a cross-file helper
+    shared by every file in *file_paths*.
+
+    Places it at ``<common-ancestor-dir>/<module_name>.py`` — the common
+    ancestor package of every call site — so importing it from any call site
+    can never be circular: an ancestor package never depends on its own
+    descendants. ``module_name`` is deliberately boring/configurable
+    (``cross_file_helper_module`` in config, default ``"common"``) rather
+    than LLM-chosen; see the 0.8.0-b plan for why placement stays mechanical
+    in v1.
+    """
+    dirs = [Path(fp).resolve().parent for fp in file_paths]
+    common_dir = _common_ancestor_dir(dirs)
+    target_file = common_dir / f"{module_name}.py"
+    dotted_module, _ = _repo_index.file_to_module_and_package(
+        target_file, Path(repo_root).resolve()
+    )
+    return target_file, dotted_module
+
+
+# ---------------------------------------------------------------------------
 # LLM integration
 # ---------------------------------------------------------------------------
 

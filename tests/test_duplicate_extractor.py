@@ -32,6 +32,8 @@ from crispen.refactors.duplicate_extractor import (
     _apply_edits,
     _build_function_body_fps,
     _collect_called_names,
+    _common_ancestor_dir,
+    _cross_file_helper_target,
     _filter_maximal_groups,
     _find_cross_file_duplicate_groups,
     _find_duplicate_groups,
@@ -551,6 +553,72 @@ def test_find_cross_file_groups_caps_at_max_groups():
         ranges[fb] = [(1, 3)]
     groups = _find_cross_file_duplicate_groups(sequences, ranges, max_groups=3)
     assert len(groups) == 3
+
+
+# ---------------------------------------------------------------------------
+# _common_ancestor_dir / _cross_file_helper_target
+# ---------------------------------------------------------------------------
+
+
+def test_common_ancestor_dir_shared_parent():
+    d1 = Path("/repo/pkg/sub1")
+    d2 = Path("/repo/pkg/sub2")
+    assert _common_ancestor_dir([d1, d2]) == Path("/repo/pkg")
+
+
+def test_common_ancestor_dir_same_dir():
+    d = Path("/repo/pkg")
+    assert _common_ancestor_dir([d, d]) == d
+
+
+def test_common_ancestor_dir_stops_at_first_divergence():
+    d1 = Path("/a/b")
+    d2 = Path("/a/c")
+    assert _common_ancestor_dir([d1, d2]) == Path("/a")
+
+
+def test_common_ancestor_dir_three_dirs():
+    d1 = Path("/repo/pkg/x")
+    d2 = Path("/repo/pkg/y")
+    d3 = Path("/repo/pkg/z/w")
+    assert _common_ancestor_dir([d1, d2, d3]) == Path("/repo/pkg")
+
+
+def test_cross_file_helper_target_common_package(tmp_path):
+    pkg = tmp_path / "pkg" / "sub"
+    pkg.mkdir(parents=True)
+    f1 = pkg / "a.py"
+    f2 = pkg / "b.py"
+    f1.write_text("", encoding="utf-8")
+    f2.write_text("", encoding="utf-8")
+    target, dotted = _cross_file_helper_target(
+        [str(f1), str(f2)], str(tmp_path), "common"
+    )
+    assert target == pkg / "common.py"
+    assert dotted == "pkg.sub.common"
+
+
+def test_cross_file_helper_target_different_packages(tmp_path):
+    pkg_a = tmp_path / "pkg" / "a_sub"
+    pkg_b = tmp_path / "pkg" / "b_sub"
+    pkg_a.mkdir(parents=True)
+    pkg_b.mkdir(parents=True)
+    f1 = pkg_a / "a.py"
+    f2 = pkg_b / "b.py"
+    target, dotted = _cross_file_helper_target(
+        [str(f1), str(f2)], str(tmp_path), "common"
+    )
+    assert target == tmp_path / "pkg" / "common.py"
+    assert dotted == "pkg.common"
+
+
+def test_cross_file_helper_target_custom_module_name(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    f1 = tmp_path / "pkg" / "a.py"
+    f2 = tmp_path / "pkg" / "b.py"
+    target, dotted = _cross_file_helper_target([str(f1), str(f2)], str(tmp_path), "lib")
+    assert target.name == "lib.py"
+    assert dotted == "pkg.lib"
 
 
 # ---------------------------------------------------------------------------
