@@ -410,6 +410,52 @@ Configuration:
 - `extraction_retries` — how many times to retry after an algorithmic check fails (default: 2).
 - `llm_verify_retries` — how many times to retry after the LLM verification step rejects the output (default: 2).
 
+#### Cross-file duplicate extraction
+
+The same detection also runs **across every file in the diff**, not just within one file. When a duplicate block is found in 2+ different files, crispen extracts it into a shared helper placed at the common ancestor package of every call site (the deepest package that's an ancestor of all of them), and imports it into each one.
+
+Placing the helper at the common ancestor makes circularity structurally impossible — an ancestor package never depends on its own descendants — which is why placement stays mechanical (a configurable, boring module name) rather than LLM-chosen. If the target module already exists, the new helper is appended to it rather than overwriting it.
+
+**Before** (`pkg/a.py` and `pkg/b.py`, both in the diff):
+```python
+# pkg/a.py
+def load_settings(path):
+    text = path.read_text(encoding="utf-8")
+    return text.strip().split(",")
+
+# pkg/b.py
+def load_labels(config_path):
+    content = config_path.read_text(encoding="utf-8")
+    return content.strip().split(",")
+```
+
+**After:**
+```python
+# pkg/common.py
+def read_comma_separated(path):
+    text = path.read_text(encoding="utf-8")
+    stripped = text.strip()
+    parts = stripped.split(",")
+    return parts
+
+# pkg/a.py
+from pkg.common import read_comma_separated
+
+def load_settings(path):
+    return read_comma_separated(path)
+
+# pkg/b.py
+from pkg.common import read_comma_separated
+
+def load_labels(config_path):
+    return read_comma_separated(config_path)
+```
+
+Configuration:
+- `cross_file_helper_module` — module name for the shared helper, placed at `<common-ancestor-package>/<this>.py` (default: `"common"`).
+
+Not yet supported (explicitly deferred): LLM-recommended placement (an alternative to the common-ancestor package), and duplicate detection across the whole codebase rather than just the files in the diff — matches FileLimiter's existing diff-only philosophy.
+
 ---
 
 ### 3. Match existing function
