@@ -3127,6 +3127,61 @@ def test_patch_update_updates_per_file_source(tmp_path):
     assert any("patch_update" in m for m in msgs)
 
 
+def test_patch_update_skips_entities_migrated_from_test_file(tmp_path):
+    """Splitting a test file must not report/perform cross-file @patch updates.
+
+    @patch decorators only ever target application code, so when the file
+    being split by FileLimiter is itself a test file, any entities it moves
+    (and any @patch decorators physically attached to them) never represent
+    real cross-file patch-string work — nothing outside the split referenced
+    them by dotted path. Unlike test_patch_update_updates_per_file_source
+    (which splits an application file), this must be a no-op: no @patch
+    string in another file gets rewritten and no patch-update stats fire.
+    """
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "test_big.py"
+    big_source = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(big_source, encoding="utf-8")
+    # A separate test file that "patches" a name defined in the file being
+    # split. In real usage this would never happen (test-defined names are
+    # not @patch targets), but it proves the old dotted path is genuinely
+    # left untouched rather than merely lacking a matching consumer.
+    other_diff = pkg / "test_other.py"
+    other_diff.write_text(
+        '@patch("mypkg.test_big.MyClass")\ndef test_it(): pass\n', encoding="utf-8"
+    )
+
+    fl_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=["test_big.py: FileLimiter: moved MyClass → utils.py"],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    stats = RunStats()
+    with patch(_FL_PATCH, return_value=fl_result):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 10)], str(other_diff): [(1, 2)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="basic",
+                ),
+                _repo_root=str(tmp_path),
+                stats=stats,
+            )
+        )
+    updated_text = other_diff.read_text(encoding="utf-8")
+    assert "mypkg.test_big.MyClass" in updated_text
+    assert "mypkg.utils.MyClass" not in updated_text
+    assert not any("patch_update" in m for m in msgs)
+    assert stats.patch_single_candidate == 0
+    assert stats.patch_update_edits == 0
+
+
 def test_patch_update_updates_other_file(tmp_path):
     """'update' mode, a separate file outside per_file gets updated on disk."""
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")

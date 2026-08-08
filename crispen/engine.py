@@ -1197,7 +1197,15 @@ def run_engine(
             pre_split_src = state["source"]
             state["source"] = fl_result.original_source
 
-            if fl_result.entity_to_target:
+            # Patch-string updates exist to fix up @patch decorators in *other*
+            # files that reference an entity moved by splitting an application
+            # file. When the file being split is itself a test file, any @patch
+            # decorators on its entities travel with them to their new home —
+            # nothing was rewritten, so entries here would only inflate the
+            # patch-update stats without representing real cross-file work.
+            if fl_result.entity_to_target and not Path(filepath).name.startswith(
+                "test_"
+            ):
                 combined_patch_map.update(
                     _build_patch_map(
                         filepath, fl_result, Path(filepath).parent, pre_split_src
@@ -1282,7 +1290,13 @@ def run_engine(
                 if len(new_source.splitlines()) > config.max_file_lines:
                     _fl_recursive.append((str(new_path), new_source))
 
-            if r_result.entity_to_target and not r_result.abort:
+            # See the matching comment in the non-recursive pass above: skip
+            # patch-map entries for entities migrated within a test file.
+            if (
+                r_result.entity_to_target
+                and not r_result.abort
+                and not Path(r_path).name.startswith("test_")
+            ):
                 combined_patch_map.update(
                     _build_patch_map(r_path, r_result, Path(r_path).parent, r_source)
                 )
