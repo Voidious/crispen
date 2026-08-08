@@ -187,6 +187,7 @@ class _SeqInfo:
     source: str
     fingerprint: str
     class_scope: Optional[str] = None  # enclosing class name, or None if module-level
+    filepath: str = ""  # set only for cross-file grouping; "" for the single-file pass
 
 
 @dataclass
@@ -535,41 +536,52 @@ def _filter_maximal_groups(groups: List[List[_SeqInfo]]) -> List[List[_SeqInfo]]
     """Return only maximal groups, discarding those overlapping a larger group.
 
     Groups are sorted by their longest sequence (descending) and greedily selected:
-    a group is kept only if none of its sequences overlap an already-claimed line range.
-    This prevents multiple helpers being extracted for overlapping spans, where the
-    smaller extractions would end up unused after the larger one is applied.
+    a group is kept only if none of its sequences overlap an already-claimed line
+    range *in the same file*. Filepath is part of the comparison so cross-file
+    groups (whose sequences have real, distinct filepaths) are compared correctly;
+    the single-file pass leaves every seq.filepath at "" so this is equivalent to
+    the old line-only comparison there. This prevents multiple helpers being
+    extracted for overlapping spans, where the smaller extractions would end up
+    unused after the larger one is applied.
     """
     sorted_groups = sorted(
         groups,
         key=lambda g: max(s.end_line - s.start_line for s in g),
         reverse=True,
     )
-    claimed: List[Tuple[int, int]] = []
+    claimed: List[Tuple[str, int, int]] = []
     result = []
     for group in sorted_groups:
         overlaps = any(
-            seq.start_line <= c_end and seq.end_line >= c_start
+            seq.filepath == c_file
+            and seq.start_line <= c_end
+            and seq.end_line >= c_start
             for seq in group
-            for c_start, c_end in claimed
+            for c_file, c_start, c_end in claimed
         )
         if not overlaps:
             result.append(group)
             for seq in group:
-                claimed.append((seq.start_line, seq.end_line))
+                claimed.append((seq.filepath, seq.start_line, seq.end_line))
     return result
 
 
 def _has_internal_overlap(seqs: List[_SeqInfo]) -> bool:
-    """Return True if any two sequences in the group overlap each other.
+    """Return True if any two sequences in the group overlap each other *in the
+    same file*.
 
     Overlapping sequences within a group indicate sequential repetition
     (e.g. [A,B] and [B,C] both matching) rather than true duplication at
     distinct call sites.  Extracting a helper from such a group would leave
-    part of the original pattern unreplaced.
+    part of the original pattern unreplaced. Sorting by (filepath, start_line)
+    groups same-file sequences together so only adjacent, same-file pairs need
+    checking; the single-file pass leaves every seq.filepath at "" so this is
+    equivalent to the old start_line-only sort there.
     """
-    sorted_seqs = sorted(seqs, key=lambda s: s.start_line)
+    sorted_seqs = sorted(seqs, key=lambda s: (s.filepath, s.start_line))
     for i in range(len(sorted_seqs) - 1):
-        if sorted_seqs[i].end_line >= sorted_seqs[i + 1].start_line:
+        a, b = sorted_seqs[i], sorted_seqs[i + 1]
+        if a.filepath == b.filepath and a.end_line >= b.start_line:
             return True
     return False
 
@@ -587,6 +599,44 @@ def _find_duplicate_groups(
         if len(seqs) < 2:
             continue
         if not any(_overlaps_diff(s, changed_ranges) for s in seqs):
+            continue
+        if _has_internal_overlap(seqs):
+            continue
+        groups.append(seqs)
+    groups = _filter_maximal_groups(groups)
+    return groups[:max_groups]
+
+
+def _find_cross_file_duplicate_groups(
+    sequences: List[_SeqInfo],
+    changed_ranges_by_file: Dict[str, List[Tuple[int, int]]],
+    max_groups: int = 5,
+) -> List[List[_SeqInfo]]:
+    """Like :func:`_find_duplicate_groups`, but across every file in the diff.
+
+    *sequences* must have a real ``seq.filepath`` set on each entry (unlike the
+    single-file pass, which leaves it at the "" default) — callers collect
+    sequences from every changed file and tag each with its origin path before
+    calling this.
+
+    Only returns groups whose occurrences span 2+ *distinct* files. A
+    same-file-only duplicate is already found and handled by the existing
+    per-file :class:`DuplicateExtractor` pass, so counting it here too would
+    just be redundant, more expensive (cross-file extraction needs its own
+    placement + multi-file transaction), work for no benefit.
+    """
+    by_fp: Dict[str, List[_SeqInfo]] = {}
+    for seq in sequences:
+        by_fp.setdefault(seq.fingerprint, []).append(seq)
+    groups = []
+    for seqs in by_fp.values():
+        if len(seqs) < 2:
+            continue
+        if len({s.filepath for s in seqs}) < 2:
+            continue
+        if not any(
+            _overlaps_diff(s, changed_ranges_by_file.get(s.filepath, [])) for s in seqs
+        ):
             continue
         if _has_internal_overlap(seqs):
             continue

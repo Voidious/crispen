@@ -33,6 +33,7 @@ from crispen.refactors.duplicate_extractor import (
     _build_function_body_fps,
     _collect_called_names,
     _filter_maximal_groups,
+    _find_cross_file_duplicate_groups,
     _find_duplicate_groups,
     _has_internal_overlap,
     _find_insertion_point,
@@ -455,6 +456,101 @@ def test_filter_maximal_groups_keeps_non_overlapping():
 
     result = _filter_maximal_groups([group1, group2])
     assert len(result) == 2
+
+
+def test_filter_maximal_groups_same_lines_different_files_not_subsumed():
+    # Same line ranges, but different files — must NOT be treated as
+    # overlapping (filepath is part of the comparison key).
+    s_a1 = _SeqInfo([], 1, 10, "<module>", "", "fp_a", filepath="a.py")
+    s_a2 = _SeqInfo([], 20, 29, "<module>", "", "fp_a", filepath="a.py")
+    group_a = [s_a1, s_a2]
+
+    s_b1 = _SeqInfo([], 1, 10, "<module>", "", "fp_b", filepath="b.py")
+    s_b2 = _SeqInfo([], 20, 29, "<module>", "", "fp_b", filepath="b.py")
+    group_b = [s_b1, s_b2]
+
+    result = _filter_maximal_groups([group_a, group_b])
+    assert len(result) == 2
+
+
+def test_has_internal_overlap_same_lines_different_files_no_overlap():
+    # Same line ranges, different files — not an internal overlap.
+    s1 = _SeqInfo([], 27, 30, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 29, 32, "<module>", "", "fp1", filepath="b.py")
+    assert not _has_internal_overlap([s1, s2])
+
+
+# ---------------------------------------------------------------------------
+# _find_cross_file_duplicate_groups
+# ---------------------------------------------------------------------------
+
+
+def test_find_cross_file_groups_empty():
+    assert _find_cross_file_duplicate_groups([], {}) == []
+
+
+def test_find_cross_file_groups_singleton():
+    seq = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    ranges = {"a.py": [(1, 3)]}
+    assert _find_cross_file_duplicate_groups([seq], ranges) == []
+
+
+def test_find_cross_file_groups_excludes_same_file_only():
+    # Both occurrences in the same file — already handled by the per-file
+    # pass, so the cross-file pass must not double-count it.
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1", filepath="a.py")
+    ranges = {"a.py": [(1, 12)]}
+    assert _find_cross_file_duplicate_groups([s1, s2], ranges) == []
+
+
+def test_find_cross_file_groups_valid():
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1", filepath="b.py")
+    ranges = {"a.py": [(1, 3)], "b.py": [(1, 1)]}  # only a.py's occurrence in diff
+    groups = _find_cross_file_duplicate_groups([s1, s2], ranges)
+    assert len(groups) == 1
+    assert set(id(s) for s in groups[0]) == {id(s1), id(s2)}
+
+
+def test_find_cross_file_groups_no_diff_overlap_in_any_file():
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1", filepath="b.py")
+    ranges = {"a.py": [(50, 60)], "b.py": [(50, 60)]}
+    assert _find_cross_file_duplicate_groups([s1, s2], ranges) == []
+
+
+def test_find_cross_file_groups_missing_file_in_ranges_defaults_empty():
+    # b.py has no entry in changed_ranges_by_file at all.
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1", filepath="b.py")
+    ranges = {"a.py": [(1, 3)]}
+    groups = _find_cross_file_duplicate_groups([s1, s2], ranges)
+    assert len(groups) == 1
+
+
+def test_find_cross_file_groups_skips_internally_overlapping():
+    # Same-file internal overlap still disqualifies the group even when it
+    # also spans another file.
+    s1 = _SeqInfo([], 27, 30, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 29, 32, "<module>", "", "fp1", filepath="a.py")
+    s3 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="b.py")
+    ranges = {"a.py": [(27, 32)], "b.py": [(1, 3)]}
+    assert _find_cross_file_duplicate_groups([s1, s2, s3], ranges) == []
+
+
+def test_find_cross_file_groups_caps_at_max_groups():
+    sequences = []
+    ranges: dict = {}
+    for i in range(6):
+        fp = f"fp{i}"
+        fa, fb = f"a{i}.py", f"b{i}.py"
+        sequences.append(_SeqInfo([], 1, 3, "<module>", "", fp, filepath=fa))
+        sequences.append(_SeqInfo([], 1, 3, "<module>", "", fp, filepath=fb))
+        ranges[fa] = [(1, 3)]
+        ranges[fb] = [(1, 3)]
+    groups = _find_cross_file_duplicate_groups(sequences, ranges, max_groups=3)
+    assert len(groups) == 3
 
 
 # ---------------------------------------------------------------------------
