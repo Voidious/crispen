@@ -1,6 +1,6 @@
 [project]
 name = "crispen"
-version = "0.7.2"
+version = "0.7.3"
 description = "Automated refactoring tool for Python code diffs"
 requires-python = ">=3.12"
 dependencies = [
@@ -25,28 +25,141 @@ dev = [
 ]
 
 [tool.crispen]
-min_duplicate_weight = 3
-max_duplicate_seq_len = 8
-min_tuple_size = 4
+# LLM provider: "anthropic" (default), "openai", "deepseek", "moonshot", "gemini",
+# "mistral", "zai", "lmstudio", or "ollama"
 provider = "anthropic"
+
+# LLM model to use (default: "claude-sonnet-4-6")
 model = "claude-sonnet-4-6"
+
+# Optional base URL override for OpenAI-compatible providers.
+# Useful for LM Studio on a non-default port, or other self-hosted endpoints.
+# base_url = "http://localhost:1234/v1"
+
+# Optional tool_choice override for OpenAI-compatible providers (default: unset).
+# Use "required" for local models (e.g. LM Studio with qwen3) that do not
+# support the default named-function form.
+# tool_choice = "required"
+
+# HTTP timeout in seconds for each LLM API call (default: 60.0).
+# Raise this when using slow local models.
+# api_timeout = 60.0
+
+# FunctionSplitter: max function body lines before splitting (default: 75)
 max_function_length = 75
-helper_docstrings = false
+
+# FileLimiter: max file lines before splitting into sibling files (default: 1000).
+# Set to 0 to disable FileLimiter entirely.
+max_file_lines = 1000
+
+# FileLimiter: when the diff covers every line of the file (whole-file add or
+# replacement), place new files in a subdirectory named after the module
+# (e.g. service/*.py for service.py). Default: true.
+file_limiter_subdir_split = true
+
+# FileLimiter: route pytest fixtures split out of test files to conftest.py
+# instead of a regular sibling module, so pytest auto-discovers them without
+# any import in the original file (avoids F401/F811 flake8 warnings).
+# Set to false if not using pytest or using custom fixture decorators. Default: true.
+file_limiter_pytest_conftest = true
+
+# FileLimiter: when to keep re-export stubs in the original file for public
+# names that were moved to new files. Re-exports preserve the module's public
+# API so existing callers need no changes. Default: "imported".
+#
+# "always"      — Always add re-exports for every public name. Best for
+#                 library packages whose public API may not be imported within
+#                 this codebase.
+# "application" — Add re-exports in non-test files (same as "always"), but
+#                 omit them in test files. Pragmatic middle ground.
+# "imported"    — Only add a re-export when the name is actually imported from
+#                 the original module somewhere else in the project (the same
+#                 rule already used for private names). Best for most
+#                 application codebases. Note: only detects
+#                 "from module import name" style imports, not qualified access
+#                 via "module.name".
+file_limiter_reexports = "imported"
+
+# Tuple Return to Dataclass: min tuple element count to trigger replacement (default: 4)
+min_tuple_size = 4
+
+# Tuple Return to Dataclass: update callers in diff files even outside changed ranges (default: true)
+# When false and unreachable callers exist, the transformation is skipped instead
 update_diff_file_callers = true
+
+# DuplicateExtractor: min statement weight for a duplicate group (default: 3)
+min_duplicate_weight = 3
+
+# DuplicateExtractor: max sequence length for duplicate search (default: 8)
+max_duplicate_seq_len = 8
+
+# Whether to generate docstrings in extracted helper functions (default: false)
+helper_docstrings = false
+
+# Retry counts for extraction and LLM verification failures
 extraction_retries = 2
 llm_verify_retries = 2
+
+# FileLimiter: additional retry attempts after an LLM-related failure (default: 2)
 file_limiter_retries = 2
+
+# Rate-limit (HTTP 429) retry settings.
+# rate_limit_retries: additional attempts after a 429 response (default: 6 = 7 total).
+#   Set to 0 to disable retries and raise an error immediately on the first 429.
+# rate_limit_backoff: initial wait in seconds before the first retry (default: 20.0).
+#   Each retry doubles the delay: 20, 40, 80, 160, 320, 640 seconds.
 rate_limit_retries = 6
 rate_limit_backoff = 20.0
+
+# FileLimiter: recursively split newly-created files that are still over the
+# limit (default: true). The recursion terminates when each new file is either
+# under the limit, aborted (cannot be split), or produces no further oversized files.
 file_limiter_recursive = true
-file_limiter_subdir_split = true
-file_limiter_pytest_conftest = true
-file_limiter_reexports = "imported"
+
+# FileLimiter: how to update @patch string literals in test files after
+# FileLimiter moves entities to new sub-modules (default: "basic").
+#
+# "ignore"  — Leave all @patch strings as-is.
+# "basic"   — Scan every *.py file and update patch strings that are
+#             unambiguous: entity imported by exactly one new sub-module,
+#             or resolved via call-graph traversal to a single sub-module.
+#             Import aliases from the original file that land in exactly one
+#             new file are also updated.
+# "rewrite" — Performs "basic" first, then uses an LLM to resolve forking
+#             cases (entities imported by multiple new files). A verify step
+#             checks each proposal; failed functions are retried up to
+#             patch_update_retries additional times before being skipped.
+#             Also handles @patch(module.CONSTANT), with patch(...) forms,
+#             and patch.multiple(...) (including with patch.multiple(...)).
 file_limiter_patch_update = "basic"
+
+# FileLimiter: additional LLM verify+retry attempts per function in
+# "rewrite" mode (default: 2 = three total attempts; 0 = no retry).
 patch_update_retries = 2
+
+# BFS call-graph traversal limits for patch_update "basic" and "rewrite" modes.
+# Increase callgraph_max_depth for codebases with deep call chains.
+# Increase callgraph_max_modules for large codebases with wide import graphs.
 callgraph_max_depth = 12
 callgraph_max_modules = 50
+
+# Timing output printed at the end of each run (default: "detailed").
+# "off"      — no timing output.
+# "basic"    — total run time, total LLM time, and total token counts.
+# "detailed" — adds per-call timing lines during the run (in verbose mode)
+#              plus per-call-type, per-refactor, and per-file breakdowns.
 timing = "detailed"
+
+# Run only specific refactors (default: run all).
+# Valid names: "if_not_else", "duplicate_extractor", "function_splitter",
+# "tuple_dataclass", "file_limiter", "match_function"
+# ("match_function" controls the sub-pass inside duplicate_extractor that
+# replaces inline code with calls to existing functions; only takes effect
+# when duplicate_extractor is also enabled.)
+# enabled_refactors = ["function_splitter", "file_limiter"]
+
+# Always skip specific refactors (ignored when enabled_refactors is set).
+# disabled_refactors = ["file_limiter"]
 
 [tool.pytest.ini_options]
 addopts = "--cov=crispen --cov-branch --cov-fail-under=100"

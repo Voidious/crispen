@@ -126,9 +126,9 @@ class CrispenConfig:
     file_limiter_reexports: str = "imported"
 
     # Controls how @patch string literals in test files are updated after
-    # FileLimiter moves entities to new sub-modules.
+    # FileLimiter moves entities to new sub-modules (default: "basic").
     #
-    # "ignore"  — Do nothing (default).  @patch strings are left as-is.
+    # "ignore"  — Do nothing.  @patch strings are left as-is.
     # "basic"   — Scan every *.py file in the repo and replace string
     #             literals referencing a moved entity's old dotted path
     #             (e.g. "pkg.old_module.func") with the new path, but only
@@ -145,7 +145,9 @@ class CrispenConfig:
     #             and a chunk of test functions and proposes updated @patch
     #             strings.  A second LLM verify step checks each proposal;
     #             failed chunks are retried up to patch_update_retries
-    #             additional times before being skipped.
+    #             additional times before being skipped.  Also handles
+    #             @patch(module.CONSTANT), with patch(...) forms, and
+    #             patch.multiple(...) (including with patch.multiple(...)).
     file_limiter_patch_update: str = "basic"
 
     # Number of additional LLM verify+retry attempts for each function chunk
@@ -175,6 +177,11 @@ class CrispenConfig:
     # Refactor deny-list: named refactors are always skipped.
     # Ignored when enabled_refactors is non-empty.
     disabled_refactors: List[str] = field(default_factory=list)
+
+    # These are project-wide toggles. To protect one specific statement,
+    # function, or file instead, use a `# crispen: skip` (or
+    # `# crispen: skip=<name>`, same names as above) comment, or
+    # `# crispen: skip-file` for the whole file. See crispen.skip_comments.
 
     # Timing output level: "off" disables timing output entirely.
     # "basic" shows total run time, total LLM time, and total token counts.

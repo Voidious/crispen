@@ -168,6 +168,22 @@ def test_is_patch_call_other_name():
     assert _is_patch_call(call_node) is False
 
 
+def test_is_patch_call_multiple_match():
+    call_node = cst.parse_expression('patch.multiple("foo", attr=DEFAULT)')
+    assert _is_patch_call(call_node) is True
+
+
+def test_is_patch_call_attribute_multiple_match():
+    call_node = cst.parse_expression('mock.patch.multiple("foo", attr=DEFAULT)')
+    assert _is_patch_call(call_node) is True
+
+
+def test_is_patch_call_other_multiple_not_match():
+    # "multiple" attribute rooted at something other than "patch".
+    call_node = cst.parse_expression('other.multiple("foo")')
+    assert _is_patch_call(call_node) is False
+
+
 # ---------------------------------------------------------------------------
 # _matches_any
 # ---------------------------------------------------------------------------
@@ -277,6 +293,26 @@ def test_find_attribute_patch():
     result = _find_test_functions_to_update(src, {"crispen.before.X"})
     assert len(result) == 1
     assert result[0].function_name == "test_f"
+
+
+def test_find_patch_multiple():
+    # @patch.multiple("crispen.before.X", attr=DEFAULT) — multiple form.
+    src = '@patch.multiple("crispen.before.X", attr=DEFAULT)\ndef test_f(): pass\n'
+    result = _find_test_functions_to_update(src, {"crispen.before.X"})
+    assert len(result) == 1
+    assert result[0].function_name == "test_f"
+    assert "crispen.before.X" in result[0].old_patch_paths
+
+
+def test_find_attribute_patch_multiple():
+    # @mock.patch.multiple("crispen.before.X", attr=DEFAULT) — Attribute form.
+    src = (
+        '@mock.patch.multiple("crispen.before.X", attr=DEFAULT)\n'
+        "def test_f(): pass\n"
+    )
+    result = _find_test_functions_to_update(src, {"crispen.before.X"})
+    assert len(result) == 1
+    assert "crispen.before.X" in result[0].old_patch_paths
 
 
 def test_find_multiple_functions():
@@ -469,6 +505,27 @@ def test_body_scan_nested_in_if():
         "    if True:\n"
         '        with patch("old.X") as m:\n'
         "            pass\n"
+    )
+    result = _find_with_patch_paths_in_body(src, {"old.X"}, {}, {})
+    assert result == ["old.X"]
+
+
+def test_body_scan_patch_multiple():
+    src = (
+        "def test_f():\n"
+        '    with patch.multiple("old.X", attr=DEFAULT):\n'
+        "        pass\n"
+    )
+    result = _find_with_patch_paths_in_body(src, {"old.X"}, {}, {})
+    assert result == ["old.X"]
+
+
+def test_body_scan_attribute_patch_multiple():
+    # ``with mock.patch.multiple(...)`` form.
+    src = (
+        "def test_f():\n"
+        '    with mock.patch.multiple("old.X", attr=DEFAULT):\n'
+        "        pass\n"
     )
     result = _find_with_patch_paths_in_body(src, {"old.X"}, {}, {})
     assert result == ["old.X"]
@@ -7095,6 +7152,16 @@ def test_patch_strings_in_text_empty():
     assert _patch_strings_in_text("def test_f(): pass\n") == set()
 
 
+def test_patch_strings_in_text_multiple_decorator():
+    text = '@patch.multiple("pkg.mod.A", attr=DEFAULT)\ndef test_f(): pass\n'
+    assert _patch_strings_in_text(text) == {"pkg.mod.A"}
+
+
+def test_patch_strings_in_text_attribute_multiple_decorator():
+    text = '@mock.patch.multiple("pkg.mod.B", attr=DEFAULT)\ndef test_f(): pass\n'
+    assert _patch_strings_in_text(text) == {"pkg.mod.B"}
+
+
 # ---------------------------------------------------------------------------
 # _rewrite_candidates_check
 # ---------------------------------------------------------------------------
@@ -7800,6 +7867,14 @@ def test_get_const_votes_successful_vote():
     """LLM updated the path → new literal collected, vote returned."""
     refs = [_make_ref("TARGET", "pkg.mod.X")]
     code = '@patch("pkg.mod.sub.X")\ndef test_f(m): pass\n'
+    result = _get_const_votes_from_rewrite(code, refs)
+    assert result == {"pkg.mod.X": "pkg.mod.sub.X"}
+
+
+def test_get_const_votes_patch_multiple_successful_vote():
+    """@patch.multiple(NAME, ...) is recognized the same as @patch(NAME)."""
+    refs = [_make_ref("TARGET", "pkg.mod.X")]
+    code = '@patch.multiple("pkg.mod.sub.X", attr=DEFAULT)\ndef test_f(): pass\n'
     result = _get_const_votes_from_rewrite(code, refs)
     assert result == {"pkg.mod.X": "pkg.mod.sub.X"}
 

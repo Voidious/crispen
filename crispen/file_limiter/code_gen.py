@@ -2383,6 +2383,43 @@ def generate_file_splits(
         name for e in classified.entities for name in e.names_defined
     }
 
+    # TOP_LEVEL entities whose entire source is import statements and/or (in
+    # subdir-split mode) just the module docstring reduce to nothing once the
+    # per-target-file loop below strips out re-derived imports/docstring. That
+    # is fine when such an entity shares a target file with real content
+    # (e.g. a docstring block grouped with a migrated function still needs
+    # its imports re-derived and its docstring routed to __init__.py), but
+    # when EVERY entity placed in a target file is vacuous this way, the
+    # result is a new file containing only the boilerplate header (e.g. a
+    # bare "from __future__ import annotations"). Detect that case per
+    # target file and drop those entities from the plan instead, leaving
+    # them in the original file.
+    def _top_level_entity_is_vacuous(entity: Entity) -> bool:
+        if entity.kind != EntityKind.TOP_LEVEL:
+            return False
+        stripped = _strip_top_level_import_lines(entity_source_map[entity.name])
+        if subdir_name is not None:
+            stripped = _strip_module_docstring(stripped)
+        # Mirror the shebang-stripping the per-target-file loop below applies,
+        # so an entity of "shebang + imports" alone is also detected as
+        # vacuous instead of surviving as a boilerplate-only file.
+        if shebang and entity.start_line == 1:
+            nl = stripped.find("\n")
+            stripped = stripped[nl + 1 :] if nl != -1 else ""
+        return not stripped.strip()
+
+    vacuous_entity_names: Set[str] = {
+        e.name for e in classified.entities if _top_level_entity_is_vacuous(e)
+    }
+    _target_file_groups: Dict[str, List[str]] = {}
+    for _p in plan.placements:
+        _target_file_groups.setdefault(_p.target_file, []).extend(_p.group)
+    vacuous_only_targets: Set[str] = {
+        target_file
+        for target_file, names in _target_file_groups.items()
+        if names and all(name in vacuous_entity_names for name in names)
+    }
+
     # Extract import info from post-refactor source.
     import_infos = _extract_import_info(post_source)
 
@@ -2427,6 +2464,7 @@ def generate_file_splits(
         p
         for p in plan.placements
         if p.target_file != original_basename
+        and p.target_file not in vacuous_only_targets
         and not any(name in main_sticky for name in p.group)
     ]
 

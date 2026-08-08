@@ -2268,6 +2268,17 @@ class DuplicateExtractor(Refactor):
         )
         MetadataWrapper(tree).visit(collector)
 
+        # Drop skip-marked sequences from consideration entirely: they are
+        # never extracted from, matched against an existing function, or
+        # used as one occurrence of a duplicate group (the remaining
+        # occurrences, if any, can still be grouped/extracted amongst
+        # themselves).
+        collector.sequences = [
+            seq
+            for seq in collector.sequences
+            if not self._is_skipped(seq.start_line, "duplicate_extractor")
+        ]
+
         # 8. Preliminary duplicate groups.
         groups = _find_duplicate_groups(collector.sequences, self.changed_ranges)
 

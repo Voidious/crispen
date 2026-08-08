@@ -28,6 +28,7 @@ from .refactors.duplicate_extractor import DuplicateExtractor
 from .refactors.function_splitter import FunctionSplitter
 from .refactors.if_not_else import IfNotElse
 from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
+from .skip_comments import has_skip_file_marker
 
 # Single-file refactors applied in order before TupleDataclass.
 _REFACTORS = [IfNotElse, DuplicateExtractor, FunctionSplitter]
@@ -853,6 +854,9 @@ def run_engine(
             continue
 
         original_source = path.read_text(encoding="utf-8")
+        if has_skip_file_marker(original_source):
+            yield f"SKIP {filepath}: crispen: skip-file marker"
+            continue
         current_source = original_source
         file_msgs: List[str] = []
         had_parse_error = False
@@ -1127,9 +1131,13 @@ def run_engine(
     combined_patch_map: Dict[str, str] = {}
     _fl_all_contexts: List[_FLContext] = []
     if config.max_file_lines > 0 and _should_run("file_limiter", config):
-        # Pending queue for recursive FileLimiter processing: (filepath, source)
-        # pairs for newly-created files that are still over the limit.
-        _fl_recursive: List[Tuple[str, str]] = []
+        # Pending queue for recursive FileLimiter processing: (filepath, source,
+        # is_test_origin) tuples for newly-created files that are still over the
+        # limit. is_test_origin tracks whether the file *ultimately* descends
+        # from a test-file split, since an intermediate file's own name (e.g.
+        # "helpers.py" split out of "test_big.py") no longer carries the
+        # "test_" prefix that would otherwise identify it.
+        _fl_recursive: List[Tuple[str, str, bool]] = []
         # Track the final content of each new file created by FileLimiter so
         # lines_added/deleted counts reflect the net result, not interim states.
         _fl_new_file_final: Dict[str, Optional[str]] = {}
@@ -1192,12 +1200,26 @@ def run_engine(
                     config.file_limiter_recursive
                     and len(new_source.splitlines()) > config.max_file_lines
                 ):
-                    _fl_recursive.append((str(new_path), new_source))
+                    _fl_recursive.append(
+                        (
+                            str(new_path),
+                            new_source,
+                            Path(filepath).name.startswith("test_"),
+                        )
+                    )
 
             pre_split_src = state["source"]
             state["source"] = fl_result.original_source
 
-            if fl_result.entity_to_target:
+            # Patch-string updates exist to fix up @patch decorators in *other*
+            # files that reference an entity moved by splitting an application
+            # file. When the file being split is itself a test file, any @patch
+            # decorators on its entities travel with them to their new home —
+            # nothing was rewritten, so entries here would only inflate the
+            # patch-update stats without representing real cross-file work.
+            if fl_result.entity_to_target and not Path(filepath).name.startswith(
+                "test_"
+            ):
                 combined_patch_map.update(
                     _build_patch_map(
                         filepath, fl_result, Path(filepath).parent, pre_split_src
@@ -1234,7 +1256,7 @@ def run_engine(
         # when no oversized new files remain.
         _recursive_msgs: List[str] = []
         while _fl_recursive:
-            r_path, r_source = _fl_recursive.pop(0)
+            r_path, r_source, r_is_test_origin = _fl_recursive.pop(0)
             n_lines = len(r_source.splitlines())
             try:
                 r_result = run_file_limiter(
@@ -1280,9 +1302,18 @@ def run_engine(
                 _stats.file_limiter_edits += 1
                 _fl_new_file_final[str(new_path)] = new_source
                 if len(new_source.splitlines()) > config.max_file_lines:
-                    _fl_recursive.append((str(new_path), new_source))
+                    _fl_recursive.append((str(new_path), new_source, r_is_test_origin))
 
-            if r_result.entity_to_target and not r_result.abort:
+            # See the matching comment in the non-recursive pass above: skip
+            # patch-map entries for entities migrated within a test file. Use
+            # r_is_test_origin (not r_path's own name) since an intermediate
+            # file created by splitting a test file no longer carries the
+            # "test_" prefix itself.
+            if (
+                r_result.entity_to_target
+                and not r_result.abort
+                and not r_is_test_origin
+            ):
                 combined_patch_map.update(
                     _build_patch_map(r_path, r_result, Path(r_path).parent, r_source)
                 )

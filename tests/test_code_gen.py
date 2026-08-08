@@ -4854,6 +4854,99 @@ def test_generate_subdir_docstring_not_stripped_from_non_subdir_split():
     assert '"""Module doc."""' in new_src
 
 
+def test_generate_vacuous_top_level_block_alone_creates_no_file():
+    # Regression: a TOP_LEVEL block that is only import statements plus the
+    # module docstring loses all of its content once imports are re-derived
+    # and (in subdir mode) the docstring is routed to __init__.py. Placed
+    # alone in its own target file, this used to leave behind a new file
+    # containing only the boilerplate header, e.g. a bare
+    # "from __future__ import annotations". No such file should be created;
+    # the entity should stay in the original file instead.
+    source = (
+        "from __future__ import annotations\n\n"
+        '"""Module doc."""\n\n'
+        "import os\n\n\n"
+        "def helper():\n"
+        "    return os.sep\n"
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 5, ["annotations", "os"])
+    e_helper = _make_entity("helper", 8, 9)
+    c = _classified(entities=[e_block, e_helper])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1"], target_file="foo/meta.py"),
+            GroupPlacement(group=["helper"], target_file="foo/helpers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "pkg/foo.py", subdir_name="foo")
+
+    assert not result.abort
+    assert "foo/meta.py" not in result.new_files
+    # The docstring is neither lost nor left in an empty file — it stays in
+    # the (reconstructed) original source alongside the re-export.
+    assert '"""Module doc."""' in result.original_source
+    helpers_src = result.new_files["foo/helpers.py"]
+    assert helpers_src.count("from __future__ import annotations") == 1
+
+
+def test_generate_vacuous_top_level_block_with_shebang_alone_creates_no_file():
+    # Regression: a TOP_LEVEL block of "shebang + imports" loses all of its
+    # content once the shebang is stripped (restored separately at the top of
+    # the reconstructed original) and imports are re-derived. Placed alone in
+    # its own target file, this used to leave behind a new file containing
+    # only the boilerplate import line, since the vacuous check didn't account
+    # for the shebang stripping the real per-file generation loop applies.
+    source = (
+        "#!/usr/bin/env python\n"
+        "from __future__ import annotations\n\n\n"
+        "def helper():\n"
+        "    return 1\n"
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 2, ["annotations"])
+    e_helper = _make_entity("helper", 5, 6)
+    c = _classified(entities=[e_block, e_helper])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1"], target_file="meta.py"),
+            GroupPlacement(group=["helper"], target_file="helpers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "pkg/big.py", subdir_name=None)
+
+    assert not result.abort
+    assert "meta.py" not in result.new_files
+    assert result.original_source.startswith("#!/usr/bin/env python\n")
+    helpers_src = result.new_files["helpers.py"]
+    assert helpers_src.count("from __future__ import annotations") == 1
+
+
+def test_generate_vacuous_top_level_block_grouped_with_content_still_moves():
+    # When a vacuous TOP_LEVEL block shares a target file with real content,
+    # it is still treated as migrated — its re-derived imports and (in
+    # subdir mode) docstring routing are still needed by that file.
+    source = (
+        '"""Module doc."""\n\n'
+        "import os\n\n\n"
+        "def helper():\n"
+        "    return os.sep\n"
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 3, ["os"])
+    e_helper = _make_entity("helper", 6, 7)
+    c = _classified(entities=[e_block, e_helper])
+    plan = _plan(
+        [GroupPlacement(group=["_block_1", "helper"], target_file="foo/helpers.py")]
+    )
+
+    result = generate_file_splits(c, plan, source, "pkg/foo.py", subdir_name="foo")
+
+    assert not result.abort
+    helpers_src = result.new_files["foo/helpers.py"]
+    assert "import os" in helpers_src
+    assert "def helper" in helpers_src
+
+
 # ---------------------------------------------------------------------------
 # _is_test_name
 # ---------------------------------------------------------------------------

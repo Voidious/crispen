@@ -369,13 +369,23 @@ _PATCH_SINGLE_VERIFY_TOOL: dict = {
 }
 
 
+def _is_patch_root(expr: cst.BaseExpression) -> bool:
+    """Return True if *expr* is `patch` or an attribute chain ending in `.patch`."""
+    if isinstance(expr, cst.Name) and expr.value == "patch":
+        return True
+    if isinstance(expr, cst.Attribute) and expr.attr.value == "patch":
+        return True
+    return False
+
+
 def _is_patch_call(call: cst.Call) -> bool:
-    """Return True if *call* is a patch(...) or *.patch(...) call."""
+    """Return True if *call* is patch(...), *.patch(...), patch.multiple(...),
+    or *.patch.multiple(...)."""
     func = call.func
-    if isinstance(func, cst.Name) and func.value == "patch":
+    if _is_patch_root(func):
         return True
-    if isinstance(func, cst.Attribute) and func.attr.value == "patch":
-        return True
+    if isinstance(func, cst.Attribute) and func.attr.value == "multiple":
+        return _is_patch_root(func.value)
     return False
 
 
@@ -658,6 +668,24 @@ def _restore_const_refs(func_text: str, const_refs: List["_ConstRef"]) -> str:
     return tree.visit(_ConstReverter(reverse_map)).code
 
 
+def _is_patch_root_ast(expr: ast.expr) -> bool:
+    """ast counterpart of :func:`_is_patch_root`."""
+    if isinstance(expr, ast.Name) and expr.id == "patch":
+        return True
+    if isinstance(expr, ast.Attribute) and expr.attr == "patch":
+        return True
+    return False
+
+
+def _is_patch_call_ast(func: ast.expr) -> bool:
+    """ast counterpart of :func:`_is_patch_call`."""
+    if _is_patch_root_ast(func):
+        return True
+    if isinstance(func, ast.Attribute) and func.attr == "multiple":
+        return _is_patch_root_ast(func.value)
+    return False
+
+
 def _get_const_votes_from_rewrite(
     func_text: str,
     const_refs: List["_ConstRef"],
@@ -690,11 +718,7 @@ def _get_const_votes_from_rewrite(
     for deco in func_node.decorator_list:
         if not isinstance(deco, ast.Call):
             continue
-        f = deco.func
-        if not (
-            (isinstance(f, ast.Name) and f.id == "patch")
-            or (isinstance(f, ast.Attribute) and f.attr == "patch")
-        ):
+        if not _is_patch_call_ast(deco.func):
             continue
         if not deco.args:
             continue
@@ -740,7 +764,8 @@ def _find_with_patch_paths_in_body(
 
     Walks the function body but does not recurse into nested function definitions.
     Handles plain string literals, module-level named constants, and
-    ``module.CONSTANT`` attribute forms for both ``patch(...)`` and ``*.patch(...)``.
+    ``module.CONSTANT`` attribute forms for ``patch(...)``, ``*.patch(...)``,
+    ``patch.multiple(...)``, and ``*.patch.multiple(...)``.
     Also covers ``async with patch(...)`` context managers.
     """
     try:
@@ -775,11 +800,7 @@ def _find_with_patch_paths_in_body(
             call = item.context_expr
             if not isinstance(call, ast.Call):
                 continue
-            func = call.func
-            is_patch = (isinstance(func, ast.Name) and func.id == "patch") or (
-                isinstance(func, ast.Attribute) and func.attr == "patch"
-            )
-            if not is_patch or not call.args:
+            if not _is_patch_call_ast(call.func) or not call.args:
                 continue
             arg0 = call.args[0]
             if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str):
@@ -833,7 +854,7 @@ class _PatchFunctionCollector(cst.CSTVisitor):
         stable_dec_paths: List[str] = []  # decorator paths already correct
         all_const_refs: List[_ConstRef] = []  # const refs for every const @patch
         has_match = False  # True when at least one decorator path matches old_paths
-        patch_dec_idx = 0  # counts only @patch / *.patch decorators
+        patch_dec_idx = 0  # counts only @patch / *.patch(.multiple) decorators
 
         for dec in node.decorators:
             if not isinstance(dec.decorator, cst.Call):
@@ -2428,8 +2449,9 @@ def _candidates_check(
     return None
 
 
-# Matches the first string arg of any ``patch(...)`` or ``X.patch(...)`` call.
-_PATCH_ARG_RE = re.compile(r'\bpatch\s*\(\s*["\']([^"\']+)["\']')
+# Matches the first string arg of any ``patch(...)``, ``X.patch(...)``,
+# ``patch.multiple(...)``, or ``X.patch.multiple(...)`` call.
+_PATCH_ARG_RE = re.compile(r'\bpatch(?:\.multiple)?\s*\(\s*["\']([^"\']+)["\']')
 
 
 def _patch_strings_in_text(text: str) -> Set[str]:

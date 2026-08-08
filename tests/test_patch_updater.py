@@ -23,6 +23,27 @@ def test_non_matching_string_unchanged():
     )
 
 
+def test_bom_source_no_match_returns_unchanged():
+    # Regression: libcst's parser drops a leading BOM but its renderer does
+    # not restore it, so a naive parse-then-render round trip through a
+    # non-matching file used to report a change (and would have silently
+    # stripped the BOM from disk) even though no @patch string was touched.
+    src = '﻿patch("other.module.OtherClass")\n'
+    result = apply_patch_strings(
+        src, {"old.module.MyClass": "old.module.helpers.MyClass"}
+    )
+    assert result == src
+
+
+def test_bom_source_with_match_preserves_bom():
+    src = '﻿patch("old.module.MyClass")\n'
+    result = apply_patch_strings(
+        src, {"old.module.MyClass": "old.module.helpers.MyClass"}
+    )
+    assert result.startswith("﻿")
+    assert '"old.module.helpers.MyClass"' in result
+
+
 def test_exact_match_double_quoted():
     src = 'patch("old.module.MyClass")\n'
     result = apply_patch_strings(

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Set, Tuple
 
+from ..skip_comments import extract_comments, is_skipped
 from .dep_graph import build_dep_graph, find_sccs
 from .entity_parser import Entity, EntityKind, parse_entities
 
@@ -151,6 +152,14 @@ def classify_entities(
         if entity.kind == EntityKind.TOP_LEVEL and _is_import_only_entity(
             entity, source_lines
         ):
+            entity_class[entity.name] = EntityClass.UNMODIFIED
+
+    # `# crispen: skip` / `# crispen: skip=file_limiter` forces an entity to
+    # stay in the original file, the same way an UNMODIFIED entity does.
+    comments_by_line = extract_comments(post_refactor_source)
+    plain_lines = post_refactor_source.splitlines()
+    for entity in entities:
+        if is_skipped(entity.start_line, "file_limiter", plain_lines, comments_by_line):
             entity_class[entity.name] = EntityClass.UNMODIFIED
 
     # Abort when the entire file is one strongly connected component.

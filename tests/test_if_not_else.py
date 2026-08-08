@@ -179,3 +179,29 @@ else:
 def test_bitwise_not_skipped():
     result = _apply(BITWISE_NOT)
     assert result == BITWISE_NOT
+
+
+# ---------------------------------------------------------------------------
+# `# crispen: skip` escape hatch
+# ---------------------------------------------------------------------------
+
+
+def _apply_with_source(source: str, ranges=None) -> str:
+    if ranges is None:
+        ranges = [(1, 100)]
+    tree = cst.parse_module(source)
+    wrapper = MetadataWrapper(tree)
+    transformer = IfNotElse(ranges, source=source)
+    new_tree = wrapper.visit(transformer)
+    return new_tree.code
+
+
+def test_skip_marker_trailing_comment_protects_if():
+    source = "if not x:  # crispen: skip\n    a()\nelse:\n    b()\n"
+    assert _apply_with_source(source) == source
+
+
+def test_skip_marker_scoped_to_other_refactor_does_not_protect():
+    source = "if not x:  # crispen: skip=tuple_dataclass\n    a()\nelse:\n    b()\n"
+    result = _apply_with_source(source)
+    assert "if x:" in result

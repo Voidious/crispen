@@ -33,6 +33,10 @@ class IfNotElse(Refactor):
         if not self._in_changed_range(original_node):
             return updated_node
 
+        pos = self.get_metadata(PositionProvider, original_node)
+        if self._is_skipped(pos.start.line, "if_not_else"):
+            return updated_node
+
         # Test must be a UnaryOperation with Not operator
         test = updated_node.test
         if not isinstance(test, cst.UnaryOperation):
@@ -66,10 +70,5 @@ class IfNotElse(Refactor):
             orelse=orelse.with_changes(body=original_body),
         )
 
-        try:
-            pos = self.get_metadata(PositionProvider, original_node)
-            line = pos.start.line
-        except KeyError:  # pragma: no cover
-            line = "?"
-        self.changes_made.append(f"IfNotElse: flipped if/else at line {line}")
+        self.changes_made.append(f"IfNotElse: flipped if/else at line {pos.start.line}")
         return new_node
