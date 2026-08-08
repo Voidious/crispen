@@ -2675,11 +2675,19 @@ class DuplicateExtractor(Refactor):
                 if replacement is None:
                     continue
                 edits.append((seq.start_line - 1, seq.end_line, replacement))
+                # Two trailing blank lines, not one: _lift_and_dedup_imports
+                # only preserves blank lines that fall *after* the last
+                # import line it collects — since our raw insertion is
+                # itself the last (and typically only nearby) import line,
+                # omitting these would leave zero blank lines between the
+                # rebuilt import block and the following def/class (PEP 8
+                # wants two), rather than merely losing the original
+                # spacing that was there before this insertion.
                 edits.append(
                     (
                         import_insert_idx,
                         import_insert_idx,
-                        f"from {target_module} import {func.name}\n",
+                        f"from {target_module} import {func.name}\n\n\n",
                     )
                 )
                 matched_line_ranges.add((seq.start_line, seq.end_line))

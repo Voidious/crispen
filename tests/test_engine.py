@@ -1991,8 +1991,12 @@ def test_run_engine_repo_wide_match_function_end_to_end(tmp_path, monkeypatch):
         )
 
     new_source = f.read_text(encoding="utf-8")
-    assert "from appmod.helpers import _setup" in new_source
-    assert "_setup()" in new_source
+    # Exact match, not substring: PEP 8 wants two blank lines between the
+    # inserted import and the following def (flake8 E302) — caught by an
+    # earlier live-LLM run against this exact scenario.
+    assert new_source == (
+        "from appmod.helpers import _setup\n" "\n" "\n" "def foo():\n" "    _setup()\n"
+    )
 
 
 def test_file_limiter_empty_original_source_deletes_file(tmp_path):

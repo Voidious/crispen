@@ -4722,9 +4722,17 @@ def test_repo_match_accepted_end_to_end(monkeypatch):
             repo_function_index=_REPO_FUNC_INDEX_SINGLE,
             repo_index=repo_index,
         )
-    assert de._new_source is not None
-    assert "from appmod.helpers import _setup" in de._new_source
-    assert "_setup()" in de._new_source
+    # Exact string, not just substring checks: the inserted import must be
+    # separated from the following def by PEP 8's two blank lines. A prior
+    # version of this code emitted only a single trailing newline after the
+    # raw-inserted import, which _lift_and_dedup_imports' blank-line-collapse
+    # pass (designed to clean up gaps *within* an existing import block) then
+    # swallowed entirely — a live-LLM run against a real two-file repo caught
+    # it (flake8 E302) where this test's earlier substring-only assertions
+    # did not.
+    assert de._new_source == (
+        "from appmod.helpers import _setup\n" "\n" "\n" "def foo():\n" "    _setup()\n"
+    )
     assert "repo-wide match" in de.changes_made[0]
 
 
