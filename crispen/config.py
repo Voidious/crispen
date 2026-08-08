@@ -42,6 +42,22 @@ class CrispenConfig:
     # Whether to generate docstrings in extracted helper functions
     helper_docstrings: bool = False
 
+    # DuplicateExtractor: scope of the "match existing function" sub-pass
+    # (see "match_function" in enabled_refactors/disabled_refactors below).
+    # "file" — only consider functions defined in the same file being
+    #          processed.
+    # "repo" — also consider free functions and @staticmethods defined
+    #          anywhere else in the repo (default). Instance and class
+    #          methods are never considered repo-wide, since matching one
+    #          would require knowing an instance of the enclosing class is
+    #          in scope at the call site — real type information this pass
+    #          doesn't have. A cross-module match is only proposed when it
+    #          doesn't introduce a new package-level dependency: either the
+    #          call site's file (or another file in its own top-level
+    #          package) already imports the target's top-level package, or
+    #          both share the same top-level package already.
+    match_functions_scope: str = "repo"
+
     # FunctionSplitter: maximum function body lines (excluding docstring)
     max_function_length: int = 75
 

@@ -1,6 +1,7 @@
 """Tests for duplicate_extractor: 100% branch coverage."""
 
 import textwrap
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import libcst as cst
@@ -14,10 +15,12 @@ from crispen.refactors.duplicate_extractor import (
     _build_helper_insertion,
     _build_repo_function_index,
     _decorator_name,
+    _first_funcdef_idx,
     _has_funcdef,
     _collect_attribute_names,
     _collect_called_attr_names,
     _collect_ast_store_names,
+    _module_level_names,
     _replace_unused_in_target,
     _scope_end_line,
     _extract_defined_names,
@@ -62,6 +65,7 @@ from crispen.refactors.duplicate_extractor import (
     _helper_imports_local_name,
     _strip_helper_docstring,
     _strip_unused_call_assignments,
+    _target_import_is_proven_safe,
     _verify_extraction,
     _would_create_proxy_wrappers,
     DuplicateExtractor,
@@ -2038,6 +2042,117 @@ def test_repo_function_info_is_dataclass():
     info = _RepoFunctionInfo(func=func, module="pkg.mod")
     assert info.func is func
     assert info.module == "pkg.mod"
+
+
+# ---------------------------------------------------------------------------
+# _module_level_names
+# ---------------------------------------------------------------------------
+
+
+def test_module_level_names_funcdef_and_classdef():
+    names = _module_level_names("def foo(): pass\nclass Bar: pass\n")
+    assert names == {"foo", "Bar"}
+
+
+def test_module_level_names_imports():
+    names = _module_level_names(
+        "import os\nimport numpy as np\nfrom pkg import helper as h\n"
+    )
+    assert names == {"os", "np", "h"}
+
+
+def test_module_level_names_simple_assignment():
+    assert _module_level_names("x = 1\n") == {"x"}
+
+
+def test_module_level_names_tuple_assignment():
+    assert _module_level_names("a, b = 1, 2\n") == {"a", "b"}
+
+
+def test_module_level_names_syntax_error():
+    assert _module_level_names("def f(:\n") == set()
+
+
+def test_module_level_names_ignores_other_statements():
+    assert _module_level_names("foo()\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _first_funcdef_idx
+# ---------------------------------------------------------------------------
+
+
+def test_first_funcdef_idx_finds_def():
+    lines = ["import os\n", "\n", "def foo():\n", "    pass\n"]
+    assert _first_funcdef_idx(lines) == 2
+
+
+def test_first_funcdef_idx_no_def():
+    lines = ["import os\n", "x = 1\n"]
+    assert _first_funcdef_idx(lines) == 2
+
+
+def test_first_funcdef_idx_skips_indented():
+    lines = ["if True:\n", "    def nested(): pass\n", "def real(): pass\n"]
+    assert _first_funcdef_idx(lines) == 2
+
+
+# ---------------------------------------------------------------------------
+# _target_import_is_proven_safe
+# ---------------------------------------------------------------------------
+
+
+def _make_repo_index(**overrides) -> RepoIndex:
+    defaults = dict(
+        module_to_source={},
+        module_to_package={},
+        module_to_defs={},
+        file_to_module={},
+    )
+    defaults.update(overrides)
+    return RepoIndex(**defaults)
+
+
+def test_import_safe_current_module_none():
+    index = _make_repo_index()
+    assert _target_import_is_proven_safe(None, "pkg.helpers", index) is False
+
+
+def test_import_safe_same_module():
+    index = _make_repo_index()
+    assert _target_import_is_proven_safe("pkg.mod", "pkg.mod", index) is False
+
+
+def test_import_safe_same_top_level_package():
+    index = _make_repo_index()
+    assert _target_import_is_proven_safe("pkg.mod", "pkg.helpers", index) is True
+
+
+def test_import_safe_current_file_already_imports_target_package():
+    index = _make_repo_index(
+        module_to_source={"appa.mod": "import libx.thing\n"},
+        module_to_package={"appa.mod": "appa"},
+    )
+    assert _target_import_is_proven_safe("appa.mod", "libx.helpers", index) is True
+
+
+def test_import_safe_sibling_module_already_imports_target_package():
+    index = _make_repo_index(
+        module_to_source={
+            "appa.mod": "x = 1\n",
+            "appa.other": "import libx.thing\n",
+        },
+        module_to_package={"appa.mod": "appa", "appa.other": "appa"},
+    )
+    assert _target_import_is_proven_safe("appa.mod", "libx.helpers", index) is True
+
+
+def test_import_safe_no_existing_dependency():
+    index = _make_repo_index(
+        module_to_source={"appa.mod": "x = 1\n", "appa.other": "y = 2\n"},
+        module_to_package={"appa.mod": "appa", "appa.other": "appa"},
+    )
+    assert _target_import_is_proven_safe("appa.mod", "libx.helpers", index) is False
 
 
 # ---------------------------------------------------------------------------
@@ -4269,6 +4384,128 @@ _FUNC_MATCH_THEN_DUP_RANGES = [(2, 30)]  # covers foo, bar, baz bodies
 
 
 # ---------------------------------------------------------------------------
+# Repo-wide function-match integration fixtures
+# ---------------------------------------------------------------------------
+
+# No candidate function is defined locally — the only match comes from the
+# repo-wide index passed in via repo_function_index/repo_index.
+_REPO_MATCH_SOURCE = textwrap.dedent(
+    """\
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_REPO_MATCH_RANGES = [(1, 4)]  # covers foo.body
+
+_REPO_SETUP_BODY = "    x = compute(data)\n    y = transform(x)\n    z = finalize(y)\n"
+
+
+def _repo_func_info(name: str, body: str = _REPO_SETUP_BODY) -> _FunctionInfo:
+    return _FunctionInfo(
+        name=name,
+        source=f"def {name}():\n{body}",
+        scope="<module>",
+        body_source=body,
+        body_stmt_count=3,
+        params=[],
+    )
+
+
+def _repo_index_for_file(current_file: str, module: str = "appmod.mod") -> RepoIndex:
+    abs_path = str(Path(current_file).resolve())
+    return RepoIndex(
+        module_to_source={},
+        module_to_package={module: "appmod"},
+        module_to_defs={},
+        file_to_module={abs_path: module},
+    )
+
+
+# Single unambiguous candidate, same top-level package as the current file
+# ("appmod") — the dependency-safety check passes immediately.
+_REPO_FUNC_INDEX_SINGLE = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_setup"), module="appmod.helpers")
+    ]
+}
+
+# Same fingerprint maps to two different repo functions — ambiguous, skipped.
+_REPO_FUNC_INDEX_AMBIGUOUS = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_alt_a"), module="appmod.a"),
+        _RepoFunctionInfo(func=_repo_func_info("_alt_b"), module="appmod.b"),
+    ]
+}
+
+# Candidate function's name collides with a name already bound in the file.
+_REPO_MATCH_COLLISION_SOURCE = textwrap.dedent(
+    """\
+    _setup = None
+
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_REPO_MATCH_COLLISION_RANGES = [(1, 6)]
+
+# Candidate function's name equals the matched sequence's own scope name.
+_REPO_FUNC_INDEX_SAME_NAME_AS_SCOPE = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("foo"), module="appmod.helpers")
+    ]
+}
+
+# Different, unrelated top-level package with no existing import anywhere —
+# the dependency-safety check fails.
+_REPO_FUNC_INDEX_UNSAFE = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_setup"), module="otherpkg.helpers")
+    ]
+}
+
+# foo.body (in range) and bar.body (out of range) each independently match a
+# repo-wide candidate, so only foo's should ever reach the LLM. bar's body
+# uses an if/else shape (not 3 sequential assignments) so its fingerprint
+# doesn't coincidentally collide with foo's despite the different names.
+_REPO_MATCH_MIXED_SOURCE = textwrap.dedent(
+    """\
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+
+    def bar():
+        if flag:
+            value = load(source)
+        else:
+            value = default(source)
+    """
+)
+_REPO_MATCH_MIXED_RANGES = [(1, 4)]  # covers foo.body only; bar.body (7-10) is out
+_REPO_BAR_BODY = (
+    "    if flag:\n"
+    "        value = load(source)\n"
+    "    else:\n"
+    "        value = default(source)\n"
+)
+_REPO_FUNC_INDEX_MIXED = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_setup"), module="appmod.helpers")
+    ],
+    _normalize_source(_REPO_BAR_BODY): [
+        _RepoFunctionInfo(
+            func=_repo_func_info("_bar_helper", body=_REPO_BAR_BODY),
+            module="appmod.helpers",
+        )
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
 # Function-match integration tests
 # ---------------------------------------------------------------------------
 
@@ -4458,6 +4695,203 @@ def test_func_match_then_dup_extract(monkeypatch):
     assert de._new_source is not None
     # One func-match change + one dup-extract change
     assert len(de.changes_made) == 2
+
+
+# ---------------------------------------------------------------------------
+# Repo-wide function-match integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_repo_match_accepted_end_to_end(monkeypatch):
+    """A single, safe, non-colliding repo-wide candidate is matched and imported."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ),
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            verbose=True,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+        )
+    assert de._new_source is not None
+    assert "from appmod.helpers import _setup" in de._new_source
+    assert "_setup()" in de._new_source
+    assert "repo-wide match" in de.changes_made[0]
+
+
+def test_repo_match_skips_matched_and_ambiguous(monkeypatch):
+    """foo.body already matched locally; _setup.body's repo fingerprint is ambiguous."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _FUNC_MATCH_RANGES,
+            source=_FUNC_MATCH_SOURCE,
+            verbose=True,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_AMBIGUOUS,
+            repo_index=repo_index,
+        )
+    # Only the local match (foo.body → _setup()) fired a veto call; the
+    # repo-wide pass never got as far as the LLM for either sequence.
+    assert mock_run.call_count == 1
+    assert "appmod" not in (de._new_source or "")
+
+
+def test_repo_match_skips_out_of_diff_range(monkeypatch):
+    """A repo-wide candidate outside the changed ranges is never considered."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_MIXED_RANGES,
+            source=_REPO_MATCH_MIXED_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_MIXED,
+            repo_index=repo_index,
+        )
+    # Only foo's in-range match fired a veto call; bar's out-of-range match
+    # was skipped without ever reaching the LLM.
+    assert mock_run.call_count == 1
+    assert "from appmod.helpers import _setup" in de._new_source
+    assert "_bar_helper" not in de._new_source
+
+
+def test_repo_match_skips_name_collision(monkeypatch):
+    """A candidate whose name is already bound in the file is skipped."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_COLLISION_RANGES,
+            source=_REPO_MATCH_COLLISION_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
+
+
+def test_repo_match_skips_same_name_as_scope(monkeypatch):
+    """A candidate whose name equals the matched sequence's own scope is skipped."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SAME_NAME_AS_SCOPE,
+            repo_index=repo_index,
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
+
+
+def test_repo_match_skips_dependency_unsafe(monkeypatch):
+    """A candidate in an unrelated, never-imported package is skipped."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_UNSAFE,
+            repo_index=repo_index,
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
+
+
+def test_repo_match_veto_rejected(monkeypatch):
+    """The LLM veto rejecting a repo-wide candidate leaves the source untouched."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(False, "different", ""),
+        ),
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+        )
+    assert de._new_source is None
+
+
+def test_repo_match_scope_file_ignores_repo_index(monkeypatch):
+    """match_functions_scope='file' never consults the repo-wide index."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="file",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
 
 
 # ---------------------------------------------------------------------------

@@ -119,6 +119,15 @@ max_duplicate_seq_len = 8
 # Whether to generate docstrings in extracted helper functions (default: false)
 helper_docstrings = false
 
+# DuplicateExtractor: scope of the "match_function" sub-pass (default: "repo").
+# "file" — only consider functions defined in the same file being processed.
+# "repo" — also consider free functions and @staticmethods defined anywhere
+#          else in the repo. Instance/class methods are never considered
+#          repo-wide (matching one would need real type information this
+#          pass doesn't have). A cross-module match is only proposed when it
+#          doesn't introduce a new package-level dependency.
+match_functions_scope = "repo"
+
 # Retry counts for extraction and LLM verification failures
 extraction_retries = 2
 llm_verify_retries = 2
@@ -400,13 +409,17 @@ Configuration:
 
 **Replaces a code block with a call to an existing function that performs the same operation.**
 
-When a block of code in the diff is semantically equivalent to the body of an existing function in the same file, crispen replaces the inline block with a call to that function. This is the complement of DuplicateExtractor: instead of creating a new helper, it recognises that one already exists.
+When a block of code in the diff is semantically equivalent to the body of an existing function — in the same file, or (by default) anywhere else in the repo — crispen replaces the inline block with a call to that function. This is the complement of DuplicateExtractor: instead of creating a new helper, it recognises that one already exists.
 
 The algorithm:
-1. Fingerprints every function body in the file by its normalised AST structure (ignoring variable names, whitespace, and comments).
-2. For each statement sequence in the diff, checks whether its fingerprint matches any function body.
-3. Asks the LLM to verify the match is semantically valid and not a coincidental structural similarity.
-4. If confirmed, asks the LLM to generate the correct call expression (mapping arguments as needed) and replaces the block.
+1. Fingerprints every candidate function body (in the file, and repo-wide when `match_functions_scope = "repo"`) by its normalised AST structure (ignoring variable names, whitespace, and comments). Repo-wide candidates are restricted to free functions and `@staticmethod`s — instance/class methods are never matched, since replacing a block with a call to one would require knowing an instance of the enclosing class is already in scope, which needs real type information crispen doesn't have.
+2. For each statement sequence in the diff, checks whether its fingerprint matches exactly one candidate function body (an ambiguous fingerprint — matching more than one repo-wide function — is skipped).
+3. For a repo-wide candidate, verifies the match wouldn't introduce a new package-level dependency: the call site's file (or another file already in its own top-level package) must already import the target's top-level package, or both must already share the same top-level package. Otherwise the match is skipped — crispen never adds a new cross-package import on your behalf without that assurance.
+4. Asks the LLM to verify the match is semantically valid and not a coincidental structural similarity.
+5. If confirmed, asks the LLM to generate the correct call expression (mapping arguments as needed) and replaces the block. For a repo-wide match, also adds the needed import.
+
+Configuration:
+- `match_functions_scope` — `"file"` (only match functions in the same file) or `"repo"` (also match free functions and `@staticmethod`s anywhere else in the repo, subject to the dependency-safety check above). Default: `"repo"`.
 
 **Before:**
 ```python

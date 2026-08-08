@@ -24,11 +24,14 @@ from .patch_rewriter import (
 )
 from .patch_updater import apply_patch_strings
 from .refactors.caller_updater import CallerUpdater
-from .refactors.duplicate_extractor import DuplicateExtractor
+from .refactors.duplicate_extractor import (
+    DuplicateExtractor,
+    _build_repo_function_index,
+)
 from .refactors.function_splitter import FunctionSplitter
 from .refactors.if_not_else import IfNotElse
 from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
-from .repo_index import EXCLUDED_DIR_NAMES
+from .repo_index import EXCLUDED_DIR_NAMES, build_repo_index
 from .skip_comments import has_skip_file_marker
 
 # Single-file refactors applied in order before TupleDataclass.
@@ -845,6 +848,20 @@ def run_engine(
     # e.g. DuplicateExtractor's repo-wide match-function mode.
     repo_root = _repo_root if _repo_root is not None else _find_repo_root(changed)
 
+    # Built once per run (not per file) so DuplicateExtractor's repo-wide
+    # match-function pass doesn't re-scan the whole repo for every changed
+    # file. Only built when actually needed: match_function must be enabled
+    # and scoped to "repo", and there must be a resolvable repo root.
+    _repo_wide_index = None
+    _repo_function_index: Dict[str, list] = {}
+    if (
+        repo_root is not None
+        and config.match_functions_scope == "repo"
+        and _should_run("match_function", config)
+    ):
+        _repo_wide_index = build_repo_index(repo_root)
+        _repo_function_index = _build_repo_function_index(_repo_wide_index)
+
     # ------------------------------------------------------------------ #
     # Phase 1 — single-file refactors + TupleDataclass (private only)     #
     # ------------------------------------------------------------------ #
@@ -895,6 +912,9 @@ def run_engine(
                         tool_choice=config.tool_choice,
                         api_timeout=config.api_timeout,
                         match_functions=_should_run("match_function", config),
+                        match_functions_scope=config.match_functions_scope,
+                        repo_function_index=_repo_function_index,
+                        repo_index=_repo_wide_index,
                         timing=config.timing,
                         current_file=filepath,
                         rate_limit_retries=config.rate_limit_retries,

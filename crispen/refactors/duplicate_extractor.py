@@ -8,6 +8,7 @@ import sys
 import textwrap
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import libcst as cst
@@ -443,6 +444,79 @@ def _build_repo_function_index(
             fp = _normalize_source(func.body_source)
             fps.setdefault(fp, []).append(_RepoFunctionInfo(func=func, module=module))
     return fps
+
+
+def _module_level_names(source: str) -> set:
+    """Return every name bound at module level: defs, classes, imports, assignments.
+
+    Used to detect whether calling a repo-wide matched function by its bare
+    name would collide with something already defined in the current file —
+    an import alone can't fix that, so such candidates must be skipped.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                collected: List[str] = []
+                _collect_ast_store_names(target, collected)
+                names.update(collected)
+    return names
+
+
+def _target_import_is_proven_safe(
+    current_module: Optional[str],
+    target_module: str,
+    index: "_repo_index.RepoIndex",
+) -> bool:
+    """Return True if importing from *target_module* is not a brand-new
+    package-level dependency for the file that owns *current_module*.
+
+    "Proven safe" means one of:
+    - *target_module* shares its top-level package with *current_module*
+      (no new package dependency at all), or
+    - the current file already imports something from the target's
+      top-level package, or
+    - some other module already in the current file's top-level package
+      already imports the target's top-level package.
+
+    Any of these shows the package-to-package dependency edge already
+    exists somewhere, so adding one more import within it can't be
+    introducing new (possibly circular) coupling between packages that
+    didn't already talk to each other. Returns False (never safe) when
+    *current_module* is unknown, e.g. the file isn't under the repo root.
+    """
+    if current_module is None or current_module == target_module:
+        return False
+    target_top = target_module.split(".")[0]
+    current_top = current_module.split(".")[0]
+    if current_top == target_top:
+        return True
+    if any(
+        mod.split(".")[0] == target_top
+        for mod, _ in index.get_imports(current_module).values()
+    ):
+        return True
+    for module in index.module_to_source:
+        if module == current_module or module.split(".")[0] != current_top:
+            continue
+        if any(
+            mod.split(".")[0] == target_top
+            for mod, _ in index.get_imports(module).values()
+        ):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1771,6 +1845,22 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
     return bool(new_helper_imports & orig_params)
 
 
+def _first_funcdef_idx(source_lines: List[str]) -> int:
+    """Return the 0-based index of the first unindented ``def``/``class`` line.
+
+    Used both as the end boundary of the top-of-file import block (by
+    :func:`_lift_and_dedup_imports`) and as a safe insertion point for a new
+    module-level import line — guaranteed not to land above a shebang or
+    module docstring, which a raw insertion at line 0 could do.
+    """
+    for i, line in enumerate(source_lines):
+        if line[:1] in (" ", "\t"):
+            continue
+        if re.match(r"^(?:async\s+def|def|class)\s", line.strip()):
+            return i
+    return len(source_lines)
+
+
 def _lift_and_dedup_imports(source: str) -> str:
     """Lift misplaced module-level imports to the import block and deduplicate.
 
@@ -1790,17 +1880,10 @@ def _lift_and_dedup_imports(source: str) -> str:
     function-local lazy imports, etc.) and wildcard imports are left untouched.
     """
     lines = source.splitlines(keepends=True)
-    n = len(lines)
 
     # ── pass 1: find the import block boundary ──────────────────────────────
     # The import block ends at the first unindented def/class line.
-    first_funcdef_idx = n
-    for i, line in enumerate(lines):
-        if line[:1] in (" ", "\t"):
-            continue
-        if re.match(r"^(?:async\s+def|def|class)\s", line.strip()):
-            first_funcdef_idx = i
-            break
+    first_funcdef_idx = _first_funcdef_idx(lines)
 
     # ── pass 2: collect simple unindented import lines ──────────────────────
     _FROM_RE = re.compile(r"^from\s+(\S+)\s+import\s+([^(\\#]+)$")
@@ -2271,6 +2354,9 @@ class DuplicateExtractor(Refactor):
         tool_choice: Optional[str] = None,
         api_timeout: float = 60.0,
         match_functions: bool = True,
+        match_functions_scope: str = "repo",
+        repo_function_index: Optional[Dict[str, List[_RepoFunctionInfo]]] = None,
+        repo_index: Optional["_repo_index.RepoIndex"] = None,
         timing: str = "detailed",
         current_file: str = "",
         rate_limit_retries: int = 6,
@@ -2291,11 +2377,143 @@ class DuplicateExtractor(Refactor):
         self._api_timeout = api_timeout
         self._hard_timeout = api_timeout + 30
         self._match_functions = match_functions
+        self._match_functions_scope = match_functions_scope
+        self._repo_function_index = repo_function_index or {}
+        self._repo_index = repo_index
         self._rate_limit_retries = rate_limit_retries
         self._rate_limit_backoff = rate_limit_backoff
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
+
+    def _attempt_func_match(
+        self, client, seq: _SeqInfo, func: _FunctionInfo, source: str
+    ) -> Optional[str]:
+        """Veto, generate, and verify a call replacing seq's body with func().
+
+        Returns the call-site replacement text if accepted, or None if the
+        LLM vetoes the match, generation/verification fails, or a call times
+        out. Shared by both the file-local and repo-wide match-function
+        passes — the only difference between them is which candidate
+        functions are considered and (for repo-wide matches) that an import
+        is also added when a match is accepted.
+        """
+        if self.verbose:
+            print(
+                f"crispen: DuplicateExtractor: func-match check — "
+                f"scope '{seq.scope}': lines {seq.start_line}-{seq.end_line}"
+                f" → '{func.name}'",
+                file=sys.stderr,
+                flush=True,
+            )
+        self.stats.llm_veto_calls += 1
+        timing: list = []
+        try:
+            is_valid, reason, _veto_notes = _run_with_timeout(
+                _llm_veto_func_match,
+                self._hard_timeout,
+                client,
+                seq,
+                func,
+                source,
+                self._model,
+                self._provider,
+                tool_choice_override=self._tool_choice,
+                _timing_out=timing,
+                rate_limit_retries=self._rate_limit_retries,
+                rate_limit_backoff=self._rate_limit_backoff,
+            )
+            if timing:
+                lr = timing[0]
+                self.stats.record_llm_call(
+                    lr.elapsed,
+                    lr.input_tokens,
+                    lr.output_tokens,
+                    "veto",
+                    "duplicate_extractor",
+                    self.current_file,
+                )
+        except _ApiTimeout:
+            print(
+                "crispen: DuplicateExtractor:   → func-match veto timed out",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+        if self.verbose:
+            status = "ACCEPTED" if is_valid else "VETOED"
+            timing_suffix = ""
+            if self.timing == "detailed" and timing:
+                lr = timing[0]
+                timing_suffix = (
+                    f" [{lr.elapsed:.2f}s,"
+                    f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
+                )
+            print(
+                f"crispen: DuplicateExtractor:   → {status}: {reason}"
+                f"{timing_suffix}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not is_valid:
+            self.stats.llm_rejected += 1
+            return None
+        timing2: list = []
+        if func.scope == "<module>" and not func.params:
+            replacement = _generate_no_arg_call(seq, func)
+        else:
+            self.stats.llm_edit_calls += 1
+            try:
+                replacement = _run_with_timeout(
+                    _llm_generate_call,
+                    self._hard_timeout,
+                    client,
+                    seq,
+                    func,
+                    source,
+                    self._model,
+                    self._provider,
+                    tool_choice_override=self._tool_choice,
+                    _timing_out=timing2,
+                    rate_limit_retries=self._rate_limit_retries,
+                    rate_limit_backoff=self._rate_limit_backoff,
+                )
+                if timing2:
+                    lr = timing2[0]
+                    self.stats.record_llm_call(
+                        lr.elapsed,
+                        lr.input_tokens,
+                        lr.output_tokens,
+                        "edit",
+                        "duplicate_extractor",
+                        self.current_file,
+                    )
+            except _ApiTimeout:
+                print(
+                    "crispen: DuplicateExtractor:   → call generation timed out",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+            if replacement is None:
+                return None  # pragma: no cover
+        if not _verify_extraction(None, [replacement]):
+            return None
+        if self.verbose:
+            timing_suffix = ""
+            if self.timing == "detailed" and timing2:
+                lr = timing2[0]
+                timing_suffix = (
+                    f" [{lr.elapsed:.2f}s,"
+                    f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
+                )
+            print(
+                f"crispen: DuplicateExtractor:   → replacing '{seq.scope}'"
+                f" with '{func.name}()'{timing_suffix}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return replacement
 
     def _analyze(self, source: str) -> None:
         # 1. Parse tree; early-return on syntax error.
@@ -2354,8 +2572,44 @@ class DuplicateExtractor(Refactor):
             )
         )
 
+        # 9b. Same check against the repo-wide index (built once per run and
+        # passed in). Deliberately approximate — the real dependency-safety
+        # and name-collision checks happen in the match loop itself — this
+        # is only here so the early exit below doesn't skip a file whose
+        # only candidate match is repo-wide.
+        repo_matches_enabled = (
+            self._match_functions
+            and self._match_functions_scope == "repo"
+            and self._repo_function_index
+        )
+        current_module = (
+            self._repo_index.file_to_module.get(str(Path(self.current_file).resolve()))
+            if self.current_file and self._repo_index is not None
+            else None
+        )
+
+        def _repo_candidates(fingerprint: str) -> List[_RepoFunctionInfo]:
+            # Candidates defined in this same file are already reachable (if
+            # called anywhere in-file) via the local match pass above —
+            # counting them here would only add noise, e.g. a block inside
+            # foo() whose fingerprint happens to equal foo()'s own body would
+            # otherwise see foo() itself as a spurious same-file "competing"
+            # candidate.
+            return [
+                c
+                for c in self._repo_function_index.get(fingerprint, [])
+                if c.module != current_module
+            ]
+
+        has_repo_func_matches = repo_matches_enabled and any(
+            _overlaps_diff(seq, self.changed_ranges)
+            and len(_repo_candidates(seq.fingerprint)) == 1
+            and _repo_candidates(seq.fingerprint)[0].func.name != seq.scope
+            for seq in collector.sequences
+        )
+
         # 10. Early exit — nothing to do.
-        if not has_func_matches and not groups:
+        if not has_func_matches and not has_repo_func_matches and not groups:
             return
 
         # 12. Create API client.
@@ -2381,127 +2635,57 @@ class DuplicateExtractor(Refactor):
                 func = func_body_fps[seq.fingerprint]
                 if func.name == seq.scope:
                     continue
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: func-match check — "
-                        f"scope '{seq.scope}': lines {seq.start_line}-{seq.end_line}"
-                        f" → '{func.name}'",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                self.stats.llm_veto_calls += 1
-                timing: list = []
-                try:
-                    is_valid, reason, _veto_notes = _run_with_timeout(
-                        _llm_veto_func_match,
-                        self._hard_timeout,
-                        client,
-                        seq,
-                        func,
-                        source,
-                        self._model,
-                        self._provider,
-                        tool_choice_override=self._tool_choice,
-                        _timing_out=timing,
-                        rate_limit_retries=self._rate_limit_retries,
-                        rate_limit_backoff=self._rate_limit_backoff,
-                    )
-                    if timing:
-                        lr = timing[0]
-                        self.stats.record_llm_call(
-                            lr.elapsed,
-                            lr.input_tokens,
-                            lr.output_tokens,
-                            "veto",
-                            "duplicate_extractor",
-                            self.current_file,
-                        )
-                except _ApiTimeout:
-                    print(
-                        "crispen: DuplicateExtractor:   → func-match veto timed out",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                replacement = self._attempt_func_match(client, seq, func, source)
+                if replacement is None:
                     continue
-                if self.verbose:
-                    status = "ACCEPTED" if is_valid else "VETOED"
-                    timing_suffix = ""
-                    if self.timing == "detailed" and timing:
-                        lr = timing[0]
-                        timing_suffix = (
-                            f" [{lr.elapsed:.2f}s,"
-                            f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
-                        )
-                    print(
-                        f"crispen: DuplicateExtractor:   → {status}: {reason}"
-                        f"{timing_suffix}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                if not is_valid:
-                    self.stats.llm_rejected += 1
-                    continue
-                timing2: list = []
-                if func.scope == "<module>" and not func.params:
-                    replacement = _generate_no_arg_call(seq, func)
-                else:
-                    self.stats.llm_edit_calls += 1
-                    try:
-                        replacement = _run_with_timeout(
-                            _llm_generate_call,
-                            self._hard_timeout,
-                            client,
-                            seq,
-                            func,
-                            source,
-                            self._model,
-                            self._provider,
-                            tool_choice_override=self._tool_choice,
-                            _timing_out=timing2,
-                            rate_limit_retries=self._rate_limit_retries,
-                            rate_limit_backoff=self._rate_limit_backoff,
-                        )
-                        if timing2:
-                            lr = timing2[0]
-                            self.stats.record_llm_call(
-                                lr.elapsed,
-                                lr.input_tokens,
-                                lr.output_tokens,
-                                "edit",
-                                "duplicate_extractor",
-                                self.current_file,
-                            )
-                    except _ApiTimeout:
-                        print(
-                            "crispen: DuplicateExtractor:"
-                            "   → call generation timed out",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        continue
-                    if replacement is None:
-                        continue  # pragma: no cover
-                if not _verify_extraction(None, [replacement]):
-                    continue
-                if self.verbose:
-                    timing_suffix = ""
-                    if self.timing == "detailed" and timing2:
-                        lr = timing2[0]
-                        timing_suffix = (
-                            f" [{lr.elapsed:.2f}s,"
-                            f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
-                        )
-                    print(
-                        f"crispen: DuplicateExtractor:   → replacing '{seq.scope}'"
-                        f" with '{func.name}()'{timing_suffix}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
                 edits.append((seq.start_line - 1, seq.end_line, replacement))
                 matched_line_ranges.add((seq.start_line, seq.end_line))
                 pending_changes.append(
                     f"DuplicateExtractor: replaced '{seq.scope}' body"
                     f" with call to '{func.name}'"
+                )
+
+        # 14b. Repo-wide function body match pass — same idea as 14, but the
+        # candidate function lives in a different module, so a match also
+        # needs the dependency-safety veto (no new package coupling) and a
+        # name-collision check (the bare call must actually resolve to the
+        # newly-imported function), plus emits an import for the accepted
+        # call. Skips sequences already matched by the file-local pass above,
+        # and ambiguous fingerprints (matching more than one repo function).
+        if repo_matches_enabled:
+            module_names = _module_level_names(source)
+            import_insert_idx = _first_funcdef_idx(source_lines)
+            for seq in collector.sequences:
+                if (seq.start_line, seq.end_line) in matched_line_ranges:
+                    continue
+                if not _overlaps_diff(seq, self.changed_ranges):
+                    continue
+                candidates = _repo_candidates(seq.fingerprint)
+                if len(candidates) != 1:
+                    continue
+                repo_func = candidates[0]
+                func, target_module = repo_func.func, repo_func.module
+                if func.name == seq.scope or func.name in module_names:
+                    continue
+                if not _target_import_is_proven_safe(
+                    current_module, target_module, self._repo_index
+                ):
+                    continue
+                replacement = self._attempt_func_match(client, seq, func, source)
+                if replacement is None:
+                    continue
+                edits.append((seq.start_line - 1, seq.end_line, replacement))
+                edits.append(
+                    (
+                        import_insert_idx,
+                        import_insert_idx,
+                        f"from {target_module} import {func.name}\n",
+                    )
+                )
+                matched_line_ranges.add((seq.start_line, seq.end_line))
+                pending_changes.append(
+                    f"DuplicateExtractor: replaced '{seq.scope}' body with call to "
+                    f"'{target_module}.{func.name}' (repo-wide match)"
                 )
 
         # 15. Recompute duplicate groups excluding matched sequences.

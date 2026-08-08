@@ -1882,6 +1882,119 @@ def test_engine_match_function_enabled_by_default(tmp_path):
     assert constructed_with.get("match_functions") is True
 
 
+def test_engine_repo_wide_index_built_when_scope_repo_and_repo_root(tmp_path):
+    """scope='repo' + a resolvable repo_root builds and passes a real index."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+
+    constructed_with: dict = {}
+    original_init = __import__(
+        "crispen.refactors.duplicate_extractor", fromlist=["DuplicateExtractor"]
+    ).DuplicateExtractor.__init__
+
+    def _spy_init(self, *args, **kwargs):
+        constructed_with.update(kwargs)
+        original_init(self, *args, **kwargs)
+
+    with patch("crispen.engine.DuplicateExtractor.__init__", side_effect=_spy_init):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(match_functions_scope="repo"),
+            )
+        )
+
+    assert constructed_with.get("match_functions_scope") == "repo"
+    assert constructed_with.get("repo_index") is not None
+    assert constructed_with.get("repo_function_index") is not None
+
+
+def test_engine_repo_wide_index_not_built_without_repo_root(tmp_path):
+    """scope='repo' but no resolvable repo_root: no index is built or passed."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+
+    constructed_with: dict = {}
+    original_init = __import__(
+        "crispen.refactors.duplicate_extractor", fromlist=["DuplicateExtractor"]
+    ).DuplicateExtractor.__init__
+
+    def _spy_init(self, *args, **kwargs):
+        constructed_with.update(kwargs)
+        original_init(self, *args, **kwargs)
+
+    with patch("crispen.engine.DuplicateExtractor.__init__", side_effect=_spy_init):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(match_functions_scope="repo"),
+            )
+        )
+
+    assert constructed_with.get("repo_index") is None
+    assert constructed_with.get("repo_function_index") == {}
+
+
+def test_engine_repo_wide_index_not_built_when_scope_file(tmp_path):
+    """scope='file' never builds the repo-wide index, even with a repo_root."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+
+    with patch("crispen.engine.build_repo_index") as mock_build:
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(match_functions_scope="file"),
+            )
+        )
+
+    mock_build.assert_not_called()
+
+
+def test_run_engine_repo_wide_match_function_end_to_end(tmp_path, monkeypatch):
+    """A block matching a function in a sibling file is replaced with a call
+    to it, plus the needed import — through the real run_engine pipeline."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    pkg = tmp_path / "appmod"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "helpers.py").write_text(
+        "def _setup():\n"
+        "    x = compute(data)\n"
+        "    y = transform(x)\n"
+        "    z = finalize(y)\n",
+        encoding="utf-8",
+    )
+    f = pkg / "mod.py"
+    f.write_text(
+        "def foo():\n"
+        "    x = compute(data)\n"
+        "    y = transform(x)\n"
+        "    z = finalize(y)\n",
+        encoding="utf-8",
+    )
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ),
+    ):
+        list(
+            run_engine(
+                {str(f): [(1, 4)]},
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(match_functions_scope="repo"),
+            )
+        )
+
+    new_source = f.read_text(encoding="utf-8")
+    assert "from appmod.helpers import _setup" in new_source
+    assert "_setup()" in new_source
+
+
 def test_file_limiter_empty_original_source_deletes_file(tmp_path):
     """FileLimiter returns empty original_source → original file is deleted."""
     f = tmp_path / "big.py"

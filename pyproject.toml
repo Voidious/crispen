@@ -96,6 +96,15 @@ max_duplicate_seq_len = 8
 # Whether to generate docstrings in extracted helper functions (default: false)
 helper_docstrings = false
 
+# DuplicateExtractor: scope of the "match_function" sub-pass (default: "repo").
+# "file" — only consider functions defined in the same file being processed.
+# "repo" — also consider free functions and @staticmethods defined anywhere
+#          else in the repo. Instance/class methods are never considered
+#          repo-wide (matching one would need real type information this
+#          pass doesn't have). A cross-module match is only proposed when it
+#          doesn't introduce a new package-level dependency.
+match_functions_scope = "repo"
+
 # Retry counts for extraction and LLM verification failures
 extraction_retries = 2
 llm_verify_retries = 2
