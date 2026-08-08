@@ -3206,6 +3206,66 @@ def test_patch_update_skips_entities_migrated_from_test_file(tmp_path):
     assert stats.patch_update_edits == 0
 
 
+def test_patch_update_skips_entities_migrated_from_test_file_recursively(tmp_path):
+    """The test-file patch-map skip must survive recursion into new files.
+
+    An intermediate file created by splitting a test file (e.g. "helpers.py"
+    split out of "test_big.py") no longer carries a "test_" prefix itself, so
+    checking *its* name for the recursive pass's patch-map skip would miss
+    the case entirely and reintroduce the false patch-update stats bug that
+    test_patch_update_skips_entities_migrated_from_test_file fixed for the
+    non-recursive path.
+    """
+    (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f = pkg / "test_big.py"
+    big_source = "".join(f"var_{i} = {i}\n" for i in range(10))
+    f.write_text(big_source, encoding="utf-8")
+    other_diff = pkg / "test_other.py"
+    other_diff.write_text(
+        '@patch("mypkg.test_big.MyClass")\ndef test_it(): pass\n', encoding="utf-8"
+    )
+
+    oversized = "".join(f"x_{i} = {i}\n" for i in range(10))
+    first_result = FileLimiterResult(
+        original_source="# reduced\n",
+        new_files={"helpers.py": oversized},
+        messages=[],
+        abort=False,
+    )
+    # Recursive pass on the intermediate "helpers.py" (no "test_" prefix of
+    # its own) still migrates an entity that descends from the test file.
+    second_result = FileLimiterResult(
+        original_source="# reduced helpers\n",
+        new_files={"utils.py": "class MyClass: pass\n"},
+        messages=["helpers.py: FileLimiter: moved MyClass → utils.py"],
+        abort=False,
+        entity_to_target={"MyClass": "utils.py"},
+    )
+    stats = RunStats()
+    with patch(_FL_PATCH, side_effect=[first_result, second_result]):
+        msgs = list(
+            run_engine(
+                {str(f): [(1, 10)], str(other_diff): [(1, 2)]},
+                config=CrispenConfig(
+                    max_file_lines=5,
+                    file_limiter_patch_update="basic",
+                    file_limiter_recursive=True,
+                ),
+                _repo_root=str(tmp_path),
+                stats=stats,
+            )
+        )
+    updated_text = other_diff.read_text(encoding="utf-8")
+    assert "mypkg.test_big.MyClass" in updated_text
+    assert "mypkg.utils.MyClass" not in updated_text
+    assert not any("patch_update" in m for m in msgs)
+    assert stats.patch_single_candidate == 0
+    assert stats.patch_update_edits == 0
+
+
 def test_patch_update_updates_other_file(tmp_path):
     """'update' mode, a separate file outside per_file gets updated on disk."""
     (tmp_path / "pyproject.toml").write_text("[tool.crispen]\n", encoding="utf-8")

@@ -26,7 +26,12 @@ from typing import Dict, List, Optional
 
 # Excludes "skip-file" via the negative lookahead so it is only ever
 # recognized by _SKIP_FILE_RE, not treated as a bare/global "skip".
-_SKIP_RE = re.compile(r"#\s*crispen:\s*skip(?!-)(?:=([\w,]+))?\b")
+# The two branches after "skip" are mutually exclusive on purpose: either an
+# "=" followed by a non-empty name list, or a bare marker with no "=" at all.
+# A malformed "skip=" (trailing "=" with no names, e.g. a typo) must match
+# neither branch and fail outright, rather than falling back to a bare skip
+# and silently protecting the target from every refactor.
+_SKIP_RE = re.compile(r"#\s*crispen:\s*skip(?!-)(?:=([\w,]+)\b|\b(?!=))")
 _SKIP_FILE_RE = re.compile(r"#\s*crispen:\s*skip-file\b")
 
 

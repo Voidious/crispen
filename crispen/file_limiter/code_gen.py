@@ -2400,6 +2400,12 @@ def generate_file_splits(
         stripped = _strip_top_level_import_lines(entity_source_map[entity.name])
         if subdir_name is not None:
             stripped = _strip_module_docstring(stripped)
+        # Mirror the shebang-stripping the per-target-file loop below applies,
+        # so an entity of "shebang + imports" alone is also detected as
+        # vacuous instead of surviving as a boilerplate-only file.
+        if shebang and entity.start_line == 1:
+            nl = stripped.find("\n")
+            stripped = stripped[nl + 1 :] if nl != -1 else ""
         return not stripped.strip()
 
     vacuous_entity_names: Set[str] = {

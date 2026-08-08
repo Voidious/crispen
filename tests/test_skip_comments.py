@@ -68,6 +68,16 @@ def test_is_skipped_scoped_marker_multiple_names():
     assert is_skipped(2, "function_splitter", lines, comments) is False
 
 
+def test_is_skipped_malformed_empty_scope_is_not_a_bare_skip():
+    # "skip=" with no names after the "=" (e.g. a typo/paste error) must not
+    # silently fall back to a bare, all-refactors skip.
+    source = "def f():\n    pass  # crispen: skip=\n"
+    lines = source.splitlines()
+    comments = extract_comments(source)
+    assert is_skipped(2, "duplicate_extractor", lines, comments) is False
+    assert is_skipped(2, "function_splitter", lines, comments) is False
+
+
 def test_is_skipped_leading_comment_directly_above():
     source = "# crispen: skip\ndef f():\n    pass\n"
     lines = source.splitlines()

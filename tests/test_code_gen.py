@@ -4890,6 +4890,38 @@ def test_generate_vacuous_top_level_block_alone_creates_no_file():
     assert helpers_src.count("from __future__ import annotations") == 1
 
 
+def test_generate_vacuous_top_level_block_with_shebang_alone_creates_no_file():
+    # Regression: a TOP_LEVEL block of "shebang + imports" loses all of its
+    # content once the shebang is stripped (restored separately at the top of
+    # the reconstructed original) and imports are re-derived. Placed alone in
+    # its own target file, this used to leave behind a new file containing
+    # only the boilerplate import line, since the vacuous check didn't account
+    # for the shebang stripping the real per-file generation loop applies.
+    source = (
+        "#!/usr/bin/env python\n"
+        "from __future__ import annotations\n\n\n"
+        "def helper():\n"
+        "    return 1\n"
+    )
+    e_block = Entity(EntityKind.TOP_LEVEL, "_block_1", 1, 2, ["annotations"])
+    e_helper = _make_entity("helper", 5, 6)
+    c = _classified(entities=[e_block, e_helper])
+    plan = _plan(
+        [
+            GroupPlacement(group=["_block_1"], target_file="meta.py"),
+            GroupPlacement(group=["helper"], target_file="helpers.py"),
+        ]
+    )
+
+    result = generate_file_splits(c, plan, source, "pkg/big.py", subdir_name=None)
+
+    assert not result.abort
+    assert "meta.py" not in result.new_files
+    assert result.original_source.startswith("#!/usr/bin/env python\n")
+    helpers_src = result.new_files["helpers.py"]
+    assert helpers_src.count("from __future__ import annotations") == 1
+
+
 def test_generate_vacuous_top_level_block_grouped_with_content_still_moves():
     # When a vacuous TOP_LEVEL block shares a target file with real content,
     # it is still treated as migrated — its re-derived imports and (in

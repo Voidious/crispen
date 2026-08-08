@@ -126,9 +126,9 @@ class CrispenConfig:
     file_limiter_reexports: str = "imported"
 
     # Controls how @patch string literals in test files are updated after
-    # FileLimiter moves entities to new sub-modules.
+    # FileLimiter moves entities to new sub-modules (default: "basic").
     #
-    # "ignore"  — Do nothing (default).  @patch strings are left as-is.
+    # "ignore"  — Do nothing.  @patch strings are left as-is.
     # "basic"   — Scan every *.py file in the repo and replace string
     #             literals referencing a moved entity's old dotted path
     #             (e.g. "pkg.old_module.func") with the new path, but only
