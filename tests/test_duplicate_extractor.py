@@ -6947,8 +6947,16 @@ def test_skip_marker_excludes_marked_occurrence_no_llm_call():
     assert de.get_rewritten_source() is None
 
 
-def test_skip_marker_scoped_to_other_refactor_still_forms_group():
+def test_skip_marker_scoped_to_other_refactor_still_forms_group(monkeypatch):
     """A skip marker scoped to a different refactor does not protect this one."""
+    # Relies on no real provider key being available so construction fails
+    # fast at the API-key check, before any network call — delete all of
+    # them explicitly (matches test_engine_propagates_api_error) rather than
+    # assuming the ambient environment happens to lack one.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     source = textwrap.dedent(
         """\
         def foo():
