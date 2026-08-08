@@ -14,6 +14,7 @@ import libcst as cst
 from libcst.metadata import MetadataWrapper, PositionProvider
 
 from .. import llm_client as _llm_client
+from .. import repo_index as _repo_index
 from ..import_sort import _sort_imports_pep8
 from .base import Refactor
 
@@ -195,6 +196,7 @@ class _FunctionInfo:
     body_source: str  # raw source of the function body (indented)
     body_stmt_count: int  # number of top-level statements in the body
     params: List[str]  # positional parameter names (empty → no-arg function)
+    is_staticmethod: bool = False  # scope != "<module>" and @staticmethod-decorated
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +290,16 @@ class _SequenceCollector(cst.CSTVisitor):
 # ---------------------------------------------------------------------------
 
 
+def _decorator_name(dec: cst.Decorator) -> str:
+    """Return the simple name of a decorator (``@foo`` or ``@mod.foo`` → ``"foo"``)."""
+    expr = dec.decorator
+    if isinstance(expr, cst.Name):
+        return expr.value
+    if isinstance(expr, cst.Attribute):
+        return expr.attr.value
+    return ""
+
+
 class _FunctionCollector(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (PositionProvider,)
 
@@ -314,6 +326,9 @@ class _FunctionCollector(cst.CSTVisitor):
                 body_source = ""
             body_stmt_count = len(node.body.body)
             params = [p.name.value for p in node.params.params]
+            is_staticmethod = any(
+                _decorator_name(d) == "staticmethod" for d in node.decorators
+            )
             self.functions.append(
                 _FunctionInfo(
                     name=node.name.value,
@@ -322,6 +337,7 @@ class _FunctionCollector(cst.CSTVisitor):
                     body_source=body_source,
                     body_stmt_count=body_stmt_count,
                     params=params,
+                    is_staticmethod=is_staticmethod,
                 )
             )
         self._scope_stack.append(node.name.value)
@@ -382,6 +398,50 @@ def _build_function_body_fps(
         if func.name in called_names:
             fp = _normalize_source(func.body_source)
             fps[fp] = func
+    return fps
+
+
+# ---------------------------------------------------------------------------
+# Repo-wide function fingerprint index
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RepoFunctionInfo:
+    """A repo-wide match-function candidate: a _FunctionInfo plus its module."""
+
+    func: _FunctionInfo
+    module: str  # dotted module path the function is defined in
+
+
+def _build_repo_function_index(
+    index: "_repo_index.RepoIndex",
+) -> Dict[str, List[_RepoFunctionInfo]]:
+    """Fingerprint every free function and ``@staticmethod`` across the repo.
+
+    Keyed by normalized body fingerprint; a fingerprint may map to more than
+    one function (e.g. identical trivial bodies in unrelated modules), so
+    callers must disambiguate (or skip ambiguous fingerprints).
+
+    Instance and class methods are excluded: matching a code block to one
+    would require knowing an instance of the enclosing class is in scope at
+    the call site, which needs real type information this pass doesn't have.
+    A ``@staticmethod`` needs no such instance, so it's safe to include.
+    """
+    fps: Dict[str, List[_RepoFunctionInfo]] = {}
+    for module, source in index.module_to_source.items():
+        try:
+            tree = cst.parse_module(source)
+        except cst.ParserSyntaxError:
+            continue
+        source_lines = source.splitlines(keepends=True)
+        collector = _FunctionCollector(source_lines)
+        MetadataWrapper(tree).visit(collector)
+        for func in collector.functions:
+            if func.scope != "<module>" and not func.is_staticmethod:
+                continue
+            fp = _normalize_source(func.body_source)
+            fps.setdefault(fp, []).append(_RepoFunctionInfo(func=func, module=module))
     return fps
 
 

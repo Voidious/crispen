@@ -8,9 +8,12 @@ import pytest
 from libcst.metadata import MetadataWrapper
 
 from crispen.errors import CrispenAPIError
+from crispen.repo_index import RepoIndex
 from crispen.refactors.duplicate_extractor import (
     _ApiTimeout,
     _build_helper_insertion,
+    _build_repo_function_index,
+    _decorator_name,
     _has_funcdef,
     _collect_attribute_names,
     _collect_called_attr_names,
@@ -20,6 +23,7 @@ from crispen.refactors.duplicate_extractor import (
     _extract_defined_names,
     _FunctionCollector,
     _FunctionInfo,
+    _RepoFunctionInfo,
     _SeqInfo,
     _SequenceCollector,
     _apply_edits,
@@ -1933,6 +1937,107 @@ def test_function_collector_no_params():
     source = "def f():\n    pass\n"
     funcs = _collect_functions(source)
     assert funcs[0].params == []
+
+
+def test_function_collector_marks_staticmethod():
+    source = "class C:\n    @staticmethod\n    def helper():\n        pass\n"
+    funcs = _collect_functions(source)
+    assert funcs[0].is_staticmethod is True
+
+
+def test_function_collector_instance_method_not_static():
+    source = "class C:\n    def method(self):\n        pass\n"
+    funcs = _collect_functions(source)
+    assert funcs[0].is_staticmethod is False
+
+
+def test_function_collector_module_level_not_static():
+    source = "def foo():\n    pass\n"
+    funcs = _collect_functions(source)
+    assert funcs[0].is_staticmethod is False
+
+
+def test_function_collector_other_decorator_not_static():
+    source = "class C:\n    @classmethod\n    def helper(cls):\n        pass\n"
+    funcs = _collect_functions(source)
+    assert funcs[0].is_staticmethod is False
+
+
+def test_decorator_name_simple():
+    (dec,) = cst.parse_module("@staticmethod\ndef f(): pass\n").body[0].decorators
+    assert _decorator_name(dec) == "staticmethod"
+
+
+def test_decorator_name_attribute():
+    (dec,) = cst.parse_module("@mod.deco\ndef f(): pass\n").body[0].decorators
+    assert _decorator_name(dec) == "deco"
+
+
+def test_decorator_name_call_unrecognized():
+    (dec,) = cst.parse_module("@deco()\ndef f(): pass\n").body[0].decorators
+    assert _decorator_name(dec) == ""
+
+
+# ---------------------------------------------------------------------------
+# _build_repo_function_index
+# ---------------------------------------------------------------------------
+
+
+def _index_from_sources(sources: dict) -> RepoIndex:
+    return RepoIndex(
+        module_to_source=sources,
+        module_to_package={},
+        module_to_defs={},
+        file_to_module={},
+    )
+
+
+def test_repo_function_index_includes_free_function():
+    index = _index_from_sources({"pkg.mod": "def helper():\n    x = 1\n    return x\n"})
+    fps = _build_repo_function_index(index)
+    matches = [r for group in fps.values() for r in group]
+    assert len(matches) == 1
+    assert matches[0].func.name == "helper"
+    assert matches[0].module == "pkg.mod"
+
+
+def test_repo_function_index_includes_staticmethod():
+    source = "class C:\n    @staticmethod\n    def helper():\n        return 1\n"
+    index = _index_from_sources({"pkg.mod": source})
+    fps = _build_repo_function_index(index)
+    matches = [r for group in fps.values() for r in group]
+    assert len(matches) == 1
+    assert matches[0].func.name == "helper"
+
+
+def test_repo_function_index_excludes_instance_method():
+    source = "class C:\n    def helper(self):\n        return 1\n"
+    index = _index_from_sources({"pkg.mod": source})
+    fps = _build_repo_function_index(index)
+    assert fps == {}
+
+
+def test_repo_function_index_skips_syntax_error():
+    index = _index_from_sources({"pkg.bad": "def f(:\n"})
+    fps = _build_repo_function_index(index)
+    assert fps == {}
+
+
+def test_repo_function_index_groups_by_fingerprint():
+    src_a = "def a():\n    x = 1\n    return x\n"
+    src_b = "def b():\n    x = 1\n    return x\n"
+    index = _index_from_sources({"pkg.a": src_a, "pkg.b": src_b})
+    fps = _build_repo_function_index(index)
+    assert len(fps) == 1
+    (group,) = fps.values()
+    assert {r.func.name for r in group} == {"a", "b"}
+
+
+def test_repo_function_info_is_dataclass():
+    func = _make_func_info("foo")
+    info = _RepoFunctionInfo(func=func, module="pkg.mod")
+    assert info.func is func
+    assert info.module == "pkg.mod"
 
 
 # ---------------------------------------------------------------------------
