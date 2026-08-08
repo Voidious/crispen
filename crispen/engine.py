@@ -24,6 +24,7 @@ from .patch_rewriter import (
 )
 from .patch_updater import apply_patch_strings
 from .refactors.caller_updater import CallerUpdater
+from .refactors.cross_file_duplicate import run_cross_file_duplicate_extraction
 from .refactors.duplicate_extractor import (
     DuplicateExtractor,
     _build_repo_function_index,
@@ -1025,6 +1026,24 @@ def run_engine(
             "candidates": candidates,
             "ranges": ranges,
         }
+
+    # ------------------------------------------------------------------ #
+    # Phase 1b — cross-file new-duplicate extraction                      #
+    # ------------------------------------------------------------------ #
+    # Runs on Phase 1's output (so any local extraction/match-function edits
+    # are already reflected) and looks for duplicate blocks spanning 2+
+    # files in the diff. Not a per-file Refactor: it can write a new helper
+    # file plus edit N call-site files in one pass, so it lives in its own
+    # module — see crispen/refactors/cross_file_duplicate.py.
+    if _should_run("duplicate_extractor", config):
+        # run_cross_file_duplicate_extraction manages its own stats directly
+        # (duplicate_extracted, llm_veto_calls, etc. — see the module), same
+        # as FileLimiter does, rather than through _categorize_into_stats'
+        # message-prefix parsing (which is only wired into Phase 1/2's own
+        # loops above) — calling both would double-count.
+        yield from run_cross_file_duplicate_extraction(
+            per_file, repo_root, config, verbose=verbose, stats=_stats
+        )
 
     # ------------------------------------------------------------------ #
     # Phase 2 — cross-file public-function transforms + caller updates    #

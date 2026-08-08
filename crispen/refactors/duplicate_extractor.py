@@ -813,14 +813,27 @@ def _llm_veto(
     rate_limit_retries: int = 6,
     rate_limit_backoff: float = 20.0,
 ) -> Tuple[bool, str, str]:
+    # Groups from the cross-file pass have a real seq.filepath on every entry;
+    # the single-file pass leaves it at "" for all of them.
+    cross_file = len({s.filepath for s in group}) > 1
+
+    def _block_header(i: int, s: _SeqInfo) -> str:
+        loc = f"lines {s.start_line}-{s.end_line}"
+        if cross_file:
+            return f"Block {i + 1} (file: {s.filepath}, scope: {s.scope}, {loc}):\n"
+        return f"Block {i + 1} (scope: {s.scope}, {loc}):\n"
+
     blocks_text = "\n\n".join(
-        f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
-        f"```python\n{s.source.rstrip()}\n```"
+        _block_header(i, s) + f"```python\n{s.source.rstrip()}\n```"
         for i, s in enumerate(group)
     )
+    source_desc = (
+        f"{len(group)} structurally similar code blocks from different files"
+        if cross_file
+        else f"{len(group)} structurally similar code blocks from the same Python file"
+    )
     prompt = (
-        f"Here are {len(group)} structurally similar code blocks from the same "
-        f"Python file:\n\n{blocks_text}\n\n"
+        f"Here are {source_desc}:\n\n{blocks_text}\n\n"
         "Do these blocks represent the same semantic operation such that extracting "
         "a shared helper function would improve clarity? Or are they coincidentally "
         "similar but conceptually distinct?\n\n"
@@ -1089,6 +1102,35 @@ def _llm_generate_call(
     return None  # pragma: no cover
 
 
+_VERIFY_CHECKLIST = (
+    "Check each of the following:\n"
+    "1. Every variable read (but not locally assigned) in the original block "
+    "is passed as a parameter to the helper\n"
+    "2. Every variable assigned in the original block and used afterward is "
+    "returned by the helper and captured at the call site\n"
+    "3. No parameter is assigned before it is first read in the helper body\n"
+    "4. If the original block ends with a non-None return, the call site "
+    "replacement also propagates that return value\n"
+    "5. The call site replacements match the original indentation and cover "
+    "exactly the lines of the original block\n"
+    "6. If the helper is called more than once with different arguments, verify "
+    "each call site against the exact local variables that appeared in the "
+    "original code at that location — not merely variables of the same type. "
+    "Same-type variables (e.g. two dicts, two strings) that are both in scope "
+    "are a swap risk: confirm neither was substituted for the other across call "
+    "sites.\n"
+    "7. No line from the helper body is duplicated verbatim in the call site "
+    "replacement. If setup lines were extracted into the helper, they must not "
+    "also appear before or after the call — otherwise the extraction is wrong.\n"
+    "8. Does the function name clearly and accurately describe what the body "
+    "does? Flag the name if it is misleading, too generic, or omits a crucial "
+    "detail — for example, an important side-effect that the name gives no hint "
+    "of (e.g. a function named 'compute_total' that also writes to a database).\n"
+    "If correct, set is_correct=True and issues=[]. "
+    "Otherwise set is_correct=False and list each specific issue."
+)
+
+
 def _llm_verify_extraction(
     client,
     group: List[_SeqInfo],
@@ -1132,31 +1174,7 @@ def _llm_verify_extraction(
         f"Call site replacements:\n{replacements_text}\n\n"
         f"Source context around duplicate blocks "
         f"(lines {window_start + 1}–{window_end}):\n```python\n{snippet}\n```\n\n"
-        "Check each of the following:\n"
-        "1. Every variable read (but not locally assigned) in the original block "
-        "is passed as a parameter to the helper\n"
-        "2. Every variable assigned in the original block and used afterward is "
-        "returned by the helper and captured at the call site\n"
-        "3. No parameter is assigned before it is first read in the helper body\n"
-        "4. If the original block ends with a non-None return, the call site "
-        "replacement also propagates that return value\n"
-        "5. The call site replacements match the original indentation and cover "
-        "exactly the lines of the original block\n"
-        "6. If the helper is called more than once with different arguments, verify "
-        "each call site against the exact local variables that appeared in the "
-        "original code at that location — not merely variables of the same type. "
-        "Same-type variables (e.g. two dicts, two strings) that are both in scope "
-        "are a swap risk: confirm neither was substituted for the other across call "
-        "sites.\n"
-        "7. No line from the helper body is duplicated verbatim in the call site "
-        "replacement. If setup lines were extracted into the helper, they must not "
-        "also appear before or after the call — otherwise the extraction is wrong.\n"
-        "8. Does the function name clearly and accurately describe what the body "
-        "does? Flag the name if it is misleading, too generic, or omits a crucial "
-        "detail — for example, an important side-effect that the name gives no hint "
-        "of (e.g. a function named 'compute_total' that also writes to a database).\n"
-        "If correct, set is_correct=True and issues=[]. "
-        "Otherwise set is_correct=False and list each specific issue."
+        f"{_VERIFY_CHECKLIST}"
     )
     result = _llm_client.call_with_tool(
         client,
