@@ -1999,6 +1999,63 @@ def test_run_engine_repo_wide_match_function_end_to_end(tmp_path, monkeypatch):
     )
 
 
+def test_run_engine_repo_wide_match_skips_mutual_pair(tmp_path, monkeypatch):
+    """Two diffed files with identical, newly-added function bodies must not
+    each replace their body with a call into the other -- that would leave
+    both as pure delegates calling each other (circular import, or infinite
+    recursion if the import happened to resolve). Found via a live two-file
+    self-check run (crispen-dev channel, 2026-08-09): before the fix, this
+    exact setup produced `from appmod.helpers import _setup` in mod.py and
+    `from appmod.mod import foo` in helpers.py simultaneously."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    pkg = tmp_path / "appmod"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    helpers = pkg / "helpers.py"
+    helpers.write_text(
+        "def _setup():\n"
+        "    x = compute(data)\n"
+        "    y = transform(x)\n"
+        "    z = finalize(y)\n",
+        encoding="utf-8",
+    )
+    mod = pkg / "mod.py"
+    mod.write_text(
+        "def foo():\n"
+        "    x = compute(data)\n"
+        "    y = transform(x)\n"
+        "    z = finalize(y)\n",
+        encoding="utf-8",
+    )
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        list(
+            run_engine(
+                {str(mod): [(1, 4)], str(helpers): [(1, 4)]},
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(
+                    match_functions_scope="repo",
+                    enabled_refactors=["duplicate_extractor", "match_function"],
+                ),
+            )
+        )
+
+    # Neither file was turned into a delegate calling the other. (The
+    # cross-file duplicate-extraction pass may separately propose extracting
+    # the shared body into a new module -- that path is circularity-safe by
+    # construction, per _cross_file_helper_target, and isn't what this test
+    # is checking; it's fine either way as long as neither file imports from
+    # the other.)
+    mock_run.assert_not_called()
+    assert "from appmod.helpers import _setup" not in mod.read_text(encoding="utf-8")
+    assert "from appmod.mod import foo" not in helpers.read_text(encoding="utf-8")
+
+
 def test_file_limiter_empty_original_source_deletes_file(tmp_path):
     """FileLimiter returns empty original_source → original file is deleted."""
     f = tmp_path / "big.py"

@@ -9,7 +9,7 @@ import textwrap
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import libcst as cst
 from libcst.metadata import MetadataWrapper, PositionProvider
@@ -2567,6 +2567,7 @@ class DuplicateExtractor(Refactor):
         match_functions_scope: str = "repo",
         repo_function_index: Optional[Dict[str, List[_RepoFunctionInfo]]] = None,
         repo_index: Optional["_repo_index.RepoIndex"] = None,
+        changed_modules: FrozenSet[str] = frozenset(),
         timing: str = "detailed",
         current_file: str = "",
         rate_limit_retries: int = 6,
@@ -2590,6 +2591,7 @@ class DuplicateExtractor(Refactor):
         self._match_functions_scope = match_functions_scope
         self._repo_function_index = repo_function_index or {}
         self._repo_index = repo_index
+        self._changed_modules = changed_modules
         self._rate_limit_retries = rate_limit_retries
         self._rate_limit_backoff = rate_limit_backoff
         self._new_source: Optional[str] = None
@@ -2877,6 +2879,34 @@ class DuplicateExtractor(Refactor):
                 func, target_module = repo_func.func, repo_func.module
                 if func.name == seq.scope or func.name in module_names:
                     continue
+                # Symmetric-match guard: target_module is only a hazard if
+                # its own file is *also* part of this run's diff — only then
+                # will it get its own independent repo-wide match pass off
+                # the same frozen index. (A target outside the diff is never
+                # itself processed this run, so it can never propose the
+                # mirror-image match — nothing to guard against.) When it
+                # is, check whether target_module's own pass would see
+                # *this* file's function as its sole, unambiguous candidate
+                # for this same fingerprint — accepting the match here would
+                # then risk a mutual pair: two files in the same run each
+                # replacing their identical body with a call into the
+                # other, leaving both as pure delegates calling each other
+                # (circular import, or infinite recursion if the import
+                # happened to resolve). The repo-wide index is a single
+                # snapshot taken before any file in this run is rewritten,
+                # so nothing else would catch this.
+                if target_module in self._changed_modules:
+                    reverse_candidates = [
+                        c
+                        for c in self._repo_function_index.get(seq.fingerprint, [])
+                        if c.module != target_module
+                    ]
+                    if (
+                        len(reverse_candidates) == 1
+                        and reverse_candidates[0].module == current_module
+                        and reverse_candidates[0].func.name == seq.scope
+                    ):
+                        continue
                 if not _target_import_is_proven_safe(
                     current_module, target_module, self._repo_index
                 ):

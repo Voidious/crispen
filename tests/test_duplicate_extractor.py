@@ -4683,6 +4683,19 @@ _REPO_FUNC_INDEX_UNSAFE = {
     ]
 }
 
+# The fingerprint's only non-self candidate ("_setup" in appmod.helpers) is
+# unambiguous from this file's perspective -- but the index *also* contains
+# this file's own "foo" (module="appmod.mod", the current file), which is
+# exactly what appmod.helpers' own repo-match pass would independently find
+# as *its* sole candidate. Accepting the match here would let both files
+# replace their identical bodies with calls into each other in the same run.
+_REPO_FUNC_INDEX_MUTUAL = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_setup"), module="appmod.helpers"),
+        _RepoFunctionInfo(func=_repo_func_info("foo"), module="appmod.mod"),
+    ]
+}
+
 # foo.body (in range) and bar.body (out of range) each independently match a
 # repo-wide candidate, so only foo's should ever reach the LLM. bar's body
 # uses an if/else shape (not 3 sequential assignments) so its fingerprint
@@ -5095,6 +5108,34 @@ def test_repo_match_veto_rejected(monkeypatch):
     assert de._new_source is None
 
 
+def test_repo_match_allows_safe_target_also_in_diff(monkeypatch):
+    """The target's file being part of this run's diff isn't itself
+    disqualifying -- only an actual reverse-candidate hazard is. With a
+    single, non-mutual candidate, the match proceeds normally even though
+    target_module is in changed_modules."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ),
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+            changed_modules=frozenset({"appmod.mod", "appmod.helpers"}),
+        )
+    assert de._new_source == (
+        "from appmod.helpers import _setup\n" "\n" "\n" "def foo():\n" "    _setup()\n"
+    )
+
+
 def test_repo_match_scope_file_ignores_repo_index(monkeypatch):
     """match_functions_scope='file' never consults the repo-wide index."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
@@ -5116,6 +5157,65 @@ def test_repo_match_scope_file_ignores_repo_index(monkeypatch):
         )
     mock_run.assert_not_called()
     assert de._new_source is None
+
+
+def test_repo_match_skips_symmetric_mutual_candidate(monkeypatch):
+    """A candidate that would itself independently match back to this file's
+    own function is skipped -- guards against two files in the same run each
+    replacing their identical body with a call into the other, which would
+    leave both as pure delegates calling each other (circular import, or
+    infinite recursion if the import happened to resolve). Found via a live
+    two-file self-check run; see crispen-dev channel history 2026-08-09."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_MUTUAL,
+            repo_index=repo_index,
+            changed_modules=frozenset({"appmod.mod", "appmod.helpers"}),
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
+
+
+def test_repo_match_allows_non_mutual_target_outside_diff(monkeypatch):
+    """The symmetric-match guard only applies when the target's own file is
+    *also* part of this run's diff (changed_modules) -- a target outside the
+    diff never gets its own independent pass this run, so it can't propose
+    the mirror-image match, and the (otherwise identical) candidate is
+    matched normally. Regression guard for the guard itself: without the
+    changed_modules restriction, this would be a false-positive skip."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ),
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_MUTUAL,
+            repo_index=repo_index,
+            changed_modules=frozenset({"appmod.mod"}),  # appmod.helpers not diffed
+        )
+    assert de._new_source == (
+        "from appmod.helpers import _setup\n" "\n" "\n" "def foo():\n" "    _setup()\n"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Generator, List, NamedTuple, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Generator, List, NamedTuple, Optional, Set, Tuple
 
 from .stats import RunStats
 
@@ -855,6 +855,7 @@ def run_engine(
     # and scoped to "repo", and there must be a resolvable repo root.
     _repo_wide_index = None
     _repo_function_index: Dict[str, list] = {}
+    _changed_modules: FrozenSet[str] = frozenset()
     if (
         repo_root is not None
         and config.match_functions_scope == "repo"
@@ -862,6 +863,17 @@ def run_engine(
     ):
         _repo_wide_index = build_repo_index(repo_root)
         _repo_function_index = _build_repo_function_index(_repo_wide_index)
+        # Every other file in *this run's* diff — not just this one file —
+        # will independently get its own repo-wide match-function pass off
+        # the same frozen _repo_function_index snapshot. A candidate whose
+        # module is in this set could, on its own turn, symmetrically
+        # propose matching back into the current file; see the mutual-match
+        # guard in DuplicateExtractor for what that guards against.
+        _changed_modules = frozenset(
+            _repo_wide_index.file_to_module[p]
+            for p in (str(Path(f).resolve()) for f in changed)
+            if p in _repo_wide_index.file_to_module
+        )
 
     # ------------------------------------------------------------------ #
     # Phase 1 — single-file refactors + TupleDataclass (private only)     #
@@ -916,6 +928,7 @@ def run_engine(
                         match_functions_scope=config.match_functions_scope,
                         repo_function_index=_repo_function_index,
                         repo_index=_repo_wide_index,
+                        changed_modules=_changed_modules,
                         timing=config.timing,
                         current_file=filepath,
                         rate_limit_retries=config.rate_limit_retries,
