@@ -16,6 +16,7 @@ from crispen.refactors.duplicate_extractor import (
     _build_repo_function_index,
     _decorator_name,
     _first_funcdef_idx,
+    _top_import_block_end,
     _has_funcdef,
     _collect_attribute_names,
     _collect_called_attr_names,
@@ -6387,6 +6388,76 @@ def test_lift_and_dedup_no_block_imports_inserts_before_first_funcdef():
         "def second_fn():\n"
         "    pass\n"
     )
+
+
+def test_lift_and_dedup_lifts_import_stranded_after_module_constant():
+    # Found live: a new import inserted right before the first def landed
+    # after an intervening module-level constant/dict (not itself a def or
+    # class), so the old "before first_funcdef_idx" check thought it was
+    # already in the block and never lifted it — E402 in the real output.
+    src = (
+        "from typing import Any\n"
+        "\n"
+        "_CONFIG = {'a': 1}\n"
+        "\n"
+        "from collections import OrderedDict\n"  # misplaced — after _CONFIG
+        "def _helper():\n"
+        "    pass\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == (
+        "from typing import Any\n"
+        "from collections import OrderedDict\n"
+        "\n"
+        "_CONFIG = {'a': 1}\n"
+        "\n"
+        "def _helper():\n"
+        "    pass\n"
+    )
+
+
+def test_lift_and_dedup_no_block_imports_inserts_before_module_constant():
+    # No original imports at all, and the file's first statement is a
+    # constant (not a def) — the lifted block belongs at the true top, above
+    # the constant, not merely before the first def further down.
+    src = (
+        "_CONFIG = {'a': 1}\n"
+        "\n"
+        "from collections import OrderedDict\n"  # misplaced
+        "def _helper():\n"
+        "    pass\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == (
+        "from collections import OrderedDict\n"
+        "_CONFIG = {'a': 1}\n"
+        "\n"
+        "def _helper():\n"
+        "    pass\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _top_import_block_end
+# ---------------------------------------------------------------------------
+
+
+def test_top_import_block_end_skips_docstring_and_imports():
+    src = '"""Module doc."""\nfrom typing import Any\nimport os\nx = 1\n'
+    lines = src.splitlines(keepends=True)
+    assert _top_import_block_end(src, lines) == 3
+
+
+def test_top_import_block_end_no_trailing_statement():
+    src = "from typing import Any\nimport os\n"
+    lines = src.splitlines(keepends=True)
+    assert _top_import_block_end(src, lines) == len(lines)
+
+
+def test_top_import_block_end_syntax_error_falls_back_to_funcdef_idx():
+    src = "def f(:\n"  # invalid syntax
+    lines = src.splitlines(keepends=True)
+    assert _top_import_block_end(src, lines) == _first_funcdef_idx(lines)
 
 
 # ---------------------------------------------------------------------------

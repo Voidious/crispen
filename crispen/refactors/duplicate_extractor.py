@@ -1957,10 +1957,9 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
 def _first_funcdef_idx(source_lines: List[str]) -> int:
     """Return the 0-based index of the first unindented ``def``/``class`` line.
 
-    Used both as the end boundary of the top-of-file import block (by
-    :func:`_lift_and_dedup_imports`) and as a safe insertion point for a new
-    module-level import line — guaranteed not to land above a shebang or
-    module docstring, which a raw insertion at line 0 could do.
+    Used as a safe insertion point for a new module-level import line —
+    guaranteed not to land above a shebang or module docstring, which a raw
+    insertion at line 0 could do.
     """
     for i, line in enumerate(source_lines):
         if line[:1] in (" ", "\t"):
@@ -1970,19 +1969,51 @@ def _first_funcdef_idx(source_lines: List[str]) -> int:
     return len(source_lines)
 
 
+def _top_import_block_end(source: str, source_lines: List[str]) -> int:
+    """Return the 0-based line index where the top-of-file import block ends.
+
+    Unlike :func:`_first_funcdef_idx` (bounded only by the first ``def``/
+    ``class``), this stops at the first top-level statement of *any* kind
+    that isn't the module docstring or an import — e.g. a module-level
+    constant or dict literal sitting between the real imports and the first
+    function. Without this, an import newly inserted just above the first
+    ``def`` (past such statements) looks like it's already "in the block"
+    to a check that only compares against ``_first_funcdef_idx``, so it
+    never gets lifted — leaving a stranded, PEP 8-violating import.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return _first_funcdef_idx(source_lines)
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            continue  # module docstring (or a stray top-level string literal)
+        return node.lineno - 1
+    return len(source_lines)
+
+
 def _lift_and_dedup_imports(source: str) -> str:
     """Lift misplaced module-level imports to the import block and deduplicate.
 
     When a helper is inserted before a function that is not the first in the
     file, its leading ``from X import Y`` lines land after the first
-    ``def``/``class``, violating PEP 8.  When a helper re-imports names
-    already present at the top, flake8 reports F811.  This function fixes both:
+    ``def``/``class`` — or even after an intervening module-level constant
+    or dict literal that sits between the real imports and the first
+    ``def`` — violating PEP 8.  When a helper re-imports names already
+    present at the top, flake8 reports F811.  This function fixes both:
 
     1. Collect every simple, unindented ``from X import …`` / ``import X``
        line from anywhere in the file.
     2. Merge names for the same module (deduplicate).
     3. Emit the merged set within the top-of-file import block (before the
-       first ``def``/``class``), removing all later occurrences.
+       first non-docstring, non-import top-level statement), removing all
+       later occurrences.
 
     Only single-line imports without parentheses, backslash continuations, or
     inline comments are handled.  Indented imports (``if TYPE_CHECKING:``,
@@ -1991,8 +2022,10 @@ def _lift_and_dedup_imports(source: str) -> str:
     lines = source.splitlines(keepends=True)
 
     # ── pass 1: find the import block boundary ──────────────────────────────
-    # The import block ends at the first unindented def/class line.
-    first_funcdef_idx = _first_funcdef_idx(lines)
+    # The import block ends at the first non-docstring, non-import top-level
+    # statement — not merely the first def/class, which would still count a
+    # module-level constant or dict literal as "inside the block".
+    top_block_end_idx = _top_import_block_end(source, lines)
 
     # ── pass 2: collect simple unindented import lines ──────────────────────
     _FROM_RE = re.compile(r"^from\s+(\S+)\s+import\s+([^(\\#]+)$")
@@ -2016,14 +2049,14 @@ def _lift_and_dedup_imports(source: str) -> str:
                 continue
             all_imports.append((i, stripped))
             import_indices.add(i)
-            if i < first_funcdef_idx:
+            if i < top_block_end_idx:
                 last_block_import_idx = i
             continue
         mp = _PLAIN_RE.match(stripped)
         if mp:
             all_imports.append((i, stripped))
             import_indices.add(i)
-            if i < first_funcdef_idx:
+            if i < top_block_end_idx:
                 last_block_import_idx = i
 
     if not all_imports:
@@ -2057,7 +2090,7 @@ def _lift_and_dedup_imports(source: str) -> str:
                 plain_seen.add(module)
 
     # ── early exit if nothing to do ─────────────────────────────────────────
-    has_misplaced = any(i >= first_funcdef_idx for i, _ in all_imports)
+    has_misplaced = any(i >= top_block_end_idx for i, _ in all_imports)
     from_counts: Dict[str, int] = {}
     plain_counts: Dict[str, int] = {}
     for _, text in all_imports:
@@ -2085,20 +2118,21 @@ def _lift_and_dedup_imports(source: str) -> str:
     sorted_imports = _sort_imports_pep8(all_final_imports)
 
     first_block_import_idx = min(
-        (i for i, _ in all_imports if i < first_funcdef_idx), default=-1
+        (i for i, _ in all_imports if i < top_block_end_idx), default=-1
     )
 
     # ── pass 5: rebuild source ───────────────────────────────────────────────
-    # Emit the sorted block at the first block import position (or just before
-    # the first def/class if there are no block imports).  Skip all original
-    # import lines and blank lines within the original block region — the
-    # sorted block replaces them entirely.
+    # Emit the sorted block at the first block import position (or just after
+    # any leading docstring, before the first non-import statement, if there
+    # are no block imports).  Skip all original import lines and blank lines
+    # within the original block region — the sorted block replaces them
+    # entirely.
     result: List[str] = []
     import_block_emitted = False
 
     for i, line in enumerate(lines):
-        # Edge case: no block imports — insert before the first def/class.
-        if i == first_funcdef_idx and not import_block_emitted:
+        # Edge case: no block imports — insert at the top import boundary.
+        if i == top_block_end_idx and not import_block_emitted:
             for imp in sorted_imports:
                 result.append(imp + "\n")
             import_block_emitted = True
