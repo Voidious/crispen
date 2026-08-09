@@ -221,7 +221,7 @@ def _llm_extract_cross_file(
         client,
         provider,
         model,
-        1024,
+        5000,
         _CROSS_FILE_EXTRACT_TOOL,
         "extract_cross_file_helper",
         [{"role": "user", "content": prompt}],
