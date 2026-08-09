@@ -7261,6 +7261,26 @@ def test_llm_verify_extraction_without_timing_out():
     assert issues == []
 
 
+def test_llm_verify_extraction_rejects_when_truncated():
+    """A truncated/empty verify response is treated as unverified, not correct."""
+    from crispen.refactors.duplicate_extractor import _llm_verify_extraction
+
+    client = MagicMock()
+    resp = MagicMock()
+    resp.content = []  # no tool_use block, e.g. response cut off by max_tokens
+    client.messages.create.return_value = resp
+    group = [_make_seq_info(1, 3), _make_seq_info(5, 7)]
+    is_correct, issues = _llm_verify_extraction(
+        client,
+        group,
+        "def _helper(): pass\n",
+        ["    _helper()\n", "    _helper()\n"],
+        "a = 1\nb = 2\n",
+    )
+    assert is_correct is False
+    assert issues
+
+
 def test_func_match_veto_timing_recorded(monkeypatch):
     """When func-match veto accepts, record_llm_call is invoked for the veto call."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")

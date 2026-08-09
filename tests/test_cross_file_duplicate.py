@@ -625,6 +625,23 @@ def test_llm_verify_extraction_cross_file():
     assert issues == []
 
 
+def test_llm_verify_extraction_cross_file_rejects_when_truncated():
+    client = MagicMock()
+    resp = MagicMock()
+    resp.content = []  # no tool_use block, e.g. response cut off by max_tokens
+    client.messages.create.return_value = resp
+    group = [_seq("a.py", 2, 4), _seq("b.py", 2, 4)]
+    is_correct, issues = _llm_verify_extraction_cross_file(
+        client,
+        group,
+        _HAPPY_EXTRACT["helper_source"],
+        _HAPPY_EXTRACT["call_site_replacements"],
+        {"a.py": f"def foo():\n{_DUP_BODY}", "b.py": f"def bar():\n{_DUP_BODY}"},
+    )
+    assert is_correct is False
+    assert issues
+
+
 # ---------------------------------------------------------------------------
 # End-to-end via run_engine
 # ---------------------------------------------------------------------------

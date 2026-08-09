@@ -289,7 +289,7 @@ def _llm_verify_extraction_cross_file(
         client,
         provider,
         model,
-        512,
+        4096,
         _VERIFY_TOOL,
         "verify_extraction",
         [{"role": "user", "content": prompt}],
@@ -301,7 +301,9 @@ def _llm_verify_extraction_cross_file(
     if _timing_out is not None:
         _timing_out.append(result)
     if result.tool_input is None:
-        return True, []  # pragma: no cover
+        return False, [
+            "Verification response was truncated or empty — treating as unverified."
+        ]
     return result.tool_input["is_correct"], result.tool_input.get("issues", [])
 
 

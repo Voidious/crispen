@@ -1183,8 +1183,9 @@ def _llm_verify_extraction(
     """Ask the LLM to verify the extraction is semantically correct.
 
     Returns ``(is_correct, issues)`` where *issues* is a list of specific
-    problems found.  Returns ``(True, [])`` if the call times out or the LLM
-    cannot respond, so a verification failure never silently blocks commits.
+    problems found.  Returns ``(False, [...])`` if the call is truncated or
+    the LLM otherwise fails to respond with a tool call — an extraction that
+    cannot be positively verified is treated as unverified, not correct.
     """
     blocks_text = "\n\n".join(
         f"Original block {i + 1} (scope: {s.scope}, "
@@ -1216,7 +1217,7 @@ def _llm_verify_extraction(
         client,
         provider,
         model,
-        512,
+        4096,
         _VERIFY_TOOL,
         "verify_extraction",
         [{"role": "user", "content": prompt}],
@@ -1228,7 +1229,9 @@ def _llm_verify_extraction(
     if _timing_out is not None:
         _timing_out.append(result)
     if result.tool_input is None:
-        return True, []  # pragma: no cover
+        return False, [
+            "Verification response was truncated or empty — treating as unverified."
+        ]
     return result.tool_input["is_correct"], result.tool_input.get("issues", [])
 
 
