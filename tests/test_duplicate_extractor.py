@@ -1190,6 +1190,33 @@ def test_names_in_edit_texts_skips_syntax_errors():
     assert isinstance(names, set)
 
 
+def test_names_in_edit_texts_includes_names_only_in_original_source():
+    # A setup line (last_import_line = 0) sits just outside the matched
+    # duplicate range, so it never appears in the replacement text. Without
+    # also scanning the original source at each edit's range, the cleaner
+    # would never consider it "touched" and would leave it dead.
+    source = (
+        "def f():\n"
+        "    last_import_line = 0\n"
+        "    for node in tree.body:\n"
+        "        last_import_line = max(last_import_line, node.end_lineno)\n"
+        "    return last_import_line\n"
+    )
+    groups = [
+        (
+            "_find_insertion_point",
+            [(2, 4, "    insert_after = _find_insertion_point(tree)\n")],
+            "msg",
+        )
+    ]
+    names_without_source = _names_in_edit_texts(groups)
+    assert "last_import_line" not in names_without_source
+
+    names_with_source = _names_in_edit_texts(groups, source)
+    assert "last_import_line" in names_with_source
+    assert "_find_insertion_point" in names_with_source
+
+
 # ---------------------------------------------------------------------------
 # _missing_free_vars
 # ---------------------------------------------------------------------------

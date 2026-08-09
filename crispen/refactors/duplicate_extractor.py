@@ -1721,26 +1721,36 @@ def _is_pure_literal(node: ast.expr) -> bool:
     return False
 
 
-def _names_in_edit_texts(extraction_groups) -> set:
-    """Return all bare ``Name`` ids found in every edit text of *extraction_groups*.
+def _names_in_edit_texts(extraction_groups, source: str = "") -> set:
+    """Return all bare ``Name`` ids touched by every edit in *extraction_groups*.
 
     ``extraction_groups`` is the list of ``(func_name, group_edits, msg)``
     tuples accepted at the end of ``DuplicateExtractor._transform``.  Each
     ``group_edits`` entry is a ``(start, end, text)`` triple; *text* may be
     the helper function source or a call-site replacement.  Collecting names
-    from all of them gives the set of variables that the extraction actually
-    touched.
+    from the replacement text alone misses variables that a replaced block
+    used to read but which no longer appear anywhere in the new text (e.g. a
+    setup line just outside the matched duplicate range that only existed to
+    feed the block being replaced) — those become newly dead but never look
+    "touched" by the edit.  Passing *source* also collects names from the
+    *original* text at each edit's range so such variables are still allowed
+    to be swept as newly-unused.
     """
     names: set = set()
+    source_lines = source.splitlines(keepends=True) if source else []
     for _, g_edits, _ in extraction_groups:
-        for _start, _end, text in g_edits:
-            try:
-                tree = ast.parse(text)
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Name):
-                    names.add(node.id)
+        for start, end, text in g_edits:
+            texts = [text]
+            if source_lines:
+                texts.append("".join(source_lines[start:end]))
+            for t in texts:
+                try:
+                    tree = ast.parse(textwrap.dedent(t))
+                except SyntaxError:
+                    continue
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Name):
+                        names.add(node.id)
     return names
 
 
@@ -3733,7 +3743,7 @@ class DuplicateExtractor(Refactor):
                 all_pending.append(msg)
 
             if all_edits:
-                _extracted_names = _names_in_edit_texts(extraction_groups)
+                _extracted_names = _names_in_edit_texts(extraction_groups, source)
                 combined = _pyflakes_strip_unused_simple_assigns(
                     combined, _extracted_names
                 )
