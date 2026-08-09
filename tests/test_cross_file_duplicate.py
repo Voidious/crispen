@@ -235,6 +235,63 @@ def test_happy_path_extracts_and_writes_helper(tmp_path, monkeypatch):
     assert str(helper_file) in stats.files_edited
 
 
+# Regression (found by a live self-check run): a duplicated block that was
+# the only user of an import in a file leaves that import dead once the
+# block's only use moves into the new cross-file helper. Weight 3 (3
+# statements), matching _DUP_BODY's shape.
+_DUP_BODY_THREADING = (
+    "    t = threading.Thread(target=lambda: None)\n" "    t.start()\n" "    t.join()\n"
+)
+
+_THREADING_EXTRACT = {
+    "function_name": "shared_helper",
+    "helper_source": (
+        "import threading\n"
+        "\n"
+        "\n"
+        "def shared_helper():\n"
+        "    t = threading.Thread(target=lambda: None)\n"
+        "    t.start()\n"
+        "    t.join()\n"
+    ),
+    "call_site_replacements": [
+        "    shared_helper()\n",
+        "    shared_helper()\n",
+    ],
+}
+
+
+def test_dead_import_stripped_after_only_use_extracted(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_dup_pair(tmp_path, body=_DUP_BODY_THREADING)
+    for f, funcname in ((f1, "foo"), (f2, "bar")):
+        f.write_text(
+            f"import threading\n\n\ndef {funcname}():\n{_DUP_BODY_THREADING}",
+            encoding="utf-8",
+        )
+    per_file = _per_file_for(f1, f2)
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(_THREADING_EXTRACT),
+            _make_verify_response(True, []),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(per_file, str(tmp_path), _cfg(tmp_path))
+        )
+    assert len(msgs) == 1
+
+    for f in (f1, f2):
+        new_src = per_file[str(f)]["source"]
+        assert "shared_helper()" in new_src
+        assert "import threading" not in new_src
+
+    helper_file = tmp_path / "pkg" / "common.py"
+    assert "import threading" in helper_file.read_text(encoding="utf-8")
+
+
 def test_veto_rejected_skips_group(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     f1, f2 = _write_dup_pair(tmp_path)

@@ -39,6 +39,7 @@ from .duplicate_extractor import (
     _lift_and_dedup_imports,
     _llm_veto,
     _pyflakes_new_undefined_names,
+    _pyflakes_strip_newly_unused_imports,
     _run_with_timeout,
     _strip_helper_docstring,
     _verify_extraction,
@@ -518,6 +519,7 @@ def run_cross_file_duplicate_extraction(
                         (insert_idx, insert_idx, import_line)
                     ]
                     combined = _lift_and_dedup_imports(_apply_edits(src, fp_edits))
+                    combined = _pyflakes_strip_newly_unused_imports(src, combined)
                     try:
                         compile(combined, fp, "exec")
                     except SyntaxError:

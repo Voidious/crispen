@@ -1599,6 +1599,73 @@ def _pyflakes_new_undefined_names(original: str, candidate: str) -> set:
     return after.names - before.names
 
 
+def _pyflakes_strip_newly_unused_imports(original: str, candidate: str) -> str:
+    """Remove imports that became unused because of the edit.
+
+    Cross-file extraction can move the only use of an import (e.g. a helper
+    that called ``threading.Thread``) out of a file entirely, leaving the
+    ``import`` statement dead. Compares pyflakes ``UnusedImport`` (F401)
+    diagnostics before and after the edit — same diff pattern already used
+    for undefined names — and only removes an ``import``/``from ... import``
+    statement when *every* name it binds is newly unused, never one that was
+    already unused (or only partially unused) before the edit.
+    """
+    import pyflakes.api
+    import pyflakes.messages
+
+    class _Collector:
+        def __init__(self):
+            self.names: set = set()
+
+        def unexpectedError(self, filename, msg):  # pragma: no cover
+            pass
+
+        def syntaxError(self, filename, msg, lineno, offset, text):  # pragma: no cover
+            pass
+
+        def flake(self, msg):
+            if isinstance(msg, pyflakes.messages.UnusedImport):
+                self.names.add(msg.message_args[0])
+
+    before = _Collector()
+    pyflakes.api.check(original, "<original>", reporter=before)
+    after = _Collector()
+    pyflakes.api.check(candidate, "<candidate>", reporter=after)
+    newly_unused = after.names - before.names
+    if not newly_unused:
+        return candidate
+
+    try:
+        tree = ast.parse(candidate)
+    except SyntaxError:  # pragma: no cover
+        return candidate  # pragma: no cover
+
+    lines_to_remove: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            fullnames = [a.asname or a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            fullnames = [f"{module}.{a.asname or a.name}" for a in node.names]
+        else:
+            continue
+        if fullnames and set(fullnames).issubset(newly_unused):
+            lines_to_remove.update(range(node.lineno, node.end_lineno + 1))
+
+    if not lines_to_remove:
+        return candidate
+
+    lines = candidate.splitlines(keepends=True)
+    cleaned = "".join(
+        line for i, line in enumerate(lines, 1) if i not in lines_to_remove
+    )
+    try:
+        compile(cleaned, "<stripped>", "exec")
+    except SyntaxError:
+        return candidate
+    return cleaned
+
+
 def _is_pure_literal(node: ast.expr) -> bool:
     """Return True if *node* is a side-effect-free literal expression.
 

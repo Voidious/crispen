@@ -58,6 +58,7 @@ from crispen.refactors.duplicate_extractor import (
     _is_pure_literal,
     _names_in_edit_texts,
     _pyflakes_new_undefined_names,
+    _pyflakes_strip_newly_unused_imports,
     _pyflakes_strip_unused_simple_assigns,
     _run_with_timeout,
     _sequence_weight,
@@ -1107,6 +1108,56 @@ def test_pyflakes_strip_unused_simple_assigns_empty_allowed():
     )
     result = _pyflakes_strip_unused_simple_assigns(source, set())
     assert result == source
+
+
+# ---------------------------------------------------------------------------
+# _pyflakes_strip_newly_unused_imports
+# ---------------------------------------------------------------------------
+
+
+def test_pyflakes_strip_newly_unused_imports_removes_plain_import():
+    original = "import threading\n\n\ndef foo():\n    threading.Thread().start()\n"
+    candidate = "import threading\n\n\ndef foo():\n    pass\n"
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert "import threading" not in result
+    assert "def foo():" in result
+
+
+def test_pyflakes_strip_newly_unused_imports_removes_from_import_when_fully_unused():
+    original = "from typing import Dict\n\n\ndef foo() -> Dict:\n    return {}\n"
+    candidate = "from typing import Dict\n\n\ndef foo():\n    return None\n"
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert "from typing import Dict" not in result
+
+
+def test_pyflakes_strip_newly_unused_imports_keeps_partial_from_import():
+    # Dict became unused but List is still used — the statement binds both
+    # names, so it must be left alone rather than partially edited.
+    original = (
+        "from typing import List, Dict\n\n\ndef foo(x: List) -> Dict:\n    return {}\n"
+    )
+    candidate = (
+        "from typing import List, Dict\n\n\ndef foo(x: List):\n    return None\n"
+    )
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert result == candidate
+
+
+def test_pyflakes_strip_newly_unused_imports_keeps_preexisting_unused():
+    # "os" was already unused before the edit — not this function's concern.
+    original = "import os\n\n\ndef foo():\n    return 1\n"
+    candidate = "import os\n\n\ndef foo():\n    return 2\n"
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert result == candidate
+
+
+def test_pyflakes_strip_newly_unused_imports_fallback_on_syntax_error():
+    # Removing the import would leave an empty if-block — SyntaxError, so
+    # the candidate is returned unchanged.
+    original = "if True:\n    import os\n    os.getcwd()\n"
+    candidate = "if True:\n    import os\n"
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert result == candidate
 
 
 # ---------------------------------------------------------------------------
