@@ -1,0 +1,8 @@
+--- a/a_input.py
++++ b/a_input.py
+@@ -0,0 +1,5 @@
++def process_order(payload):
++    ref = payload["customer_ref"]
++    normalized = ref.strip().upper()
++    tag = normalized.replace("-", "")
++    return tag
