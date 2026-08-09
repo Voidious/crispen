@@ -578,6 +578,38 @@ def test_llm_extract_cross_file_minimal():
     assert result == _HAPPY_EXTRACT
 
 
+def test_llm_extract_cross_file_prompt_includes_return_note():
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(_HAPPY_EXTRACT)
+    group = [
+        _seq("a.py", 1, 1, source="    return 1\n"),
+        _seq("b.py", 1, 1, source="    return 1\n"),
+    ]
+    _llm_extract_cross_file(
+        client,
+        group,
+        {"a.py": "def foo():\n    return 1\n", "b.py": "def bar():\n    return 1\n"},
+        "pkg.common",
+    )
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "call site replacement for every occurrence must be" in prompt
+    assert "`return <helper_call>(...)`" in prompt
+
+
+def test_llm_extract_cross_file_prompt_omits_return_note_when_not_applicable():
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(_HAPPY_EXTRACT)
+    group = [_seq("a.py", 1, 2), _seq("b.py", 1, 2)]
+    _llm_extract_cross_file(
+        client,
+        group,
+        {"a.py": "def foo():\n    x = 1\n", "b.py": "def bar():\n    x = 1\n"},
+        "pkg.common",
+    )
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "call site replacement for every occurrence must be" not in prompt
+
+
 def test_llm_verify_extraction_cross_file():
     client = MagicMock()
     client.messages.create.return_value = _make_verify_response(True, [])

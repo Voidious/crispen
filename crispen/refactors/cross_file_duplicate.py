@@ -35,6 +35,7 @@ from .duplicate_extractor import (
     _find_cross_file_duplicate_groups,
     _find_escaping_vars,
     _first_funcdef_idx,
+    _group_ends_in_return,
     _has_call_to,
     _lift_and_dedup_imports,
     _llm_veto,
@@ -139,8 +140,19 @@ def _llm_extract_cross_file(
             f"\n\nThe following variables are assigned within the duplicate block "
             f"and referenced by code that immediately follows the block at one or "
             f"more call sites: {vars_str}. The helper function must return these "
-            f"variables. At call sites where the return value is needed, capture it; "
-            f"at call sites where it is not needed, discard the return value."
+            f"variables. Every call site replacement that needs the returned "
+            f"value(s) MUST begin with the capturing assignment or `return` — "
+            f"check this individually for each call site, including ones later "
+            f"in the list, not just the first. At call sites where the return "
+            f"value is not needed, discard it."
+        )
+    return_note = ""
+    if _group_ends_in_return(group):
+        return_note = (
+            "\n\nEach duplicate block's own last statement is `return <expr>` "
+            "— the call site replacement for every occurrence must be "
+            "`return <helper_call>(...)`, never a bare call that silently "
+            "drops the return value."
         )
     used_names_note = ""
     if used_names:
@@ -172,7 +184,9 @@ def _llm_extract_cross_file(
             f"helper_source:\n```python\n{prior_helper}```\n\n"
             f"call_site_replacements:\n{repls_text}\n\n"
             f"But failed these checks:\n{failures_str}\n\n"
-            f"Please correct these issues in your new attempt."
+            f"Before responding, check EVERY call site replacement individually "
+            f"against these issues — a fix that only corrects the first call "
+            f"site and leaves a later one with the same mistake will fail again."
         )
     prompt = (
         "Extract the following duplicate code blocks — found in different files — "
@@ -197,6 +211,7 @@ def _llm_extract_cross_file(
         "`is` — `is` only gives correct results for singletons like `None`, `True`, "
         "and `False`, not for constructed objects like `set()`."
         f"{escaping_note}"
+        f"{return_note}"
         f"{used_names_note}"
         f"{docstring_note}"
         f"{veto_notes_note}"

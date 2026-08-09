@@ -866,6 +866,28 @@ def _llm_veto(
     return False, "no tool response", ""  # pragma: no cover
 
 
+def _group_ends_in_return(group: List[_SeqInfo]) -> bool:
+    """Return True if every sequence in *group* ends with a `return` statement.
+
+    A block shaped like this needs no escaping-variable handling at all — the
+    correct call site replacement is simply ``return <helper_call>(...)``. Left
+    unflagged, extraction prompts have no guidance for this shape and models
+    have been observed dropping the `return` at some (but not all) call sites,
+    silently turning the function into one that falls through to `None`.
+    """
+    for seq in group:
+        dedented = textwrap.dedent(seq.source)
+        wrapped = "def _check():\n" + textwrap.indent(dedented, "    ")
+        try:
+            tree = ast.parse(wrapped)
+        except SyntaxError:
+            return False
+        func_body = tree.body[0].body  # type: ignore[attr-defined]
+        if not func_body or not isinstance(func_body[-1], ast.Return):
+            return False
+    return True
+
+
 def _llm_extract(
     client,
     group: List[_SeqInfo],
@@ -908,8 +930,19 @@ def _llm_extract(
             f"\n\nThe following variables are assigned within the duplicate block "
             f"and referenced by code that immediately follows the block at one or "
             f"more call sites: {vars_str}. The helper function must return these "
-            f"variables. At call sites where the return value is needed, capture it; "
-            f"at call sites where it is not needed, discard the return value."
+            f"variables. Every call site replacement that needs the returned "
+            f"value(s) MUST begin with the capturing assignment or `return` — "
+            f"check this individually for each call site, including ones later "
+            f"in the list, not just the first. At call sites where the return "
+            f"value is not needed, discard it."
+        )
+    return_note = ""
+    if _group_ends_in_return(group):
+        return_note = (
+            "\n\nEach duplicate block's own last statement is `return <expr>` "
+            "— the call site replacement for every occurrence must be "
+            "`return <helper_call>(...)`, never a bare call that silently "
+            "drops the return value."
         )
     used_names_note = ""
     if used_names:
@@ -941,7 +974,9 @@ def _llm_extract(
             f"helper_source:\n```python\n{prior_helper}```\n\n"
             f"call_site_replacements:\n{repls_text}\n\n"
             f"But failed these checks:\n{failures_str}\n\n"
-            f"Please correct these issues in your new attempt."
+            f"Before responding, check EVERY call site replacement individually "
+            f"against these issues — a fix that only corrects the first call "
+            f"site and leaves a later one with the same mistake will fail again."
         )
     class_scopes = {s.class_scope for s in group}
     all_same_class = len(class_scopes) == 1 and None not in class_scopes
@@ -977,6 +1012,7 @@ def _llm_extract(
         "`is` — `is` only gives correct results for singletons like `None`, `True`, "
         "and `False`, not for constructed objects like `set()`."
         f"{escaping_note}"
+        f"{return_note}"
         f"{used_names_note}"
         f"{docstring_note}"
         f"{veto_notes_note}"

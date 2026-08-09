@@ -4087,6 +4087,104 @@ def test_llm_extract_skips_non_matching_blocks(monkeypatch):
     assert result["function_name"] == "helper"
 
 
+def test_group_ends_in_return_true_single_and_multi_statement():
+    from crispen.refactors.duplicate_extractor import _group_ends_in_return
+
+    single = _make_seq_info(1, 1, "    return x\n")
+    multi = _make_seq_info(1, 2, "    y = x + 1\n    return y\n")
+    assert _group_ends_in_return([single]) is True
+    assert _group_ends_in_return([single, multi]) is True
+
+
+def test_group_ends_in_return_false_no_return():
+    from crispen.refactors.duplicate_extractor import _group_ends_in_return
+
+    seq = _make_seq_info(1, 1, "    x = 1\n")
+    assert _group_ends_in_return([seq]) is False
+
+
+def test_group_ends_in_return_false_mixed_group():
+    """Only one sequence in the group lacking a trailing return is enough
+    to make the whole group ineligible for the return-note."""
+    from crispen.refactors.duplicate_extractor import _group_ends_in_return
+
+    ends_in_return = _make_seq_info(1, 1, "    return x\n")
+    does_not = _make_seq_info(5, 5, "    x = 1\n")
+    assert _group_ends_in_return([ends_in_return, does_not]) is False
+
+
+def test_group_ends_in_return_false_on_syntax_error():
+    from crispen.refactors.duplicate_extractor import _group_ends_in_return
+
+    seq = _make_seq_info(1, 1, "    def (:\n")
+    assert _group_ends_in_return([seq]) is False
+
+
+def test_llm_extract_prompt_includes_return_note_when_group_ends_in_return():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper():\n    return 1\n",
+            "call_site_replacements": ["    return helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    return 1\n")]
+    _llm_extract(client, group, "def foo():\n    return 1\n")
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "call site replacement for every occurrence must be" in prompt
+    assert "`return <helper_call>(...)`" in prompt
+
+
+def test_llm_extract_prompt_omits_return_note_when_group_does_not_end_in_return():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper():\n    pass\n",
+            "call_site_replacements": ["    helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    x = 1\n")]
+    _llm_extract(client, group, "def foo():\n    x = 1\n")
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "call site replacement for every occurrence must be" not in prompt
+
+
+def test_llm_extract_prompt_failures_note_is_surgical():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper(): pass\n",
+            "call_site_replacements": ["helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    x = 1\n")]
+    _llm_extract(
+        client,
+        group,
+        "a = 1\n",
+        prev_failures=["call site 2 did not capture the return value"],
+        prev_output={
+            "helper_source": "def helper(): pass\n",
+            "call_site_replacements": ["x = helper()\n", "helper()\n"],
+        },
+    )
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "check EVERY call site replacement individually" in prompt
+    assert "leaves a later one with the same mistake will fail again" in prompt
+
+
 def test_llm_veto_with_timing_out(monkeypatch):
     """_llm_veto appends result to _timing_out when provided."""
     from crispen.refactors.duplicate_extractor import _llm_veto
