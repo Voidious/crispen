@@ -213,6 +213,17 @@ class CrispenConfig:
     # "detailed" adds per-call-type, per-refactor, and per-file breakdowns.
     timing: str = "detailed"
 
+    # Opt-in debug log: when set, every LLM tool call (from any refactor)
+    # appends one JSON line to this file with the caller, provider, model,
+    # full prompt messages, and the raw tool_input the model returned.
+    # Off (None) by default — the log captures full file contents on every
+    # call and can grow large fast. Turn it on when you need to diagnose an
+    # LLM-produced result after the fact without reverse-engineering it from
+    # the final diff (crispen's normal stderr output only prints summary
+    # lines, not the raw prompt/response). Best-effort: a write failure
+    # (e.g. unwritable path) is silently ignored rather than failing the run.
+    debug_llm_log: Optional[str] = None
+
 
 def format_header(config: "CrispenConfig") -> List[str]:
     """Return config lines printed to stderr before the first LLM call."""
@@ -234,6 +245,8 @@ def format_header(config: "CrispenConfig") -> List[str]:
         lines.append(f"  {'patch_update_retries:':<{w}}{config.patch_update_retries}")
     if config.base_url is not None:
         lines.append(f"  {'base_url:':<{w}}{config.base_url}")
+    if config.debug_llm_log is not None:
+        lines.append(f"  {'debug_llm_log:':<{w}}{config.debug_llm_log}")
     return lines
 
 

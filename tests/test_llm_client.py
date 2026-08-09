@@ -11,7 +11,16 @@ from crispen.llm_client import (
     call_with_tool,
     get_api_key,
     make_client,
+    set_debug_log,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_debug_log():
+    """Debug-log state is a module-level global; never let it leak between tests."""
+    set_debug_log(None)
+    yield
+    set_debug_log(None)
 
 
 # ---------------------------------------------------------------------------
@@ -1074,3 +1083,135 @@ def test_call_with_tool_tool_choice_override():
         )
     call_kwargs = client.chat.completions.create.call_args[1]
     assert call_kwargs["tool_choice"] == "required"
+
+
+# ---------------------------------------------------------------------------
+# debug_llm_log (set_debug_log / _log_debug_call)
+# ---------------------------------------------------------------------------
+
+
+def test_call_with_tool_disabled_by_default_writes_nothing(tmp_path):
+    log_path = tmp_path / "debug.jsonl"
+    client = MagicMock()
+    client.messages.create.return_value = _make_anthropic_response(
+        "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+    )
+    call_with_tool(
+        client,
+        "anthropic",
+        "claude-sonnet-4-6",
+        256,
+        _TOOL,
+        "evaluate_duplicate",
+        _MESSAGES,
+    )
+    assert not log_path.exists()
+
+
+def test_call_with_tool_anthropic_logs_when_enabled(tmp_path):
+    log_path = tmp_path / "debug.jsonl"
+    set_debug_log(str(log_path))
+    client = MagicMock()
+    client.messages.create.return_value = _make_anthropic_response(
+        "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+    )
+    call_with_tool(
+        client,
+        "anthropic",
+        "claude-sonnet-4-6",
+        256,
+        _TOOL,
+        "evaluate_duplicate",
+        _MESSAGES,
+        caller="DuplicateExtractor",
+    )
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["caller"] == "DuplicateExtractor"
+    assert record["provider"] == "anthropic"
+    assert record["model"] == "claude-sonnet-4-6"
+    assert record["tool_name"] == "evaluate_duplicate"
+    assert record["messages"] == _MESSAGES
+    assert record["tool_input"] == {"is_valid_duplicate": True, "reason": "same"}
+    assert record["input_tokens"] == 100
+    assert record["output_tokens"] == 50
+    assert record["truncated"] is False
+    assert isinstance(record["timestamp"], float)
+
+
+def test_call_with_tool_openai_logs_when_enabled(tmp_path):
+    log_path = tmp_path / "debug.jsonl"
+    set_debug_log(str(log_path))
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.return_value = _make_openai_response(
+            "evaluate_duplicate", {"is_valid_duplicate": False, "reason": "no"}
+        )
+        call_with_tool(
+            client,
+            "moonshot",
+            "kimi-k2.5",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+            caller="DuplicateExtractor",
+        )
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["provider"] == "moonshot"
+    assert record["tool_input"] == {"is_valid_duplicate": False, "reason": "no"}
+
+
+def test_call_with_tool_logs_multiple_calls_append(tmp_path):
+    log_path = tmp_path / "debug.jsonl"
+    set_debug_log(str(log_path))
+    client = MagicMock()
+    client.messages.create.return_value = _make_anthropic_response(
+        "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+    )
+    call_with_tool(
+        client,
+        "anthropic",
+        "claude-sonnet-4-6",
+        256,
+        _TOOL,
+        "evaluate_duplicate",
+        _MESSAGES,
+    )
+    call_with_tool(
+        client,
+        "anthropic",
+        "claude-sonnet-4-6",
+        256,
+        _TOOL,
+        "evaluate_duplicate",
+        _MESSAGES,
+    )
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+
+
+def test_call_with_tool_debug_log_write_failure_is_swallowed(tmp_path):
+    # A directory where a file is expected: open() raises OSError (IsADirectoryError
+    # on POSIX / PermissionError on Windows, both subclasses of OSError).
+    bad_path = tmp_path / "not_a_file"
+    bad_path.mkdir()
+    set_debug_log(str(bad_path))
+    client = MagicMock()
+    client.messages.create.return_value = _make_anthropic_response(
+        "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+    )
+    result = call_with_tool(
+        client,
+        "anthropic",
+        "claude-sonnet-4-6",
+        256,
+        _TOOL,
+        "evaluate_duplicate",
+        _MESSAGES,
+    )
+    assert result.tool_input == {"is_valid_duplicate": True, "reason": "same"}

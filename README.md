@@ -68,6 +68,14 @@ model = "claude-sonnet-4-6"
 # Raise this when using slow local models.
 # api_timeout = 60.0
 
+# Opt-in debug log path (default: unset). When set, every LLM tool call
+# appends one JSON line with the caller, provider, model, full prompt
+# messages, and the raw tool_input the model returned. Off by default since
+# the log captures full file contents on every call and can grow large fast.
+# Useful for diagnosing an unexpected result after the fact — crispen's
+# normal stderr output only prints summary lines, not the raw prompt/response.
+# debug_llm_log = "crispen-debug.jsonl"
+
 # FunctionSplitter: max function body lines before splitting (default: 75)
 max_function_length = 75
 

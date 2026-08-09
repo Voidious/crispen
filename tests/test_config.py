@@ -143,6 +143,20 @@ def test_load_config_all_options(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_debug_llm_log_default():
+    cfg = CrispenConfig()
+    assert cfg.debug_llm_log is None
+
+
+def test_load_config_debug_llm_log(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.crispen]\ndebug_llm_log = 'crispen-debug.jsonl'\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(project_root=tmp_path)
+    assert cfg.debug_llm_log == "crispen-debug.jsonl"
+
+
 def test_file_limiter_pytest_conftest_default():
     cfg = CrispenConfig()
     assert cfg.file_limiter_pytest_conftest is True
@@ -221,6 +235,7 @@ def test_format_header_defaults():
     assert "file_limiter_patch_update:" in text
     assert "patch_update_retries:" not in text
     assert "base_url" not in text
+    assert "debug_llm_log" not in text
 
 
 def test_format_header_patch_update_rewrite():
@@ -235,3 +250,10 @@ def test_format_header_with_base_url():
     lines = format_header(cfg)
     text = "\n".join(lines)
     assert "http://localhost:1234/v1" in text
+
+
+def test_format_header_with_debug_llm_log():
+    cfg = CrispenConfig(debug_llm_log="/tmp/crispen-debug.jsonl")
+    lines = format_header(cfg)
+    text = "\n".join(lines)
+    assert "/tmp/crispen-debug.jsonl" in text

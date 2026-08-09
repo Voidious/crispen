@@ -42,6 +42,63 @@ class LLMCallResult:
     truncated: bool = False  # True when the response was cut off by the token limit
 
 
+# Path for the opt-in raw-call debug log (see CrispenConfig.debug_llm_log).
+# Module-level rather than threaded through every call_with_tool caller —
+# call_with_tool is invoked from ~20 sites across 5 modules, none of which
+# otherwise need a full CrispenConfig in scope.
+_debug_log_path: Optional[str] = None
+
+
+def set_debug_log(path: Optional[str]) -> None:
+    """Enable (path given) or disable (None) raw LLM call logging.
+
+    Call once at startup with ``config.debug_llm_log``. Every subsequent
+    ``call_with_tool`` invocation, regardless of which module made it,
+    appends one JSON line to *path*.
+    """
+    global _debug_log_path
+    _debug_log_path = path
+
+
+def _log_debug_call(
+    caller: str,
+    provider: str,
+    model: str,
+    tool_name: str,
+    messages: list,
+    result: "LLMCallResult",
+) -> None:
+    """Best-effort append of one raw-call record to the debug log, if enabled.
+
+    Captures the exact prompt sent and the exact tool_input the model
+    returned — the two things summary stderr lines never include — so a
+    surprising result can be diagnosed directly instead of reverse-engineered
+    from the final diff. A write failure (bad path, full disk, etc.) is
+    swallowed rather than failing the run; the log is a debugging aid, not
+    part of crispen's actual output.
+    """
+    if _debug_log_path is None:
+        return
+    record = {
+        "timestamp": time.time(),
+        "caller": caller,
+        "provider": provider,
+        "model": model,
+        "tool_name": tool_name,
+        "messages": messages,
+        "tool_input": result.tool_input,
+        "elapsed": result.elapsed,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "truncated": result.truncated,
+    }
+    try:
+        with open(_debug_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except OSError:
+        pass
+
+
 # Maps provider name to its required environment variable.
 # None means no API key is required (e.g. LM Studio running locally).
 def _token_param(model: str) -> str:
@@ -176,13 +233,15 @@ def call_with_tool(
             out_tok = int(response.usage.output_tokens)
         except (AttributeError, TypeError, ValueError):
             in_tok, out_tok = 0, 0
-        return LLMCallResult(
+        _result = LLMCallResult(
             tool_input=tool_input,
             elapsed=time.perf_counter() - t0,
             input_tokens=in_tok,
             output_tokens=out_tok,
             truncated=_truncated,
         )
+        _log_debug_call(caller, provider, model, tool_name, messages, _result)
+        return _result
     else:
         openai_tool = {
             "type": "function",
@@ -317,10 +376,12 @@ def call_with_tool(
             out_tok = int(response.usage.completion_tokens)
         except (AttributeError, TypeError, ValueError):
             in_tok, out_tok = 0, 0
-        return LLMCallResult(
+        _result = LLMCallResult(
             tool_input=tool_input,
             elapsed=time.perf_counter() - t0,
             input_tokens=in_tok,
             output_tokens=out_tok,
             truncated=_truncated,
         )
+        _log_debug_call(caller, provider, model, tool_name, messages, _result)
+        return _result
