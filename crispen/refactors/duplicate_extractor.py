@@ -846,7 +846,7 @@ def _llm_veto(
         client,
         provider,
         model,
-        384,
+        2048,
         _VETO_TOOL,
         "evaluate_duplicate",
         [{"role": "user", "content": prompt}],
