@@ -7281,6 +7281,20 @@ def test_llm_verify_extraction_rejects_when_truncated():
     assert issues
 
 
+def test_verify_tool_requires_call_site_argument_mapping():
+    """The verify tool schema forces the model to produce a per-call-site
+    argument mapping before it can answer is_correct — a prose-only checklist
+    instruction was found not to reliably change model behavior under forced
+    tool_choice, since nothing required the model to engage with it."""
+    from crispen.refactors.duplicate_extractor import _VERIFY_TOOL
+
+    props = _VERIFY_TOOL["input_schema"]["properties"]
+    required = _VERIFY_TOOL["input_schema"]["required"]
+    assert "call_site_argument_mapping" in props
+    assert props["call_site_argument_mapping"]["type"] == "array"
+    assert required.index("call_site_argument_mapping") < required.index("is_correct")
+
+
 def test_func_match_veto_timing_recorded(monkeypatch):
     """When func-match veto accepts, record_llm_call is invoked for the veto call."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")

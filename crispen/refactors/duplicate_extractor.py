@@ -725,6 +725,25 @@ _VERIFY_TOOL: dict = {
     "input_schema": {
         "type": "object",
         "properties": {
+            "call_site_argument_mapping": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Required scratch work, one entry per call site, filled in "
+                    "before deciding is_correct. For each call site, write: the "
+                    "original block's local variables (by name) that fed the "
+                    "duplicated logic at that specific location, then the "
+                    "proposed argument(s) passed to the helper at that same call "
+                    "site, e.g. 'call site 1: original (candidate, trial_deps) "
+                    "-> proposed (chosen, file_deps) — MISMATCH' or 'call site 2: "
+                    "original (target, homes) -> proposed (target, homes) — "
+                    "match'. This is the single most common way extractions "
+                    "break when a helper has 2+ call sites: a plausible-looking "
+                    "argument tuple assembled by crossing one call site's "
+                    "variable with another call site's variable. Do this for "
+                    "every call site individually before setting is_correct."
+                ),
+            },
             "is_correct": {
                 "type": "boolean",
                 "description": (
@@ -740,7 +759,7 @@ _VERIFY_TOOL: dict = {
                 ),
             },
         },
-        "required": ["is_correct", "issues"],
+        "required": ["call_site_argument_mapping", "is_correct", "issues"],
     },
 }
 
