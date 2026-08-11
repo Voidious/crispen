@@ -676,9 +676,20 @@ def _cross_file_helper_target(
     (``cross_file_helper_module`` in config, default ``"common"``) rather
     than LLM-chosen; see the 0.8.0-b plan for why placement stays mechanical
     in v1.
+
+    If a package directory of that name already exists alongside the target
+    (e.g. ``tools/common/`` already exists as a package when placing at
+    ``tools/``), a same-named ``<module_name>.py`` module would be shadowed
+    by the package on import — Python's file finder resolves the package
+    first, silently making the new module's definitions unreachable via its
+    dotted path. In that case, an underscore is appended to ``module_name``
+    (repeating until clear) so the target never collides with an existing
+    package.
     """
     dirs = [Path(fp).resolve().parent for fp in file_paths]
     common_dir = _common_ancestor_dir(dirs)
+    while (common_dir / module_name).is_dir():
+        module_name = f"{module_name}_"
     target_file = common_dir / f"{module_name}.py"
     dotted_module, _ = _repo_index.file_to_module_and_package(
         target_file, Path(repo_root).resolve()

@@ -623,6 +623,40 @@ def test_cross_file_helper_target_custom_module_name(tmp_path):
     assert dotted == "pkg.lib"
 
 
+def test_cross_file_helper_target_avoids_existing_package_collision(tmp_path):
+    # pkg/common/ already exists as a package (e.g. shared tool helpers) —
+    # a same-named pkg/common.py module would be shadowed by it on import.
+    pkg = tmp_path / "pkg"
+    (pkg / "sub_a").mkdir(parents=True)
+    (pkg / "sub_b").mkdir(parents=True)
+    (pkg / "common").mkdir()
+    (pkg / "common" / "__init__.py").write_text("", encoding="utf-8")
+    f1 = pkg / "sub_a" / "a.py"
+    f2 = pkg / "sub_b" / "b.py"
+    target, dotted = _cross_file_helper_target(
+        [str(f1), str(f2)], str(tmp_path), "common"
+    )
+    assert target == pkg / "common_.py"
+    assert dotted == "pkg.common_"
+
+
+def test_cross_file_helper_target_avoids_repeated_package_collisions(tmp_path):
+    pkg = tmp_path / "pkg"
+    (pkg / "sub_a").mkdir(parents=True)
+    (pkg / "sub_b").mkdir(parents=True)
+    (pkg / "common").mkdir()
+    (pkg / "common" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "common_").mkdir()
+    (pkg / "common_" / "__init__.py").write_text("", encoding="utf-8")
+    f1 = pkg / "sub_a" / "a.py"
+    f2 = pkg / "sub_b" / "b.py"
+    target, dotted = _cross_file_helper_target(
+        [str(f1), str(f2)], str(tmp_path), "common"
+    )
+    assert target == pkg / "common__.py"
+    assert dotted == "pkg.common__"
+
+
 # ---------------------------------------------------------------------------
 # _verify_extraction
 # ---------------------------------------------------------------------------
