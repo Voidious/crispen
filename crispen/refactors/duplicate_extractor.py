@@ -2110,6 +2110,60 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
     return bool(new_helper_imports & orig_params)
 
 
+def _helper_reimports_module_level_name(
+    helper_source: str, original_source: str
+) -> set:
+    """Return names the helper re-imports that are already module-level imports.
+
+    A local ``import``/``from X import Y`` inside the helper that duplicates a
+    name already imported at the top level of the original file always
+    re-binds to the live target at call time. That silently bypasses
+    ``mock.patch`` on the *referencing* module's attribute (the usual way
+    tests patch a name imported via ``from X import Y``) instead of raising
+    an error -- a real, previously-shipped bug where an extracted helper's
+    redundant local import made LLM-call tests silently stop hitting their
+    mock. There is no legitimate reason to re-import a name locally that the
+    module already imported successfully at top level (that rules out the
+    usual circular-import justification for a deferred import).
+    """
+    try:
+        helper_tree = ast.parse(textwrap.dedent(helper_source))
+    except SyntaxError:
+        return set()
+
+    helper_imports: set = set()
+    for node in ast.walk(helper_tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name.split(".")[0]
+                helper_imports.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name
+                helper_imports.add(name)
+
+    if not helper_imports:
+        return set()
+
+    try:
+        orig_tree = ast.parse(original_source)
+    except SyntaxError:
+        return set()
+
+    orig_top_imports: set = set()
+    for node in orig_tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name.split(".")[0]
+                orig_top_imports.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name
+                orig_top_imports.add(name)
+
+    return helper_imports & orig_top_imports
+
+
 def _first_funcdef_idx(source_lines: List[str]) -> int:
     """Return the 0-based index of the first unindented ``def``/``class`` line.
 
@@ -3592,6 +3646,32 @@ class DuplicateExtractor(Refactor):
                                     f" extraction FAILED — "
                                     f"undefined name(s) introduced by edit: "
                                     f"{', '.join(sorted(undef))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                    # Check 12: helper re-imports an already-module-level name
+                    if not _check_failed:
+                        reimported = _helper_reimports_module_level_name(
+                            helper_source, source
+                        )
+                        if reimported:
+                            _failures.append(
+                                f"helper locally re-imports name(s) already "
+                                f"imported at module level: "
+                                f"{', '.join(sorted(reimported))} -- remove the "
+                                f"local import and use the module-level name "
+                                f"directly (a local re-import bypasses "
+                                f"mock.patch on the module-level name)"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"helper locally re-imports name(s) already "
+                                    f"imported at module level: "
+                                    f"{', '.join(sorted(reimported))}",
                                     file=sys.stderr,
                                     flush=True,
                                 )

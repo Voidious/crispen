@@ -68,6 +68,7 @@ from crispen.refactors.duplicate_extractor import (
     _replacement_steals_post_block_line,
     _lift_and_dedup_imports,
     _helper_imports_local_name,
+    _helper_reimports_module_level_name,
     _strip_helper_docstring,
     _strip_unused_call_assignments,
     _target_import_is_proven_safe,
@@ -6293,6 +6294,61 @@ def test_helper_imports_local_name_kwarg():
 
 
 # ---------------------------------------------------------------------------
+# _helper_reimports_module_level_name
+# ---------------------------------------------------------------------------
+
+
+def test_helper_reimports_module_level_name_true():
+    helper = "def _h():\n    from pkg import call_with_tool\n    call_with_tool()\n"
+    original = "from pkg import call_with_tool\ndef test(x):\n    call_with_tool()\n"
+    assert _helper_reimports_module_level_name(helper, original) == {"call_with_tool"}
+
+
+def test_helper_reimports_module_level_name_not_reimported():
+    # Helper imports a different name than anything imported in the original.
+    helper = "def _h():\n    from pkg import other_name\n    other_name()\n"
+    original = "from pkg import call_with_tool\ndef test(x):\n    call_with_tool()\n"
+    assert _helper_reimports_module_level_name(helper, original) == set()
+
+
+def test_helper_reimports_module_level_name_no_imports_in_helper():
+    helper = "def _h():\n    pass\n"
+    original = "from pkg import call_with_tool\ndef test(x):\n    pass\n"
+    assert _helper_reimports_module_level_name(helper, original) == set()
+
+
+def test_helper_reimports_module_level_name_syntax_error_helper():
+    assert _helper_reimports_module_level_name("def (:\n", "import os\n") == set()
+
+
+def test_helper_reimports_module_level_name_syntax_error_original():
+    helper = "def _h():\n    import os\n"
+    assert _helper_reimports_module_level_name(helper, "(:\n") == set()
+
+
+def test_helper_reimports_module_level_name_plain_import():
+    helper = "def _h():\n    import os\n    os.getcwd()\n"
+    original = "import os\ndef test(x):\n    os.getcwd()\n"
+    assert _helper_reimports_module_level_name(helper, original) == {"os"}
+
+
+def test_helper_reimports_module_level_name_asname():
+    helper = "def _h():\n    import numpy as np\n    np.array([])\n"
+    original = "import numpy as np\ndef test(x):\n    np.array([])\n"
+    assert _helper_reimports_module_level_name(helper, original) == {"np"}
+
+
+def test_helper_reimports_module_level_name_original_not_top_level():
+    # call_with_tool is only imported inside a function in the original -- not
+    # a top-level import, so the helper's local import isn't flagged.
+    helper = "def _h():\n    from pkg import call_with_tool\n    call_with_tool()\n"
+    original = (
+        "def test(x):\n" "    from pkg import call_with_tool\n" "    call_with_tool()\n"
+    )
+    assert _helper_reimports_module_level_name(helper, original) == set()
+
+
+# ---------------------------------------------------------------------------
 # Integration: block-ends-with-return guard
 # ---------------------------------------------------------------------------
 
@@ -6456,6 +6512,100 @@ def test_helper_imports_local_guard_skips_silent(monkeypatch):
         de = DuplicateExtractor(
             _PARAM_DUP_RANGES,
             source=_PARAM_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# Integration: helper-reimports-module-level-name guard
+# ---------------------------------------------------------------------------
+
+_MODULE_IMPORT_DUP_SOURCE = textwrap.dedent(
+    """\
+    from pkg import call_with_tool
+
+    def test_a(mock_client):
+        if debug:
+            pass
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+
+    def test_b(mock_client):
+        result = None
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_MODULE_IMPORT_DUP_RANGES = [(12, 14)]  # overlaps test_b's duplicate block
+
+
+def _make_module_reimport_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            # helper re-imports call_with_tool locally instead of using the
+            # existing module-level import -- the real bug this check exists
+            # to catch (it silently bypasses mock.patch on the module-level
+            # name instead of raising an error).
+            "helper_source": (
+                "def _helper():\n"
+                "    from pkg import call_with_tool\n"
+                "    x = compute(data)\n"
+                "    y = transform(x)\n"
+                "    z = finalize(y)\n"
+            ),
+            "call_site_replacements": [
+                "    _helper()\n",
+                "    _helper()\n",
+            ],
+        }
+    )
+
+
+def test_helper_reimports_module_level_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when helper locally re-imports a module-level name."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_module_reimport_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _MODULE_IMPORT_DUP_RANGES,
+            source=_MODULE_IMPORT_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert (
+        "helper locally re-imports name(s) already imported at module level"
+        in capsys.readouterr().err
+    )
+
+
+def test_helper_reimports_module_level_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_module_reimport_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _MODULE_IMPORT_DUP_RANGES,
+            source=_MODULE_IMPORT_DUP_SOURCE,
             verbose=False,
             extraction_retries=0,
             llm_verify_retries=0,
