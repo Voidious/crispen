@@ -2207,6 +2207,59 @@ def _helper_defines_class_colliding_with_origin(
     return colliding
 
 
+_DIRECTIVE_COMMENT_RE = re.compile(
+    r"#\s*("
+    r"pragma:\s*no\s*(?:cover|branch)"
+    r"|noqa"
+    r"|type:\s*ignore"
+    r"|fmt:\s*(?:skip|off|on)"
+    r"|pylint:\s*(?:disable|enable)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _directive_comments(source: str) -> set:
+    """Return the set of linter/formatter/coverage directive comments
+    (``# pragma: no cover``, ``# noqa``, ``# type: ignore``, ``# fmt: skip``,
+    ``# pylint: disable=...``, etc.) found anywhere in ``source``, normalized
+    to their directive *kind* (case-folded, whitespace-collapsed, specific
+    codes like ``noqa: E501`` or ``type: ignore[arg-type]`` dropped).
+    """
+    found = set()
+    for match in _DIRECTIVE_COMMENT_RE.finditer(source):
+        found.add(re.sub(r"\s+", " ", match.group(1).strip().lower()))
+    return found
+
+
+def _dropped_directive_comments(
+    original_blocks: List[str], helper_source: str, call_replacements: List[str]
+) -> set:
+    """Return directive comments present in the original call-site block(s)
+    that are missing from the assembled helper + replacements.
+
+    A duplicate block guarded by e.g. ``# pragma: no cover`` or ``# noqa``
+    conveys real intent to a coverage/lint tool. When extraction merges such
+    a line into a shared helper, it's easy for the LLM to keep the guarded
+    code but silently drop the trailing comment -- syntactically invisible
+    (every test still passes) but it reintroduces the exact warning/failure
+    the comment was suppressing. This only checks that each directive *kind*
+    seen in the originals still appears somewhere in the output, not that
+    counts match -- multiple call sites merging into one helper line is a
+    legitimate reduction from N occurrences to 1.
+    """
+    original: set = set()
+    for block in original_blocks:
+        original |= _directive_comments(block)
+    if not original:
+        return set()
+
+    output = _directive_comments(helper_source)
+    for repl in call_replacements:
+        output |= _directive_comments(repl)
+    return original - output
+
+
 def _first_funcdef_idx(source_lines: List[str]) -> int:
     """Return the 0-based index of the first unindented ``def``/``class`` line.
 
@@ -3715,6 +3768,38 @@ class DuplicateExtractor(Refactor):
                                     f"helper locally re-imports name(s) already "
                                     f"imported at module level: "
                                     f"{', '.join(sorted(reimported))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                    # Check 13: helper/replacements drop a linter, formatter,
+                    # or coverage directive comment present in the original
+                    # block(s) (# pragma: no cover, # noqa, # type: ignore,
+                    # # fmt: skip, # pylint: disable, etc.)
+                    if not _check_failed:
+                        original_blocks = [
+                            "".join(source_lines[seq.start_line - 1 : seq.end_line])
+                            for seq in group
+                        ]
+                        dropped = _dropped_directive_comments(
+                            original_blocks, helper_source, call_replacements
+                        )
+                        if dropped:
+                            _failures.append(
+                                f"helper/replacement drops directive comment(s) "
+                                f"present in the original block(s): "
+                                f"{', '.join(sorted(dropped))} -- keep the "
+                                f"comment on whichever line(s) carry the "
+                                f"guarded code in the extracted output"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"helper/replacement drops directive "
+                                    f"comment(s) present in the original "
+                                    f"block(s): {', '.join(sorted(dropped))}",
                                     file=sys.stderr,
                                     flush=True,
                                 )

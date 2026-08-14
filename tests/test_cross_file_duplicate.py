@@ -1050,6 +1050,96 @@ def test_helper_class_no_collision_with_origin_class(tmp_path, monkeypatch):
     assert (tmp_path / "pkg" / "common.py").exists()
 
 
+def test_dropped_directive_comment_rejected(tmp_path, monkeypatch):
+    """Regression (same shape as a live self-check finding, reproduced here
+    at the cross-file layer): the original duplicate block ends with a line
+    carrying a `# pragma: no cover` comment, but the extracted helper drops
+    the comment while keeping the guarded code. Every test still passes --
+    the drop is syntactically invisible -- but it silently reintroduces
+    whatever the comment was suppressing (here, a coverage-gate failure)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_dup_pair(
+        tmp_path,
+        body=(
+            "    stripped = data.strip()\n"
+            '    upper = stripped.replace(" ", "")\n'
+            "    return upper  # pragma: no cover\n"
+        ),
+    )
+    per_file = _per_file_for(f1, f2)
+    bad_extract = dict(_HAPPY_EXTRACT)
+    bad_extract["helper_source"] = (
+        "def shared_helper(data):\n"
+        "    stripped = data.strip()\n"
+        "    upper = stripped.upper()\n"
+        '    parts = upper.split(",")\n'
+        "    return parts\n"
+    )
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(bad_extract),
+            _make_extract_response(bad_extract),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert msgs == []
+    assert stats.algorithmic_rejected == 1
+    assert not (tmp_path / "pkg" / "common.py").exists()
+
+
+def test_directive_comment_preserved_not_flagged(tmp_path, monkeypatch):
+    """A helper that keeps the original block's directive comment is
+    unaffected by the check."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_dup_pair(
+        tmp_path,
+        body=(
+            "    stripped = data.strip()\n"
+            '    upper = stripped.replace(" ", "")\n'
+            "    return upper  # pragma: no cover\n"
+        ),
+    )
+    per_file = _per_file_for(f1, f2)
+    extract = dict(_HAPPY_EXTRACT)
+    extract["helper_source"] = (
+        "def shared_helper(data):\n"
+        "    stripped = data.strip()\n"
+        "    upper = stripped.upper()\n"
+        '    parts = upper.split(",")\n'
+        "    return parts  # pragma: no cover\n"
+    )
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(extract),
+            _make_verify_response(True, []),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert len(msgs) == 1
+    assert stats.algorithmic_rejected == 0
+    assert (tmp_path / "pkg" / "common.py").exists()
+
+
 def test_helper_docstrings_true_keeps_docstring(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     f1, f2 = _write_dup_pair(tmp_path)

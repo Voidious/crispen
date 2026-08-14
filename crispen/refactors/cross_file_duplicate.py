@@ -31,6 +31,7 @@ from .duplicate_extractor import (
     _SequenceCollector,
     _apply_edits,
     _cross_file_helper_target,
+    _dropped_directive_comments,
     _extract_defined_names,
     _find_cross_file_duplicate_groups,
     _find_escaping_vars,
@@ -605,6 +606,31 @@ def run_cross_file_duplicate_extraction(
                             "(classes/exceptions match by identity, not name, "
                             "so an origin file's own except/isinstance checks "
                             "would silently stop matching)"
+                        )
+
+                # A directive comment (# pragma: no cover, # noqa,
+                # # type: ignore, # fmt: skip, # pylint: disable, etc.) on a
+                # line inside the original block(s) that doesn't survive into
+                # the assembled helper/replacements is syntactically
+                # invisible -- every test still passes -- but it reintroduces
+                # whatever warning/failure the comment was suppressing.
+                if not failures:
+                    original_blocks = [
+                        "".join(
+                            file_lines[seq.filepath][seq.start_line - 1 : seq.end_line]
+                        )
+                        for seq in group
+                    ]
+                    dropped = _dropped_directive_comments(
+                        original_blocks, helper_source, call_replacements
+                    )
+                    if dropped:
+                        failures.append(
+                            "helper/replacement drops directive comment(s) "
+                            "present in the original block(s): "
+                            f"{', '.join(sorted(dropped))} -- keep the "
+                            "comment on whichever line(s) carry the guarded "
+                            "code in the extracted output"
                         )
 
             if failures:

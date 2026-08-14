@@ -70,6 +70,8 @@ from crispen.refactors.duplicate_extractor import (
     _helper_imports_local_name,
     _helper_reimports_module_level_name,
     _helper_defines_class_colliding_with_origin,
+    _directive_comments,
+    _dropped_directive_comments,
     _strip_helper_docstring,
     _strip_unused_call_assignments,
     _target_import_is_proven_safe,
@@ -6420,6 +6422,102 @@ def test_helper_defines_class_colliding_with_origin_nested_class_not_flagged():
 
 
 # ---------------------------------------------------------------------------
+# _directive_comments / _dropped_directive_comments
+# ---------------------------------------------------------------------------
+
+
+def test_directive_comments_pragma_no_cover():
+    assert _directive_comments("x = 1  # pragma: no cover\n") == {"pragma: no cover"}
+
+
+def test_directive_comments_pragma_no_branch():
+    assert _directive_comments("if x:  # pragma: no branch\n    pass\n") == {
+        "pragma: no branch"
+    }
+
+
+def test_directive_comments_noqa_bare():
+    assert _directive_comments("import os  # noqa\n") == {"noqa"}
+
+
+def test_directive_comments_noqa_with_code_normalizes_to_bare_kind():
+    # Specific codes (E501, F401, ...) are dropped -- only the directive
+    # *kind* is tracked, so a code mismatch between original and output
+    # doesn't spuriously trip the check.
+    assert _directive_comments("import os  # noqa: F401\n") == {"noqa"}
+
+
+def test_directive_comments_type_ignore_with_bracket_code():
+    assert _directive_comments("x: int = f()  # type: ignore[assignment]\n") == {
+        "type: ignore"
+    }
+
+
+def test_directive_comments_fmt_skip():
+    assert _directive_comments("x = [1,  2,  3]  # fmt: skip\n") == {"fmt: skip"}
+
+
+def test_directive_comments_fmt_off_and_on():
+    src = "x = 1  # fmt: off\ny  =  2\nz = 3  # fmt: on\n"
+    assert _directive_comments(src) == {"fmt: off", "fmt: on"}
+
+
+def test_directive_comments_pylint_disable():
+    assert _directive_comments("eval(x)  # pylint: disable=eval-used\n") == {
+        "pylint: disable"
+    }
+
+
+def test_directive_comments_case_insensitive():
+    assert _directive_comments("x = 1  # PRAGMA: NO COVER\n") == {"pragma: no cover"}
+
+
+def test_directive_comments_none_present():
+    assert _directive_comments("x = 1\ny = 2  # a plain comment\n") == set()
+
+
+def test_dropped_directive_comments_dropped():
+    original = ["    return upper  # pragma: no cover\n"]
+    helper = "def _h():\n    return upper\n"
+    assert _dropped_directive_comments(original, helper, ["_h()\n"]) == {
+        "pragma: no cover"
+    }
+
+
+def test_dropped_directive_comments_preserved_in_helper():
+    original = ["    return upper  # pragma: no cover\n"]
+    helper = "def _h():\n    return upper  # pragma: no cover\n"
+    assert _dropped_directive_comments(original, helper, ["_h()\n"]) == set()
+
+
+def test_dropped_directive_comments_preserved_in_replacement():
+    # The directive doesn't have to survive in the helper specifically --
+    # only somewhere in the assembled output (helper or call site).
+    original = ["    x = f()  # noqa: F401\n"]
+    helper = "def _h():\n    return f()\n"
+    replacements = ["    x = _h()  # noqa\n"]
+    assert _dropped_directive_comments(original, helper, replacements) == set()
+
+
+def test_dropped_directive_comments_nothing_in_original():
+    original = ["    return upper\n"]
+    helper = "def _h():\n    return upper\n"
+    assert _dropped_directive_comments(original, helper, ["_h()\n"]) == set()
+
+
+def test_dropped_directive_comments_multiple_call_sites_collapse_to_one():
+    # Two call sites both had the same guard; the merged helper only needs
+    # to carry it once -- this checks presence, not per-occurrence counts.
+    original = [
+        "    return upper  # pragma: no cover\n",
+        "    return upper  # pragma: no cover\n",
+    ]
+    helper = "def _h():\n    return upper  # pragma: no cover\n"
+    replacements = ["_h()\n", "_h()\n"]
+    assert _dropped_directive_comments(original, helper, replacements) == set()
+
+
+# ---------------------------------------------------------------------------
 # Integration: block-ends-with-return guard
 # ---------------------------------------------------------------------------
 
@@ -6682,6 +6780,137 @@ def test_helper_reimports_module_level_guard_skips_silent(monkeypatch):
             llm_verify_retries=0,
         )
     assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# Integration: dropped-directive-comment guard
+# ---------------------------------------------------------------------------
+
+_PRAGMA_DUP_SOURCE = textwrap.dedent(
+    """\
+    def test_a(mock_client):
+        if debug:
+            pass
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)  # pragma: no cover
+
+    def test_b(mock_client):
+        result = None
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)  # pragma: no cover
+    """
+)
+_PRAGMA_DUP_RANGES = [(10, 12)]  # overlaps test_b's duplicate block
+
+
+def _make_pragma_dropped_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            # Merges both call sites' identical block but silently drops the
+            # trailing `# pragma: no cover` that was on the original lines --
+            # the real bug this check exists to catch (found by a live
+            # self-check run: coverage still fails even though every test
+            # passes, since the guarded line is no longer excluded).
+            "helper_source": (
+                "def _helper():\n"
+                "    x = compute(data)\n"
+                "    y = transform(x)\n"
+                "    z = finalize(y)\n"
+            ),
+            "call_site_replacements": [
+                "    _helper()\n",
+                "    _helper()\n",
+            ],
+        }
+    )
+
+
+def _make_pragma_preserved_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            "helper_source": (
+                "def _helper():\n"
+                "    x = compute(data)\n"
+                "    y = transform(x)\n"
+                "    z = finalize(y)  # pragma: no cover\n"
+            ),
+            "call_site_replacements": [
+                "    _helper()\n",
+                "    _helper()\n",
+            ],
+        }
+    )
+
+
+def test_dropped_directive_comment_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when the helper drops a directive comment that
+    was on the original duplicate block."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_pragma_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _PRAGMA_DUP_RANGES,
+            source=_PRAGMA_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert "helper/replacement drops directive comment(s)" in capsys.readouterr().err
+
+
+def test_dropped_directive_comment_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_pragma_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _PRAGMA_DUP_RANGES,
+            source=_PRAGMA_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+def test_directive_comment_preserved_not_flagged(monkeypatch):
+    """A helper that keeps the directive comment is unaffected by the check."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_pragma_preserved_extract_response(),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _PRAGMA_DUP_RANGES,
+            source=_PRAGMA_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is not None
+    assert "# pragma: no cover" in de._new_source
 
 
 # ---------------------------------------------------------------------------
