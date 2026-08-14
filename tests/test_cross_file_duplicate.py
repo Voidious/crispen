@@ -967,6 +967,89 @@ def test_helper_references_undefined_private_name(tmp_path, monkeypatch):
     assert not (tmp_path / "pkg" / "common.py").exists()
 
 
+def test_helper_class_collides_with_origin_class(tmp_path, monkeypatch):
+    """Regression (found by a live self-check run against crispen's own
+    source): the LLM's helper_source defines its own class (e.g. a custom
+    exception type used for a hard-timeout guard) with the same name as a
+    class an origin file already defines at module level. Both classes
+    compile fine standalone and neither name is undefined, so pyflakes-based
+    checks miss it -- but they're two distinct objects sharing a name.
+    Classes/exceptions match by identity, not name: an origin file's own
+    `except _ApiTimeout:` elsewhere in the file would silently stop matching
+    whatever the shared helper raises."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_dup_pair(tmp_path)
+    f1.write_text(
+        "class _ApiTimeout(Exception):\n    pass\n\n\n"
+        + f1.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    per_file = _per_file_for(f1, f2)
+    bad_extract = dict(_HAPPY_EXTRACT)
+    bad_extract["helper_source"] = (
+        "class _ApiTimeout(Exception):\n    pass\n\n\n"
+        + _HAPPY_EXTRACT["helper_source"]
+    )
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(bad_extract),
+            _make_extract_response(bad_extract),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert msgs == []
+    assert stats.algorithmic_rejected == 1
+    assert not (tmp_path / "pkg" / "common.py").exists()
+
+
+def test_helper_class_no_collision_with_origin_class(tmp_path, monkeypatch):
+    """A helper class whose name doesn't collide with anything an origin
+    file already defines is unaffected by the new check."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_dup_pair(tmp_path)
+    f1.write_text(
+        "class _SomeOtherThing(Exception):\n    pass\n\n\n"
+        + f1.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    per_file = _per_file_for(f1, f2)
+    extract = dict(_HAPPY_EXTRACT)
+    extract["helper_source"] = (
+        "class _ApiTimeout(Exception):\n    pass\n\n\n"
+        + _HAPPY_EXTRACT["helper_source"]
+    )
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(extract),
+            _make_verify_response(True, []),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert len(msgs) == 1
+    assert stats.algorithmic_rejected == 0
+    assert (tmp_path / "pkg" / "common.py").exists()
+
+
 def test_helper_docstrings_true_keeps_docstring(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     f1, f2 = _write_dup_pair(tmp_path)

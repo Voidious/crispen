@@ -37,6 +37,7 @@ from .duplicate_extractor import (
     _first_funcdef_idx,
     _group_ends_in_return,
     _has_call_to,
+    _helper_defines_class_colliding_with_origin,
     _lift_and_dedup_imports,
     _llm_veto,
     _pyflakes_new_undefined_names,
@@ -584,6 +585,26 @@ def run_cross_file_duplicate_extraction(
                             "likely references a private import or constant "
                             "from the original file): "
                             f"{', '.join(sorted(helper_undef))}"
+                        )
+
+                # A class the helper defines locally (e.g. a custom exception
+                # type) is a distinct object from a same-named class an
+                # origin file already defines at module level — pyflakes
+                # can't catch this, since neither name is undefined.
+                if not failures:
+                    colliding_classes = _helper_defines_class_colliding_with_origin(
+                        helper_source, file_sources
+                    )
+                    if colliding_classes:
+                        failures.append(
+                            "helper module defines class(es) that collide with "
+                            "an identically named class already defined in an "
+                            "origin file: "
+                            f"{', '.join(sorted(colliding_classes))} — import "
+                            "the existing class instead of redefining it "
+                            "(classes/exceptions match by identity, not name, "
+                            "so an origin file's own except/isinstance checks "
+                            "would silently stop matching)"
                         )
 
             if failures:

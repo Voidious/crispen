@@ -84,9 +84,7 @@ def test_non_ascii_message_does_not_crash_on_narrow_console_encoding():
     """A cp1252 stdout (Windows default console codepage) must not crash on
     the "→" characters emitted in FileLimiter progress messages."""
     messages = ["crispen: FileLimiter:   → done [1.23s, 100 in / 20 out]"]
-    narrow_stdout = io.TextIOWrapper(
-        io.BytesIO(), encoding="cp1252", errors="strict"
-    )
+    narrow_stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
     with patch("sys.stdin", StringIO("some diff text")):
         with patch("crispen.cli.parse_diff", return_value={"foo.py": [(1, 5)]}):
             with patch("crispen.cli.run_engine", return_value=iter(messages)):

@@ -2164,6 +2164,49 @@ def _helper_reimports_module_level_name(
     return helper_imports & orig_top_imports
 
 
+def _helper_defines_class_colliding_with_origin(
+    helper_source: str, file_sources: Dict[str, str]
+) -> set:
+    """Return class names the helper defines that collide with a same-named
+    module-level class already defined in one of the origin files.
+
+    Cross-file extraction places the helper in a brand-new shared module. If
+    the helper defines its own class (most often an exception type) with the
+    same name as a class an origin file already defines at module level,
+    that produces two distinct class objects that merely share a name.
+    Classes/exceptions match by identity, not name -- if an origin file
+    still has an ``except <Name>:`` (or any other reference to its own,
+    pre-existing class) surviving outside the extracted block, it silently
+    stops matching whatever the shared helper raises/returns. There is no
+    legitimate reason for a new shared helper to define a second,
+    independent class an origin file already owns -- the correct fix is
+    always to import the existing class rather than redefine it.
+    """
+    try:
+        helper_tree = ast.parse(textwrap.dedent(helper_source))
+    except SyntaxError:
+        return set()
+
+    helper_classes = {
+        node.name for node in helper_tree.body if isinstance(node, ast.ClassDef)
+    }
+    if not helper_classes:
+        return set()
+
+    colliding: set = set()
+    for source in file_sources.values():
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        origin_classes = {
+            node.name for node in tree.body if isinstance(node, ast.ClassDef)
+        }
+        colliding |= helper_classes & origin_classes
+
+    return colliding
+
+
 def _first_funcdef_idx(source_lines: List[str]) -> int:
     """Return the 0-based index of the first unindented ``def``/``class`` line.
 

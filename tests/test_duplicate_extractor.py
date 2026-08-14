@@ -69,6 +69,7 @@ from crispen.refactors.duplicate_extractor import (
     _lift_and_dedup_imports,
     _helper_imports_local_name,
     _helper_reimports_module_level_name,
+    _helper_defines_class_colliding_with_origin,
     _strip_helper_docstring,
     _strip_unused_call_assignments,
     _target_import_is_proven_safe,
@@ -6346,6 +6347,76 @@ def test_helper_reimports_module_level_name_original_not_top_level():
         "def test(x):\n" "    from pkg import call_with_tool\n" "    call_with_tool()\n"
     )
     assert _helper_reimports_module_level_name(helper, original) == set()
+
+
+# ---------------------------------------------------------------------------
+# _helper_defines_class_colliding_with_origin
+# ---------------------------------------------------------------------------
+
+
+def test_helper_defines_class_colliding_with_origin_true():
+    helper = (
+        "class _ApiTimeout(Exception):\n"
+        "    pass\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        "a.py": (
+            "class _ApiTimeout(Exception):\n"
+            "    pass\n\n\n"
+            "def call():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except _ApiTimeout:\n"
+            "        pass\n"
+        ),
+        "b.py": "def other():\n    pass\n",
+    }
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == {
+        "_ApiTimeout"
+    }
+
+
+def test_helper_defines_class_colliding_with_origin_no_collision():
+    helper = "class _Widget:\n    pass\n"
+    file_sources = {
+        "a.py": "class _ApiTimeout(Exception):\n    pass\n",
+        "b.py": "def other():\n    pass\n",
+    }
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == set()
+
+
+def test_helper_defines_class_colliding_with_origin_no_classes_in_helper():
+    helper = "def run_with_timeout(f, t):\n    return f()\n"
+    file_sources = {"a.py": "class _ApiTimeout(Exception):\n    pass\n"}
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == set()
+
+
+def test_helper_defines_class_colliding_with_origin_syntax_error_helper():
+    file_sources = {"a.py": "class _ApiTimeout(Exception):\n    pass\n"}
+    assert (
+        _helper_defines_class_colliding_with_origin("def (:\n", file_sources) == set()
+    )
+
+
+def test_helper_defines_class_colliding_with_origin_syntax_error_origin_file():
+    helper = "class _ApiTimeout(Exception):\n    pass\n"
+    file_sources = {"a.py": "(:\n", "b.py": "class _ApiTimeout(Exception):\n    pass\n"}
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == {
+        "_ApiTimeout"
+    }
+
+
+def test_helper_defines_class_colliding_with_origin_nested_class_not_flagged():
+    # Only module-level classes in the origin file count -- a same-named
+    # class nested inside a function/class in the origin isn't a real
+    # module-level identity collision.
+    helper = "class _ApiTimeout(Exception):\n    pass\n"
+    file_sources = {
+        "a.py": "def make():\n    class _ApiTimeout(Exception):\n        pass\n"
+    }
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == set()
 
 
 # ---------------------------------------------------------------------------
