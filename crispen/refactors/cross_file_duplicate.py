@@ -31,6 +31,7 @@ from .duplicate_extractor import (
     _SequenceCollector,
     _apply_edits,
     _cross_file_helper_target,
+    _default_param_drops_call_time_global,
     _dropped_directive_comments,
     _extract_defined_names,
     _find_cross_file_duplicate_groups,
@@ -631,6 +632,25 @@ def run_cross_file_duplicate_extraction(
                             f"{', '.join(sorted(dropped))} -- keep the "
                             "comment on whichever line(s) carry the guarded "
                             "code in the extracted output"
+                        )
+
+                # A default of the form module.attr (e.g. file=sys.stderr)
+                # binds once at def-time, not fresh on each call. If every
+                # original call site passed it explicitly, moving it into
+                # the assembled helper's default signature changes behavior
+                # for any caller where the referenced attribute gets
+                # reassigned after the helper is defined.
+                if not failures:
+                    dropped_defaults = _default_param_drops_call_time_global(
+                        original_blocks, helper_source, call_replacements
+                    )
+                    if dropped_defaults:
+                        failures.append(
+                            "helper turns call-time global keyword "
+                            "argument(s) into a default parameter value: "
+                            f"{', '.join(sorted(dropped_defaults))} -- keep "
+                            "passing the argument explicitly at each call "
+                            "site instead of relying on the default"
                         )
 
             if failures:

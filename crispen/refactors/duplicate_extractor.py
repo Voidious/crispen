@@ -2260,6 +2260,64 @@ def _dropped_directive_comments(
     return original - output
 
 
+def _default_param_drops_call_time_global(
+    original_blocks: List[str], helper_source: str, call_replacements: List[str]
+) -> set:
+    """Return helper parameter names whose default value turns a call-time
+    global/stdlib singleton keyword argument (e.g. ``file=sys.stderr``) into
+    a value bound once at function-*definition* time instead of being kept
+    explicit at each call site.
+
+    A default of the form ``module.attr`` is evaluated exactly once, when
+    the ``def`` line runs -- classic Python late-binding. If every original
+    call site passed the same ``name=module.attr`` keyword explicitly (a
+    value meant to be re-read fresh on each call), moving it into the
+    assembled helper's default signature and dropping it from the call
+    sites changes behavior for any caller where the referenced attribute
+    gets reassigned after the helper is defined -- e.g. pytest's ``capsys``
+    fixture replacing ``sys.stderr`` per test, invisible to every other
+    check since the merge is semantically identical in the common case
+    where the global is never reassigned.
+    """
+    try:
+        helper_tree = ast.parse(textwrap.dedent(helper_source))
+    except SyntaxError:
+        return set()
+
+    params_with_defaults: List[Tuple[str, ast.expr]] = []
+    for node in helper_tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        pos_args = node.args.posonlyargs + node.args.args
+        defaults = node.args.defaults
+        if defaults:
+            for arg, default in zip(
+                pos_args[len(pos_args) - len(defaults) :], defaults
+            ):
+                params_with_defaults.append((arg.arg, default))
+        for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            if default is not None:
+                params_with_defaults.append((arg.arg, default))
+
+    flagged: set = set()
+    for pname, default in params_with_defaults:
+        if not (
+            isinstance(default, ast.Attribute) and isinstance(default.value, ast.Name)
+        ):
+            continue
+        default_expr = f"{default.value.id}.{default.attr}"
+        kw_pattern = re.compile(
+            rf"\b{re.escape(pname)}\s*=\s*{re.escape(default_expr)}\b"
+        )
+        if not any(kw_pattern.search(block) for block in original_blocks):
+            continue
+        if any(kw_pattern.search(repl) for repl in call_replacements):
+            continue
+        flagged.add(pname)
+
+    return flagged
+
+
 def _first_funcdef_idx(source_lines: List[str]) -> int:
     """Return the 0-based index of the first unindented ``def``/``class`` line.
 
@@ -3800,6 +3858,37 @@ class DuplicateExtractor(Refactor):
                                     f"helper/replacement drops directive "
                                     f"comment(s) present in the original "
                                     f"block(s): {', '.join(sorted(dropped))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                    # Check 14: helper turns a call-time global/stdlib
+                    # singleton keyword argument (e.g. file=sys.stderr) into
+                    # a default parameter value, dropping it from the call
+                    # sites -- binds once at def-time instead of fresh on
+                    # each call.
+                    if not _check_failed:
+                        dropped_defaults = _default_param_drops_call_time_global(
+                            original_blocks, helper_source, call_replacements
+                        )
+                        if dropped_defaults:
+                            _failures.append(
+                                f"helper turns call-time global keyword "
+                                f"argument(s) into a default parameter value: "
+                                f"{', '.join(sorted(dropped_defaults))} -- keep "
+                                f"passing the argument explicitly at each call "
+                                f"site instead of relying on the default "
+                                f"(a default is bound once at def-time, not "
+                                f"fresh on each call)"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"helper turns call-time global keyword "
+                                    f"argument(s) into a default parameter "
+                                    f"value: {', '.join(sorted(dropped_defaults))}",
                                     file=sys.stderr,
                                     flush=True,
                                 )

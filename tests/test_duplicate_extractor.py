@@ -72,6 +72,7 @@ from crispen.refactors.duplicate_extractor import (
     _helper_defines_class_colliding_with_origin,
     _directive_comments,
     _dropped_directive_comments,
+    _default_param_drops_call_time_global,
     _strip_helper_docstring,
     _strip_unused_call_assignments,
     _target_import_is_proven_safe,
@@ -6911,6 +6912,237 @@ def test_directive_comment_preserved_not_flagged(monkeypatch):
         )
     assert de._new_source is not None
     assert "# pragma: no cover" in de._new_source
+
+
+# ---------------------------------------------------------------------------
+# _default_param_drops_call_time_global
+# ---------------------------------------------------------------------------
+
+
+def test_default_param_drops_call_time_global_flagged():
+    original = [
+        '    print(f"a: {status}", file=sys.stderr, flush=True)\n',
+        '    print(f"b: {status}", file=sys.stderr, flush=True)\n',
+    ]
+    helper = (
+        "def _log(status, file=sys.stderr):\n"
+        '    print(f"{status}", file=file, flush=True)\n'
+    )
+    replacements = ["    _log(status)\n", "    _log(status)\n"]
+    assert _default_param_drops_call_time_global(original, helper, replacements) == {
+        "file"
+    }
+
+
+def test_default_param_preserved_explicitly_not_flagged():
+    # Same shape, but the call sites still pass file=sys.stderr explicitly
+    # rather than relying on the default -- not a behavior change.
+    original = [
+        '    print(f"a: {status}", file=sys.stderr, flush=True)\n',
+        '    print(f"b: {status}", file=sys.stderr, flush=True)\n',
+    ]
+    helper = (
+        "def _log(status, file=sys.stderr):\n"
+        '    print(f"{status}", file=file, flush=True)\n'
+    )
+    replacements = [
+        "    _log(status, file=sys.stderr)\n",
+        "    _log(status, file=sys.stderr)\n",
+    ]
+    assert (
+        _default_param_drops_call_time_global(original, helper, replacements) == set()
+    )
+
+
+def test_default_param_not_previously_explicit_not_flagged():
+    # A brand-new default parameter that wasn't an explicit call-site
+    # argument before extraction isn't a regression -- nothing was dropped.
+    original = ["    do_thing()\n", "    do_thing()\n"]
+    helper = "def _do(file=sys.stderr):\n    do_thing()\n"
+    replacements = ["    _do()\n", "    _do()\n"]
+    assert (
+        _default_param_drops_call_time_global(original, helper, replacements) == set()
+    )
+
+
+def test_default_param_non_attribute_default_not_flagged():
+    # A plain constant/None default is definitionally fine -- it's not a
+    # global resolved fresh at each call.
+    original = ["    log(level=DEFAULT_LEVEL)\n"]
+    helper = "def _log(level=None):\n    log(level=level)\n"
+    replacements = ["    _log()\n"]
+    assert (
+        _default_param_drops_call_time_global(original, helper, replacements) == set()
+    )
+
+
+def test_default_param_kwonly_arg_flagged():
+    # A required kwonly arg with no default (level) alongside one that does
+    # (stream) exercises both branches of the kwonly-defaults scan.
+    original = ["    emit(msg, level=1, stream=sys.stdout)\n"]
+    helper = (
+        "def _emit(msg, *, level, stream=sys.stdout):\n    write(msg, level, stream)\n"
+    )
+    replacements = ["    _emit(msg, level=1)\n"]
+    assert _default_param_drops_call_time_global(original, helper, replacements) == {
+        "stream"
+    }
+
+
+def test_default_param_syntax_error_helper():
+    assert (
+        _default_param_drops_call_time_global(["file=sys.stderr\n"], "def (:\n", [])
+        == set()
+    )
+
+
+def test_default_param_no_functions_in_helper():
+    assert _default_param_drops_call_time_global(["x = 1\n"], "x = 1\n", []) == set()
+
+
+def test_default_param_no_defaults_in_helper():
+    original = ["    f(file=sys.stderr)\n"]
+    helper = "def _f(file):\n    pass\n"
+    assert (
+        _default_param_drops_call_time_global(original, helper, ["_f(sys.stderr)\n"])
+        == set()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Integration: default-param-drops-call-time-global guard
+# ---------------------------------------------------------------------------
+
+_DEFAULT_GLOBAL_DUP_SOURCE = textwrap.dedent(
+    """\
+    def log_a(status):
+        if debug:
+            pass
+        x = compute(status)
+        y = transform(x)
+        print(y, file=sys.stderr, flush=True)
+
+    def log_b(status):
+        result = None
+        x = compute(status)
+        y = transform(x)
+        print(y, file=sys.stderr, flush=True)
+    """
+)
+_DEFAULT_GLOBAL_DUP_RANGES = [(10, 12)]  # overlaps log_b's duplicate block
+
+
+def _make_default_global_dropped_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            # Turns the explicit file=sys.stderr keyword argument both call
+            # sites passed into a default parameter value instead -- the
+            # real bug this check exists to catch (found by a live
+            # self-check run: a default is bound once at def-time, so a
+            # caller that reassigns sys.stderr after the helper is defined,
+            # like pytest's capsys fixture, no longer reaches it).
+            "helper_source": (
+                "def _helper(status, file=sys.stderr):\n"
+                "    x = compute(status)\n"
+                "    y = transform(x)\n"
+                "    print(y, file=file, flush=True)\n"
+            ),
+            "call_site_replacements": [
+                "    _helper(status)\n",
+                "    _helper(status)\n",
+            ],
+        }
+    )
+
+
+def _make_default_global_preserved_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            "helper_source": (
+                "def _helper(status, file=sys.stderr):\n"
+                "    x = compute(status)\n"
+                "    y = transform(x)\n"
+                "    print(y, file=file, flush=True)\n"
+            ),
+            "call_site_replacements": [
+                "    _helper(status, file=sys.stderr)\n",
+                "    _helper(status, file=sys.stderr)\n",
+            ],
+        }
+    )
+
+
+def test_default_param_drops_global_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when the helper turns a call-time global keyword
+    argument into a default parameter value dropped from the call sites."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_default_global_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _DEFAULT_GLOBAL_DUP_RANGES,
+            source=_DEFAULT_GLOBAL_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert (
+        "helper turns call-time global keyword argument(s) into a default "
+        "parameter value" in capsys.readouterr().err
+    )
+
+
+def test_default_param_drops_global_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_default_global_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _DEFAULT_GLOBAL_DUP_RANGES,
+            source=_DEFAULT_GLOBAL_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+def test_default_param_global_kept_explicit_not_flagged(monkeypatch):
+    """A helper that still receives the argument explicitly at each call
+    site (not relying on the default) is unaffected by the check."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_default_global_preserved_extract_response(),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _DEFAULT_GLOBAL_DUP_RANGES,
+            source=_DEFAULT_GLOBAL_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is not None
+    assert de._new_source.count("    _helper(status, file=sys.stderr)\n") == 2
 
 
 # ---------------------------------------------------------------------------
