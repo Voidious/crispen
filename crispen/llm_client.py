@@ -259,8 +259,16 @@ def call_with_tool(
                 "parameters": tool["input_schema"],
             },
         }
+        _moonshot_thinking_enabled = (
+            provider == "moonshot" and model in _MOONSHOT_THINKING_ENABLED_MODELS
+        )
         if tool_choice_override is not None:
             resolved_tool_choice: Any = tool_choice_override
+        elif _moonshot_thinking_enabled:
+            # These models reject a forced function tool_choice while thinking
+            # is enabled ("tool_choice 'specified' is incompatible with
+            # thinking enabled"), unlike kimi-k3 and other moonshot models.
+            resolved_tool_choice = "auto"
         else:
             resolved_tool_choice = {"type": "function", "function": {"name": tool_name}}
         create_kwargs: dict[str, Any] = {
@@ -271,9 +279,7 @@ def call_with_tool(
             "messages": messages,
         }
         if provider == "moonshot":
-            thinking_type = (
-                "enabled" if model in _MOONSHOT_THINKING_ENABLED_MODELS else "disabled"
-            )
+            thinking_type = "enabled" if _moonshot_thinking_enabled else "disabled"
             create_kwargs["extra_body"] = {"thinking": {"type": thinking_type}}
         elif provider == "openai" and model.startswith("gpt-5"):
             # gpt-5.x rejects forced function tool_choice combined with its
