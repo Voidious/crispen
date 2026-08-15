@@ -442,7 +442,8 @@ def test_verify_rejected_retries_then_exhausts(tmp_path, monkeypatch):
     assert stats.llm_verify_calls == 2
 
 
-def test_verify_timeout_accepts(tmp_path, monkeypatch):
+def test_verify_timeout_skips_group(tmp_path, monkeypatch, capsys):
+    """Verify timeout must fail closed (skip the group), not silently accept."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     from crispen.refactors.duplicate_extractor import _ApiTimeout
 
@@ -472,7 +473,9 @@ def test_verify_timeout_accepts(tmp_path, monkeypatch):
         msgs = list(
             run_cross_file_duplicate_extraction(per_file, str(tmp_path), _cfg(tmp_path))
         )
-    assert len(msgs) == 1
+    assert len(msgs) == 0
+    err = capsys.readouterr().err
+    assert "cross-file API call timed out, skipping group" in err
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +733,8 @@ def test_algorithmic_retry_verbose_false(tmp_path, monkeypatch):
     assert len(msgs) == 1
 
 
-def test_verify_timeout_accepts_verbose_false(tmp_path, monkeypatch):
+def test_verify_timeout_skips_group_verbose_false(tmp_path, monkeypatch):
+    """Verify timeout must fail closed (skip the group), not silently accept."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     from crispen.refactors.duplicate_extractor import _ApiTimeout
 
@@ -756,7 +760,7 @@ def test_verify_timeout_accepts_verbose_false(tmp_path, monkeypatch):
                 per_file, str(tmp_path), _cfg(tmp_path), verbose=False
             )
         )
-    assert len(msgs) == 1
+    assert len(msgs) == 0
 
 
 def test_verify_retry_verbose_false(tmp_path, monkeypatch):

@@ -4005,14 +4005,13 @@ class DuplicateExtractor(Refactor):
                             self.current_file,
                         )
                 except _ApiTimeout:
-                    if self.verbose:
-                        print(
-                            "crispen: DuplicateExtractor:   → verify timed out,"
-                            " accepting extraction",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    verify_ok, verify_issues = True, []
+                    print(
+                        "crispen: DuplicateExtractor: API call timed out,"
+                        " skipping group",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
 
                 if self.verbose:
                     v_status = "ACCEPTED" if verify_ok else "REJECTED"

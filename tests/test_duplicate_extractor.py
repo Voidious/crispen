@@ -7729,7 +7729,7 @@ def test_extraction_retry_on_alg_failure_silent(monkeypatch):
 
 
 def test_llm_verify_timeout_verbose(monkeypatch, capsys):
-    """Verify times out (verbose=True) -> extraction is accepted and logged."""
+    """Verify times out (verbose=True) -> group is skipped, not accepted."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     from crispen.refactors.duplicate_extractor import _llm_verify_extraction
 
@@ -7755,9 +7755,9 @@ def test_llm_verify_timeout_verbose(monkeypatch, capsys):
     ):
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=True)
 
-    assert de._new_source is not None
+    assert de._new_source is None
     err = capsys.readouterr().err
-    assert "verify timed out" in err
+    assert "API call timed out, skipping group" in err
 
 
 def test_llm_verify_rejects_then_retries_verbose(monkeypatch, capsys):
@@ -7877,7 +7877,7 @@ def test_llm_verify_exhausted_skips_group(monkeypatch):
 
 
 def test_llm_verify_timeout_silent(monkeypatch):
-    """Verify times out (verbose=False) -> extraction is accepted silently."""
+    """Verify times out (verbose=False) -> group is skipped, not accepted."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     from crispen.refactors.duplicate_extractor import _llm_verify_extraction
 
@@ -7903,7 +7903,7 @@ def test_llm_verify_timeout_silent(monkeypatch):
     ):
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
 
-    assert de._new_source is not None
+    assert de._new_source is None
 
 
 # ---------------------------------------------------------------------------
