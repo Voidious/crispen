@@ -70,6 +70,7 @@ from crispen.refactors.duplicate_extractor import (
     _helper_imports_local_name,
     _helper_reimports_module_level_name,
     _helper_defines_class_colliding_with_origin,
+    _helper_imports_class_orphaning_sibling_origin,
     _directive_comments,
     _dropped_directive_comments,
     _default_param_drops_call_time_global,
@@ -6420,6 +6421,151 @@ def test_helper_defines_class_colliding_with_origin_nested_class_not_flagged():
         "a.py": "def make():\n    class _ApiTimeout(Exception):\n        pass\n"
     }
     assert _helper_defines_class_colliding_with_origin(helper, file_sources) == set()
+
+
+# ---------------------------------------------------------------------------
+# _helper_imports_class_orphaning_sibling_origin
+# ---------------------------------------------------------------------------
+
+
+def test_helper_imports_class_orphaning_sibling_origin_true(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    b = pkg / "b.py"
+    helper = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        str(a): "class _ApiTimeout(Exception):\n    pass\n",
+        str(b): (
+            "class _ApiTimeout(Exception):\n"
+            "    pass\n\n\n"
+            "def call():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except _ApiTimeout:\n"
+            "        pass\n"
+        ),
+    }
+    assert _helper_imports_class_orphaning_sibling_origin(
+        helper, file_sources, str(tmp_path)
+    ) == {"_ApiTimeout"}
+
+
+def test_helper_imports_class_orphaning_sibling_origin_no_collision(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    b = pkg / "b.py"
+    helper = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        str(a): "class _ApiTimeout(Exception):\n    pass\n",
+        str(b): "def other():\n    pass\n",
+    }
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_no_imports_in_helper(tmp_path):
+    helper = "def run_with_timeout(f, t):\n    return f()\n"
+    file_sources = {str(tmp_path / "a.py"): "class _ApiTimeout(Exception):\n    pass\n"}
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_syntax_error_helper(tmp_path):
+    file_sources = {str(tmp_path / "a.py"): "class _ApiTimeout(Exception):\n    pass\n"}
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            "def (:\n", file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_relative_import_ignored(
+    tmp_path,
+):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    b = pkg / "b.py"
+    helper = (
+        "from .a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        str(a): "class _ApiTimeout(Exception):\n    pass\n",
+        str(b): "class _ApiTimeout(Exception):\n    pass\n",
+    }
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_syntax_error_origin_file(
+    tmp_path,
+):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    b = pkg / "b.py"
+    helper = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        str(a): "class _ApiTimeout(Exception):\n    pass\n",
+        str(b): "(:\n",
+    }
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_self_import_not_flagged(
+    tmp_path,
+):
+    # The helper imports the class from the same origin file that defines
+    # it -- not a collision, just reusing the owning file's own class.
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    helper = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {str(a): "class _ApiTimeout(Exception):\n    pass\n"}
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
 
 
 # ---------------------------------------------------------------------------

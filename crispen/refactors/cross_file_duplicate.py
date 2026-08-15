@@ -40,6 +40,7 @@ from .duplicate_extractor import (
     _group_ends_in_return,
     _has_call_to,
     _helper_defines_class_colliding_with_origin,
+    _helper_imports_class_orphaning_sibling_origin,
     _lift_and_dedup_imports,
     _llm_veto,
     _pyflakes_new_undefined_names,
@@ -607,6 +608,29 @@ def run_cross_file_duplicate_extraction(
                             "(classes/exceptions match by identity, not name, "
                             "so an origin file's own except/isinstance checks "
                             "would silently stop matching)"
+                        )
+
+                # A class the helper *imports* from one origin file, rather
+                # than defines itself, can orphan a different origin file's
+                # own separate, same-named class -- same identity-vs-name
+                # hazard as the check above, reached by importing instead
+                # of defining.
+                if not failures:
+                    orphaned_classes = _helper_imports_class_orphaning_sibling_origin(
+                        helper_source, file_sources, repo_root
+                    )
+                    if orphaned_classes:
+                        failures.append(
+                            "helper imports class(es) from one origin file "
+                            "that collide with a same-named, separately "
+                            "defined class still owned by a different origin "
+                            "file: "
+                            f"{', '.join(sorted(orphaned_classes))} -- either "
+                            "import the class each origin file already uses "
+                            "for its own un-extracted code, or update every "
+                            "origin file's remaining references (e.g. "
+                            "except/isinstance checks) to use the imported "
+                            "class consistently"
                         )
 
                 # A directive comment (# pragma: no cover, # noqa,

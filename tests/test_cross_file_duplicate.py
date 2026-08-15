@@ -1050,6 +1050,111 @@ def test_helper_class_no_collision_with_origin_class(tmp_path, monkeypatch):
     assert (tmp_path / "pkg" / "common.py").exists()
 
 
+def test_helper_imports_class_orphaning_sibling_origin_rejected(tmp_path, monkeypatch):
+    """Regression (found by a live self-check run against crispen's own
+    source): both origin files define their own, separate `_ApiTimeout`
+    class for the same purpose. The helper correctly avoids *redefining*
+    either one (that's the previous check's job) but instead *imports* only
+    one origin's class -- silently orphaning the other origin file's own,
+    un-extracted `except _ApiTimeout:` (or similar) references, which still
+    expect their own distinct class object. Classes/exceptions match by
+    identity, not name."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_dup_pair(tmp_path)
+    f1.write_text(
+        "class _ApiTimeout(Exception):\n    pass\n\n\n"
+        + f1.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    f2.write_text(
+        "class _ApiTimeout(Exception):\n"
+        "    pass\n\n\n"
+        "def other():\n"
+        "    try:\n"
+        "        pass\n"
+        "    except _ApiTimeout:\n"
+        "        pass\n\n\n" + f2.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    per_file = _per_file_for(f1, f2)
+    bad_extract = dict(_HAPPY_EXTRACT)
+    bad_extract["helper_source"] = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def shared_helper(data):\n"
+        "    if not data:\n"
+        "        raise _ApiTimeout('empty')\n"
+        "    stripped = data.strip()\n"
+        "    upper = stripped.upper()\n"
+        '    parts = upper.split(",")\n'
+        "    return parts\n"
+    )
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(bad_extract),
+            _make_extract_response(bad_extract),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert msgs == []
+    assert stats.algorithmic_rejected == 1
+    assert not (tmp_path / "pkg" / "common.py").exists()
+
+
+def test_helper_imports_class_no_orphaned_sibling_origin(tmp_path, monkeypatch):
+    """A helper importing a class from one origin file is unaffected by the
+    new check when no *different* origin file defines its own separate,
+    same-named class."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_dup_pair(tmp_path)
+    f1.write_text(
+        "class _ApiTimeout(Exception):\n    pass\n\n\n"
+        + f1.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    per_file = _per_file_for(f1, f2)
+    extract = dict(_HAPPY_EXTRACT)
+    extract["helper_source"] = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def shared_helper(data):\n"
+        "    if not data:\n"
+        "        raise _ApiTimeout('empty')\n"
+        "    stripped = data.strip()\n"
+        "    upper = stripped.upper()\n"
+        '    parts = upper.split(",")\n'
+        "    return parts\n"
+    )
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(extract),
+            _make_verify_response(True, []),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert len(msgs) == 1
+    assert stats.algorithmic_rejected == 0
+    assert (tmp_path / "pkg" / "common.py").exists()
+
+
 def test_dropped_directive_comment_rejected(tmp_path, monkeypatch):
     """Regression (same shape as a live self-check finding, reproduced here
     at the cross-file layer): the original duplicate block ends with a line

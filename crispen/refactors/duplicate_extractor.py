@@ -2207,6 +2207,69 @@ def _helper_defines_class_colliding_with_origin(
     return colliding
 
 
+def _helper_imports_class_orphaning_sibling_origin(
+    helper_source: str, file_sources: Dict[str, str], repo_root: str
+) -> set:
+    """Return class names the helper imports from one origin file that
+    collide with a same-named, but separately defined, module-level class
+    still owned by a *different* origin file.
+
+    The previous check (:func:`_helper_defines_class_colliding_with_origin`)
+    catches a helper that *defines* its own class colliding with an origin's
+    class -- the correct fix is to import the origin's existing class
+    instead of redefining it. But when the extracted block also existed in
+    a *different* origin file that defines its own, separate, same-named
+    class (e.g. two files each with their own private exception type for
+    the same purpose), importing only one of them into the shared helper
+    leaves the other origin file's own class orphaned: the assembled helper
+    now raises/returns the imported class, but the other origin file's
+    un-extracted code (e.g. its own ``except OwnClass:``) still expects its
+    own distinct class object. Classes/exceptions match by identity, not
+    name, so that silently stops matching -- same underlying hazard as the
+    define-collision case, just reached by importing instead of defining.
+    """
+    try:
+        helper_tree = ast.parse(textwrap.dedent(helper_source))
+    except SyntaxError:
+        return set()
+
+    imported: List[Tuple[str, str]] = []
+    for node in helper_tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            for alias in node.names:
+                local_name = alias.asname if alias.asname else alias.name
+                imported.append((local_name, node.module))
+    if not imported:
+        return set()
+
+    try:
+        root = Path(repo_root).resolve()
+    except (OSError, ValueError):  # pragma: no cover
+        return set()
+
+    module_classes: Dict[str, set] = {}
+    for fp, source in file_sources.items():
+        try:
+            dotted, _ = _repo_index.file_to_module_and_package(Path(fp).resolve(), root)
+        except ValueError:  # pragma: no cover
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        module_classes[dotted] = {
+            node.name for node in tree.body if isinstance(node, ast.ClassDef)
+        }
+
+    colliding: set = set()
+    for class_name, src_module in imported:
+        for dotted, classes in module_classes.items():
+            if dotted != src_module and class_name in classes:
+                colliding.add(class_name)
+
+    return colliding
+
+
 _DIRECTIVE_COMMENT_RE = re.compile(
     r"#\s*("
     r"pragma:\s*no\s*(?:cover|branch)"
