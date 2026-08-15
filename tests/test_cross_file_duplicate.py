@@ -1342,6 +1342,242 @@ def test_default_param_global_kept_explicit_not_flagged(tmp_path, monkeypatch):
     assert (tmp_path / "pkg" / "common.py").exists()
 
 
+# ---------------------------------------------------------------------------
+# Integration: dropped-escaping-var-capture guard (shared with same-file)
+# ---------------------------------------------------------------------------
+
+
+def _write_escape_capture_pair(tmp_path: Path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f1 = pkg / "a.py"
+    f2 = pkg / "b.py"
+    # A module-level _rl_delay makes the name always resolvable (matching the
+    # real bug's shape: an outer-scope value that a dropped call-site
+    # reassignment leaves silently stale, not a hard undefined-name error).
+    f1.write_text(
+        "_rl_delay = 1\n\n\n"
+        "def foo(a):\n"
+        "    x = a + 1\n"
+        "    y = x * 2\n"
+        "    _rl_delay = x + y\n"
+        "    if _rl_delay is not None:\n"
+        "        wait(_rl_delay)\n",
+        encoding="utf-8",
+    )
+    f2.write_text(
+        "_rl_delay = 1\n\n\n"
+        "def bar(a):\n"
+        "    x = a + 1\n"
+        "    y = x * 2\n"
+        "    _rl_delay = x + y\n"
+        "    log(_rl_delay)\n",
+        encoding="utf-8",
+    )
+    return f1, f2
+
+
+def test_dropped_escaping_var_capture_rejected(tmp_path, monkeypatch):
+    """Regression (same shape as a live self-check finding, reproduced here
+    at the cross-file layer): one call site drops the reassignment of a
+    variable that escapes for its own occurrence."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_escape_capture_pair(tmp_path)
+    per_file = _per_file_for(f1, f2)
+    bad_extract = {
+        "function_name": "shared_helper",
+        "helper_source": (
+            "def shared_helper(a):\n"
+            "    x = a + 1\n"
+            "    y = x * 2\n"
+            "    return x + y\n"
+        ),
+        "call_site_replacements": [
+            "    _rl_delay = shared_helper(a)\n",
+            "    shared_helper(a)\n",  # drops the reassignment
+        ],
+    }
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(bad_extract),
+            _make_extract_response(bad_extract),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert msgs == []
+    assert stats.algorithmic_rejected == 1
+    assert not (tmp_path / "pkg" / "common.py").exists()
+
+
+def test_escaping_var_capture_preserved_not_flagged_cross_file(tmp_path, monkeypatch):
+    """Both call sites capture the return value -- unaffected by the check."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_escape_capture_pair(tmp_path)
+    per_file = _per_file_for(f1, f2)
+    extract = {
+        "function_name": "shared_helper",
+        "helper_source": (
+            "def shared_helper(a):\n"
+            "    x = a + 1\n"
+            "    y = x * 2\n"
+            "    return x + y\n"
+        ),
+        "call_site_replacements": [
+            "    _rl_delay = shared_helper(a)\n",
+            "    _rl_delay = shared_helper(a)\n",
+        ],
+    }
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(extract),
+            _make_verify_response(True, []),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert len(msgs) == 1
+    assert stats.algorithmic_rejected == 0
+    assert (tmp_path / "pkg" / "common.py").exists()
+
+
+# ---------------------------------------------------------------------------
+# Integration: call-site argument identity mismatch guard (shared with
+# same-file)
+# ---------------------------------------------------------------------------
+
+
+def _write_crossed_args_pair(tmp_path: Path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    f1 = pkg / "a.py"
+    f2 = pkg / "b.py"
+    # A single tuple-assignment statement (weight 1, below min_duplicate_weight)
+    # so this shared setup isn't itself detected as a spurious duplicate group.
+    globals_block = 'trial_deps, candidate, file_deps, chosen = {}, "a", {}, "b"\n\n\n'
+    f1.write_text(
+        globals_block + "def trial_step():\n"
+        "    trial_deps[candidate] = None\n"
+        "    depth = topo_depth(trial_deps, candidate)\n"
+        "    depth += 1\n"
+        "    if depth > 0:\n"
+        "        log_trial(depth)\n",
+        encoding="utf-8",
+    )
+    f2.write_text(
+        globals_block + "def apply_step():\n"
+        "    file_deps[chosen] = None\n"
+        "    depth = topo_depth(file_deps, chosen)\n"
+        "    depth += 1\n"
+        "    log_apply(depth)\n",
+        encoding="utf-8",
+    )
+    return f1, f2
+
+
+def test_call_site_argument_identity_mismatch_rejected(tmp_path, monkeypatch):
+    """Regression (same shape as a live self-check finding, reproduced here
+    at the cross-file layer): the two call sites' arguments got crossed."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_crossed_args_pair(tmp_path)
+    per_file = _per_file_for(f1, f2)
+    bad_extract = {
+        "function_name": "shared_register",
+        "helper_source": (
+            "def shared_register(deps, key):\n"
+            "    deps[key] = None\n"
+            "    depth = len(deps)\n"
+            "    return depth + 1\n"
+        ),
+        "call_site_replacements": [
+            "    depth = shared_register(file_deps, chosen)\n",
+            "    depth = shared_register(trial_deps, candidate)\n",
+        ],
+    }
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(bad_extract),
+            _make_extract_response(bad_extract),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert msgs == []
+    assert stats.algorithmic_rejected == 1
+    assert not (tmp_path / "pkg" / "common.py").exists()
+
+
+def test_call_site_argument_identity_not_crossed_not_flagged_cross_file(
+    tmp_path, monkeypatch
+):
+    """Each call site's arguments come from its own block -- unaffected."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    f1, f2 = _write_crossed_args_pair(tmp_path)
+    per_file = _per_file_for(f1, f2)
+    extract = {
+        "function_name": "shared_register",
+        "helper_source": (
+            "def shared_register(deps, key):\n"
+            "    deps[key] = None\n"
+            "    depth = len(deps)\n"
+            "    return depth + 1\n"
+        ),
+        "call_site_replacements": [
+            "    depth = shared_register(trial_deps, candidate)\n",
+            "    depth = shared_register(file_deps, chosen)\n",
+        ],
+    }
+    stats = RunStats()
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "same op"),
+            _make_extract_response(extract),
+            _make_verify_response(True, []),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file,
+                str(tmp_path),
+                _cfg(tmp_path, extraction_retries=1),
+                stats=stats,
+            )
+        )
+    assert len(msgs) == 1
+    assert stats.algorithmic_rejected == 0
+    assert (tmp_path / "pkg" / "common.py").exists()
+
+
 def test_helper_docstrings_true_keeps_docstring(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     f1, f2 = _write_dup_pair(tmp_path)

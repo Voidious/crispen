@@ -30,12 +30,14 @@ from .duplicate_extractor import (
     _SeqInfo,
     _SequenceCollector,
     _apply_edits,
+    _call_site_argument_identity_mismatch,
     _cross_file_helper_target,
     _default_param_drops_call_time_global,
     _dropped_directive_comments,
+    _dropped_escaping_var_capture,
+    _escaping_vars_for_seq,
     _extract_defined_names,
     _find_cross_file_duplicate_groups,
-    _find_escaping_vars,
     _first_funcdef_idx,
     _group_ends_in_return,
     _has_call_to,
@@ -380,13 +382,22 @@ def run_cross_file_duplicate_extraction(
             fp: src.splitlines(keepends=True) for fp, src in file_sources.items()
         }
 
-        escaping_vars: set = set()
+        escaping_vars_per_seq = [
+            _escaping_vars_for_seq(
+                seq,
+                file_lines[seq.filepath],
+                [
+                    (other.start_line, other.end_line)
+                    for other in group
+                    if other is not seq and other.filepath == seq.filepath
+                ],
+            )
+            for seq in group
+        ]
+        escaping_vars_fs = frozenset().union(*escaping_vars_per_seq)
         used_names: set = set()
         for fp in file_paths:
-            fp_seqs = [s for s in group if s.filepath == fp]
-            escaping_vars |= _find_escaping_vars(fp_seqs, file_lines[fp])
             used_names |= _extract_defined_names(file_sources[fp])
-        escaping_vars_fs = frozenset(escaping_vars)
 
         target_file, dotted_module = _cross_file_helper_target(
             file_paths, repo_root, config.cross_file_helper_module
@@ -675,6 +686,43 @@ def run_cross_file_duplicate_extraction(
                             f"{', '.join(sorted(dropped_defaults))} -- keep "
                             "passing the argument explicitly at each call "
                             "site instead of relying on the default"
+                        )
+
+                # If an occurrence's own original block assigned an
+                # escaping variable but its replacement no longer assigns it
+                # anywhere, surrounding code that reads the variable
+                # afterward would see a stale value from before the call.
+                if not failures:
+                    dropped_capture = _dropped_escaping_var_capture(
+                        original_blocks, call_replacements, escaping_vars_per_seq
+                    )
+                    if dropped_capture:
+                        failures.append(
+                            "replacement drops the reassignment of "
+                            "escaping variable(s) present in the original "
+                            "block: "
+                            f"{', '.join(sorted(dropped_capture))} -- "
+                            "capture the helper's return value into the "
+                            "same variable at this call site instead of "
+                            "calling it as a bare statement"
+                        )
+
+                # An occurrence's call site passing an argument name that
+                # never appears in that occurrence's own original block but
+                # does appear in a different occurrence's block means the
+                # extraction likely crossed two call sites' arguments.
+                if not failures:
+                    crossed_args = _call_site_argument_identity_mismatch(
+                        original_blocks, call_replacements
+                    )
+                    if crossed_args:
+                        failures.append(
+                            "call site passes argument(s) that belong to a "
+                            "different occurrence's original block, not "
+                            "this one's: "
+                            f"{', '.join(sorted(crossed_args))} -- each "
+                            "call site's arguments must come from its own "
+                            "original block's locals"
                         )
 
             if failures:

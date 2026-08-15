@@ -2381,6 +2381,111 @@ def _default_param_drops_call_time_global(
     return flagged
 
 
+def _names_referenced_in(block_source: str) -> set:
+    """Return every bare name referenced anywhere in block_source, in any
+    context (assigned or merely read)."""
+    try:
+        tree = ast.parse(textwrap.dedent(block_source))
+    except SyntaxError:
+        return set()
+    return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+
+
+def _dropped_escaping_var_capture(
+    original_blocks: List[str],
+    call_replacements: List[str],
+    escaping_vars_per_occurrence: List[set],
+) -> set:
+    """Return escaping variable names an occurrence's own original block
+    assigned that its replacement no longer assigns anywhere.
+
+    ``escaping_vars_per_occurrence`` (from :func:`_find_escaping_vars_per_seq`,
+    one set per group member, in the same order as *original_blocks*/
+    *call_replacements*) names variables *that specific occurrence's own*
+    block assigns and that subsequent code following *that occurrence*
+    still reads afterward -- the helper is expected to return them so this
+    call site can re-capture the value. Using each occurrence's own
+    escaping set (rather than the group-wide union) matters: two duplicate
+    blocks often assign the same variable name, but only the occurrence(s)
+    where that name is actually read afterward need the assignment
+    preserved -- a sibling occurrence reusing the name is not itself a
+    signal that this occurrence's copy escapes. If a specific occurrence's
+    own original block assigned one of its own escaping names but that
+    occurrence's assembled replacement drops the assignment entirely, the
+    surrounding code that reads the variable afterward now sees a stale
+    value from before the call instead of the freshly computed one --
+    exactly the shape of a caller-side reassignment silently lost when an
+    inline statement became a function call (e.g. ``x = x * 2`` turning into
+    a bare ``helper(x)`` at one call site while a sibling site correctly
+    keeps ``x = helper(x)``).
+    """
+    dropped: set = set()
+    for block, repl, escaping in zip(
+        original_blocks, call_replacements, escaping_vars_per_occurrence
+    ):
+        assigned_in_block = _names_assigned_in(block) & escaping
+        if not assigned_in_block:
+            continue
+        dropped |= assigned_in_block - _names_assigned_in(repl)
+    return dropped
+
+
+def _call_argument_names(source: str) -> set:
+    """Return bare-name arguments (positional or keyword values) passed to
+    any function call anywhere in *source*."""
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return set()
+    names: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for arg in node.args:
+                if isinstance(arg, ast.Name):
+                    names.add(arg.id)
+            for kw in node.keywords:
+                if isinstance(kw.value, ast.Name):
+                    names.add(kw.value.id)
+    return names
+
+
+def _call_site_argument_identity_mismatch(
+    original_blocks: List[str], call_replacements: List[str]
+) -> set:
+    """Return argument names passed at one occurrence's call site that never
+    appear in that occurrence's own original block but do appear in a
+    *different* occurrence's original block.
+
+    Each occurrence's replacement calls the shared helper with whatever
+    local names that particular call site needs -- normally names already
+    present somewhere in that occurrence's own original block, since that
+    block is literally where those locals were used. If an argument name is
+    absent from the occurrence's own block but present in a sibling
+    occurrence's block instead, the extraction likely wired this call site
+    to a different occurrence's locals -- e.g. two structurally similar call
+    sites (a "trial" step and an "apply" step, each closing over its own
+    variable pair) getting their argument lists crossed between sites.
+    There is no ordinary reason for one call site's arguments to come
+    exclusively from names that only appear at a *different* site, since
+    call_site_replacements only ever replaces that occurrence's own line
+    range.
+    """
+    per_occurrence_names = [_names_referenced_in(b) for b in original_blocks]
+    mismatched: set = set()
+    for i, repl in enumerate(call_replacements):
+        own_names = per_occurrence_names[i]
+        other_names: set = set()
+        for j, names in enumerate(per_occurrence_names):
+            if j != i:
+                other_names |= names
+        for arg_name in _call_argument_names(repl):
+            if arg_name in own_names:
+                continue
+            if arg_name in other_names:
+                mismatched.add(arg_name)
+    return mismatched
+
+
 def _first_funcdef_idx(source_lines: List[str]) -> int:
     """Return the 0-based index of the first unindented ``def``/``class`` line.
 
@@ -2622,60 +2727,103 @@ def _names_assigned_in(block_source: str) -> set:
     return names
 
 
-def _find_escaping_vars(group: List[_SeqInfo], source_lines: List[str]) -> set:
-    """Return names assigned in any group sequence that are referenced after it.
+def _escaping_vars_for_seq(
+    seq: _SeqInfo,
+    source_lines: List[str],
+    exclude_line_ranges: Sequence[Tuple[int, int]] = (),
+) -> set:
+    """Return names *seq*'s own block assigns that are referenced after it.
 
     A variable "escapes" when the block assigns it and subsequent code in the
     same scope (at the same or deeper indentation level) references it.
+
+    ``exclude_line_ranges`` (1-based, inclusive ``(start_line, end_line)``
+    pairs) marks other duplicate blocks in the same group -- that code will
+    itself be replaced by a call, so a reference confined to it (most often
+    a sibling occurrence simply reusing the same variable name for its own,
+    unrelated local) must not count as this occurrence's variable escaping.
+    Without this, two duplicate blocks that both assign e.g. ``rd`` and
+    happen to sit back-to-back would make the first block's ``rd`` look
+    like it escapes merely because the second block's own (soon to be
+    extracted) code mentions the same name.
+    """
+    block_src = "".join(source_lines[seq.start_line - 1 : seq.end_line])
+    assigned = _names_assigned_in(block_src)
+    if not assigned:
+        return set()
+
+    # Infer the block's indentation level from its first non-empty line.
+    first_line = next(
+        (ln for ln in source_lines[seq.start_line - 1 : seq.end_line] if ln.strip()),
+        "",
+    )
+    block_indent = len(first_line) - len(first_line.lstrip())
+
+    # Collect lines that follow the block within the same scope, skipping
+    # any line that belongs to another duplicate block in this group.
+    # For indented blocks: stop when indentation falls below block_indent.
+    # For module-level (indent 0): stop at the next def/class statement.
+    after_lines: List[str] = []
+    for offset, line in enumerate(source_lines[seq.end_line :]):
+        line_no = seq.end_line + 1 + offset
+        excluded = any(s <= line_no <= e for s, e in exclude_line_ranges)
+        if not line.strip():
+            if not excluded:
+                after_lines.append(line)
+            continue
+        line_indent = len(line) - len(line.lstrip())
+        if block_indent == 0:
+            if re.match(r"def |class ", line):
+                break
+        elif line_indent < block_indent:
+            break
+        if not excluded:
+            after_lines.append(line)
+
+    if not after_lines:
+        return set()
+
+    after_src = "".join(after_lines)
+    try:
+        after_tree = ast.parse(textwrap.dedent(after_src))
+    except SyntaxError:
+        return set()
+
+    used_after = {n.id for n in ast.walk(after_tree) if isinstance(n, ast.Name)}
+    return assigned & used_after
+
+
+def _find_escaping_vars_per_seq(
+    group: List[_SeqInfo], source_lines: List[str]
+) -> List[set]:
+    """Return, in group order, the escaping-variable set for each sequence.
+
+    Unlike :func:`_find_escaping_vars`, this keeps each sequence's own
+    escaping names separate instead of merging them -- needed to tell
+    whether a *specific* occurrence's own block is the one that actually
+    needs its assignment preserved, as opposed to another occurrence in the
+    group merely reusing the same variable name.
+    """
+    result = []
+    for i, seq in enumerate(group):
+        exclude = [
+            (other.start_line, other.end_line)
+            for j, other in enumerate(group)
+            if j != i
+        ]
+        result.append(_escaping_vars_for_seq(seq, source_lines, exclude))
+    return result
+
+
+def _find_escaping_vars(group: List[_SeqInfo], source_lines: List[str]) -> set:
+    """Return names assigned in any group sequence that are referenced after it.
+
     The helper must return these variables so callers that need them can
     capture the return value.
     """
     escaping: set = set()
-    for seq in group:
-        block_src = "".join(source_lines[seq.start_line - 1 : seq.end_line])
-        assigned = _names_assigned_in(block_src)
-        if not assigned:
-            continue
-
-        # Infer the block's indentation level from its first non-empty line.
-        first_line = next(
-            (
-                ln
-                for ln in source_lines[seq.start_line - 1 : seq.end_line]
-                if ln.strip()
-            ),
-            "",
-        )
-        block_indent = len(first_line) - len(first_line.lstrip())
-
-        # Collect lines that follow the block within the same scope.
-        # For indented blocks: stop when indentation falls below block_indent.
-        # For module-level (indent 0): stop at the next def/class statement.
-        after_lines: List[str] = []
-        for line in source_lines[seq.end_line :]:
-            if not line.strip():
-                after_lines.append(line)
-                continue
-            line_indent = len(line) - len(line.lstrip())
-            if block_indent == 0:
-                if re.match(r"def |class ", line):
-                    break
-            elif line_indent < block_indent:
-                break
-            after_lines.append(line)
-
-        if not after_lines:
-            continue
-
-        after_src = "".join(after_lines)
-        try:
-            after_tree = ast.parse(textwrap.dedent(after_src))
-        except SyntaxError:
-            continue
-
-        used_after = {n.id for n in ast.walk(after_tree) if isinstance(n, ast.Name)}
-        escaping |= assigned & used_after
-
+    for per_seq in _find_escaping_vars_per_seq(group, source_lines):
+        escaping |= per_seq
     return escaping
 
 
@@ -3321,7 +3469,8 @@ class DuplicateExtractor(Refactor):
         for group in groups:
             # Compute escaping vars algorithmically before any LLM call so the
             # extraction prompt can instruct the LLM to return them.
-            escaping_vars = frozenset(_find_escaping_vars(group, source_lines))
+            escaping_vars_per_seq = _find_escaping_vars_per_seq(group, source_lines)
+            escaping_vars = frozenset().union(*escaping_vars_per_seq)
 
             # Skip groups that would leave a function as a trivial proxy wrapper
             # (i.e. the extracted block is the function's entire body).
@@ -3952,6 +4101,68 @@ class DuplicateExtractor(Refactor):
                                     f"helper turns call-time global keyword "
                                     f"argument(s) into a default parameter "
                                     f"value: {', '.join(sorted(dropped_defaults))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                    # Check 15: an occurrence's own original block assigned
+                    # an escaping variable but its replacement no longer
+                    # assigns it anywhere -- surrounding code that reads the
+                    # variable afterward would see a stale value.
+                    if not _check_failed:
+                        dropped_capture = _dropped_escaping_var_capture(
+                            original_blocks,
+                            call_replacements,
+                            escaping_vars_per_seq,
+                        )
+                        if dropped_capture:
+                            _failures.append(
+                                f"replacement drops the reassignment of "
+                                f"escaping variable(s) present in the "
+                                f"original block: "
+                                f"{', '.join(sorted(dropped_capture))} -- "
+                                f"capture the helper's return value into "
+                                f"the same variable at this call site "
+                                f"instead of calling it as a bare statement"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"replacement drops the reassignment of "
+                                    f"escaping variable(s): "
+                                    f"{', '.join(sorted(dropped_capture))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                    # Check 16: an occurrence's call site passes an argument
+                    # name that never appears in that occurrence's own
+                    # original block but does appear in a different
+                    # occurrence's block -- the extraction likely crossed
+                    # two call sites' arguments.
+                    if not _check_failed:
+                        crossed_args = _call_site_argument_identity_mismatch(
+                            original_blocks, call_replacements
+                        )
+                        if crossed_args:
+                            _failures.append(
+                                f"call site passes argument(s) that belong "
+                                f"to a different occurrence's original "
+                                f"block, not this one's: "
+                                f"{', '.join(sorted(crossed_args))} -- each "
+                                f"call site's arguments must come from its "
+                                f"own original block's locals"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"call site passes argument(s) crossed "
+                                    f"from a different occurrence: "
+                                    f"{', '.join(sorted(crossed_args))}",
                                     file=sys.stderr,
                                     flush=True,
                                 )

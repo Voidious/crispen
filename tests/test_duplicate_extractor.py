@@ -45,6 +45,12 @@ from crispen.refactors.duplicate_extractor import (
     _has_call_to,
     _has_def,
     _find_escaping_vars,
+    _find_escaping_vars_per_seq,
+    _escaping_vars_for_seq,
+    _dropped_escaping_var_capture,
+    _call_argument_names,
+    _call_site_argument_identity_mismatch,
+    _names_referenced_in,
     _has_mutable_literal_is_check,
     _has_param_overwritten_before_read,
     _llm_generate_call,
@@ -1509,6 +1515,62 @@ def test_find_escaping_vars_module_level_stops_at_def():
     # CONSTANT is in after_lines; not in assigned → set().
     # z inside def foo(z) is not scanned (stopped before that def).
     assert _find_escaping_vars([seq], source_lines) == set()
+
+
+# ---------------------------------------------------------------------------
+# _escaping_vars_for_seq / _find_escaping_vars_per_seq (exclude_line_ranges)
+# ---------------------------------------------------------------------------
+
+
+def test_escaping_vars_for_seq_sibling_reuse_excluded():
+    # Regression: two duplicate blocks both assign 'rd'. Without excluding
+    # the sibling block's own lines, the first block's 'rd' looks like it
+    # escapes merely because the second (soon to be extracted) block
+    # mentions the same name -- it must not.
+    source_lines = [
+        "def test_f():\n",
+        "    rd = json.loads(a)\n",  # seq1: lines 2
+        "    rd = json.loads(b)\n",  # seq2: lines 3
+    ]
+    seq1 = _make_esc_seq(2, 2)
+    seq2 = _make_esc_seq(3, 3)
+    per_seq = _find_escaping_vars_per_seq([seq1, seq2], source_lines)
+    assert per_seq == [set(), set()]
+
+
+def test_escaping_vars_for_seq_real_usage_still_detected_excluding_sibling():
+    # A sibling occurrence shares the name, but genuine surviving code
+    # (outside every group member) still reads it -- must still escape for
+    # both occurrences (the real usage line follows each of them).
+    source_lines = [
+        "def test_f():\n",
+        "    rd = json.loads(a)\n",  # seq1: line 2
+        "    rd = json.loads(b)\n",  # seq2: line 3
+        "    assert rd is not None\n",  # real usage, not part of the group
+    ]
+    seq1 = _make_esc_seq(2, 2)
+    seq2 = _make_esc_seq(3, 3)
+    per_seq = _find_escaping_vars_per_seq([seq1, seq2], source_lines)
+    assert per_seq == [{"rd"}, {"rd"}]
+
+
+def test_escaping_vars_for_seq_excludes_blank_line_in_sibling_range():
+    # The excluded sibling range can include a blank line -- must be
+    # skipped like any other excluded line, not appended to after_lines.
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",  # seq: line 2
+        "    y = other(x)\n",  # sibling: line 3
+        "\n",  # sibling: blank line 4
+        "def bar():\n",  # module-level stop
+        "    pass\n",
+    ]
+    seq = _make_esc_seq(2, 2)
+    assert _escaping_vars_for_seq(seq, source_lines, [(3, 4)]) == set()
+
+
+def test_find_escaping_vars_per_seq_empty_group():
+    assert _find_escaping_vars_per_seq([], []) == []
 
 
 # ---------------------------------------------------------------------------
@@ -7289,6 +7351,397 @@ def test_default_param_global_kept_explicit_not_flagged(monkeypatch):
         )
     assert de._new_source is not None
     assert de._new_source.count("    _helper(status, file=sys.stderr)\n") == 2
+
+
+# ---------------------------------------------------------------------------
+# _names_referenced_in
+# ---------------------------------------------------------------------------
+
+
+def test_names_referenced_in_basic():
+    assert _names_referenced_in("x = f(y)\nreturn x\n") == {"x", "f", "y"}
+
+
+def test_names_referenced_in_syntax_error():
+    assert _names_referenced_in("def (:\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _dropped_escaping_var_capture
+# ---------------------------------------------------------------------------
+
+
+def test_dropped_escaping_var_capture_flagged():
+    # Bug A shape: original inline code does `x = x * 2`; one call site
+    # correctly captures the helper's return, the other drops it while the
+    # variable still escapes for that occurrence.
+    original = ["    x *= 2\n", "    x *= 2\n"]
+    replacements = ["    x = _helper(x)\n", "    _helper(x)\n"]
+    escaping_per_occ = [{"x"}, {"x"}]
+    assert _dropped_escaping_var_capture(original, replacements, escaping_per_occ) == {
+        "x"
+    }
+
+
+def test_dropped_escaping_var_capture_captured_not_flagged():
+    original = ["    x *= 2\n", "    x *= 2\n"]
+    replacements = ["    x = _helper(x)\n", "    x = _helper(x)\n"]
+    escaping_per_occ = [{"x"}, {"x"}]
+    assert (
+        _dropped_escaping_var_capture(original, replacements, escaping_per_occ) == set()
+    )
+
+
+def test_dropped_escaping_var_capture_not_escaping_for_this_occurrence():
+    # This occurrence's own escaping set is empty (nothing after its own
+    # block reads the name) -- dropping the assignment here is fine.
+    original = ["    rd = json.loads(a)\n", "    rd = json.loads(b)\n"]
+    replacements = ["    rd = _helper(a)\n", "    _helper(b)\n"]
+    escaping_per_occ = [{"rd"}, set()]
+    assert (
+        _dropped_escaping_var_capture(original, replacements, escaping_per_occ) == set()
+    )
+
+
+def test_dropped_escaping_var_capture_empty_inputs():
+    assert _dropped_escaping_var_capture([], [], []) == set()
+
+
+# ---------------------------------------------------------------------------
+# _call_argument_names
+# ---------------------------------------------------------------------------
+
+
+def test_call_argument_names_positional():
+    assert _call_argument_names("    _helper(data, other)\n") == {"data", "other"}
+
+
+def test_call_argument_names_keyword():
+    assert _call_argument_names("    _helper(name=data)\n") == {"data"}
+
+
+def test_call_argument_names_non_name_args_ignored():
+    assert _call_argument_names('    _helper(1, "x", flag=True)\n') == set()
+
+
+def test_call_argument_names_syntax_error():
+    assert _call_argument_names("def (:\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _call_site_argument_identity_mismatch
+# ---------------------------------------------------------------------------
+
+
+def test_call_site_argument_identity_mismatch_crossed():
+    # Bug B shape: a "trial" and an "apply" call site, each closing over its
+    # own variable pair, got their arguments crossed between sites.
+    original = [
+        "    trial_deps[candidate] = None\n",
+        "    file_deps[chosen] = None\n",
+    ]
+    replacements = [
+        "    _register(file_deps, chosen)\n",  # should be trial_deps/candidate
+        "    _register(trial_deps, candidate)\n",  # should be file_deps/chosen
+    ]
+    assert _call_site_argument_identity_mismatch(original, replacements) == {
+        "file_deps",
+        "chosen",
+        "trial_deps",
+        "candidate",
+    }
+
+
+def test_call_site_argument_identity_mismatch_own_names_not_flagged():
+    original = [
+        "    trial_deps[candidate] = None\n",
+        "    file_deps[chosen] = None\n",
+    ]
+    replacements = [
+        "    _register(trial_deps, candidate)\n",
+        "    _register(file_deps, chosen)\n",
+    ]
+    assert _call_site_argument_identity_mismatch(original, replacements) == set()
+
+
+def test_call_site_argument_identity_mismatch_new_name_not_flagged():
+    # An argument absent from every occurrence's original block (e.g. a
+    # shared module-level constant) isn't a crossed-site signal.
+    original = ["    do_thing()\n", "    do_thing()\n"]
+    replacements = ["    _helper(CONFIG)\n", "    _helper(CONFIG)\n"]
+    assert _call_site_argument_identity_mismatch(original, replacements) == set()
+
+
+def test_call_site_argument_identity_mismatch_empty_inputs():
+    assert _call_site_argument_identity_mismatch([], []) == set()
+
+
+# ---------------------------------------------------------------------------
+# Integration: dropped-escaping-var-capture guard (Check 15)
+# ---------------------------------------------------------------------------
+
+_ESCAPE_CAPTURE_DUP_SOURCE = textwrap.dedent(
+    """\
+    def retry_a():
+        x = compute(a)
+        y = transform(x)
+        _rl_delay *= 2
+        if _rl_delay is not None:
+            wait(_rl_delay)
+
+    def retry_b():
+        x = compute(a)
+        y = transform(x)
+        _rl_delay *= 2
+        log(_rl_delay)
+    """
+)
+_ESCAPE_CAPTURE_DUP_RANGES = [(9, 11)]  # overlaps retry_b's duplicate block
+
+
+def _make_escape_capture_dropped_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            "helper_source": (
+                "def _helper(a, delay):\n"
+                "    x = compute(a)\n"
+                "    y = transform(x)\n"
+                "    return delay * 2\n"
+            ),
+            "call_site_replacements": [
+                "    _rl_delay = _helper(a, _rl_delay)\n",
+                "    _helper(a, _rl_delay)\n",  # drops the reassignment
+            ],
+        }
+    )
+
+
+def _make_escape_capture_preserved_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            "helper_source": (
+                "def _helper(a, delay):\n"
+                "    x = compute(a)\n"
+                "    y = transform(x)\n"
+                "    return delay * 2\n"
+            ),
+            "call_site_replacements": [
+                "    _rl_delay = _helper(a, _rl_delay)\n",
+                "    _rl_delay = _helper(a, _rl_delay)\n",
+            ],
+        }
+    )
+
+
+def test_dropped_escaping_var_capture_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when a call site drops the reassignment of an
+    escaping variable its own original block assigned."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_escape_capture_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _ESCAPE_CAPTURE_DUP_RANGES,
+            source=_ESCAPE_CAPTURE_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert (
+        "replacement drops the reassignment of escaping variable(s)"
+        in capsys.readouterr().err
+    )
+
+
+def test_dropped_escaping_var_capture_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_escape_capture_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _ESCAPE_CAPTURE_DUP_RANGES,
+            source=_ESCAPE_CAPTURE_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+def test_escaping_var_capture_preserved_not_flagged(monkeypatch):
+    """Both call sites capture the return value -- unaffected by the check."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_escape_capture_preserved_extract_response(),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _ESCAPE_CAPTURE_DUP_RANGES,
+            source=_ESCAPE_CAPTURE_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is not None
+    assert de._new_source.count("_rl_delay = _helper(a, _rl_delay)") == 2
+
+
+# ---------------------------------------------------------------------------
+# Integration: call-site argument identity mismatch guard (Check 16)
+# ---------------------------------------------------------------------------
+
+_CROSSED_ARGS_DUP_SOURCE = textwrap.dedent(
+    """\
+    trial_deps = {}
+    candidate = "a"
+    file_deps = {}
+    chosen = "b"
+
+    def trial_step():
+        trial_deps[candidate] = None
+        depth = topo_depth(trial_deps, candidate)
+        depth += 1
+        if depth > 0:
+            log_trial(depth)
+
+    def apply_step():
+        file_deps[chosen] = None
+        depth = topo_depth(file_deps, chosen)
+        depth += 1
+        log_apply(depth)
+    """
+)
+_CROSSED_ARGS_DUP_RANGES = [(14, 16)]  # overlaps apply_step's duplicate block
+
+
+def _make_crossed_args_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_register",
+            "placement": "module_level",
+            "helper_source": (
+                "def _register(deps, key):\n"
+                "    deps[key] = None\n"
+                "    depth = topo_depth(deps, key)\n"
+                "    return depth + 1\n"
+            ),
+            "call_site_replacements": [
+                # trial_step's call site wired to apply_step's own locals,
+                # and vice versa -- both names still appear *somewhere* in
+                # the combined output (satisfying the broader free-variable
+                # check), just at the wrong call site.
+                "    depth = _register(file_deps, chosen)\n",
+                "    depth = _register(trial_deps, candidate)\n",
+            ],
+        }
+    )
+
+
+def _make_uncrossed_args_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_register",
+            "placement": "module_level",
+            "helper_source": (
+                "def _register(deps, key):\n"
+                "    deps[key] = None\n"
+                "    depth = topo_depth(deps, key)\n"
+                "    return depth + 1\n"
+            ),
+            "call_site_replacements": [
+                "    depth = _register(trial_deps, candidate)\n",
+                "    depth = _register(file_deps, chosen)\n",
+            ],
+        }
+    )
+
+
+def test_call_site_argument_identity_mismatch_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when a call site's arguments belong to a
+    different occurrence's original block."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_crossed_args_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _CROSSED_ARGS_DUP_RANGES,
+            source=_CROSSED_ARGS_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert (
+        "call site passes argument(s) crossed from a different occurrence"
+        in capsys.readouterr().err
+    )
+
+
+def test_call_site_argument_identity_mismatch_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_crossed_args_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _CROSSED_ARGS_DUP_RANGES,
+            source=_CROSSED_ARGS_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+def test_call_site_argument_identity_not_crossed_not_flagged(monkeypatch):
+    """Each call site's arguments come from its own block -- unaffected."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_uncrossed_args_extract_response(),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _CROSSED_ARGS_DUP_RANGES,
+            source=_CROSSED_ARGS_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is not None
+    assert "_register(trial_deps, candidate)" in de._new_source
+    assert "_register(file_deps, chosen)" in de._new_source
 
 
 # ---------------------------------------------------------------------------
