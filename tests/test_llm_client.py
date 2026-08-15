@@ -528,6 +528,26 @@ def test_call_with_tool_moonshot_success():
     }
 
 
+def test_call_with_tool_moonshot_thinking_enabled_model():
+    with patch("crispen.llm_client.openai") as mock_oai:
+        mock_oai.APIError = Exception
+        client = MagicMock()
+        client.chat.completions.create.return_value = _make_openai_response(
+            "evaluate_duplicate", {"is_valid_duplicate": True, "reason": "same"}
+        )
+        call_with_tool(
+            client,
+            "moonshot",
+            "kimi-k2.7-code",
+            256,
+            _TOOL,
+            "evaluate_duplicate",
+            _MESSAGES,
+        )
+    call_kwargs = client.chat.completions.create.call_args[1]
+    assert call_kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
 def test_call_with_tool_moonshot_api_error():
     with patch("crispen.llm_client.openai") as mock_oai:
         mock_oai.BadRequestError = Exception

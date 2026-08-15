@@ -110,6 +110,14 @@ def _token_param(model: str) -> str:
     return "max_tokens"
 
 
+# Moonshot models that reject `thinking: {"type": "disabled"}` outright and
+# require `thinking: {"type": "enabled"}` instead (the mirror image of
+# kimi-k3, which requires "disabled" — see call_with_tool below). Add a model
+# here only once its opposite requirement is confirmed; every other moonshot
+# model keeps the existing blanket "disabled" default.
+_MOONSHOT_THINKING_ENABLED_MODELS = {"kimi-k2.7-code"}
+
+
 _PROVIDER_ENV_VARS: dict[str, Optional[str]] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "moonshot": "MOONSHOT_API_KEY",
@@ -263,7 +271,10 @@ def call_with_tool(
             "messages": messages,
         }
         if provider == "moonshot":
-            create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            thinking_type = (
+                "enabled" if model in _MOONSHOT_THINKING_ENABLED_MODELS else "disabled"
+            )
+            create_kwargs["extra_body"] = {"thinking": {"type": thinking_type}}
         elif provider == "openai" and model.startswith("gpt-5"):
             # gpt-5.x rejects forced function tool_choice combined with its
             # default (non-"none") reasoning_effort on /v1/chat/completions.
