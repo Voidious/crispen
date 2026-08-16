@@ -966,6 +966,7 @@ def run_engine(
 
             rewritten = transformer.get_rewritten_source()
             new_source = rewritten if rewritten is not None else new_tree.code
+            _stats.merge(transformer.stats)
             if new_source == current_source:
                 continue
 
@@ -981,7 +982,6 @@ def run_engine(
             for msg in transformer.get_changes():
                 file_msgs.append(f"{filepath}: {msg}")
                 _categorize_into_stats(_stats, msg)
-            _stats.merge(transformer.stats)
             current_source = new_source
 
         # Apply TupleDataclass — private functions only in this pass.

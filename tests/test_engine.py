@@ -165,6 +165,33 @@ def test_rewritten_source_used_when_available(tmp_path):
     assert f.read_text(encoding="utf-8") == rewritten
 
 
+class _RejectingRefactor(Refactor):
+    """Simulates a pass that makes a real LLM call but rejects every
+    candidate, so the file source ends up unchanged."""
+
+    @classmethod
+    def name(cls):
+        return "RejectingRefactor"
+
+    def leave_Module(self, original_node, updated_node):
+        self.stats.llm_veto_calls += 1
+        self.stats.llm_rejected += 1
+        return updated_node
+
+
+def test_stats_merged_even_when_pass_makes_no_change(tmp_path):
+    """A refactor pass whose only candidates were all rejected produces no
+    source change, but the LLM calls it made were real and must still be
+    reflected in the run's merged stats."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    stats = RunStats()
+    with patch("crispen.engine._REFACTORS", [_RejectingRefactor]):
+        list(run_engine({str(f): [(1, 1)]}, stats=stats))
+    assert stats.llm_veto_calls == 1
+    assert stats.llm_rejected == 1
+
+
 # ---------------------------------------------------------------------------
 # Parse error
 # ---------------------------------------------------------------------------
