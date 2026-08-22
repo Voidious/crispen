@@ -2295,32 +2295,69 @@ def _directive_comments(source: str) -> set:
     return found
 
 
+def _directive_comment_lines(source: str) -> List[Tuple[str, str]]:
+    """Return (code, kind) for each line in ``source`` carrying a directive
+    comment, where ``code`` is that line's code portion (comment and
+    surrounding whitespace stripped) and ``kind`` is the normalized
+    directive kind (see ``_directive_comments``).
+    """
+    pairs = []
+    for line in source.splitlines():
+        match = _DIRECTIVE_COMMENT_RE.search(line)
+        if not match:
+            continue
+        code = line[: match.start()].split("#", 1)[0].strip()
+        kind = re.sub(r"\s+", " ", match.group(1).strip().lower())
+        pairs.append((code, kind))
+    return pairs
+
+
 def _dropped_directive_comments(
     original_blocks: List[str], helper_source: str, call_replacements: List[str]
 ) -> set:
     """Return directive comments present in the original call-site block(s)
-    that are missing from the assembled helper + replacements.
+    that were confidently dropped from the assembled helper + replacements.
 
     A duplicate block guarded by e.g. ``# pragma: no cover`` or ``# noqa``
     conveys real intent to a coverage/lint tool. When extraction merges such
     a line into a shared helper, it's easy for the LLM to keep the guarded
     code but silently drop the trailing comment -- syntactically invisible
     (every test still passes) but it reintroduces the exact warning/failure
-    the comment was suppressing. This only checks that each directive *kind*
-    seen in the originals still appears somewhere in the output, not that
-    counts match -- multiple call sites merging into one helper line is a
-    legitimate reduction from N occurrences to 1.
+    the comment was suppressing.
+
+    Each original directive-commented line is paired with its code (the
+    line's text minus the comment). A drop is only flagged when that exact
+    code line survives verbatim somewhere in the output *without* its
+    comment -- the "LLM kept the code but silently dropped the comment"
+    case this check exists for. Multiple call sites merging into one helper
+    line is a legitimate reduction from N occurrences to 1, so an exact
+    (code, kind) match anywhere in the output also clears it.
+
+    If the guarded code doesn't survive verbatim anywhere (the line was
+    legitimately rewritten -- e.g. folded into a differently-shaped
+    condition or a new statement, as can happen when several call sites'
+    guards merge into one shared branch), there's no reliable way to tell
+    whether the comment still belongs there, so it's not flagged.
     """
-    original: set = set()
+    originals: List[Tuple[str, str]] = []
     for block in original_blocks:
-        original |= _directive_comments(block)
-    if not original:
+        originals.extend(_directive_comment_lines(block))
+    if not originals:
         return set()
 
-    output = _directive_comments(helper_source)
-    for repl in call_replacements:
-        output |= _directive_comments(repl)
-    return original - output
+    output_source = helper_source + "\n" + "\n".join(call_replacements)
+    matched_with_comment = set(_directive_comment_lines(output_source))
+    code_without_comment = {
+        line.split("#", 1)[0].strip() for line in output_source.splitlines()
+    }
+
+    dropped = set()
+    for code, kind in originals:
+        if (code, kind) in matched_with_comment:
+            continue
+        if code and code in code_without_comment:
+            dropped.add(kind)
+    return dropped
 
 
 def _default_param_drops_call_time_global(

@@ -1180,9 +1180,8 @@ def test_dropped_directive_comment_rejected(tmp_path, monkeypatch):
     bad_extract["helper_source"] = (
         "def shared_helper(data):\n"
         "    stripped = data.strip()\n"
-        "    upper = stripped.upper()\n"
-        '    parts = upper.split(",")\n'
-        "    return parts\n"
+        '    upper = stripped.replace(" ", "")\n'
+        "    return upper\n"
     )
     stats = RunStats()
     with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
