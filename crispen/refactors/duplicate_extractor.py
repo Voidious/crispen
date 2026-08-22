@@ -918,6 +918,45 @@ def _group_ends_in_return(group: List[_SeqInfo]) -> bool:
     return True
 
 
+def _directive_comment_note(group: List[_SeqInfo]) -> str:
+    """Return an extraction-prompt note when any block in *group* carries a
+    linter/coverage directive comment, else "".
+
+    Found by a live self-check run: a block guarded by e.g.
+    ``# pragma: no cover`` got merged into a shared helper whose call sites
+    became reachable through more than one original condition. The extraction
+    kept the comment text at the call site, but the line it actually still
+    described (never exercised by any test) had moved to a different line
+    inside the new helper, which had no comment at all -- a real coverage
+    regression that every test still passed. The comment describes a
+    *reachability* property of one specific line, not decoration to be copied
+    onto whatever the original statement textually becomes.
+    """
+    kinds: set = set()
+    for s in group:
+        kinds |= _directive_comments(s.source)
+    if not kinds:
+        return ""
+    kinds_str = ", ".join(sorted(kinds))
+    return (
+        f"\n\nOne or more of the duplicate blocks carries a linter/coverage "
+        f"directive comment ({kinds_str}). This suppresses a real tool warning "
+        f"because of a property of that exact line -- e.g. `# pragma: no cover` "
+        f"means that line is never exercised by any test. That property "
+        f"belongs to the line's reachability, not to its text, so copying the "
+        f"comment onto whatever line the original statement maps to is not "
+        f"enough if the extraction changes reachability. This commonly happens "
+        f"when several call sites' guard conditions get merged into one shared "
+        f"helper: a line that was previously reached only under the guarded "
+        f"condition can become reachable through a different call site's "
+        f"condition once both paths return through the same helper call. Trace "
+        f"each guarded line's condition through the extraction and place the "
+        f"comment on whichever line in the new code is still actually true of "
+        f"that property -- which may end up inside the helper rather than at "
+        f"the call site, or vice versa."
+    )
+
+
 def _llm_extract(
     client,
     group: List[_SeqInfo],
@@ -987,6 +1026,7 @@ def _llm_extract(
         if helper_docstrings
         else "\n\nDo not include a docstring in the helper function."
     )
+    directive_note = _directive_comment_note(group)
     veto_notes_note = ""
     if veto_notes:
         veto_notes_note = (
@@ -1045,6 +1085,7 @@ def _llm_extract(
         f"{return_note}"
         f"{used_names_note}"
         f"{docstring_note}"
+        f"{directive_note}"
         f"{veto_notes_note}"
         f"{failures_note}"
     )
@@ -1202,6 +1243,16 @@ _VERIFY_CHECKLIST = (
     "does? Flag the name if it is misleading, too generic, or omits a crucial "
     "detail — for example, an important side-effect that the name gives no hint "
     "of (e.g. a function named 'compute_total' that also writes to a database).\n"
+    "9. If an original block carries a linter/coverage directive comment "
+    "(`# pragma: no cover`, `# noqa`, `# type: ignore`, `# fmt: skip`, "
+    "`# pylint: disable`, etc.), don't just check that the same comment text "
+    "appears somewhere in the output — check that it is still attached to "
+    "whichever line is actually true of the property it asserts (e.g. still "
+    "genuinely unreachable in tests). When several call sites' guard "
+    "conditions are merged into one shared helper branch, the line that needs "
+    "the comment can move (often into the helper), while a copy left behind "
+    "at a call site may now be reachable through a different, unrelated path "
+    "and no longer need it.\n"
     "If correct, set is_correct=True and issues=[]. "
     "Otherwise set is_correct=False and list each specific issue."
 )

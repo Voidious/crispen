@@ -33,6 +33,7 @@ from .duplicate_extractor import (
     _call_site_argument_identity_mismatch,
     _cross_file_helper_target,
     _default_param_drops_call_time_global,
+    _directive_comment_note,
     _dropped_directive_comments,
     _dropped_escaping_var_capture,
     _escaping_vars_for_seq,
@@ -173,6 +174,7 @@ def _llm_extract_cross_file(
         if helper_docstrings
         else "\n\nDo not include a docstring in the helper function."
     )
+    directive_note = _directive_comment_note(group)
     veto_notes_note = ""
     if veto_notes:
         veto_notes_note = (
@@ -220,6 +222,7 @@ def _llm_extract_cross_file(
         f"{return_note}"
         f"{used_names_note}"
         f"{docstring_note}"
+        f"{directive_note}"
         f"{veto_notes_note}"
         f"{failures_note}"
     )

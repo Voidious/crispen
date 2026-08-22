@@ -4286,6 +4286,58 @@ def test_llm_extract_prompt_omits_return_note_when_group_does_not_end_in_return(
     assert "call site replacement for every occurrence must be" not in prompt
 
 
+def test_directive_comment_note_empty_when_no_directives():
+    from crispen.refactors.duplicate_extractor import _directive_comment_note
+
+    group = [_make_seq_info(1, 1, "    x = 1\n")]
+    assert _directive_comment_note(group) == ""
+
+
+def test_directive_comment_note_mentions_kind_when_present():
+    from crispen.refactors.duplicate_extractor import _directive_comment_note
+
+    group = [_make_seq_info(1, 1, "    x = 1  # pragma: no cover\n")]
+    note = _directive_comment_note(group)
+    assert "pragma: no cover" in note
+    assert "reachability" in note
+
+
+def test_llm_extract_prompt_includes_directive_note_when_group_has_pragma():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper():\n    x = 1  # pragma: no cover\n",
+            "call_site_replacements": ["    helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    x = 1  # pragma: no cover\n")]
+    _llm_extract(client, group, "def foo():\n    x = 1  # pragma: no cover\n")
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "linter/coverage directive comment" in prompt
+
+
+def test_llm_extract_prompt_omits_directive_note_when_group_has_no_directives():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper():\n    pass\n",
+            "call_site_replacements": ["    helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    x = 1\n")]
+    _llm_extract(client, group, "def foo():\n    x = 1\n")
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "linter/coverage directive comment" not in prompt
+
+
 def test_llm_extract_prompt_failures_note_is_surgical():
     from crispen.refactors.duplicate_extractor import _llm_extract
 

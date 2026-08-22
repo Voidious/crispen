@@ -613,6 +613,40 @@ def test_llm_extract_cross_file_prompt_omits_return_note_when_not_applicable():
     assert "call site replacement for every occurrence must be" not in prompt
 
 
+def test_llm_extract_cross_file_prompt_includes_directive_note():
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(_HAPPY_EXTRACT)
+    group = [
+        _seq("a.py", 1, 1, source="    x = 1  # pragma: no cover\n"),
+        _seq("b.py", 1, 1, source="    x = 1  # pragma: no cover\n"),
+    ]
+    _llm_extract_cross_file(
+        client,
+        group,
+        {
+            "a.py": "def foo():\n    x = 1  # pragma: no cover\n",
+            "b.py": "def bar():\n    x = 1  # pragma: no cover\n",
+        },
+        "pkg.common",
+    )
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "linter/coverage directive comment" in prompt
+
+
+def test_llm_extract_cross_file_prompt_omits_directive_note_when_not_applicable():
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(_HAPPY_EXTRACT)
+    group = [_seq("a.py", 1, 2), _seq("b.py", 1, 2)]
+    _llm_extract_cross_file(
+        client,
+        group,
+        {"a.py": "def foo():\n    x = 1\n", "b.py": "def bar():\n    x = 1\n"},
+        "pkg.common",
+    )
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "linter/coverage directive comment" not in prompt
+
+
 def test_llm_verify_extraction_cross_file():
     client = MagicMock()
     client.messages.create.return_value = _make_verify_response(True, [])
