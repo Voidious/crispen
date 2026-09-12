@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Generator, List, NamedTuple, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Generator, List, NamedTuple, Optional, Set, Tuple
 
 from .stats import RunStats
 
@@ -24,10 +24,15 @@ from .patch_rewriter import (
 )
 from .patch_updater import apply_patch_strings
 from .refactors.caller_updater import CallerUpdater
-from .refactors.duplicate_extractor import DuplicateExtractor
+from .refactors.cross_file_duplicate import run_cross_file_duplicate_extraction
+from .refactors.duplicate_extractor import (
+    DuplicateExtractor,
+    _build_repo_function_index,
+)
 from .refactors.function_splitter import FunctionSplitter
 from .refactors.if_not_else import IfNotElse
 from .refactors.tuple_dataclass import TransformInfo, TupleDataclass
+from .repo_index import EXCLUDED_DIR_NAMES, build_repo_index
 from .skip_comments import has_skip_file_marker
 
 # Single-file refactors applied in order before TupleDataclass.
@@ -58,9 +63,7 @@ def _should_run(name: str, config: CrispenConfig) -> bool:
 
 
 # Directory names excluded from the outside-caller scan (e.g. virtual environments).
-_EXCLUDED_DIR_NAMES = frozenset(
-    {".venv", "venv", "env", ".tox", "__pycache__", "node_modules"}
-)
+_EXCLUDED_DIR_NAMES = EXCLUDED_DIR_NAMES
 
 # Total wall-clock budget for all files in _find_outside_callers (seconds).
 _SCOPE_ANALYSIS_TIMEOUT = 10
@@ -842,6 +845,36 @@ def run_engine(
         for line in format_header(config):
             print(line, file=sys.stderr, flush=True)
 
+    # Computed up front (not just for Phase 2) so Phase 1 can also use it —
+    # e.g. DuplicateExtractor's repo-wide match-function mode.
+    repo_root = _repo_root if _repo_root is not None else _find_repo_root(changed)
+
+    # Built once per run (not per file) so DuplicateExtractor's repo-wide
+    # match-function pass doesn't re-scan the whole repo for every changed
+    # file. Only built when actually needed: match_function must be enabled
+    # and scoped to "repo", and there must be a resolvable repo root.
+    _repo_wide_index = None
+    _repo_function_index: Dict[str, list] = {}
+    _changed_modules: FrozenSet[str] = frozenset()
+    if (
+        repo_root is not None
+        and config.match_functions_scope == "repo"
+        and _should_run("match_function", config)
+    ):
+        _repo_wide_index = build_repo_index(repo_root)
+        _repo_function_index = _build_repo_function_index(_repo_wide_index)
+        # Every other file in *this run's* diff — not just this one file —
+        # will independently get its own repo-wide match-function pass off
+        # the same frozen _repo_function_index snapshot. A candidate whose
+        # module is in this set could, on its own turn, symmetrically
+        # propose matching back into the current file; see the mutual-match
+        # guard in DuplicateExtractor for what that guards against.
+        _changed_modules = frozenset(
+            _repo_wide_index.file_to_module[p]
+            for p in (str(Path(f).resolve()) for f in changed)
+            if p in _repo_wide_index.file_to_module
+        )
+
     # ------------------------------------------------------------------ #
     # Phase 1 — single-file refactors + TupleDataclass (private only)     #
     # ------------------------------------------------------------------ #
@@ -892,6 +925,10 @@ def run_engine(
                         tool_choice=config.tool_choice,
                         api_timeout=config.api_timeout,
                         match_functions=_should_run("match_function", config),
+                        match_functions_scope=config.match_functions_scope,
+                        repo_function_index=_repo_function_index,
+                        repo_index=_repo_wide_index,
+                        changed_modules=_changed_modules,
                         timing=config.timing,
                         current_file=filepath,
                         rate_limit_retries=config.rate_limit_retries,
@@ -929,6 +966,7 @@ def run_engine(
 
             rewritten = transformer.get_rewritten_source()
             new_source = rewritten if rewritten is not None else new_tree.code
+            _stats.merge(transformer.stats)
             if new_source == current_source:
                 continue
 
@@ -944,7 +982,6 @@ def run_engine(
             for msg in transformer.get_changes():
                 file_msgs.append(f"{filepath}: {msg}")
                 _categorize_into_stats(_stats, msg)
-            _stats.merge(transformer.stats)
             current_source = new_source
 
         # Apply TupleDataclass — private functions only in this pass.
@@ -1004,10 +1041,26 @@ def run_engine(
         }
 
     # ------------------------------------------------------------------ #
+    # Phase 1b — cross-file new-duplicate extraction                      #
+    # ------------------------------------------------------------------ #
+    # Runs on Phase 1's output (so any local extraction/match-function edits
+    # are already reflected) and looks for duplicate blocks spanning 2+
+    # files in the diff. Not a per-file Refactor: it can write a new helper
+    # file plus edit N call-site files in one pass, so it lives in its own
+    # module — see crispen/refactors/cross_file_duplicate.py.
+    if _should_run("duplicate_extractor", config):
+        # run_cross_file_duplicate_extraction manages its own stats directly
+        # (duplicate_extracted, llm_veto_calls, etc. — see the module), same
+        # as FileLimiter does, rather than through _categorize_into_stats'
+        # message-prefix parsing (which is only wired into Phase 1/2's own
+        # loops above) — calling both would double-count.
+        yield from run_cross_file_duplicate_extraction(
+            per_file, repo_root, config, verbose=verbose, stats=_stats
+        )
+
+    # ------------------------------------------------------------------ #
     # Phase 2 — cross-file public-function transforms + caller updates    #
     # ------------------------------------------------------------------ #
-    repo_root = _repo_root if _repo_root is not None else _find_repo_root(changed)
-
     if repo_root and per_file:
         # Collect all public-function candidates with their qualified names.
         all_candidates: Dict[str, Tuple[TransformInfo, str]] = {}

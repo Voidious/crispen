@@ -165,6 +165,33 @@ def test_rewritten_source_used_when_available(tmp_path):
     assert f.read_text(encoding="utf-8") == rewritten
 
 
+class _RejectingRefactor(Refactor):
+    """Simulates a pass that makes a real LLM call but rejects every
+    candidate, so the file source ends up unchanged."""
+
+    @classmethod
+    def name(cls):
+        return "RejectingRefactor"
+
+    def leave_Module(self, original_node, updated_node):
+        self.stats.llm_veto_calls += 1
+        self.stats.llm_rejected += 1
+        return updated_node
+
+
+def test_stats_merged_even_when_pass_makes_no_change(tmp_path):
+    """A refactor pass whose only candidates were all rejected produces no
+    source change, but the LLM calls it made were real and must still be
+    reflected in the run's merged stats."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    stats = RunStats()
+    with patch("crispen.engine._REFACTORS", [_RejectingRefactor]):
+        list(run_engine({str(f): [(1, 1)]}, stats=stats))
+    assert stats.llm_veto_calls == 1
+    assert stats.llm_rejected == 1
+
+
 # ---------------------------------------------------------------------------
 # Parse error
 # ---------------------------------------------------------------------------
@@ -1880,6 +1907,180 @@ def test_engine_match_function_enabled_by_default(tmp_path):
         )
 
     assert constructed_with.get("match_functions") is True
+
+
+def test_engine_repo_wide_index_built_when_scope_repo_and_repo_root(tmp_path):
+    """scope='repo' + a resolvable repo_root builds and passes a real index."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+
+    constructed_with: dict = {}
+    original_init = __import__(
+        "crispen.refactors.duplicate_extractor", fromlist=["DuplicateExtractor"]
+    ).DuplicateExtractor.__init__
+
+    def _spy_init(self, *args, **kwargs):
+        constructed_with.update(kwargs)
+        original_init(self, *args, **kwargs)
+
+    with patch("crispen.engine.DuplicateExtractor.__init__", side_effect=_spy_init):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(match_functions_scope="repo"),
+            )
+        )
+
+    assert constructed_with.get("match_functions_scope") == "repo"
+    assert constructed_with.get("repo_index") is not None
+    assert constructed_with.get("repo_function_index") is not None
+
+
+def test_engine_repo_wide_index_not_built_without_repo_root(tmp_path):
+    """scope='repo' but no resolvable repo_root: no index is built or passed."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+
+    constructed_with: dict = {}
+    original_init = __import__(
+        "crispen.refactors.duplicate_extractor", fromlist=["DuplicateExtractor"]
+    ).DuplicateExtractor.__init__
+
+    def _spy_init(self, *args, **kwargs):
+        constructed_with.update(kwargs)
+        original_init(self, *args, **kwargs)
+
+    with patch("crispen.engine.DuplicateExtractor.__init__", side_effect=_spy_init):
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                config=CrispenConfig(match_functions_scope="repo"),
+            )
+        )
+
+    assert constructed_with.get("repo_index") is None
+    assert constructed_with.get("repo_function_index") == {}
+
+
+def test_engine_repo_wide_index_not_built_when_scope_file(tmp_path):
+    """scope='file' never builds the repo-wide index, even with a repo_root."""
+    f = tmp_path / "code.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+
+    with patch("crispen.engine.build_repo_index") as mock_build:
+        list(
+            run_engine(
+                {str(f): [(1, 1)]},
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(match_functions_scope="file"),
+            )
+        )
+
+    mock_build.assert_not_called()
+
+
+def test_run_engine_repo_wide_match_function_end_to_end(tmp_path, monkeypatch):
+    """A block matching a function in a sibling file is replaced with a call
+    to it, plus the needed import — through the real run_engine pipeline."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    pkg = tmp_path / "appmod"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "helpers.py").write_text(
+        "def _setup():\n"
+        "    x = compute(data)\n"
+        "    y = transform(x)\n"
+        "    z = finalize(y)\n",
+        encoding="utf-8",
+    )
+    f = pkg / "mod.py"
+    f.write_text(
+        "def foo():\n"
+        "    x = compute(data)\n"
+        "    y = transform(x)\n"
+        "    z = finalize(y)\n",
+        encoding="utf-8",
+    )
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ),
+    ):
+        list(
+            run_engine(
+                {str(f): [(1, 4)]},
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(match_functions_scope="repo"),
+            )
+        )
+
+    new_source = f.read_text(encoding="utf-8")
+    # Exact match, not substring: PEP 8 wants two blank lines between the
+    # inserted import and the following def (flake8 E302) — caught by an
+    # earlier live-LLM run against this exact scenario.
+    assert new_source == (
+        "from appmod.helpers import _setup\n" "\n" "\n" "def foo():\n" "    _setup()\n"
+    )
+
+
+def test_run_engine_repo_wide_match_skips_mutual_pair(tmp_path, monkeypatch):
+    """Two diffed files with identical, newly-added function bodies must not
+    each replace their body with a call into the other -- that would leave
+    both as pure delegates calling each other (circular import, or infinite
+    recursion if the import happened to resolve). Found via a live two-file
+    self-check run (crispen-dev channel, 2026-08-09): before the fix, this
+    exact setup produced `from appmod.helpers import _setup` in mod.py and
+    `from appmod.mod import foo` in helpers.py simultaneously."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    pkg = tmp_path / "appmod"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    helpers = pkg / "helpers.py"
+    helpers.write_text(
+        "def _setup():\n"
+        "    x = compute(data)\n"
+        "    y = transform(x)\n"
+        "    z = finalize(y)\n",
+        encoding="utf-8",
+    )
+    mod = pkg / "mod.py"
+    mod.write_text(
+        "def foo():\n"
+        "    x = compute(data)\n"
+        "    y = transform(x)\n"
+        "    z = finalize(y)\n",
+        encoding="utf-8",
+    )
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        list(
+            run_engine(
+                {str(mod): [(1, 4)], str(helpers): [(1, 4)]},
+                _repo_root=str(tmp_path),
+                config=CrispenConfig(
+                    match_functions_scope="repo",
+                    enabled_refactors=["duplicate_extractor", "match_function"],
+                ),
+            )
+        )
+
+    # Neither file was turned into a delegate calling the other. (The
+    # cross-file duplicate-extraction pass may separately propose extracting
+    # the shared body into a new module -- that path is circularity-safe by
+    # construction, per _cross_file_helper_target, and isn't what this test
+    # is checking; it's fine either way as long as neither file imports from
+    # the other.)
+    mock_run.assert_not_called()
+    assert "from appmod.helpers import _setup" not in mod.read_text(encoding="utf-8")
+    assert "from appmod.mod import foo" not in helpers.read_text(encoding="utf-8")
 
 
 def test_file_limiter_empty_original_source_deletes_file(tmp_path):

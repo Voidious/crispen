@@ -1,6 +1,7 @@
 """Tests for duplicate_extractor: 100% branch coverage."""
 
 import textwrap
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import libcst as cst
@@ -8,24 +9,34 @@ import pytest
 from libcst.metadata import MetadataWrapper
 
 from crispen.errors import CrispenAPIError
+from crispen.repo_index import RepoIndex
 from crispen.refactors.duplicate_extractor import (
     _ApiTimeout,
     _build_helper_insertion,
+    _build_repo_function_index,
+    _decorator_name,
+    _first_funcdef_idx,
+    _top_import_block_end,
     _has_funcdef,
     _collect_attribute_names,
     _collect_called_attr_names,
     _collect_ast_store_names,
+    _module_level_names,
     _replace_unused_in_target,
     _scope_end_line,
     _extract_defined_names,
     _FunctionCollector,
     _FunctionInfo,
+    _RepoFunctionInfo,
     _SeqInfo,
     _SequenceCollector,
     _apply_edits,
     _build_function_body_fps,
     _collect_called_names,
+    _common_ancestor_dir,
+    _cross_file_helper_target,
     _filter_maximal_groups,
+    _find_cross_file_duplicate_groups,
     _find_duplicate_groups,
     _has_internal_overlap,
     _find_insertion_point,
@@ -34,6 +45,12 @@ from crispen.refactors.duplicate_extractor import (
     _has_call_to,
     _has_def,
     _find_escaping_vars,
+    _find_escaping_vars_per_seq,
+    _escaping_vars_for_seq,
+    _dropped_escaping_var_capture,
+    _call_argument_names,
+    _call_site_argument_identity_mismatch,
+    _names_referenced_in,
     _has_mutable_literal_is_check,
     _has_param_overwritten_before_read,
     _llm_generate_call,
@@ -47,6 +64,7 @@ from crispen.refactors.duplicate_extractor import (
     _is_pure_literal,
     _names_in_edit_texts,
     _pyflakes_new_undefined_names,
+    _pyflakes_strip_newly_unused_imports,
     _pyflakes_strip_unused_simple_assigns,
     _run_with_timeout,
     _sequence_weight,
@@ -56,8 +74,15 @@ from crispen.refactors.duplicate_extractor import (
     _replacement_steals_post_block_line,
     _lift_and_dedup_imports,
     _helper_imports_local_name,
+    _helper_reimports_module_level_name,
+    _helper_defines_class_colliding_with_origin,
+    _helper_imports_class_orphaning_sibling_origin,
+    _directive_comments,
+    _dropped_directive_comments,
+    _default_param_drops_call_time_global,
     _strip_helper_docstring,
     _strip_unused_call_assignments,
+    _target_import_is_proven_safe,
     _verify_extraction,
     _would_create_proxy_wrappers,
     DuplicateExtractor,
@@ -447,6 +472,201 @@ def test_filter_maximal_groups_keeps_non_overlapping():
 
     result = _filter_maximal_groups([group1, group2])
     assert len(result) == 2
+
+
+def test_filter_maximal_groups_same_lines_different_files_not_subsumed():
+    # Same line ranges, but different files — must NOT be treated as
+    # overlapping (filepath is part of the comparison key).
+    s_a1 = _SeqInfo([], 1, 10, "<module>", "", "fp_a", filepath="a.py")
+    s_a2 = _SeqInfo([], 20, 29, "<module>", "", "fp_a", filepath="a.py")
+    group_a = [s_a1, s_a2]
+
+    s_b1 = _SeqInfo([], 1, 10, "<module>", "", "fp_b", filepath="b.py")
+    s_b2 = _SeqInfo([], 20, 29, "<module>", "", "fp_b", filepath="b.py")
+    group_b = [s_b1, s_b2]
+
+    result = _filter_maximal_groups([group_a, group_b])
+    assert len(result) == 2
+
+
+def test_has_internal_overlap_same_lines_different_files_no_overlap():
+    # Same line ranges, different files — not an internal overlap.
+    s1 = _SeqInfo([], 27, 30, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 29, 32, "<module>", "", "fp1", filepath="b.py")
+    assert not _has_internal_overlap([s1, s2])
+
+
+# ---------------------------------------------------------------------------
+# _find_cross_file_duplicate_groups
+# ---------------------------------------------------------------------------
+
+
+def test_find_cross_file_groups_empty():
+    assert _find_cross_file_duplicate_groups([], {}) == []
+
+
+def test_find_cross_file_groups_singleton():
+    seq = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    ranges = {"a.py": [(1, 3)]}
+    assert _find_cross_file_duplicate_groups([seq], ranges) == []
+
+
+def test_find_cross_file_groups_excludes_same_file_only():
+    # Both occurrences in the same file — already handled by the per-file
+    # pass, so the cross-file pass must not double-count it.
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1", filepath="a.py")
+    ranges = {"a.py": [(1, 12)]}
+    assert _find_cross_file_duplicate_groups([s1, s2], ranges) == []
+
+
+def test_find_cross_file_groups_valid():
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1", filepath="b.py")
+    ranges = {"a.py": [(1, 3)], "b.py": [(1, 1)]}  # only a.py's occurrence in diff
+    groups = _find_cross_file_duplicate_groups([s1, s2], ranges)
+    assert len(groups) == 1
+    assert set(id(s) for s in groups[0]) == {id(s1), id(s2)}
+
+
+def test_find_cross_file_groups_no_diff_overlap_in_any_file():
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1", filepath="b.py")
+    ranges = {"a.py": [(50, 60)], "b.py": [(50, 60)]}
+    assert _find_cross_file_duplicate_groups([s1, s2], ranges) == []
+
+
+def test_find_cross_file_groups_missing_file_in_ranges_defaults_empty():
+    # b.py has no entry in changed_ranges_by_file at all.
+    s1 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 10, 12, "<module>", "", "fp1", filepath="b.py")
+    ranges = {"a.py": [(1, 3)]}
+    groups = _find_cross_file_duplicate_groups([s1, s2], ranges)
+    assert len(groups) == 1
+
+
+def test_find_cross_file_groups_skips_internally_overlapping():
+    # Same-file internal overlap still disqualifies the group even when it
+    # also spans another file.
+    s1 = _SeqInfo([], 27, 30, "<module>", "", "fp1", filepath="a.py")
+    s2 = _SeqInfo([], 29, 32, "<module>", "", "fp1", filepath="a.py")
+    s3 = _SeqInfo([], 1, 3, "<module>", "", "fp1", filepath="b.py")
+    ranges = {"a.py": [(27, 32)], "b.py": [(1, 3)]}
+    assert _find_cross_file_duplicate_groups([s1, s2, s3], ranges) == []
+
+
+def test_find_cross_file_groups_caps_at_max_groups():
+    sequences = []
+    ranges: dict = {}
+    for i in range(6):
+        fp = f"fp{i}"
+        fa, fb = f"a{i}.py", f"b{i}.py"
+        sequences.append(_SeqInfo([], 1, 3, "<module>", "", fp, filepath=fa))
+        sequences.append(_SeqInfo([], 1, 3, "<module>", "", fp, filepath=fb))
+        ranges[fa] = [(1, 3)]
+        ranges[fb] = [(1, 3)]
+    groups = _find_cross_file_duplicate_groups(sequences, ranges, max_groups=3)
+    assert len(groups) == 3
+
+
+# ---------------------------------------------------------------------------
+# _common_ancestor_dir / _cross_file_helper_target
+# ---------------------------------------------------------------------------
+
+
+def test_common_ancestor_dir_shared_parent():
+    d1 = Path("/repo/pkg/sub1")
+    d2 = Path("/repo/pkg/sub2")
+    assert _common_ancestor_dir([d1, d2]) == Path("/repo/pkg")
+
+
+def test_common_ancestor_dir_same_dir():
+    d = Path("/repo/pkg")
+    assert _common_ancestor_dir([d, d]) == d
+
+
+def test_common_ancestor_dir_stops_at_first_divergence():
+    d1 = Path("/a/b")
+    d2 = Path("/a/c")
+    assert _common_ancestor_dir([d1, d2]) == Path("/a")
+
+
+def test_common_ancestor_dir_three_dirs():
+    d1 = Path("/repo/pkg/x")
+    d2 = Path("/repo/pkg/y")
+    d3 = Path("/repo/pkg/z/w")
+    assert _common_ancestor_dir([d1, d2, d3]) == Path("/repo/pkg")
+
+
+def test_cross_file_helper_target_common_package(tmp_path):
+    pkg = tmp_path / "pkg" / "sub"
+    pkg.mkdir(parents=True)
+    f1 = pkg / "a.py"
+    f2 = pkg / "b.py"
+    f1.write_text("", encoding="utf-8")
+    f2.write_text("", encoding="utf-8")
+    target, dotted = _cross_file_helper_target(
+        [str(f1), str(f2)], str(tmp_path), "common"
+    )
+    assert target == pkg / "common.py"
+    assert dotted == "pkg.sub.common"
+
+
+def test_cross_file_helper_target_different_packages(tmp_path):
+    pkg_a = tmp_path / "pkg" / "a_sub"
+    pkg_b = tmp_path / "pkg" / "b_sub"
+    pkg_a.mkdir(parents=True)
+    pkg_b.mkdir(parents=True)
+    f1 = pkg_a / "a.py"
+    f2 = pkg_b / "b.py"
+    target, dotted = _cross_file_helper_target(
+        [str(f1), str(f2)], str(tmp_path), "common"
+    )
+    assert target == tmp_path / "pkg" / "common.py"
+    assert dotted == "pkg.common"
+
+
+def test_cross_file_helper_target_custom_module_name(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    f1 = tmp_path / "pkg" / "a.py"
+    f2 = tmp_path / "pkg" / "b.py"
+    target, dotted = _cross_file_helper_target([str(f1), str(f2)], str(tmp_path), "lib")
+    assert target.name == "lib.py"
+    assert dotted == "pkg.lib"
+
+
+def test_cross_file_helper_target_avoids_existing_package_collision(tmp_path):
+    # pkg/common/ already exists as a package (e.g. shared tool helpers) —
+    # a same-named pkg/common.py module would be shadowed by it on import.
+    pkg = tmp_path / "pkg"
+    (pkg / "sub_a").mkdir(parents=True)
+    (pkg / "sub_b").mkdir(parents=True)
+    (pkg / "common").mkdir()
+    (pkg / "common" / "__init__.py").write_text("", encoding="utf-8")
+    f1 = pkg / "sub_a" / "a.py"
+    f2 = pkg / "sub_b" / "b.py"
+    target, dotted = _cross_file_helper_target(
+        [str(f1), str(f2)], str(tmp_path), "common"
+    )
+    assert target == pkg / "common_.py"
+    assert dotted == "pkg.common_"
+
+
+def test_cross_file_helper_target_avoids_repeated_package_collisions(tmp_path):
+    pkg = tmp_path / "pkg"
+    (pkg / "sub_a").mkdir(parents=True)
+    (pkg / "sub_b").mkdir(parents=True)
+    (pkg / "common").mkdir()
+    (pkg / "common" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "common_").mkdir()
+    (pkg / "common_" / "__init__.py").write_text("", encoding="utf-8")
+    f1 = pkg / "sub_a" / "a.py"
+    f2 = pkg / "sub_b" / "b.py"
+    target, dotted = _cross_file_helper_target(
+        [str(f1), str(f2)], str(tmp_path), "common"
+    )
+    assert target == pkg / "common__.py"
+    assert dotted == "pkg.common__"
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +1157,56 @@ def test_pyflakes_strip_unused_simple_assigns_empty_allowed():
 
 
 # ---------------------------------------------------------------------------
+# _pyflakes_strip_newly_unused_imports
+# ---------------------------------------------------------------------------
+
+
+def test_pyflakes_strip_newly_unused_imports_removes_plain_import():
+    original = "import threading\n\n\ndef foo():\n    threading.Thread().start()\n"
+    candidate = "import threading\n\n\ndef foo():\n    pass\n"
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert "import threading" not in result
+    assert "def foo():" in result
+
+
+def test_pyflakes_strip_newly_unused_imports_removes_from_import_when_fully_unused():
+    original = "from typing import Dict\n\n\ndef foo() -> Dict:\n    return {}\n"
+    candidate = "from typing import Dict\n\n\ndef foo():\n    return None\n"
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert "from typing import Dict" not in result
+
+
+def test_pyflakes_strip_newly_unused_imports_keeps_partial_from_import():
+    # Dict became unused but List is still used — the statement binds both
+    # names, so it must be left alone rather than partially edited.
+    original = (
+        "from typing import List, Dict\n\n\ndef foo(x: List) -> Dict:\n    return {}\n"
+    )
+    candidate = (
+        "from typing import List, Dict\n\n\ndef foo(x: List):\n    return None\n"
+    )
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert result == candidate
+
+
+def test_pyflakes_strip_newly_unused_imports_keeps_preexisting_unused():
+    # "os" was already unused before the edit — not this function's concern.
+    original = "import os\n\n\ndef foo():\n    return 1\n"
+    candidate = "import os\n\n\ndef foo():\n    return 2\n"
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert result == candidate
+
+
+def test_pyflakes_strip_newly_unused_imports_fallback_on_syntax_error():
+    # Removing the import would leave an empty if-block — SyntaxError, so
+    # the candidate is returned unchanged.
+    original = "if True:\n    import os\n    os.getcwd()\n"
+    candidate = "if True:\n    import os\n"
+    result = _pyflakes_strip_newly_unused_imports(original, candidate)
+    assert result == candidate
+
+
+# ---------------------------------------------------------------------------
 # _names_in_edit_texts
 # ---------------------------------------------------------------------------
 
@@ -964,6 +1234,33 @@ def test_names_in_edit_texts_skips_syntax_errors():
     # Should not raise — returns whatever names were parseable.
     names = _names_in_edit_texts(groups)
     assert isinstance(names, set)
+
+
+def test_names_in_edit_texts_includes_names_only_in_original_source():
+    # A setup line (last_import_line = 0) sits just outside the matched
+    # duplicate range, so it never appears in the replacement text. Without
+    # also scanning the original source at each edit's range, the cleaner
+    # would never consider it "touched" and would leave it dead.
+    source = (
+        "def f():\n"
+        "    last_import_line = 0\n"
+        "    for node in tree.body:\n"
+        "        last_import_line = max(last_import_line, node.end_lineno)\n"
+        "    return last_import_line\n"
+    )
+    groups = [
+        (
+            "_find_insertion_point",
+            [(2, 4, "    insert_after = _find_insertion_point(tree)\n")],
+            "msg",
+        )
+    ]
+    names_without_source = _names_in_edit_texts(groups)
+    assert "last_import_line" not in names_without_source
+
+    names_with_source = _names_in_edit_texts(groups, source)
+    assert "last_import_line" in names_with_source
+    assert "_find_insertion_point" in names_with_source
 
 
 # ---------------------------------------------------------------------------
@@ -1218,6 +1515,62 @@ def test_find_escaping_vars_module_level_stops_at_def():
     # CONSTANT is in after_lines; not in assigned → set().
     # z inside def foo(z) is not scanned (stopped before that def).
     assert _find_escaping_vars([seq], source_lines) == set()
+
+
+# ---------------------------------------------------------------------------
+# _escaping_vars_for_seq / _find_escaping_vars_per_seq (exclude_line_ranges)
+# ---------------------------------------------------------------------------
+
+
+def test_escaping_vars_for_seq_sibling_reuse_excluded():
+    # Regression: two duplicate blocks both assign 'rd'. Without excluding
+    # the sibling block's own lines, the first block's 'rd' looks like it
+    # escapes merely because the second (soon to be extracted) block
+    # mentions the same name -- it must not.
+    source_lines = [
+        "def test_f():\n",
+        "    rd = json.loads(a)\n",  # seq1: lines 2
+        "    rd = json.loads(b)\n",  # seq2: lines 3
+    ]
+    seq1 = _make_esc_seq(2, 2)
+    seq2 = _make_esc_seq(3, 3)
+    per_seq = _find_escaping_vars_per_seq([seq1, seq2], source_lines)
+    assert per_seq == [set(), set()]
+
+
+def test_escaping_vars_for_seq_real_usage_still_detected_excluding_sibling():
+    # A sibling occurrence shares the name, but genuine surviving code
+    # (outside every group member) still reads it -- must still escape for
+    # both occurrences (the real usage line follows each of them).
+    source_lines = [
+        "def test_f():\n",
+        "    rd = json.loads(a)\n",  # seq1: line 2
+        "    rd = json.loads(b)\n",  # seq2: line 3
+        "    assert rd is not None\n",  # real usage, not part of the group
+    ]
+    seq1 = _make_esc_seq(2, 2)
+    seq2 = _make_esc_seq(3, 3)
+    per_seq = _find_escaping_vars_per_seq([seq1, seq2], source_lines)
+    assert per_seq == [{"rd"}, {"rd"}]
+
+
+def test_escaping_vars_for_seq_excludes_blank_line_in_sibling_range():
+    # The excluded sibling range can include a blank line -- must be
+    # skipped like any other excluded line, not appended to after_lines.
+    source_lines = [
+        "def foo():\n",
+        "    x = compute()\n",  # seq: line 2
+        "    y = other(x)\n",  # sibling: line 3
+        "\n",  # sibling: blank line 4
+        "def bar():\n",  # module-level stop
+        "    pass\n",
+    ]
+    seq = _make_esc_seq(2, 2)
+    assert _escaping_vars_for_seq(seq, source_lines, [(3, 4)]) == set()
+
+
+def test_find_escaping_vars_per_seq_empty_group():
+    assert _find_escaping_vars_per_seq([], []) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1933,6 +2286,218 @@ def test_function_collector_no_params():
     source = "def f():\n    pass\n"
     funcs = _collect_functions(source)
     assert funcs[0].params == []
+
+
+def test_function_collector_marks_staticmethod():
+    source = "class C:\n    @staticmethod\n    def helper():\n        pass\n"
+    funcs = _collect_functions(source)
+    assert funcs[0].is_staticmethod is True
+
+
+def test_function_collector_instance_method_not_static():
+    source = "class C:\n    def method(self):\n        pass\n"
+    funcs = _collect_functions(source)
+    assert funcs[0].is_staticmethod is False
+
+
+def test_function_collector_module_level_not_static():
+    source = "def foo():\n    pass\n"
+    funcs = _collect_functions(source)
+    assert funcs[0].is_staticmethod is False
+
+
+def test_function_collector_other_decorator_not_static():
+    source = "class C:\n    @classmethod\n    def helper(cls):\n        pass\n"
+    funcs = _collect_functions(source)
+    assert funcs[0].is_staticmethod is False
+
+
+def test_decorator_name_simple():
+    (dec,) = cst.parse_module("@staticmethod\ndef f(): pass\n").body[0].decorators
+    assert _decorator_name(dec) == "staticmethod"
+
+
+def test_decorator_name_attribute():
+    (dec,) = cst.parse_module("@mod.deco\ndef f(): pass\n").body[0].decorators
+    assert _decorator_name(dec) == "deco"
+
+
+def test_decorator_name_call_unrecognized():
+    (dec,) = cst.parse_module("@deco()\ndef f(): pass\n").body[0].decorators
+    assert _decorator_name(dec) == ""
+
+
+# ---------------------------------------------------------------------------
+# _build_repo_function_index
+# ---------------------------------------------------------------------------
+
+
+def _index_from_sources(sources: dict) -> RepoIndex:
+    return RepoIndex(
+        module_to_source=sources,
+        module_to_package={},
+        module_to_defs={},
+        file_to_module={},
+    )
+
+
+def test_repo_function_index_includes_free_function():
+    index = _index_from_sources({"pkg.mod": "def helper():\n    x = 1\n    return x\n"})
+    fps = _build_repo_function_index(index)
+    matches = [r for group in fps.values() for r in group]
+    assert len(matches) == 1
+    assert matches[0].func.name == "helper"
+    assert matches[0].module == "pkg.mod"
+
+
+def test_repo_function_index_includes_staticmethod():
+    source = "class C:\n    @staticmethod\n    def helper():\n        return 1\n"
+    index = _index_from_sources({"pkg.mod": source})
+    fps = _build_repo_function_index(index)
+    matches = [r for group in fps.values() for r in group]
+    assert len(matches) == 1
+    assert matches[0].func.name == "helper"
+
+
+def test_repo_function_index_excludes_instance_method():
+    source = "class C:\n    def helper(self):\n        return 1\n"
+    index = _index_from_sources({"pkg.mod": source})
+    fps = _build_repo_function_index(index)
+    assert fps == {}
+
+
+def test_repo_function_index_skips_syntax_error():
+    index = _index_from_sources({"pkg.bad": "def f(:\n"})
+    fps = _build_repo_function_index(index)
+    assert fps == {}
+
+
+def test_repo_function_index_groups_by_fingerprint():
+    src_a = "def a():\n    x = 1\n    return x\n"
+    src_b = "def b():\n    x = 1\n    return x\n"
+    index = _index_from_sources({"pkg.a": src_a, "pkg.b": src_b})
+    fps = _build_repo_function_index(index)
+    assert len(fps) == 1
+    (group,) = fps.values()
+    assert {r.func.name for r in group} == {"a", "b"}
+
+
+def test_repo_function_info_is_dataclass():
+    func = _make_func_info("foo")
+    info = _RepoFunctionInfo(func=func, module="pkg.mod")
+    assert info.func is func
+    assert info.module == "pkg.mod"
+
+
+# ---------------------------------------------------------------------------
+# _module_level_names
+# ---------------------------------------------------------------------------
+
+
+def test_module_level_names_funcdef_and_classdef():
+    names = _module_level_names("def foo(): pass\nclass Bar: pass\n")
+    assert names == {"foo", "Bar"}
+
+
+def test_module_level_names_imports():
+    names = _module_level_names(
+        "import os\nimport numpy as np\nfrom pkg import helper as h\n"
+    )
+    assert names == {"os", "np", "h"}
+
+
+def test_module_level_names_simple_assignment():
+    assert _module_level_names("x = 1\n") == {"x"}
+
+
+def test_module_level_names_tuple_assignment():
+    assert _module_level_names("a, b = 1, 2\n") == {"a", "b"}
+
+
+def test_module_level_names_syntax_error():
+    assert _module_level_names("def f(:\n") == set()
+
+
+def test_module_level_names_ignores_other_statements():
+    assert _module_level_names("foo()\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _first_funcdef_idx
+# ---------------------------------------------------------------------------
+
+
+def test_first_funcdef_idx_finds_def():
+    lines = ["import os\n", "\n", "def foo():\n", "    pass\n"]
+    assert _first_funcdef_idx(lines) == 2
+
+
+def test_first_funcdef_idx_no_def():
+    lines = ["import os\n", "x = 1\n"]
+    assert _first_funcdef_idx(lines) == 2
+
+
+def test_first_funcdef_idx_skips_indented():
+    lines = ["if True:\n", "    def nested(): pass\n", "def real(): pass\n"]
+    assert _first_funcdef_idx(lines) == 2
+
+
+# ---------------------------------------------------------------------------
+# _target_import_is_proven_safe
+# ---------------------------------------------------------------------------
+
+
+def _make_repo_index(**overrides) -> RepoIndex:
+    defaults = dict(
+        module_to_source={},
+        module_to_package={},
+        module_to_defs={},
+        file_to_module={},
+    )
+    defaults.update(overrides)
+    return RepoIndex(**defaults)
+
+
+def test_import_safe_current_module_none():
+    index = _make_repo_index()
+    assert _target_import_is_proven_safe(None, "pkg.helpers", index) is False
+
+
+def test_import_safe_same_module():
+    index = _make_repo_index()
+    assert _target_import_is_proven_safe("pkg.mod", "pkg.mod", index) is False
+
+
+def test_import_safe_same_top_level_package():
+    index = _make_repo_index()
+    assert _target_import_is_proven_safe("pkg.mod", "pkg.helpers", index) is True
+
+
+def test_import_safe_current_file_already_imports_target_package():
+    index = _make_repo_index(
+        module_to_source={"appa.mod": "import libx.thing\n"},
+        module_to_package={"appa.mod": "appa"},
+    )
+    assert _target_import_is_proven_safe("appa.mod", "libx.helpers", index) is True
+
+
+def test_import_safe_sibling_module_already_imports_target_package():
+    index = _make_repo_index(
+        module_to_source={
+            "appa.mod": "x = 1\n",
+            "appa.other": "import libx.thing\n",
+        },
+        module_to_package={"appa.mod": "appa", "appa.other": "appa"},
+    )
+    assert _target_import_is_proven_safe("appa.mod", "libx.helpers", index) is True
+
+
+def test_import_safe_no_existing_dependency():
+    index = _make_repo_index(
+        module_to_source={"appa.mod": "x = 1\n", "appa.other": "y = 2\n"},
+        module_to_package={"appa.mod": "appa", "appa.other": "appa"},
+    )
+    assert _target_import_is_proven_safe("appa.mod", "libx.helpers", index) is False
 
 
 # ---------------------------------------------------------------------------
@@ -3651,6 +4216,156 @@ def test_llm_extract_skips_non_matching_blocks(monkeypatch):
     assert result["function_name"] == "helper"
 
 
+def test_group_ends_in_return_true_single_and_multi_statement():
+    from crispen.refactors.duplicate_extractor import _group_ends_in_return
+
+    single = _make_seq_info(1, 1, "    return x\n")
+    multi = _make_seq_info(1, 2, "    y = x + 1\n    return y\n")
+    assert _group_ends_in_return([single]) is True
+    assert _group_ends_in_return([single, multi]) is True
+
+
+def test_group_ends_in_return_false_no_return():
+    from crispen.refactors.duplicate_extractor import _group_ends_in_return
+
+    seq = _make_seq_info(1, 1, "    x = 1\n")
+    assert _group_ends_in_return([seq]) is False
+
+
+def test_group_ends_in_return_false_mixed_group():
+    """Only one sequence in the group lacking a trailing return is enough
+    to make the whole group ineligible for the return-note."""
+    from crispen.refactors.duplicate_extractor import _group_ends_in_return
+
+    ends_in_return = _make_seq_info(1, 1, "    return x\n")
+    does_not = _make_seq_info(5, 5, "    x = 1\n")
+    assert _group_ends_in_return([ends_in_return, does_not]) is False
+
+
+def test_group_ends_in_return_false_on_syntax_error():
+    from crispen.refactors.duplicate_extractor import _group_ends_in_return
+
+    seq = _make_seq_info(1, 1, "    def (:\n")
+    assert _group_ends_in_return([seq]) is False
+
+
+def test_llm_extract_prompt_includes_return_note_when_group_ends_in_return():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper():\n    return 1\n",
+            "call_site_replacements": ["    return helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    return 1\n")]
+    _llm_extract(client, group, "def foo():\n    return 1\n")
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "call site replacement for every occurrence must be" in prompt
+    assert "`return <helper_call>(...)`" in prompt
+
+
+def test_llm_extract_prompt_omits_return_note_when_group_does_not_end_in_return():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper():\n    pass\n",
+            "call_site_replacements": ["    helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    x = 1\n")]
+    _llm_extract(client, group, "def foo():\n    x = 1\n")
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "call site replacement for every occurrence must be" not in prompt
+
+
+def test_directive_comment_note_empty_when_no_directives():
+    from crispen.refactors.duplicate_extractor import _directive_comment_note
+
+    group = [_make_seq_info(1, 1, "    x = 1\n")]
+    assert _directive_comment_note(group) == ""
+
+
+def test_directive_comment_note_mentions_kind_when_present():
+    from crispen.refactors.duplicate_extractor import _directive_comment_note
+
+    group = [_make_seq_info(1, 1, "    x = 1  # pragma: no cover\n")]
+    note = _directive_comment_note(group)
+    assert "pragma: no cover" in note
+    assert "reachability" in note
+
+
+def test_llm_extract_prompt_includes_directive_note_when_group_has_pragma():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper():\n    x = 1  # pragma: no cover\n",
+            "call_site_replacements": ["    helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    x = 1  # pragma: no cover\n")]
+    _llm_extract(client, group, "def foo():\n    x = 1  # pragma: no cover\n")
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "linter/coverage directive comment" in prompt
+
+
+def test_llm_extract_prompt_omits_directive_note_when_group_has_no_directives():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper():\n    pass\n",
+            "call_site_replacements": ["    helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    x = 1\n")]
+    _llm_extract(client, group, "def foo():\n    x = 1\n")
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "linter/coverage directive comment" not in prompt
+
+
+def test_llm_extract_prompt_failures_note_is_surgical():
+    from crispen.refactors.duplicate_extractor import _llm_extract
+
+    client = MagicMock()
+    client.messages.create.return_value = _make_extract_response(
+        {
+            "function_name": "helper",
+            "placement": "module_level",
+            "helper_source": "def helper(): pass\n",
+            "call_site_replacements": ["helper()\n"],
+        }
+    )
+    group = [_make_seq_info(1, 1, "    x = 1\n")]
+    _llm_extract(
+        client,
+        group,
+        "a = 1\n",
+        prev_failures=["call site 2 did not capture the return value"],
+        prev_output={
+            "helper_source": "def helper(): pass\n",
+            "call_site_replacements": ["x = helper()\n", "helper()\n"],
+        },
+    )
+    prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "check EVERY call site replacement individually" in prompt
+    assert "leaves a later one with the same mistake will fail again" in prompt
+
+
 def test_llm_veto_with_timing_out(monkeypatch):
     """_llm_veto appends result to _timing_out when provided."""
     from crispen.refactors.duplicate_extractor import _llm_veto
@@ -4164,6 +4879,141 @@ _FUNC_MATCH_THEN_DUP_RANGES = [(2, 30)]  # covers foo, bar, baz bodies
 
 
 # ---------------------------------------------------------------------------
+# Repo-wide function-match integration fixtures
+# ---------------------------------------------------------------------------
+
+# No candidate function is defined locally — the only match comes from the
+# repo-wide index passed in via repo_function_index/repo_index.
+_REPO_MATCH_SOURCE = textwrap.dedent(
+    """\
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_REPO_MATCH_RANGES = [(1, 4)]  # covers foo.body
+
+_REPO_SETUP_BODY = "    x = compute(data)\n    y = transform(x)\n    z = finalize(y)\n"
+
+
+def _repo_func_info(name: str, body: str = _REPO_SETUP_BODY) -> _FunctionInfo:
+    return _FunctionInfo(
+        name=name,
+        source=f"def {name}():\n{body}",
+        scope="<module>",
+        body_source=body,
+        body_stmt_count=3,
+        params=[],
+    )
+
+
+def _repo_index_for_file(current_file: str, module: str = "appmod.mod") -> RepoIndex:
+    abs_path = str(Path(current_file).resolve())
+    return RepoIndex(
+        module_to_source={},
+        module_to_package={module: "appmod"},
+        module_to_defs={},
+        file_to_module={abs_path: module},
+    )
+
+
+# Single unambiguous candidate, same top-level package as the current file
+# ("appmod") — the dependency-safety check passes immediately.
+_REPO_FUNC_INDEX_SINGLE = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_setup"), module="appmod.helpers")
+    ]
+}
+
+# Same fingerprint maps to two different repo functions — ambiguous, skipped.
+_REPO_FUNC_INDEX_AMBIGUOUS = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_alt_a"), module="appmod.a"),
+        _RepoFunctionInfo(func=_repo_func_info("_alt_b"), module="appmod.b"),
+    ]
+}
+
+# Candidate function's name collides with a name already bound in the file.
+_REPO_MATCH_COLLISION_SOURCE = textwrap.dedent(
+    """\
+    _setup = None
+
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_REPO_MATCH_COLLISION_RANGES = [(1, 6)]
+
+# Candidate function's name equals the matched sequence's own scope name.
+_REPO_FUNC_INDEX_SAME_NAME_AS_SCOPE = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("foo"), module="appmod.helpers")
+    ]
+}
+
+# Different, unrelated top-level package with no existing import anywhere —
+# the dependency-safety check fails.
+_REPO_FUNC_INDEX_UNSAFE = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_setup"), module="otherpkg.helpers")
+    ]
+}
+
+# The fingerprint's only non-self candidate ("_setup" in appmod.helpers) is
+# unambiguous from this file's perspective -- but the index *also* contains
+# this file's own "foo" (module="appmod.mod", the current file), which is
+# exactly what appmod.helpers' own repo-match pass would independently find
+# as *its* sole candidate. Accepting the match here would let both files
+# replace their identical bodies with calls into each other in the same run.
+_REPO_FUNC_INDEX_MUTUAL = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_setup"), module="appmod.helpers"),
+        _RepoFunctionInfo(func=_repo_func_info("foo"), module="appmod.mod"),
+    ]
+}
+
+# foo.body (in range) and bar.body (out of range) each independently match a
+# repo-wide candidate, so only foo's should ever reach the LLM. bar's body
+# uses an if/else shape (not 3 sequential assignments) so its fingerprint
+# doesn't coincidentally collide with foo's despite the different names.
+_REPO_MATCH_MIXED_SOURCE = textwrap.dedent(
+    """\
+    def foo():
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+
+    def bar():
+        if flag:
+            value = load(source)
+        else:
+            value = default(source)
+    """
+)
+_REPO_MATCH_MIXED_RANGES = [(1, 4)]  # covers foo.body only; bar.body (7-10) is out
+_REPO_BAR_BODY = (
+    "    if flag:\n"
+    "        value = load(source)\n"
+    "    else:\n"
+    "        value = default(source)\n"
+)
+_REPO_FUNC_INDEX_MIXED = {
+    _normalize_source(_REPO_SETUP_BODY): [
+        _RepoFunctionInfo(func=_repo_func_info("_setup"), module="appmod.helpers")
+    ],
+    _normalize_source(_REPO_BAR_BODY): [
+        _RepoFunctionInfo(
+            func=_repo_func_info("_bar_helper", body=_REPO_BAR_BODY),
+            module="appmod.helpers",
+        )
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
 # Function-match integration tests
 # ---------------------------------------------------------------------------
 
@@ -4353,6 +5203,298 @@ def test_func_match_then_dup_extract(monkeypatch):
     assert de._new_source is not None
     # One func-match change + one dup-extract change
     assert len(de.changes_made) == 2
+
+
+# ---------------------------------------------------------------------------
+# Repo-wide function-match integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_repo_match_accepted_end_to_end(monkeypatch):
+    """A single, safe, non-colliding repo-wide candidate is matched and imported."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ),
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            verbose=True,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+        )
+    # Exact string, not just substring checks: the inserted import must be
+    # separated from the following def by PEP 8's two blank lines. A prior
+    # version of this code emitted only a single trailing newline after the
+    # raw-inserted import, which _lift_and_dedup_imports' blank-line-collapse
+    # pass (designed to clean up gaps *within* an existing import block) then
+    # swallowed entirely — a live-LLM run against a real two-file repo caught
+    # it (flake8 E302) where this test's earlier substring-only assertions
+    # did not.
+    assert de._new_source == (
+        "from appmod.helpers import _setup\n" "\n" "\n" "def foo():\n" "    _setup()\n"
+    )
+    assert "repo-wide match" in de.changes_made[0]
+
+
+def test_repo_match_skips_matched_and_ambiguous(monkeypatch):
+    """foo.body already matched locally; _setup.body's repo fingerprint is ambiguous."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _FUNC_MATCH_RANGES,
+            source=_FUNC_MATCH_SOURCE,
+            verbose=True,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_AMBIGUOUS,
+            repo_index=repo_index,
+        )
+    # Only the local match (foo.body → _setup()) fired a veto call; the
+    # repo-wide pass never got as far as the LLM for either sequence.
+    assert mock_run.call_count == 1
+    assert "appmod" not in (de._new_source or "")
+
+
+def test_repo_match_skips_out_of_diff_range(monkeypatch):
+    """A repo-wide candidate outside the changed ranges is never considered."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_MIXED_RANGES,
+            source=_REPO_MATCH_MIXED_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_MIXED,
+            repo_index=repo_index,
+        )
+    # Only foo's in-range match fired a veto call; bar's out-of-range match
+    # was skipped without ever reaching the LLM.
+    assert mock_run.call_count == 1
+    assert "from appmod.helpers import _setup" in de._new_source
+    assert "_bar_helper" not in de._new_source
+
+
+def test_repo_match_skips_name_collision(monkeypatch):
+    """A candidate whose name is already bound in the file is skipped."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_COLLISION_RANGES,
+            source=_REPO_MATCH_COLLISION_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
+
+
+def test_repo_match_skips_same_name_as_scope(monkeypatch):
+    """A candidate whose name equals the matched sequence's own scope is skipped."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SAME_NAME_AS_SCOPE,
+            repo_index=repo_index,
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
+
+
+def test_repo_match_skips_dependency_unsafe(monkeypatch):
+    """A candidate in an unrelated, never-imported package is skipped."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_UNSAFE,
+            repo_index=repo_index,
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
+
+
+def test_repo_match_veto_rejected(monkeypatch):
+    """The LLM veto rejecting a repo-wide candidate leaves the source untouched."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(False, "different", ""),
+        ),
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+        )
+    assert de._new_source is None
+
+
+def test_repo_match_allows_safe_target_also_in_diff(monkeypatch):
+    """The target's file being part of this run's diff isn't itself
+    disqualifying -- only an actual reverse-candidate hazard is. With a
+    single, non-mutual candidate, the match proceeds normally even though
+    target_module is in changed_modules."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ),
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+            changed_modules=frozenset({"appmod.mod", "appmod.helpers"}),
+        )
+    assert de._new_source == (
+        "from appmod.helpers import _setup\n" "\n" "\n" "def foo():\n" "    _setup()\n"
+    )
+
+
+def test_repo_match_scope_file_ignores_repo_index(monkeypatch):
+    """match_functions_scope='file' never consults the repo-wide index."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="file",
+            repo_function_index=_REPO_FUNC_INDEX_SINGLE,
+            repo_index=repo_index,
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
+
+
+def test_repo_match_skips_symmetric_mutual_candidate(monkeypatch):
+    """A candidate that would itself independently match back to this file's
+    own function is skipped -- guards against two files in the same run each
+    replacing their identical body with a call into the other, which would
+    leave both as pure delegates calling each other (circular import, or
+    infinite recursion if the import happened to resolve). Found via a live
+    two-file self-check run; see crispen-dev channel history 2026-08-09."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ) as mock_run,
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_MUTUAL,
+            repo_index=repo_index,
+            changed_modules=frozenset({"appmod.mod", "appmod.helpers"}),
+        )
+    mock_run.assert_not_called()
+    assert de._new_source is None
+
+
+def test_repo_match_allows_non_mutual_target_outside_diff(monkeypatch):
+    """The symmetric-match guard only applies when the target's own file is
+    *also* part of this run's diff (changed_modules) -- a target outside the
+    diff never gets its own independent pass this run, so it can't propose
+    the mirror-image match, and the (otherwise identical) candidate is
+    matched normally. Regression guard for the guard itself: without the
+    changed_modules restriction, this would be a false-positive skip."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    repo_index = _repo_index_for_file("mod.py")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ),
+    ):
+        de = DuplicateExtractor(
+            _REPO_MATCH_RANGES,
+            source=_REPO_MATCH_SOURCE,
+            current_file="mod.py",
+            match_functions_scope="repo",
+            repo_function_index=_REPO_FUNC_INDEX_MUTUAL,
+            repo_index=repo_index,
+            changed_modules=frozenset({"appmod.mod"}),  # appmod.helpers not diffed
+        )
+    assert de._new_source == (
+        "from appmod.helpers import _setup\n" "\n" "\n" "def foo():\n" "    _setup()\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5271,6 +6413,372 @@ def test_helper_imports_local_name_kwarg():
 
 
 # ---------------------------------------------------------------------------
+# _helper_reimports_module_level_name
+# ---------------------------------------------------------------------------
+
+
+def test_helper_reimports_module_level_name_true():
+    helper = "def _h():\n    from pkg import call_with_tool\n    call_with_tool()\n"
+    original = "from pkg import call_with_tool\ndef test(x):\n    call_with_tool()\n"
+    assert _helper_reimports_module_level_name(helper, original) == {"call_with_tool"}
+
+
+def test_helper_reimports_module_level_name_not_reimported():
+    # Helper imports a different name than anything imported in the original.
+    helper = "def _h():\n    from pkg import other_name\n    other_name()\n"
+    original = "from pkg import call_with_tool\ndef test(x):\n    call_with_tool()\n"
+    assert _helper_reimports_module_level_name(helper, original) == set()
+
+
+def test_helper_reimports_module_level_name_no_imports_in_helper():
+    helper = "def _h():\n    pass\n"
+    original = "from pkg import call_with_tool\ndef test(x):\n    pass\n"
+    assert _helper_reimports_module_level_name(helper, original) == set()
+
+
+def test_helper_reimports_module_level_name_syntax_error_helper():
+    assert _helper_reimports_module_level_name("def (:\n", "import os\n") == set()
+
+
+def test_helper_reimports_module_level_name_syntax_error_original():
+    helper = "def _h():\n    import os\n"
+    assert _helper_reimports_module_level_name(helper, "(:\n") == set()
+
+
+def test_helper_reimports_module_level_name_plain_import():
+    helper = "def _h():\n    import os\n    os.getcwd()\n"
+    original = "import os\ndef test(x):\n    os.getcwd()\n"
+    assert _helper_reimports_module_level_name(helper, original) == {"os"}
+
+
+def test_helper_reimports_module_level_name_asname():
+    helper = "def _h():\n    import numpy as np\n    np.array([])\n"
+    original = "import numpy as np\ndef test(x):\n    np.array([])\n"
+    assert _helper_reimports_module_level_name(helper, original) == {"np"}
+
+
+def test_helper_reimports_module_level_name_original_not_top_level():
+    # call_with_tool is only imported inside a function in the original -- not
+    # a top-level import, so the helper's local import isn't flagged.
+    helper = "def _h():\n    from pkg import call_with_tool\n    call_with_tool()\n"
+    original = (
+        "def test(x):\n" "    from pkg import call_with_tool\n" "    call_with_tool()\n"
+    )
+    assert _helper_reimports_module_level_name(helper, original) == set()
+
+
+# ---------------------------------------------------------------------------
+# _helper_defines_class_colliding_with_origin
+# ---------------------------------------------------------------------------
+
+
+def test_helper_defines_class_colliding_with_origin_true():
+    helper = (
+        "class _ApiTimeout(Exception):\n"
+        "    pass\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        "a.py": (
+            "class _ApiTimeout(Exception):\n"
+            "    pass\n\n\n"
+            "def call():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except _ApiTimeout:\n"
+            "        pass\n"
+        ),
+        "b.py": "def other():\n    pass\n",
+    }
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == {
+        "_ApiTimeout"
+    }
+
+
+def test_helper_defines_class_colliding_with_origin_no_collision():
+    helper = "class _Widget:\n    pass\n"
+    file_sources = {
+        "a.py": "class _ApiTimeout(Exception):\n    pass\n",
+        "b.py": "def other():\n    pass\n",
+    }
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == set()
+
+
+def test_helper_defines_class_colliding_with_origin_no_classes_in_helper():
+    helper = "def run_with_timeout(f, t):\n    return f()\n"
+    file_sources = {"a.py": "class _ApiTimeout(Exception):\n    pass\n"}
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == set()
+
+
+def test_helper_defines_class_colliding_with_origin_syntax_error_helper():
+    file_sources = {"a.py": "class _ApiTimeout(Exception):\n    pass\n"}
+    assert (
+        _helper_defines_class_colliding_with_origin("def (:\n", file_sources) == set()
+    )
+
+
+def test_helper_defines_class_colliding_with_origin_syntax_error_origin_file():
+    helper = "class _ApiTimeout(Exception):\n    pass\n"
+    file_sources = {"a.py": "(:\n", "b.py": "class _ApiTimeout(Exception):\n    pass\n"}
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == {
+        "_ApiTimeout"
+    }
+
+
+def test_helper_defines_class_colliding_with_origin_nested_class_not_flagged():
+    # Only module-level classes in the origin file count -- a same-named
+    # class nested inside a function/class in the origin isn't a real
+    # module-level identity collision.
+    helper = "class _ApiTimeout(Exception):\n    pass\n"
+    file_sources = {
+        "a.py": "def make():\n    class _ApiTimeout(Exception):\n        pass\n"
+    }
+    assert _helper_defines_class_colliding_with_origin(helper, file_sources) == set()
+
+
+# ---------------------------------------------------------------------------
+# _helper_imports_class_orphaning_sibling_origin
+# ---------------------------------------------------------------------------
+
+
+def test_helper_imports_class_orphaning_sibling_origin_true(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    b = pkg / "b.py"
+    helper = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        str(a): "class _ApiTimeout(Exception):\n    pass\n",
+        str(b): (
+            "class _ApiTimeout(Exception):\n"
+            "    pass\n\n\n"
+            "def call():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except _ApiTimeout:\n"
+            "        pass\n"
+        ),
+    }
+    assert _helper_imports_class_orphaning_sibling_origin(
+        helper, file_sources, str(tmp_path)
+    ) == {"_ApiTimeout"}
+
+
+def test_helper_imports_class_orphaning_sibling_origin_no_collision(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    b = pkg / "b.py"
+    helper = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        str(a): "class _ApiTimeout(Exception):\n    pass\n",
+        str(b): "def other():\n    pass\n",
+    }
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_no_imports_in_helper(tmp_path):
+    helper = "def run_with_timeout(f, t):\n    return f()\n"
+    file_sources = {str(tmp_path / "a.py"): "class _ApiTimeout(Exception):\n    pass\n"}
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_syntax_error_helper(tmp_path):
+    file_sources = {str(tmp_path / "a.py"): "class _ApiTimeout(Exception):\n    pass\n"}
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            "def (:\n", file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_relative_import_ignored(
+    tmp_path,
+):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    b = pkg / "b.py"
+    helper = (
+        "from .a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        str(a): "class _ApiTimeout(Exception):\n    pass\n",
+        str(b): "class _ApiTimeout(Exception):\n    pass\n",
+    }
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_syntax_error_origin_file(
+    tmp_path,
+):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    b = pkg / "b.py"
+    helper = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {
+        str(a): "class _ApiTimeout(Exception):\n    pass\n",
+        str(b): "(:\n",
+    }
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+def test_helper_imports_class_orphaning_sibling_origin_self_import_not_flagged(
+    tmp_path,
+):
+    # The helper imports the class from the same origin file that defines
+    # it -- not a collision, just reusing the owning file's own class.
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    a = pkg / "a.py"
+    helper = (
+        "from pkg.a import _ApiTimeout\n\n\n"
+        "def run_with_timeout(f, t):\n"
+        "    raise _ApiTimeout('boom')\n"
+    )
+    file_sources = {str(a): "class _ApiTimeout(Exception):\n    pass\n"}
+    assert (
+        _helper_imports_class_orphaning_sibling_origin(
+            helper, file_sources, str(tmp_path)
+        )
+        == set()
+    )
+
+
+# ---------------------------------------------------------------------------
+# _directive_comments / _dropped_directive_comments
+# ---------------------------------------------------------------------------
+
+
+def test_directive_comments_pragma_no_cover():
+    assert _directive_comments("x = 1  # pragma: no cover\n") == {"pragma: no cover"}
+
+
+def test_directive_comments_pragma_no_branch():
+    assert _directive_comments("if x:  # pragma: no branch\n    pass\n") == {
+        "pragma: no branch"
+    }
+
+
+def test_directive_comments_noqa_bare():
+    assert _directive_comments("import os  # noqa\n") == {"noqa"}
+
+
+def test_directive_comments_noqa_with_code_normalizes_to_bare_kind():
+    # Specific codes (E501, F401, ...) are dropped -- only the directive
+    # *kind* is tracked, so a code mismatch between original and output
+    # doesn't spuriously trip the check.
+    assert _directive_comments("import os  # noqa: F401\n") == {"noqa"}
+
+
+def test_directive_comments_type_ignore_with_bracket_code():
+    assert _directive_comments("x: int = f()  # type: ignore[assignment]\n") == {
+        "type: ignore"
+    }
+
+
+def test_directive_comments_fmt_skip():
+    assert _directive_comments("x = [1,  2,  3]  # fmt: skip\n") == {"fmt: skip"}
+
+
+def test_directive_comments_fmt_off_and_on():
+    src = "x = 1  # fmt: off\ny  =  2\nz = 3  # fmt: on\n"
+    assert _directive_comments(src) == {"fmt: off", "fmt: on"}
+
+
+def test_directive_comments_pylint_disable():
+    assert _directive_comments("eval(x)  # pylint: disable=eval-used\n") == {
+        "pylint: disable"
+    }
+
+
+def test_directive_comments_case_insensitive():
+    assert _directive_comments("x = 1  # PRAGMA: NO COVER\n") == {"pragma: no cover"}
+
+
+def test_directive_comments_none_present():
+    assert _directive_comments("x = 1\ny = 2  # a plain comment\n") == set()
+
+
+def test_dropped_directive_comments_dropped():
+    original = ["    return upper  # pragma: no cover\n"]
+    helper = "def _h():\n    return upper\n"
+    assert _dropped_directive_comments(original, helper, ["_h()\n"]) == {
+        "pragma: no cover"
+    }
+
+
+def test_dropped_directive_comments_preserved_in_helper():
+    original = ["    return upper  # pragma: no cover\n"]
+    helper = "def _h():\n    return upper  # pragma: no cover\n"
+    assert _dropped_directive_comments(original, helper, ["_h()\n"]) == set()
+
+
+def test_dropped_directive_comments_preserved_in_replacement():
+    # The directive doesn't have to survive in the helper specifically --
+    # only somewhere in the assembled output (helper or call site).
+    original = ["    x = f()  # noqa: F401\n"]
+    helper = "def _h():\n    return f()\n"
+    replacements = ["    x = _h()  # noqa\n"]
+    assert _dropped_directive_comments(original, helper, replacements) == set()
+
+
+def test_dropped_directive_comments_nothing_in_original():
+    original = ["    return upper\n"]
+    helper = "def _h():\n    return upper\n"
+    assert _dropped_directive_comments(original, helper, ["_h()\n"]) == set()
+
+
+def test_dropped_directive_comments_multiple_call_sites_collapse_to_one():
+    # Two call sites both had the same guard; the merged helper only needs
+    # to carry it once -- this checks presence, not per-occurrence counts.
+    original = [
+        "    return upper  # pragma: no cover\n",
+        "    return upper  # pragma: no cover\n",
+    ]
+    helper = "def _h():\n    return upper  # pragma: no cover\n"
+    replacements = ["_h()\n", "_h()\n"]
+    assert _dropped_directive_comments(original, helper, replacements) == set()
+
+
+# ---------------------------------------------------------------------------
 # Integration: block-ends-with-return guard
 # ---------------------------------------------------------------------------
 
@@ -5439,6 +6947,853 @@ def test_helper_imports_local_guard_skips_silent(monkeypatch):
             llm_verify_retries=0,
         )
     assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# Integration: helper-reimports-module-level-name guard
+# ---------------------------------------------------------------------------
+
+_MODULE_IMPORT_DUP_SOURCE = textwrap.dedent(
+    """\
+    from pkg import call_with_tool
+
+    def test_a(mock_client):
+        if debug:
+            pass
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+
+    def test_b(mock_client):
+        result = None
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)
+    """
+)
+_MODULE_IMPORT_DUP_RANGES = [(12, 14)]  # overlaps test_b's duplicate block
+
+
+def _make_module_reimport_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            # helper re-imports call_with_tool locally instead of using the
+            # existing module-level import -- the real bug this check exists
+            # to catch (it silently bypasses mock.patch on the module-level
+            # name instead of raising an error).
+            "helper_source": (
+                "def _helper():\n"
+                "    from pkg import call_with_tool\n"
+                "    x = compute(data)\n"
+                "    y = transform(x)\n"
+                "    z = finalize(y)\n"
+            ),
+            "call_site_replacements": [
+                "    _helper()\n",
+                "    _helper()\n",
+            ],
+        }
+    )
+
+
+def test_helper_reimports_module_level_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when helper locally re-imports a module-level name."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_module_reimport_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _MODULE_IMPORT_DUP_RANGES,
+            source=_MODULE_IMPORT_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert (
+        "helper locally re-imports name(s) already imported at module level"
+        in capsys.readouterr().err
+    )
+
+
+def test_helper_reimports_module_level_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_module_reimport_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _MODULE_IMPORT_DUP_RANGES,
+            source=_MODULE_IMPORT_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+# ---------------------------------------------------------------------------
+# Integration: dropped-directive-comment guard
+# ---------------------------------------------------------------------------
+
+_PRAGMA_DUP_SOURCE = textwrap.dedent(
+    """\
+    def test_a(mock_client):
+        if debug:
+            pass
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)  # pragma: no cover
+
+    def test_b(mock_client):
+        result = None
+        x = compute(data)
+        y = transform(x)
+        z = finalize(y)  # pragma: no cover
+    """
+)
+_PRAGMA_DUP_RANGES = [(10, 12)]  # overlaps test_b's duplicate block
+
+
+def _make_pragma_dropped_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            # Merges both call sites' identical block but silently drops the
+            # trailing `# pragma: no cover` that was on the original lines --
+            # the real bug this check exists to catch (found by a live
+            # self-check run: coverage still fails even though every test
+            # passes, since the guarded line is no longer excluded).
+            "helper_source": (
+                "def _helper():\n"
+                "    x = compute(data)\n"
+                "    y = transform(x)\n"
+                "    z = finalize(y)\n"
+            ),
+            "call_site_replacements": [
+                "    _helper()\n",
+                "    _helper()\n",
+            ],
+        }
+    )
+
+
+def _make_pragma_preserved_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            "helper_source": (
+                "def _helper():\n"
+                "    x = compute(data)\n"
+                "    y = transform(x)\n"
+                "    z = finalize(y)  # pragma: no cover\n"
+            ),
+            "call_site_replacements": [
+                "    _helper()\n",
+                "    _helper()\n",
+            ],
+        }
+    )
+
+
+def test_dropped_directive_comment_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when the helper drops a directive comment that
+    was on the original duplicate block."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_pragma_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _PRAGMA_DUP_RANGES,
+            source=_PRAGMA_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert "helper/replacement drops directive comment(s)" in capsys.readouterr().err
+
+
+def test_dropped_directive_comment_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_pragma_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _PRAGMA_DUP_RANGES,
+            source=_PRAGMA_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+def test_directive_comment_preserved_not_flagged(monkeypatch):
+    """A helper that keeps the directive comment is unaffected by the check."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_pragma_preserved_extract_response(),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _PRAGMA_DUP_RANGES,
+            source=_PRAGMA_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is not None
+    assert "# pragma: no cover" in de._new_source
+
+
+# ---------------------------------------------------------------------------
+# _default_param_drops_call_time_global
+# ---------------------------------------------------------------------------
+
+
+def test_default_param_drops_call_time_global_flagged():
+    original = [
+        '    print(f"a: {status}", file=sys.stderr, flush=True)\n',
+        '    print(f"b: {status}", file=sys.stderr, flush=True)\n',
+    ]
+    helper = (
+        "def _log(status, file=sys.stderr):\n"
+        '    print(f"{status}", file=file, flush=True)\n'
+    )
+    replacements = ["    _log(status)\n", "    _log(status)\n"]
+    assert _default_param_drops_call_time_global(original, helper, replacements) == {
+        "file"
+    }
+
+
+def test_default_param_preserved_explicitly_not_flagged():
+    # Same shape, but the call sites still pass file=sys.stderr explicitly
+    # rather than relying on the default -- not a behavior change.
+    original = [
+        '    print(f"a: {status}", file=sys.stderr, flush=True)\n',
+        '    print(f"b: {status}", file=sys.stderr, flush=True)\n',
+    ]
+    helper = (
+        "def _log(status, file=sys.stderr):\n"
+        '    print(f"{status}", file=file, flush=True)\n'
+    )
+    replacements = [
+        "    _log(status, file=sys.stderr)\n",
+        "    _log(status, file=sys.stderr)\n",
+    ]
+    assert (
+        _default_param_drops_call_time_global(original, helper, replacements) == set()
+    )
+
+
+def test_default_param_not_previously_explicit_not_flagged():
+    # A brand-new default parameter that wasn't an explicit call-site
+    # argument before extraction isn't a regression -- nothing was dropped.
+    original = ["    do_thing()\n", "    do_thing()\n"]
+    helper = "def _do(file=sys.stderr):\n    do_thing()\n"
+    replacements = ["    _do()\n", "    _do()\n"]
+    assert (
+        _default_param_drops_call_time_global(original, helper, replacements) == set()
+    )
+
+
+def test_default_param_non_attribute_default_not_flagged():
+    # A plain constant/None default is definitionally fine -- it's not a
+    # global resolved fresh at each call.
+    original = ["    log(level=DEFAULT_LEVEL)\n"]
+    helper = "def _log(level=None):\n    log(level=level)\n"
+    replacements = ["    _log()\n"]
+    assert (
+        _default_param_drops_call_time_global(original, helper, replacements) == set()
+    )
+
+
+def test_default_param_kwonly_arg_flagged():
+    # A required kwonly arg with no default (level) alongside one that does
+    # (stream) exercises both branches of the kwonly-defaults scan.
+    original = ["    emit(msg, level=1, stream=sys.stdout)\n"]
+    helper = (
+        "def _emit(msg, *, level, stream=sys.stdout):\n    write(msg, level, stream)\n"
+    )
+    replacements = ["    _emit(msg, level=1)\n"]
+    assert _default_param_drops_call_time_global(original, helper, replacements) == {
+        "stream"
+    }
+
+
+def test_default_param_syntax_error_helper():
+    assert (
+        _default_param_drops_call_time_global(["file=sys.stderr\n"], "def (:\n", [])
+        == set()
+    )
+
+
+def test_default_param_no_functions_in_helper():
+    assert _default_param_drops_call_time_global(["x = 1\n"], "x = 1\n", []) == set()
+
+
+def test_default_param_no_defaults_in_helper():
+    original = ["    f(file=sys.stderr)\n"]
+    helper = "def _f(file):\n    pass\n"
+    assert (
+        _default_param_drops_call_time_global(original, helper, ["_f(sys.stderr)\n"])
+        == set()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Integration: default-param-drops-call-time-global guard
+# ---------------------------------------------------------------------------
+
+_DEFAULT_GLOBAL_DUP_SOURCE = textwrap.dedent(
+    """\
+    def log_a(status):
+        if debug:
+            pass
+        x = compute(status)
+        y = transform(x)
+        print(y, file=sys.stderr, flush=True)
+
+    def log_b(status):
+        result = None
+        x = compute(status)
+        y = transform(x)
+        print(y, file=sys.stderr, flush=True)
+    """
+)
+_DEFAULT_GLOBAL_DUP_RANGES = [(10, 12)]  # overlaps log_b's duplicate block
+
+
+def _make_default_global_dropped_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            # Turns the explicit file=sys.stderr keyword argument both call
+            # sites passed into a default parameter value instead -- the
+            # real bug this check exists to catch (found by a live
+            # self-check run: a default is bound once at def-time, so a
+            # caller that reassigns sys.stderr after the helper is defined,
+            # like pytest's capsys fixture, no longer reaches it).
+            "helper_source": (
+                "def _helper(status, file=sys.stderr):\n"
+                "    x = compute(status)\n"
+                "    y = transform(x)\n"
+                "    print(y, file=file, flush=True)\n"
+            ),
+            "call_site_replacements": [
+                "    _helper(status)\n",
+                "    _helper(status)\n",
+            ],
+        }
+    )
+
+
+def _make_default_global_preserved_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            "helper_source": (
+                "def _helper(status, file=sys.stderr):\n"
+                "    x = compute(status)\n"
+                "    y = transform(x)\n"
+                "    print(y, file=file, flush=True)\n"
+            ),
+            "call_site_replacements": [
+                "    _helper(status, file=sys.stderr)\n",
+                "    _helper(status, file=sys.stderr)\n",
+            ],
+        }
+    )
+
+
+def test_default_param_drops_global_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when the helper turns a call-time global keyword
+    argument into a default parameter value dropped from the call sites."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_default_global_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _DEFAULT_GLOBAL_DUP_RANGES,
+            source=_DEFAULT_GLOBAL_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert (
+        "helper turns call-time global keyword argument(s) into a default "
+        "parameter value" in capsys.readouterr().err
+    )
+
+
+def test_default_param_drops_global_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_default_global_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _DEFAULT_GLOBAL_DUP_RANGES,
+            source=_DEFAULT_GLOBAL_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+def test_default_param_global_kept_explicit_not_flagged(monkeypatch):
+    """A helper that still receives the argument explicitly at each call
+    site (not relying on the default) is unaffected by the check."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_default_global_preserved_extract_response(),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _DEFAULT_GLOBAL_DUP_RANGES,
+            source=_DEFAULT_GLOBAL_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is not None
+    assert de._new_source.count("    _helper(status, file=sys.stderr)\n") == 2
+
+
+# ---------------------------------------------------------------------------
+# _names_referenced_in
+# ---------------------------------------------------------------------------
+
+
+def test_names_referenced_in_basic():
+    assert _names_referenced_in("x = f(y)\nreturn x\n") == {"x", "f", "y"}
+
+
+def test_names_referenced_in_syntax_error():
+    assert _names_referenced_in("def (:\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _dropped_escaping_var_capture
+# ---------------------------------------------------------------------------
+
+
+def test_dropped_escaping_var_capture_flagged():
+    # Bug A shape: original inline code does `x = x * 2`; one call site
+    # correctly captures the helper's return, the other drops it while the
+    # variable still escapes for that occurrence.
+    original = ["    x *= 2\n", "    x *= 2\n"]
+    replacements = ["    x = _helper(x)\n", "    _helper(x)\n"]
+    escaping_per_occ = [{"x"}, {"x"}]
+    assert _dropped_escaping_var_capture(original, replacements, escaping_per_occ) == {
+        "x"
+    }
+
+
+def test_dropped_escaping_var_capture_captured_not_flagged():
+    original = ["    x *= 2\n", "    x *= 2\n"]
+    replacements = ["    x = _helper(x)\n", "    x = _helper(x)\n"]
+    escaping_per_occ = [{"x"}, {"x"}]
+    assert (
+        _dropped_escaping_var_capture(original, replacements, escaping_per_occ) == set()
+    )
+
+
+def test_dropped_escaping_var_capture_not_escaping_for_this_occurrence():
+    # This occurrence's own escaping set is empty (nothing after its own
+    # block reads the name) -- dropping the assignment here is fine.
+    original = ["    rd = json.loads(a)\n", "    rd = json.loads(b)\n"]
+    replacements = ["    rd = _helper(a)\n", "    _helper(b)\n"]
+    escaping_per_occ = [{"rd"}, set()]
+    assert (
+        _dropped_escaping_var_capture(original, replacements, escaping_per_occ) == set()
+    )
+
+
+def test_dropped_escaping_var_capture_empty_inputs():
+    assert _dropped_escaping_var_capture([], [], []) == set()
+
+
+# ---------------------------------------------------------------------------
+# _call_argument_names
+# ---------------------------------------------------------------------------
+
+
+def test_call_argument_names_positional():
+    assert _call_argument_names("    _helper(data, other)\n") == {"data", "other"}
+
+
+def test_call_argument_names_keyword():
+    assert _call_argument_names("    _helper(name=data)\n") == {"data"}
+
+
+def test_call_argument_names_non_name_args_ignored():
+    assert _call_argument_names('    _helper(1, "x", flag=True)\n') == set()
+
+
+def test_call_argument_names_syntax_error():
+    assert _call_argument_names("def (:\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# _call_site_argument_identity_mismatch
+# ---------------------------------------------------------------------------
+
+
+def test_call_site_argument_identity_mismatch_crossed():
+    # Bug B shape: a "trial" and an "apply" call site, each closing over its
+    # own variable pair, got their arguments crossed between sites.
+    original = [
+        "    trial_deps[candidate] = None\n",
+        "    file_deps[chosen] = None\n",
+    ]
+    replacements = [
+        "    _register(file_deps, chosen)\n",  # should be trial_deps/candidate
+        "    _register(trial_deps, candidate)\n",  # should be file_deps/chosen
+    ]
+    assert _call_site_argument_identity_mismatch(original, replacements) == {
+        "file_deps",
+        "chosen",
+        "trial_deps",
+        "candidate",
+    }
+
+
+def test_call_site_argument_identity_mismatch_own_names_not_flagged():
+    original = [
+        "    trial_deps[candidate] = None\n",
+        "    file_deps[chosen] = None\n",
+    ]
+    replacements = [
+        "    _register(trial_deps, candidate)\n",
+        "    _register(file_deps, chosen)\n",
+    ]
+    assert _call_site_argument_identity_mismatch(original, replacements) == set()
+
+
+def test_call_site_argument_identity_mismatch_new_name_not_flagged():
+    # An argument absent from every occurrence's original block (e.g. a
+    # shared module-level constant) isn't a crossed-site signal.
+    original = ["    do_thing()\n", "    do_thing()\n"]
+    replacements = ["    _helper(CONFIG)\n", "    _helper(CONFIG)\n"]
+    assert _call_site_argument_identity_mismatch(original, replacements) == set()
+
+
+def test_call_site_argument_identity_mismatch_empty_inputs():
+    assert _call_site_argument_identity_mismatch([], []) == set()
+
+
+# ---------------------------------------------------------------------------
+# Integration: dropped-escaping-var-capture guard (Check 15)
+# ---------------------------------------------------------------------------
+
+_ESCAPE_CAPTURE_DUP_SOURCE = textwrap.dedent(
+    """\
+    def retry_a():
+        x = compute(a)
+        y = transform(x)
+        _rl_delay *= 2
+        if _rl_delay is not None:
+            wait(_rl_delay)
+
+    def retry_b():
+        x = compute(a)
+        y = transform(x)
+        _rl_delay *= 2
+        log(_rl_delay)
+    """
+)
+_ESCAPE_CAPTURE_DUP_RANGES = [(9, 11)]  # overlaps retry_b's duplicate block
+
+
+def _make_escape_capture_dropped_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            "helper_source": (
+                "def _helper(a, delay):\n"
+                "    x = compute(a)\n"
+                "    y = transform(x)\n"
+                "    return delay * 2\n"
+            ),
+            "call_site_replacements": [
+                "    _rl_delay = _helper(a, _rl_delay)\n",
+                "    _helper(a, _rl_delay)\n",  # drops the reassignment
+            ],
+        }
+    )
+
+
+def _make_escape_capture_preserved_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_helper",
+            "placement": "module_level",
+            "helper_source": (
+                "def _helper(a, delay):\n"
+                "    x = compute(a)\n"
+                "    y = transform(x)\n"
+                "    return delay * 2\n"
+            ),
+            "call_site_replacements": [
+                "    _rl_delay = _helper(a, _rl_delay)\n",
+                "    _rl_delay = _helper(a, _rl_delay)\n",
+            ],
+        }
+    )
+
+
+def test_dropped_escaping_var_capture_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when a call site drops the reassignment of an
+    escaping variable its own original block assigned."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_escape_capture_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _ESCAPE_CAPTURE_DUP_RANGES,
+            source=_ESCAPE_CAPTURE_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert (
+        "replacement drops the reassignment of escaping variable(s)"
+        in capsys.readouterr().err
+    )
+
+
+def test_dropped_escaping_var_capture_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_escape_capture_dropped_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _ESCAPE_CAPTURE_DUP_RANGES,
+            source=_ESCAPE_CAPTURE_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+def test_escaping_var_capture_preserved_not_flagged(monkeypatch):
+    """Both call sites capture the return value -- unaffected by the check."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_escape_capture_preserved_extract_response(),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _ESCAPE_CAPTURE_DUP_RANGES,
+            source=_ESCAPE_CAPTURE_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is not None
+    assert de._new_source.count("_rl_delay = _helper(a, _rl_delay)") == 2
+
+
+# ---------------------------------------------------------------------------
+# Integration: call-site argument identity mismatch guard (Check 16)
+# ---------------------------------------------------------------------------
+
+_CROSSED_ARGS_DUP_SOURCE = textwrap.dedent(
+    """\
+    trial_deps = {}
+    candidate = "a"
+    file_deps = {}
+    chosen = "b"
+
+    def trial_step():
+        trial_deps[candidate] = None
+        depth = topo_depth(trial_deps, candidate)
+        depth += 1
+        if depth > 0:
+            log_trial(depth)
+
+    def apply_step():
+        file_deps[chosen] = None
+        depth = topo_depth(file_deps, chosen)
+        depth += 1
+        log_apply(depth)
+    """
+)
+_CROSSED_ARGS_DUP_RANGES = [(14, 16)]  # overlaps apply_step's duplicate block
+
+
+def _make_crossed_args_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_register",
+            "placement": "module_level",
+            "helper_source": (
+                "def _register(deps, key):\n"
+                "    deps[key] = None\n"
+                "    depth = topo_depth(deps, key)\n"
+                "    return depth + 1\n"
+            ),
+            "call_site_replacements": [
+                # trial_step's call site wired to apply_step's own locals,
+                # and vice versa -- both names still appear *somewhere* in
+                # the combined output (satisfying the broader free-variable
+                # check), just at the wrong call site.
+                "    depth = _register(file_deps, chosen)\n",
+                "    depth = _register(trial_deps, candidate)\n",
+            ],
+        }
+    )
+
+
+def _make_uncrossed_args_extract_response():
+    return _make_extract_response(
+        {
+            "function_name": "_register",
+            "placement": "module_level",
+            "helper_source": (
+                "def _register(deps, key):\n"
+                "    deps[key] = None\n"
+                "    depth = topo_depth(deps, key)\n"
+                "    return depth + 1\n"
+            ),
+            "call_site_replacements": [
+                "    depth = _register(trial_deps, candidate)\n",
+                "    depth = _register(file_deps, chosen)\n",
+            ],
+        }
+    )
+
+
+def test_call_site_argument_identity_mismatch_guard_skips(monkeypatch, capsys):
+    """Extraction rejected when a call site's arguments belong to a
+    different occurrence's original block."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_crossed_args_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _CROSSED_ARGS_DUP_RANGES,
+            source=_CROSSED_ARGS_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+    assert (
+        "call site passes argument(s) crossed from a different occurrence"
+        in capsys.readouterr().err
+    )
+
+
+def test_call_site_argument_identity_mismatch_guard_skips_silent(monkeypatch):
+    """verbose=False: extraction rejected with no stderr output."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_crossed_args_extract_response(),
+        ]
+        de = DuplicateExtractor(
+            _CROSSED_ARGS_DUP_RANGES,
+            source=_CROSSED_ARGS_DUP_SOURCE,
+            verbose=False,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is None
+
+
+def test_call_site_argument_identity_not_crossed_not_flagged(monkeypatch):
+    """Each call site's arguments come from its own block -- unaffected."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic") as mock_anthropic:
+        mock_client = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+        mock_anthropic.APIError = Exception
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True),
+            _make_uncrossed_args_extract_response(),
+            _make_verify_response(True, []),
+        ]
+        de = DuplicateExtractor(
+            _CROSSED_ARGS_DUP_RANGES,
+            source=_CROSSED_ARGS_DUP_SOURCE,
+            extraction_retries=0,
+            llm_verify_retries=0,
+        )
+    assert de._new_source is not None
+    assert "_register(trial_deps, candidate)" in de._new_source
+    assert "_register(file_deps, chosen)" in de._new_source
 
 
 # ---------------------------------------------------------------------------
@@ -5678,6 +8033,76 @@ def test_lift_and_dedup_no_block_imports_inserts_before_first_funcdef():
     )
 
 
+def test_lift_and_dedup_lifts_import_stranded_after_module_constant():
+    # Found live: a new import inserted right before the first def landed
+    # after an intervening module-level constant/dict (not itself a def or
+    # class), so the old "before first_funcdef_idx" check thought it was
+    # already in the block and never lifted it — E402 in the real output.
+    src = (
+        "from typing import Any\n"
+        "\n"
+        "_CONFIG = {'a': 1}\n"
+        "\n"
+        "from collections import OrderedDict\n"  # misplaced — after _CONFIG
+        "def _helper():\n"
+        "    pass\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == (
+        "from typing import Any\n"
+        "from collections import OrderedDict\n"
+        "\n"
+        "_CONFIG = {'a': 1}\n"
+        "\n"
+        "def _helper():\n"
+        "    pass\n"
+    )
+
+
+def test_lift_and_dedup_no_block_imports_inserts_before_module_constant():
+    # No original imports at all, and the file's first statement is a
+    # constant (not a def) — the lifted block belongs at the true top, above
+    # the constant, not merely before the first def further down.
+    src = (
+        "_CONFIG = {'a': 1}\n"
+        "\n"
+        "from collections import OrderedDict\n"  # misplaced
+        "def _helper():\n"
+        "    pass\n"
+    )
+    result = _lift_and_dedup_imports(src)
+    assert result == (
+        "from collections import OrderedDict\n"
+        "_CONFIG = {'a': 1}\n"
+        "\n"
+        "def _helper():\n"
+        "    pass\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _top_import_block_end
+# ---------------------------------------------------------------------------
+
+
+def test_top_import_block_end_skips_docstring_and_imports():
+    src = '"""Module doc."""\nfrom typing import Any\nimport os\nx = 1\n'
+    lines = src.splitlines(keepends=True)
+    assert _top_import_block_end(src, lines) == 3
+
+
+def test_top_import_block_end_no_trailing_statement():
+    src = "from typing import Any\nimport os\n"
+    lines = src.splitlines(keepends=True)
+    assert _top_import_block_end(src, lines) == len(lines)
+
+
+def test_top_import_block_end_syntax_error_falls_back_to_funcdef_idx():
+    src = "def f(:\n"  # invalid syntax
+    lines = src.splitlines(keepends=True)
+    assert _top_import_block_end(src, lines) == _first_funcdef_idx(lines)
+
+
 # ---------------------------------------------------------------------------
 # New behaviour: veto notes, algorithmic retry, LLM verify step
 # ---------------------------------------------------------------------------
@@ -5809,7 +8234,7 @@ def test_extraction_retry_on_alg_failure_silent(monkeypatch):
 
 
 def test_llm_verify_timeout_verbose(monkeypatch, capsys):
-    """Verify times out (verbose=True) -> extraction is accepted and logged."""
+    """Verify times out (verbose=True) -> group is skipped, not accepted."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     from crispen.refactors.duplicate_extractor import _llm_verify_extraction
 
@@ -5835,9 +8260,9 @@ def test_llm_verify_timeout_verbose(monkeypatch, capsys):
     ):
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=True)
 
-    assert de._new_source is not None
+    assert de._new_source is None
     err = capsys.readouterr().err
-    assert "verify timed out" in err
+    assert "API call timed out, skipping group" in err
 
 
 def test_llm_verify_rejects_then_retries_verbose(monkeypatch, capsys):
@@ -5957,7 +8382,7 @@ def test_llm_verify_exhausted_skips_group(monkeypatch):
 
 
 def test_llm_verify_timeout_silent(monkeypatch):
-    """Verify times out (verbose=False) -> extraction is accepted silently."""
+    """Verify times out (verbose=False) -> group is skipped, not accepted."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     from crispen.refactors.duplicate_extractor import _llm_verify_extraction
 
@@ -5983,7 +8408,7 @@ def test_llm_verify_timeout_silent(monkeypatch):
     ):
         de = DuplicateExtractor(_DUP_RANGES, source=_DUP_SOURCE, verbose=False)
 
-    assert de._new_source is not None
+    assert de._new_source is None
 
 
 # ---------------------------------------------------------------------------
@@ -6203,6 +8628,40 @@ def test_llm_verify_extraction_without_timing_out():
     assert issues == []
 
 
+def test_llm_verify_extraction_rejects_when_truncated():
+    """A truncated/empty verify response is treated as unverified, not correct."""
+    from crispen.refactors.duplicate_extractor import _llm_verify_extraction
+
+    client = MagicMock()
+    resp = MagicMock()
+    resp.content = []  # no tool_use block, e.g. response cut off by max_tokens
+    client.messages.create.return_value = resp
+    group = [_make_seq_info(1, 3), _make_seq_info(5, 7)]
+    is_correct, issues = _llm_verify_extraction(
+        client,
+        group,
+        "def _helper(): pass\n",
+        ["    _helper()\n", "    _helper()\n"],
+        "a = 1\nb = 2\n",
+    )
+    assert is_correct is False
+    assert issues
+
+
+def test_verify_tool_requires_call_site_argument_mapping():
+    """The verify tool schema forces the model to produce a per-call-site
+    argument mapping before it can answer is_correct — a prose-only checklist
+    instruction was found not to reliably change model behavior under forced
+    tool_choice, since nothing required the model to engage with it."""
+    from crispen.refactors.duplicate_extractor import _VERIFY_TOOL
+
+    props = _VERIFY_TOOL["input_schema"]["properties"]
+    required = _VERIFY_TOOL["input_schema"]["required"]
+    assert "call_site_argument_mapping" in props
+    assert props["call_site_argument_mapping"]["type"] == "array"
+    assert required.index("call_site_argument_mapping") < required.index("is_correct")
+
+
 def test_func_match_veto_timing_recorded(monkeypatch):
     """When func-match veto accepts, record_llm_call is invoked for the veto call."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
@@ -6400,8 +8859,16 @@ def test_skip_marker_excludes_marked_occurrence_no_llm_call():
     assert de.get_rewritten_source() is None
 
 
-def test_skip_marker_scoped_to_other_refactor_still_forms_group():
+def test_skip_marker_scoped_to_other_refactor_still_forms_group(monkeypatch):
     """A skip marker scoped to a different refactor does not protect this one."""
+    # Relies on no real provider key being available so construction fails
+    # fast at the API-key check, before any network call — delete all of
+    # them explicitly (matches test_engine_propagates_api_error) rather than
+    # assuming the ambient environment happens to lack one.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     source = textwrap.dedent(
         """\
         def foo():

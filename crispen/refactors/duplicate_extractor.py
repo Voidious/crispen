@@ -8,12 +8,14 @@ import sys
 import textwrap
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import libcst as cst
 from libcst.metadata import MetadataWrapper, PositionProvider
 
 from .. import llm_client as _llm_client
+from .. import repo_index as _repo_index
 from ..import_sort import _sort_imports_pep8
 from .base import Refactor
 
@@ -185,6 +187,7 @@ class _SeqInfo:
     source: str
     fingerprint: str
     class_scope: Optional[str] = None  # enclosing class name, or None if module-level
+    filepath: str = ""  # set only for cross-file grouping; "" for the single-file pass
 
 
 @dataclass
@@ -195,6 +198,7 @@ class _FunctionInfo:
     body_source: str  # raw source of the function body (indented)
     body_stmt_count: int  # number of top-level statements in the body
     params: List[str]  # positional parameter names (empty → no-arg function)
+    is_staticmethod: bool = False  # scope != "<module>" and @staticmethod-decorated
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +292,16 @@ class _SequenceCollector(cst.CSTVisitor):
 # ---------------------------------------------------------------------------
 
 
+def _decorator_name(dec: cst.Decorator) -> str:
+    """Return the simple name of a decorator (``@foo`` or ``@mod.foo`` → ``"foo"``)."""
+    expr = dec.decorator
+    if isinstance(expr, cst.Name):
+        return expr.value
+    if isinstance(expr, cst.Attribute):
+        return expr.attr.value
+    return ""
+
+
 class _FunctionCollector(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (PositionProvider,)
 
@@ -314,6 +328,9 @@ class _FunctionCollector(cst.CSTVisitor):
                 body_source = ""
             body_stmt_count = len(node.body.body)
             params = [p.name.value for p in node.params.params]
+            is_staticmethod = any(
+                _decorator_name(d) == "staticmethod" for d in node.decorators
+            )
             self.functions.append(
                 _FunctionInfo(
                     name=node.name.value,
@@ -322,6 +339,7 @@ class _FunctionCollector(cst.CSTVisitor):
                     body_source=body_source,
                     body_stmt_count=body_stmt_count,
                     params=params,
+                    is_staticmethod=is_staticmethod,
                 )
             )
         self._scope_stack.append(node.name.value)
@@ -386,6 +404,123 @@ def _build_function_body_fps(
 
 
 # ---------------------------------------------------------------------------
+# Repo-wide function fingerprint index
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RepoFunctionInfo:
+    """A repo-wide match-function candidate: a _FunctionInfo plus its module."""
+
+    func: _FunctionInfo
+    module: str  # dotted module path the function is defined in
+
+
+def _build_repo_function_index(
+    index: "_repo_index.RepoIndex",
+) -> Dict[str, List[_RepoFunctionInfo]]:
+    """Fingerprint every free function and ``@staticmethod`` across the repo.
+
+    Keyed by normalized body fingerprint; a fingerprint may map to more than
+    one function (e.g. identical trivial bodies in unrelated modules), so
+    callers must disambiguate (or skip ambiguous fingerprints).
+
+    Instance and class methods are excluded: matching a code block to one
+    would require knowing an instance of the enclosing class is in scope at
+    the call site, which needs real type information this pass doesn't have.
+    A ``@staticmethod`` needs no such instance, so it's safe to include.
+    """
+    fps: Dict[str, List[_RepoFunctionInfo]] = {}
+    for module, source in index.module_to_source.items():
+        try:
+            tree = cst.parse_module(source)
+        except cst.ParserSyntaxError:
+            continue
+        source_lines = source.splitlines(keepends=True)
+        collector = _FunctionCollector(source_lines)
+        MetadataWrapper(tree).visit(collector)
+        for func in collector.functions:
+            if func.scope != "<module>" and not func.is_staticmethod:
+                continue
+            fp = _normalize_source(func.body_source)
+            fps.setdefault(fp, []).append(_RepoFunctionInfo(func=func, module=module))
+    return fps
+
+
+def _module_level_names(source: str) -> set:
+    """Return every name bound at module level: defs, classes, imports, assignments.
+
+    Used to detect whether calling a repo-wide matched function by its bare
+    name would collide with something already defined in the current file —
+    an import alone can't fix that, so such candidates must be skipped.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                collected: List[str] = []
+                _collect_ast_store_names(target, collected)
+                names.update(collected)
+    return names
+
+
+def _target_import_is_proven_safe(
+    current_module: Optional[str],
+    target_module: str,
+    index: "_repo_index.RepoIndex",
+) -> bool:
+    """Return True if importing from *target_module* is not a brand-new
+    package-level dependency for the file that owns *current_module*.
+
+    "Proven safe" means one of:
+    - *target_module* shares its top-level package with *current_module*
+      (no new package dependency at all), or
+    - the current file already imports something from the target's
+      top-level package, or
+    - some other module already in the current file's top-level package
+      already imports the target's top-level package.
+
+    Any of these shows the package-to-package dependency edge already
+    exists somewhere, so adding one more import within it can't be
+    introducing new (possibly circular) coupling between packages that
+    didn't already talk to each other. Returns False (never safe) when
+    *current_module* is unknown, e.g. the file isn't under the repo root.
+    """
+    if current_module is None or current_module == target_module:
+        return False
+    target_top = target_module.split(".")[0]
+    current_top = current_module.split(".")[0]
+    if current_top == target_top:
+        return True
+    if any(
+        mod.split(".")[0] == target_top
+        for mod, _ in index.get_imports(current_module).values()
+    ):
+        return True
+    for module in index.module_to_source:
+        if module == current_module or module.split(".")[0] != current_top:
+            continue
+        if any(
+            mod.split(".")[0] == target_top
+            for mod, _ in index.get_imports(module).values()
+        ):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Duplicate group finding
 # ---------------------------------------------------------------------------
 
@@ -401,41 +536,52 @@ def _filter_maximal_groups(groups: List[List[_SeqInfo]]) -> List[List[_SeqInfo]]
     """Return only maximal groups, discarding those overlapping a larger group.
 
     Groups are sorted by their longest sequence (descending) and greedily selected:
-    a group is kept only if none of its sequences overlap an already-claimed line range.
-    This prevents multiple helpers being extracted for overlapping spans, where the
-    smaller extractions would end up unused after the larger one is applied.
+    a group is kept only if none of its sequences overlap an already-claimed line
+    range *in the same file*. Filepath is part of the comparison so cross-file
+    groups (whose sequences have real, distinct filepaths) are compared correctly;
+    the single-file pass leaves every seq.filepath at "" so this is equivalent to
+    the old line-only comparison there. This prevents multiple helpers being
+    extracted for overlapping spans, where the smaller extractions would end up
+    unused after the larger one is applied.
     """
     sorted_groups = sorted(
         groups,
         key=lambda g: max(s.end_line - s.start_line for s in g),
         reverse=True,
     )
-    claimed: List[Tuple[int, int]] = []
+    claimed: List[Tuple[str, int, int]] = []
     result = []
     for group in sorted_groups:
         overlaps = any(
-            seq.start_line <= c_end and seq.end_line >= c_start
+            seq.filepath == c_file
+            and seq.start_line <= c_end
+            and seq.end_line >= c_start
             for seq in group
-            for c_start, c_end in claimed
+            for c_file, c_start, c_end in claimed
         )
         if not overlaps:
             result.append(group)
             for seq in group:
-                claimed.append((seq.start_line, seq.end_line))
+                claimed.append((seq.filepath, seq.start_line, seq.end_line))
     return result
 
 
 def _has_internal_overlap(seqs: List[_SeqInfo]) -> bool:
-    """Return True if any two sequences in the group overlap each other.
+    """Return True if any two sequences in the group overlap each other *in the
+    same file*.
 
     Overlapping sequences within a group indicate sequential repetition
     (e.g. [A,B] and [B,C] both matching) rather than true duplication at
     distinct call sites.  Extracting a helper from such a group would leave
-    part of the original pattern unreplaced.
+    part of the original pattern unreplaced. Sorting by (filepath, start_line)
+    groups same-file sequences together so only adjacent, same-file pairs need
+    checking; the single-file pass leaves every seq.filepath at "" so this is
+    equivalent to the old start_line-only sort there.
     """
-    sorted_seqs = sorted(seqs, key=lambda s: s.start_line)
+    sorted_seqs = sorted(seqs, key=lambda s: (s.filepath, s.start_line))
     for i in range(len(sorted_seqs) - 1):
-        if sorted_seqs[i].end_line >= sorted_seqs[i + 1].start_line:
+        a, b = sorted_seqs[i], sorted_seqs[i + 1]
+        if a.filepath == b.filepath and a.end_line >= b.start_line:
             return True
     return False
 
@@ -459,6 +605,96 @@ def _find_duplicate_groups(
         groups.append(seqs)
     groups = _filter_maximal_groups(groups)
     return groups[:max_groups]
+
+
+def _find_cross_file_duplicate_groups(
+    sequences: List[_SeqInfo],
+    changed_ranges_by_file: Dict[str, List[Tuple[int, int]]],
+    max_groups: int = 5,
+) -> List[List[_SeqInfo]]:
+    """Like :func:`_find_duplicate_groups`, but across every file in the diff.
+
+    *sequences* must have a real ``seq.filepath`` set on each entry (unlike the
+    single-file pass, which leaves it at the "" default) — callers collect
+    sequences from every changed file and tag each with its origin path before
+    calling this.
+
+    Only returns groups whose occurrences span 2+ *distinct* files. A
+    same-file-only duplicate is already found and handled by the existing
+    per-file :class:`DuplicateExtractor` pass, so counting it here too would
+    just be redundant, more expensive (cross-file extraction needs its own
+    placement + multi-file transaction), work for no benefit.
+    """
+    by_fp: Dict[str, List[_SeqInfo]] = {}
+    for seq in sequences:
+        by_fp.setdefault(seq.fingerprint, []).append(seq)
+    groups = []
+    for seqs in by_fp.values():
+        if len(seqs) < 2:
+            continue
+        if len({s.filepath for s in seqs}) < 2:
+            continue
+        if not any(
+            _overlaps_diff(s, changed_ranges_by_file.get(s.filepath, [])) for s in seqs
+        ):
+            continue
+        if _has_internal_overlap(seqs):
+            continue
+        groups.append(seqs)
+    groups = _filter_maximal_groups(groups)
+    return groups[:max_groups]
+
+
+# ---------------------------------------------------------------------------
+# Cross-file helper placement
+# ---------------------------------------------------------------------------
+
+
+def _common_ancestor_dir(dirs: List[Path]) -> Path:
+    """Return the deepest directory that is an ancestor of (or equal to) every
+    directory in *dirs*, compared by path parts (never by string prefix, which
+    could false-match on partial directory-name overlaps)."""
+    parts_lists = [d.parts for d in dirs]
+    common: List[str] = []
+    for parts in zip(*parts_lists):
+        if len(set(parts)) != 1:
+            break
+        common.append(parts[0])
+    return Path(*common)
+
+
+def _cross_file_helper_target(
+    file_paths: List[str], repo_root: str, module_name: str
+) -> Tuple[Path, str]:
+    """Return ``(target_file, dotted_import_path)`` for a cross-file helper
+    shared by every file in *file_paths*.
+
+    Places it at ``<common-ancestor-dir>/<module_name>.py`` — the common
+    ancestor package of every call site — so importing it from any call site
+    can never be circular: an ancestor package never depends on its own
+    descendants. ``module_name`` is deliberately boring/configurable
+    (``cross_file_helper_module`` in config, default ``"common"``) rather
+    than LLM-chosen; see the 0.8.0-b plan for why placement stays mechanical
+    in v1.
+
+    If a package directory of that name already exists alongside the target
+    (e.g. ``tools/common/`` already exists as a package when placing at
+    ``tools/``), a same-named ``<module_name>.py`` module would be shadowed
+    by the package on import — Python's file finder resolves the package
+    first, silently making the new module's definitions unreachable via its
+    dotted path. In that case, an underscore is appended to ``module_name``
+    (repeating until clear) so the target never collides with an existing
+    package.
+    """
+    dirs = [Path(fp).resolve().parent for fp in file_paths]
+    common_dir = _common_ancestor_dir(dirs)
+    while (common_dir / module_name).is_dir():
+        module_name = f"{module_name}_"
+    target_file = common_dir / f"{module_name}.py"
+    dotted_module, _ = _repo_index.file_to_module_and_package(
+        target_file, Path(repo_root).resolve()
+    )
+    return target_file, dotted_module
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +736,25 @@ _VERIFY_TOOL: dict = {
     "input_schema": {
         "type": "object",
         "properties": {
+            "call_site_argument_mapping": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Required scratch work, one entry per call site, filled in "
+                    "before deciding is_correct. For each call site, write: the "
+                    "original block's local variables (by name) that fed the "
+                    "duplicated logic at that specific location, then the "
+                    "proposed argument(s) passed to the helper at that same call "
+                    "site, e.g. 'call site 1: original (candidate, trial_deps) "
+                    "-> proposed (chosen, file_deps) — MISMATCH' or 'call site 2: "
+                    "original (target, homes) -> proposed (target, homes) — "
+                    "match'. This is the single most common way extractions "
+                    "break when a helper has 2+ call sites: a plausible-looking "
+                    "argument tuple assembled by crossing one call site's "
+                    "variable with another call site's variable. Do this for "
+                    "every call site individually before setting is_correct."
+                ),
+            },
             "is_correct": {
                 "type": "boolean",
                 "description": (
@@ -515,7 +770,7 @@ _VERIFY_TOOL: dict = {
                 ),
             },
         },
-        "required": ["is_correct", "issues"],
+        "required": ["call_site_argument_mapping", "is_correct", "issues"],
     },
 }
 
@@ -588,14 +843,27 @@ def _llm_veto(
     rate_limit_retries: int = 6,
     rate_limit_backoff: float = 20.0,
 ) -> Tuple[bool, str, str]:
+    # Groups from the cross-file pass have a real seq.filepath on every entry;
+    # the single-file pass leaves it at "" for all of them.
+    cross_file = len({s.filepath for s in group}) > 1
+
+    def _block_header(i: int, s: _SeqInfo) -> str:
+        loc = f"lines {s.start_line}-{s.end_line}"
+        if cross_file:
+            return f"Block {i + 1} (file: {s.filepath}, scope: {s.scope}, {loc}):\n"
+        return f"Block {i + 1} (scope: {s.scope}, {loc}):\n"
+
     blocks_text = "\n\n".join(
-        f"Block {i + 1} (scope: {s.scope}, lines {s.start_line}-{s.end_line}):\n"
-        f"```python\n{s.source.rstrip()}\n```"
+        _block_header(i, s) + f"```python\n{s.source.rstrip()}\n```"
         for i, s in enumerate(group)
     )
+    source_desc = (
+        f"{len(group)} structurally similar code blocks from different files"
+        if cross_file
+        else f"{len(group)} structurally similar code blocks from the same Python file"
+    )
     prompt = (
-        f"Here are {len(group)} structurally similar code blocks from the same "
-        f"Python file:\n\n{blocks_text}\n\n"
+        f"Here are {source_desc}:\n\n{blocks_text}\n\n"
         "Do these blocks represent the same semantic operation such that extracting "
         "a shared helper function would improve clarity? Or are they coincidentally "
         "similar but conceptually distinct?\n\n"
@@ -608,7 +876,7 @@ def _llm_veto(
         client,
         provider,
         model,
-        384,
+        2048,
         _VETO_TOOL,
         "evaluate_duplicate",
         [{"role": "user", "content": prompt}],
@@ -626,6 +894,67 @@ def _llm_veto(
             result.tool_input.get("extraction_notes", ""),
         )
     return False, "no tool response", ""  # pragma: no cover
+
+
+def _group_ends_in_return(group: List[_SeqInfo]) -> bool:
+    """Return True if every sequence in *group* ends with a `return` statement.
+
+    A block shaped like this needs no escaping-variable handling at all — the
+    correct call site replacement is simply ``return <helper_call>(...)``. Left
+    unflagged, extraction prompts have no guidance for this shape and models
+    have been observed dropping the `return` at some (but not all) call sites,
+    silently turning the function into one that falls through to `None`.
+    """
+    for seq in group:
+        dedented = textwrap.dedent(seq.source)
+        wrapped = "def _check():\n" + textwrap.indent(dedented, "    ")
+        try:
+            tree = ast.parse(wrapped)
+        except SyntaxError:
+            return False
+        func_body = tree.body[0].body  # type: ignore[attr-defined]
+        if not func_body or not isinstance(func_body[-1], ast.Return):
+            return False
+    return True
+
+
+def _directive_comment_note(group: List[_SeqInfo]) -> str:
+    """Return an extraction-prompt note when any block in *group* carries a
+    linter/coverage directive comment, else "".
+
+    Found by a live self-check run: a block guarded by e.g.
+    ``# pragma: no cover`` got merged into a shared helper whose call sites
+    became reachable through more than one original condition. The extraction
+    kept the comment text at the call site, but the line it actually still
+    described (never exercised by any test) had moved to a different line
+    inside the new helper, which had no comment at all -- a real coverage
+    regression that every test still passed. The comment describes a
+    *reachability* property of one specific line, not decoration to be copied
+    onto whatever the original statement textually becomes.
+    """
+    kinds: set = set()
+    for s in group:
+        kinds |= _directive_comments(s.source)
+    if not kinds:
+        return ""
+    kinds_str = ", ".join(sorted(kinds))
+    return (
+        f"\n\nOne or more of the duplicate blocks carries a linter/coverage "
+        f"directive comment ({kinds_str}). This suppresses a real tool warning "
+        f"because of a property of that exact line -- e.g. `# pragma: no cover` "
+        f"means that line is never exercised by any test. That property "
+        f"belongs to the line's reachability, not to its text, so copying the "
+        f"comment onto whatever line the original statement maps to is not "
+        f"enough if the extraction changes reachability. This commonly happens "
+        f"when several call sites' guard conditions get merged into one shared "
+        f"helper: a line that was previously reached only under the guarded "
+        f"condition can become reachable through a different call site's "
+        f"condition once both paths return through the same helper call. Trace "
+        f"each guarded line's condition through the extraction and place the "
+        f"comment on whichever line in the new code is still actually true of "
+        f"that property -- which may end up inside the helper rather than at "
+        f"the call site, or vice versa."
+    )
 
 
 def _llm_extract(
@@ -670,8 +999,19 @@ def _llm_extract(
             f"\n\nThe following variables are assigned within the duplicate block "
             f"and referenced by code that immediately follows the block at one or "
             f"more call sites: {vars_str}. The helper function must return these "
-            f"variables. At call sites where the return value is needed, capture it; "
-            f"at call sites where it is not needed, discard the return value."
+            f"variables. Every call site replacement that needs the returned "
+            f"value(s) MUST begin with the capturing assignment or `return` — "
+            f"check this individually for each call site, including ones later "
+            f"in the list, not just the first. At call sites where the return "
+            f"value is not needed, discard it."
+        )
+    return_note = ""
+    if _group_ends_in_return(group):
+        return_note = (
+            "\n\nEach duplicate block's own last statement is `return <expr>` "
+            "— the call site replacement for every occurrence must be "
+            "`return <helper_call>(...)`, never a bare call that silently "
+            "drops the return value."
         )
     used_names_note = ""
     if used_names:
@@ -686,6 +1026,7 @@ def _llm_extract(
         if helper_docstrings
         else "\n\nDo not include a docstring in the helper function."
     )
+    directive_note = _directive_comment_note(group)
     veto_notes_note = ""
     if veto_notes:
         veto_notes_note = (
@@ -703,7 +1044,9 @@ def _llm_extract(
             f"helper_source:\n```python\n{prior_helper}```\n\n"
             f"call_site_replacements:\n{repls_text}\n\n"
             f"But failed these checks:\n{failures_str}\n\n"
-            f"Please correct these issues in your new attempt."
+            f"Before responding, check EVERY call site replacement individually "
+            f"against these issues — a fix that only corrects the first call "
+            f"site and leaves a later one with the same mistake will fail again."
         )
     class_scopes = {s.class_scope for s in group}
     all_same_class = len(class_scopes) == 1 and None not in class_scopes
@@ -739,8 +1082,10 @@ def _llm_extract(
         "`is` — `is` only gives correct results for singletons like `None`, `True`, "
         "and `False`, not for constructed objects like `set()`."
         f"{escaping_note}"
+        f"{return_note}"
         f"{used_names_note}"
         f"{docstring_note}"
+        f"{directive_note}"
         f"{veto_notes_note}"
         f"{failures_note}"
     )
@@ -748,7 +1093,7 @@ def _llm_extract(
         client,
         provider,
         model,
-        1024,
+        5000,
         _EXTRACT_TOOL,
         "extract_helper",
         [{"role": "user", "content": prompt}],
@@ -792,7 +1137,7 @@ def _llm_veto_func_match(
         client,
         provider,
         model,
-        256,
+        2048,
         _VETO_TOOL,
         "evaluate_duplicate",
         [{"role": "user", "content": prompt}],
@@ -848,7 +1193,7 @@ def _llm_generate_call(
         client,
         provider,
         model,
-        256,
+        2048,
         _CALL_GEN_TOOL,
         "generate_call",
         [{"role": "user", "content": prompt}],
@@ -862,6 +1207,55 @@ def _llm_generate_call(
     if result.tool_input is not None:
         return result.tool_input["replacement"]
     return None  # pragma: no cover
+
+
+_VERIFY_CHECKLIST = (
+    "Check each of the following:\n"
+    "1. Every variable read (but not locally assigned) in the original block "
+    "is passed as a parameter to the helper\n"
+    "2. Every variable assigned in the original block and used afterward is "
+    "returned by the helper and captured at the call site\n"
+    "3. No parameter is assigned before it is first read in the helper body\n"
+    "4. If the original block ends with a non-None return, the call site "
+    "replacement also propagates that return value\n"
+    "5. The call site replacements match the original indentation and cover "
+    "exactly the lines of the original block\n"
+    "6. If the helper is called more than once with different arguments, verify "
+    "each call site against the exact local variables that appeared in the "
+    "original code at that location — not merely variables of the same type. "
+    "Same-type variables (e.g. two dicts, two strings) that are both in scope "
+    "are a swap risk: confirm neither was substituted for the other across call "
+    "sites. This applies per-argument AND per-pair: when a helper takes two or "
+    "more parameters, do not just check that each individual argument's type "
+    "matches — check that the entire tuple of arguments at call site A is the "
+    "exact tuple that appeared together in call site A's original block, not "
+    "a tuple assembled by mixing one argument from site A with another from "
+    "site B. Write out each call site's original variables and its proposed "
+    "arguments side by side, in order, before deciding whether they match — "
+    "a plausible-looking but crossed pairing (e.g. call site A getting call "
+    "site B's target/collection pair, and vice versa) is the single most "
+    "common failure mode here, and it will not look wrong at a glance since "
+    "every individual argument still has the right type.\n"
+    "7. No line from the helper body is duplicated verbatim in the call site "
+    "replacement. If setup lines were extracted into the helper, they must not "
+    "also appear before or after the call — otherwise the extraction is wrong.\n"
+    "8. Does the function name clearly and accurately describe what the body "
+    "does? Flag the name if it is misleading, too generic, or omits a crucial "
+    "detail — for example, an important side-effect that the name gives no hint "
+    "of (e.g. a function named 'compute_total' that also writes to a database).\n"
+    "9. If an original block carries a linter/coverage directive comment "
+    "(`# pragma: no cover`, `# noqa`, `# type: ignore`, `# fmt: skip`, "
+    "`# pylint: disable`, etc.), don't just check that the same comment text "
+    "appears somewhere in the output — check that it is still attached to "
+    "whichever line is actually true of the property it asserts (e.g. still "
+    "genuinely unreachable in tests). When several call sites' guard "
+    "conditions are merged into one shared helper branch, the line that needs "
+    "the comment can move (often into the helper), while a copy left behind "
+    "at a call site may now be reachable through a different, unrelated path "
+    "and no longer need it.\n"
+    "If correct, set is_correct=True and issues=[]. "
+    "Otherwise set is_correct=False and list each specific issue."
+)
 
 
 def _llm_verify_extraction(
@@ -880,8 +1274,9 @@ def _llm_verify_extraction(
     """Ask the LLM to verify the extraction is semantically correct.
 
     Returns ``(is_correct, issues)`` where *issues* is a list of specific
-    problems found.  Returns ``(True, [])`` if the call times out or the LLM
-    cannot respond, so a verification failure never silently blocks commits.
+    problems found.  Returns ``(False, [...])`` if the call is truncated or
+    the LLM otherwise fails to respond with a tool call — an extraction that
+    cannot be positively verified is treated as unverified, not correct.
     """
     blocks_text = "\n\n".join(
         f"Original block {i + 1} (scope: {s.scope}, "
@@ -907,37 +1302,13 @@ def _llm_verify_extraction(
         f"Call site replacements:\n{replacements_text}\n\n"
         f"Source context around duplicate blocks "
         f"(lines {window_start + 1}–{window_end}):\n```python\n{snippet}\n```\n\n"
-        "Check each of the following:\n"
-        "1. Every variable read (but not locally assigned) in the original block "
-        "is passed as a parameter to the helper\n"
-        "2. Every variable assigned in the original block and used afterward is "
-        "returned by the helper and captured at the call site\n"
-        "3. No parameter is assigned before it is first read in the helper body\n"
-        "4. If the original block ends with a non-None return, the call site "
-        "replacement also propagates that return value\n"
-        "5. The call site replacements match the original indentation and cover "
-        "exactly the lines of the original block\n"
-        "6. If the helper is called more than once with different arguments, verify "
-        "each call site against the exact local variables that appeared in the "
-        "original code at that location — not merely variables of the same type. "
-        "Same-type variables (e.g. two dicts, two strings) that are both in scope "
-        "are a swap risk: confirm neither was substituted for the other across call "
-        "sites.\n"
-        "7. No line from the helper body is duplicated verbatim in the call site "
-        "replacement. If setup lines were extracted into the helper, they must not "
-        "also appear before or after the call — otherwise the extraction is wrong.\n"
-        "8. Does the function name clearly and accurately describe what the body "
-        "does? Flag the name if it is misleading, too generic, or omits a crucial "
-        "detail — for example, an important side-effect that the name gives no hint "
-        "of (e.g. a function named 'compute_total' that also writes to a database).\n"
-        "If correct, set is_correct=True and issues=[]. "
-        "Otherwise set is_correct=False and list each specific issue."
+        f"{_VERIFY_CHECKLIST}"
     )
     result = _llm_client.call_with_tool(
         client,
         provider,
         model,
-        512,
+        4096,
         _VERIFY_TOOL,
         "verify_extraction",
         [{"role": "user", "content": prompt}],
@@ -949,7 +1320,9 @@ def _llm_verify_extraction(
     if _timing_out is not None:
         _timing_out.append(result)
     if result.tool_input is None:
-        return True, []  # pragma: no cover
+        return False, [
+            "Verification response was truncated or empty — treating as unverified."
+        ]
     return result.tool_input["is_correct"], result.tool_input.get("issues", [])
 
 
@@ -1356,6 +1729,73 @@ def _pyflakes_new_undefined_names(original: str, candidate: str) -> set:
     return after.names - before.names
 
 
+def _pyflakes_strip_newly_unused_imports(original: str, candidate: str) -> str:
+    """Remove imports that became unused because of the edit.
+
+    Cross-file extraction can move the only use of an import (e.g. a helper
+    that called ``threading.Thread``) out of a file entirely, leaving the
+    ``import`` statement dead. Compares pyflakes ``UnusedImport`` (F401)
+    diagnostics before and after the edit — same diff pattern already used
+    for undefined names — and only removes an ``import``/``from ... import``
+    statement when *every* name it binds is newly unused, never one that was
+    already unused (or only partially unused) before the edit.
+    """
+    import pyflakes.api
+    import pyflakes.messages
+
+    class _Collector:
+        def __init__(self):
+            self.names: set = set()
+
+        def unexpectedError(self, filename, msg):  # pragma: no cover
+            pass
+
+        def syntaxError(self, filename, msg, lineno, offset, text):  # pragma: no cover
+            pass
+
+        def flake(self, msg):
+            if isinstance(msg, pyflakes.messages.UnusedImport):
+                self.names.add(msg.message_args[0])
+
+    before = _Collector()
+    pyflakes.api.check(original, "<original>", reporter=before)
+    after = _Collector()
+    pyflakes.api.check(candidate, "<candidate>", reporter=after)
+    newly_unused = after.names - before.names
+    if not newly_unused:
+        return candidate
+
+    try:
+        tree = ast.parse(candidate)
+    except SyntaxError:  # pragma: no cover
+        return candidate  # pragma: no cover
+
+    lines_to_remove: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            fullnames = [a.asname or a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            fullnames = [f"{module}.{a.asname or a.name}" for a in node.names]
+        else:
+            continue
+        if fullnames and set(fullnames).issubset(newly_unused):
+            lines_to_remove.update(range(node.lineno, node.end_lineno + 1))
+
+    if not lines_to_remove:
+        return candidate
+
+    lines = candidate.splitlines(keepends=True)
+    cleaned = "".join(
+        line for i, line in enumerate(lines, 1) if i not in lines_to_remove
+    )
+    try:
+        compile(cleaned, "<stripped>", "exec")
+    except SyntaxError:
+        return candidate
+    return cleaned
+
+
 def _is_pure_literal(node: ast.expr) -> bool:
     """Return True if *node* is a side-effect-free literal expression.
 
@@ -1375,26 +1815,36 @@ def _is_pure_literal(node: ast.expr) -> bool:
     return False
 
 
-def _names_in_edit_texts(extraction_groups) -> set:
-    """Return all bare ``Name`` ids found in every edit text of *extraction_groups*.
+def _names_in_edit_texts(extraction_groups, source: str = "") -> set:
+    """Return all bare ``Name`` ids touched by every edit in *extraction_groups*.
 
     ``extraction_groups`` is the list of ``(func_name, group_edits, msg)``
     tuples accepted at the end of ``DuplicateExtractor._transform``.  Each
     ``group_edits`` entry is a ``(start, end, text)`` triple; *text* may be
     the helper function source or a call-site replacement.  Collecting names
-    from all of them gives the set of variables that the extraction actually
-    touched.
+    from the replacement text alone misses variables that a replaced block
+    used to read but which no longer appear anywhere in the new text (e.g. a
+    setup line just outside the matched duplicate range that only existed to
+    feed the block being replaced) — those become newly dead but never look
+    "touched" by the edit.  Passing *source* also collects names from the
+    *original* text at each edit's range so such variables are still allowed
+    to be swept as newly-unused.
     """
     names: set = set()
+    source_lines = source.splitlines(keepends=True) if source else []
     for _, g_edits, _ in extraction_groups:
-        for _start, _end, text in g_edits:
-            try:
-                tree = ast.parse(text)
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Name):
-                    names.add(node.id)
+        for start, end, text in g_edits:
+            texts = [text]
+            if source_lines:
+                texts.append("".join(source_lines[start:end]))
+            for t in texts:
+                try:
+                    tree = ast.parse(textwrap.dedent(t))
+                except SyntaxError:
+                    continue
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Name):
+                        names.add(node.id)
     return names
 
 
@@ -1711,36 +2161,491 @@ def _helper_imports_local_name(helper_source: str, original_source: str) -> bool
     return bool(new_helper_imports & orig_params)
 
 
+def _helper_reimports_module_level_name(
+    helper_source: str, original_source: str
+) -> set:
+    """Return names the helper re-imports that are already module-level imports.
+
+    A local ``import``/``from X import Y`` inside the helper that duplicates a
+    name already imported at the top level of the original file always
+    re-binds to the live target at call time. That silently bypasses
+    ``mock.patch`` on the *referencing* module's attribute (the usual way
+    tests patch a name imported via ``from X import Y``) instead of raising
+    an error -- a real, previously-shipped bug where an extracted helper's
+    redundant local import made LLM-call tests silently stop hitting their
+    mock. There is no legitimate reason to re-import a name locally that the
+    module already imported successfully at top level (that rules out the
+    usual circular-import justification for a deferred import).
+    """
+    try:
+        helper_tree = ast.parse(textwrap.dedent(helper_source))
+    except SyntaxError:
+        return set()
+
+    helper_imports: set = set()
+    for node in ast.walk(helper_tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name.split(".")[0]
+                helper_imports.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name
+                helper_imports.add(name)
+
+    if not helper_imports:
+        return set()
+
+    try:
+        orig_tree = ast.parse(original_source)
+    except SyntaxError:
+        return set()
+
+    orig_top_imports: set = set()
+    for node in orig_tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name.split(".")[0]
+                orig_top_imports.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name
+                orig_top_imports.add(name)
+
+    return helper_imports & orig_top_imports
+
+
+def _helper_defines_class_colliding_with_origin(
+    helper_source: str, file_sources: Dict[str, str]
+) -> set:
+    """Return class names the helper defines that collide with a same-named
+    module-level class already defined in one of the origin files.
+
+    Cross-file extraction places the helper in a brand-new shared module. If
+    the helper defines its own class (most often an exception type) with the
+    same name as a class an origin file already defines at module level,
+    that produces two distinct class objects that merely share a name.
+    Classes/exceptions match by identity, not name -- if an origin file
+    still has an ``except <Name>:`` (or any other reference to its own,
+    pre-existing class) surviving outside the extracted block, it silently
+    stops matching whatever the shared helper raises/returns. There is no
+    legitimate reason for a new shared helper to define a second,
+    independent class an origin file already owns -- the correct fix is
+    always to import the existing class rather than redefine it.
+    """
+    try:
+        helper_tree = ast.parse(textwrap.dedent(helper_source))
+    except SyntaxError:
+        return set()
+
+    helper_classes = {
+        node.name for node in helper_tree.body if isinstance(node, ast.ClassDef)
+    }
+    if not helper_classes:
+        return set()
+
+    colliding: set = set()
+    for source in file_sources.values():
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        origin_classes = {
+            node.name for node in tree.body if isinstance(node, ast.ClassDef)
+        }
+        colliding |= helper_classes & origin_classes
+
+    return colliding
+
+
+def _helper_imports_class_orphaning_sibling_origin(
+    helper_source: str, file_sources: Dict[str, str], repo_root: str
+) -> set:
+    """Return class names the helper imports from one origin file that
+    collide with a same-named, but separately defined, module-level class
+    still owned by a *different* origin file.
+
+    The previous check (:func:`_helper_defines_class_colliding_with_origin`)
+    catches a helper that *defines* its own class colliding with an origin's
+    class -- the correct fix is to import the origin's existing class
+    instead of redefining it. But when the extracted block also existed in
+    a *different* origin file that defines its own, separate, same-named
+    class (e.g. two files each with their own private exception type for
+    the same purpose), importing only one of them into the shared helper
+    leaves the other origin file's own class orphaned: the assembled helper
+    now raises/returns the imported class, but the other origin file's
+    un-extracted code (e.g. its own ``except OwnClass:``) still expects its
+    own distinct class object. Classes/exceptions match by identity, not
+    name, so that silently stops matching -- same underlying hazard as the
+    define-collision case, just reached by importing instead of defining.
+    """
+    try:
+        helper_tree = ast.parse(textwrap.dedent(helper_source))
+    except SyntaxError:
+        return set()
+
+    imported: List[Tuple[str, str]] = []
+    for node in helper_tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            for alias in node.names:
+                local_name = alias.asname if alias.asname else alias.name
+                imported.append((local_name, node.module))
+    if not imported:
+        return set()
+
+    try:
+        root = Path(repo_root).resolve()
+    except (OSError, ValueError):  # pragma: no cover
+        return set()
+
+    module_classes: Dict[str, set] = {}
+    for fp, source in file_sources.items():
+        try:
+            dotted, _ = _repo_index.file_to_module_and_package(Path(fp).resolve(), root)
+        except ValueError:  # pragma: no cover
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        module_classes[dotted] = {
+            node.name for node in tree.body if isinstance(node, ast.ClassDef)
+        }
+
+    colliding: set = set()
+    for class_name, src_module in imported:
+        for dotted, classes in module_classes.items():
+            if dotted != src_module and class_name in classes:
+                colliding.add(class_name)
+
+    return colliding
+
+
+_DIRECTIVE_COMMENT_RE = re.compile(
+    r"#\s*("
+    r"pragma:\s*no\s*(?:cover|branch)"
+    r"|noqa"
+    r"|type:\s*ignore"
+    r"|fmt:\s*(?:skip|off|on)"
+    r"|pylint:\s*(?:disable|enable)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _directive_comments(source: str) -> set:
+    """Return the set of linter/formatter/coverage directive comments
+    (``# pragma: no cover``, ``# noqa``, ``# type: ignore``, ``# fmt: skip``,
+    ``# pylint: disable=...``, etc.) found anywhere in ``source``, normalized
+    to their directive *kind* (case-folded, whitespace-collapsed, specific
+    codes like ``noqa: E501`` or ``type: ignore[arg-type]`` dropped).
+    """
+    found = set()
+    for match in _DIRECTIVE_COMMENT_RE.finditer(source):
+        found.add(re.sub(r"\s+", " ", match.group(1).strip().lower()))
+    return found
+
+
+def _directive_comment_lines(source: str) -> List[Tuple[str, str]]:
+    """Return (code, kind) for each line in ``source`` carrying a directive
+    comment, where ``code`` is that line's code portion (comment and
+    surrounding whitespace stripped) and ``kind`` is the normalized
+    directive kind (see ``_directive_comments``).
+    """
+    pairs = []
+    for line in source.splitlines():
+        match = _DIRECTIVE_COMMENT_RE.search(line)
+        if not match:
+            continue
+        code = line[: match.start()].split("#", 1)[0].strip()
+        kind = re.sub(r"\s+", " ", match.group(1).strip().lower())
+        pairs.append((code, kind))
+    return pairs
+
+
+def _dropped_directive_comments(
+    original_blocks: List[str], helper_source: str, call_replacements: List[str]
+) -> set:
+    """Return directive comments present in the original call-site block(s)
+    that were confidently dropped from the assembled helper + replacements.
+
+    A duplicate block guarded by e.g. ``# pragma: no cover`` or ``# noqa``
+    conveys real intent to a coverage/lint tool. When extraction merges such
+    a line into a shared helper, it's easy for the LLM to keep the guarded
+    code but silently drop the trailing comment -- syntactically invisible
+    (every test still passes) but it reintroduces the exact warning/failure
+    the comment was suppressing.
+
+    Each original directive-commented line is paired with its code (the
+    line's text minus the comment). A drop is only flagged when that exact
+    code line survives verbatim somewhere in the output *without* its
+    comment -- the "LLM kept the code but silently dropped the comment"
+    case this check exists for. Multiple call sites merging into one helper
+    line is a legitimate reduction from N occurrences to 1, so an exact
+    (code, kind) match anywhere in the output also clears it.
+
+    If the guarded code doesn't survive verbatim anywhere (the line was
+    legitimately rewritten -- e.g. folded into a differently-shaped
+    condition or a new statement, as can happen when several call sites'
+    guards merge into one shared branch), there's no reliable way to tell
+    whether the comment still belongs there, so it's not flagged.
+    """
+    originals: List[Tuple[str, str]] = []
+    for block in original_blocks:
+        originals.extend(_directive_comment_lines(block))
+    if not originals:
+        return set()
+
+    output_source = helper_source + "\n" + "\n".join(call_replacements)
+    matched_with_comment = set(_directive_comment_lines(output_source))
+    code_without_comment = {
+        line.split("#", 1)[0].strip() for line in output_source.splitlines()
+    }
+
+    dropped = set()
+    for code, kind in originals:
+        if (code, kind) in matched_with_comment:
+            continue
+        if code and code in code_without_comment:
+            dropped.add(kind)
+    return dropped
+
+
+def _default_param_drops_call_time_global(
+    original_blocks: List[str], helper_source: str, call_replacements: List[str]
+) -> set:
+    """Return helper parameter names whose default value turns a call-time
+    global/stdlib singleton keyword argument (e.g. ``file=sys.stderr``) into
+    a value bound once at function-*definition* time instead of being kept
+    explicit at each call site.
+
+    A default of the form ``module.attr`` is evaluated exactly once, when
+    the ``def`` line runs -- classic Python late-binding. If every original
+    call site passed the same ``name=module.attr`` keyword explicitly (a
+    value meant to be re-read fresh on each call), moving it into the
+    assembled helper's default signature and dropping it from the call
+    sites changes behavior for any caller where the referenced attribute
+    gets reassigned after the helper is defined -- e.g. pytest's ``capsys``
+    fixture replacing ``sys.stderr`` per test, invisible to every other
+    check since the merge is semantically identical in the common case
+    where the global is never reassigned.
+    """
+    try:
+        helper_tree = ast.parse(textwrap.dedent(helper_source))
+    except SyntaxError:
+        return set()
+
+    params_with_defaults: List[Tuple[str, ast.expr]] = []
+    for node in helper_tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        pos_args = node.args.posonlyargs + node.args.args
+        defaults = node.args.defaults
+        if defaults:
+            for arg, default in zip(
+                pos_args[len(pos_args) - len(defaults) :], defaults
+            ):
+                params_with_defaults.append((arg.arg, default))
+        for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            if default is not None:
+                params_with_defaults.append((arg.arg, default))
+
+    flagged: set = set()
+    for pname, default in params_with_defaults:
+        if not (
+            isinstance(default, ast.Attribute) and isinstance(default.value, ast.Name)
+        ):
+            continue
+        default_expr = f"{default.value.id}.{default.attr}"
+        kw_pattern = re.compile(
+            rf"\b{re.escape(pname)}\s*=\s*{re.escape(default_expr)}\b"
+        )
+        if not any(kw_pattern.search(block) for block in original_blocks):
+            continue
+        if any(kw_pattern.search(repl) for repl in call_replacements):
+            continue
+        flagged.add(pname)
+
+    return flagged
+
+
+def _names_referenced_in(block_source: str) -> set:
+    """Return every bare name referenced anywhere in block_source, in any
+    context (assigned or merely read)."""
+    try:
+        tree = ast.parse(textwrap.dedent(block_source))
+    except SyntaxError:
+        return set()
+    return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+
+
+def _dropped_escaping_var_capture(
+    original_blocks: List[str],
+    call_replacements: List[str],
+    escaping_vars_per_occurrence: List[set],
+) -> set:
+    """Return escaping variable names an occurrence's own original block
+    assigned that its replacement no longer assigns anywhere.
+
+    ``escaping_vars_per_occurrence`` (from :func:`_find_escaping_vars_per_seq`,
+    one set per group member, in the same order as *original_blocks*/
+    *call_replacements*) names variables *that specific occurrence's own*
+    block assigns and that subsequent code following *that occurrence*
+    still reads afterward -- the helper is expected to return them so this
+    call site can re-capture the value. Using each occurrence's own
+    escaping set (rather than the group-wide union) matters: two duplicate
+    blocks often assign the same variable name, but only the occurrence(s)
+    where that name is actually read afterward need the assignment
+    preserved -- a sibling occurrence reusing the name is not itself a
+    signal that this occurrence's copy escapes. If a specific occurrence's
+    own original block assigned one of its own escaping names but that
+    occurrence's assembled replacement drops the assignment entirely, the
+    surrounding code that reads the variable afterward now sees a stale
+    value from before the call instead of the freshly computed one --
+    exactly the shape of a caller-side reassignment silently lost when an
+    inline statement became a function call (e.g. ``x = x * 2`` turning into
+    a bare ``helper(x)`` at one call site while a sibling site correctly
+    keeps ``x = helper(x)``).
+    """
+    dropped: set = set()
+    for block, repl, escaping in zip(
+        original_blocks, call_replacements, escaping_vars_per_occurrence
+    ):
+        assigned_in_block = _names_assigned_in(block) & escaping
+        if not assigned_in_block:
+            continue
+        dropped |= assigned_in_block - _names_assigned_in(repl)
+    return dropped
+
+
+def _call_argument_names(source: str) -> set:
+    """Return bare-name arguments (positional or keyword values) passed to
+    any function call anywhere in *source*."""
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return set()
+    names: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for arg in node.args:
+                if isinstance(arg, ast.Name):
+                    names.add(arg.id)
+            for kw in node.keywords:
+                if isinstance(kw.value, ast.Name):
+                    names.add(kw.value.id)
+    return names
+
+
+def _call_site_argument_identity_mismatch(
+    original_blocks: List[str], call_replacements: List[str]
+) -> set:
+    """Return argument names passed at one occurrence's call site that never
+    appear in that occurrence's own original block but do appear in a
+    *different* occurrence's original block.
+
+    Each occurrence's replacement calls the shared helper with whatever
+    local names that particular call site needs -- normally names already
+    present somewhere in that occurrence's own original block, since that
+    block is literally where those locals were used. If an argument name is
+    absent from the occurrence's own block but present in a sibling
+    occurrence's block instead, the extraction likely wired this call site
+    to a different occurrence's locals -- e.g. two structurally similar call
+    sites (a "trial" step and an "apply" step, each closing over its own
+    variable pair) getting their argument lists crossed between sites.
+    There is no ordinary reason for one call site's arguments to come
+    exclusively from names that only appear at a *different* site, since
+    call_site_replacements only ever replaces that occurrence's own line
+    range.
+    """
+    per_occurrence_names = [_names_referenced_in(b) for b in original_blocks]
+    mismatched: set = set()
+    for i, repl in enumerate(call_replacements):
+        own_names = per_occurrence_names[i]
+        other_names: set = set()
+        for j, names in enumerate(per_occurrence_names):
+            if j != i:
+                other_names |= names
+        for arg_name in _call_argument_names(repl):
+            if arg_name in own_names:
+                continue
+            if arg_name in other_names:
+                mismatched.add(arg_name)
+    return mismatched
+
+
+def _first_funcdef_idx(source_lines: List[str]) -> int:
+    """Return the 0-based index of the first unindented ``def``/``class`` line.
+
+    Used as a safe insertion point for a new module-level import line —
+    guaranteed not to land above a shebang or module docstring, which a raw
+    insertion at line 0 could do.
+    """
+    for i, line in enumerate(source_lines):
+        if line[:1] in (" ", "\t"):
+            continue
+        if re.match(r"^(?:async\s+def|def|class)\s", line.strip()):
+            return i
+    return len(source_lines)
+
+
+def _top_import_block_end(source: str, source_lines: List[str]) -> int:
+    """Return the 0-based line index where the top-of-file import block ends.
+
+    Unlike :func:`_first_funcdef_idx` (bounded only by the first ``def``/
+    ``class``), this stops at the first top-level statement of *any* kind
+    that isn't the module docstring or an import — e.g. a module-level
+    constant or dict literal sitting between the real imports and the first
+    function. Without this, an import newly inserted just above the first
+    ``def`` (past such statements) looks like it's already "in the block"
+    to a check that only compares against ``_first_funcdef_idx``, so it
+    never gets lifted — leaving a stranded, PEP 8-violating import.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return _first_funcdef_idx(source_lines)
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            continue  # module docstring (or a stray top-level string literal)
+        return node.lineno - 1
+    return len(source_lines)
+
+
 def _lift_and_dedup_imports(source: str) -> str:
     """Lift misplaced module-level imports to the import block and deduplicate.
 
     When a helper is inserted before a function that is not the first in the
     file, its leading ``from X import Y`` lines land after the first
-    ``def``/``class``, violating PEP 8.  When a helper re-imports names
-    already present at the top, flake8 reports F811.  This function fixes both:
+    ``def``/``class`` — or even after an intervening module-level constant
+    or dict literal that sits between the real imports and the first
+    ``def`` — violating PEP 8.  When a helper re-imports names already
+    present at the top, flake8 reports F811.  This function fixes both:
 
     1. Collect every simple, unindented ``from X import …`` / ``import X``
        line from anywhere in the file.
     2. Merge names for the same module (deduplicate).
     3. Emit the merged set within the top-of-file import block (before the
-       first ``def``/``class``), removing all later occurrences.
+       first non-docstring, non-import top-level statement), removing all
+       later occurrences.
 
     Only single-line imports without parentheses, backslash continuations, or
     inline comments are handled.  Indented imports (``if TYPE_CHECKING:``,
     function-local lazy imports, etc.) and wildcard imports are left untouched.
     """
     lines = source.splitlines(keepends=True)
-    n = len(lines)
 
     # ── pass 1: find the import block boundary ──────────────────────────────
-    # The import block ends at the first unindented def/class line.
-    first_funcdef_idx = n
-    for i, line in enumerate(lines):
-        if line[:1] in (" ", "\t"):
-            continue
-        if re.match(r"^(?:async\s+def|def|class)\s", line.strip()):
-            first_funcdef_idx = i
-            break
+    # The import block ends at the first non-docstring, non-import top-level
+    # statement — not merely the first def/class, which would still count a
+    # module-level constant or dict literal as "inside the block".
+    top_block_end_idx = _top_import_block_end(source, lines)
 
     # ── pass 2: collect simple unindented import lines ──────────────────────
     _FROM_RE = re.compile(r"^from\s+(\S+)\s+import\s+([^(\\#]+)$")
@@ -1764,14 +2669,14 @@ def _lift_and_dedup_imports(source: str) -> str:
                 continue
             all_imports.append((i, stripped))
             import_indices.add(i)
-            if i < first_funcdef_idx:
+            if i < top_block_end_idx:
                 last_block_import_idx = i
             continue
         mp = _PLAIN_RE.match(stripped)
         if mp:
             all_imports.append((i, stripped))
             import_indices.add(i)
-            if i < first_funcdef_idx:
+            if i < top_block_end_idx:
                 last_block_import_idx = i
 
     if not all_imports:
@@ -1805,7 +2710,7 @@ def _lift_and_dedup_imports(source: str) -> str:
                 plain_seen.add(module)
 
     # ── early exit if nothing to do ─────────────────────────────────────────
-    has_misplaced = any(i >= first_funcdef_idx for i, _ in all_imports)
+    has_misplaced = any(i >= top_block_end_idx for i, _ in all_imports)
     from_counts: Dict[str, int] = {}
     plain_counts: Dict[str, int] = {}
     for _, text in all_imports:
@@ -1833,20 +2738,21 @@ def _lift_and_dedup_imports(source: str) -> str:
     sorted_imports = _sort_imports_pep8(all_final_imports)
 
     first_block_import_idx = min(
-        (i for i, _ in all_imports if i < first_funcdef_idx), default=-1
+        (i for i, _ in all_imports if i < top_block_end_idx), default=-1
     )
 
     # ── pass 5: rebuild source ───────────────────────────────────────────────
-    # Emit the sorted block at the first block import position (or just before
-    # the first def/class if there are no block imports).  Skip all original
-    # import lines and blank lines within the original block region — the
-    # sorted block replaces them entirely.
+    # Emit the sorted block at the first block import position (or just after
+    # any leading docstring, before the first non-import statement, if there
+    # are no block imports).  Skip all original import lines and blank lines
+    # within the original block region — the sorted block replaces them
+    # entirely.
     result: List[str] = []
     import_block_emitted = False
 
     for i, line in enumerate(lines):
-        # Edge case: no block imports — insert before the first def/class.
-        if i == first_funcdef_idx and not import_block_emitted:
+        # Edge case: no block imports — insert at the top import boundary.
+        if i == top_block_end_idx and not import_block_emitted:
             for imp in sorted_imports:
                 result.append(imp + "\n")
             import_block_emitted = True
@@ -1909,60 +2815,103 @@ def _names_assigned_in(block_source: str) -> set:
     return names
 
 
-def _find_escaping_vars(group: List[_SeqInfo], source_lines: List[str]) -> set:
-    """Return names assigned in any group sequence that are referenced after it.
+def _escaping_vars_for_seq(
+    seq: _SeqInfo,
+    source_lines: List[str],
+    exclude_line_ranges: Sequence[Tuple[int, int]] = (),
+) -> set:
+    """Return names *seq*'s own block assigns that are referenced after it.
 
     A variable "escapes" when the block assigns it and subsequent code in the
     same scope (at the same or deeper indentation level) references it.
+
+    ``exclude_line_ranges`` (1-based, inclusive ``(start_line, end_line)``
+    pairs) marks other duplicate blocks in the same group -- that code will
+    itself be replaced by a call, so a reference confined to it (most often
+    a sibling occurrence simply reusing the same variable name for its own,
+    unrelated local) must not count as this occurrence's variable escaping.
+    Without this, two duplicate blocks that both assign e.g. ``rd`` and
+    happen to sit back-to-back would make the first block's ``rd`` look
+    like it escapes merely because the second block's own (soon to be
+    extracted) code mentions the same name.
+    """
+    block_src = "".join(source_lines[seq.start_line - 1 : seq.end_line])
+    assigned = _names_assigned_in(block_src)
+    if not assigned:
+        return set()
+
+    # Infer the block's indentation level from its first non-empty line.
+    first_line = next(
+        (ln for ln in source_lines[seq.start_line - 1 : seq.end_line] if ln.strip()),
+        "",
+    )
+    block_indent = len(first_line) - len(first_line.lstrip())
+
+    # Collect lines that follow the block within the same scope, skipping
+    # any line that belongs to another duplicate block in this group.
+    # For indented blocks: stop when indentation falls below block_indent.
+    # For module-level (indent 0): stop at the next def/class statement.
+    after_lines: List[str] = []
+    for offset, line in enumerate(source_lines[seq.end_line :]):
+        line_no = seq.end_line + 1 + offset
+        excluded = any(s <= line_no <= e for s, e in exclude_line_ranges)
+        if not line.strip():
+            if not excluded:
+                after_lines.append(line)
+            continue
+        line_indent = len(line) - len(line.lstrip())
+        if block_indent == 0:
+            if re.match(r"def |class ", line):
+                break
+        elif line_indent < block_indent:
+            break
+        if not excluded:
+            after_lines.append(line)
+
+    if not after_lines:
+        return set()
+
+    after_src = "".join(after_lines)
+    try:
+        after_tree = ast.parse(textwrap.dedent(after_src))
+    except SyntaxError:
+        return set()
+
+    used_after = {n.id for n in ast.walk(after_tree) if isinstance(n, ast.Name)}
+    return assigned & used_after
+
+
+def _find_escaping_vars_per_seq(
+    group: List[_SeqInfo], source_lines: List[str]
+) -> List[set]:
+    """Return, in group order, the escaping-variable set for each sequence.
+
+    Unlike :func:`_find_escaping_vars`, this keeps each sequence's own
+    escaping names separate instead of merging them -- needed to tell
+    whether a *specific* occurrence's own block is the one that actually
+    needs its assignment preserved, as opposed to another occurrence in the
+    group merely reusing the same variable name.
+    """
+    result = []
+    for i, seq in enumerate(group):
+        exclude = [
+            (other.start_line, other.end_line)
+            for j, other in enumerate(group)
+            if j != i
+        ]
+        result.append(_escaping_vars_for_seq(seq, source_lines, exclude))
+    return result
+
+
+def _find_escaping_vars(group: List[_SeqInfo], source_lines: List[str]) -> set:
+    """Return names assigned in any group sequence that are referenced after it.
+
     The helper must return these variables so callers that need them can
     capture the return value.
     """
     escaping: set = set()
-    for seq in group:
-        block_src = "".join(source_lines[seq.start_line - 1 : seq.end_line])
-        assigned = _names_assigned_in(block_src)
-        if not assigned:
-            continue
-
-        # Infer the block's indentation level from its first non-empty line.
-        first_line = next(
-            (
-                ln
-                for ln in source_lines[seq.start_line - 1 : seq.end_line]
-                if ln.strip()
-            ),
-            "",
-        )
-        block_indent = len(first_line) - len(first_line.lstrip())
-
-        # Collect lines that follow the block within the same scope.
-        # For indented blocks: stop when indentation falls below block_indent.
-        # For module-level (indent 0): stop at the next def/class statement.
-        after_lines: List[str] = []
-        for line in source_lines[seq.end_line :]:
-            if not line.strip():
-                after_lines.append(line)
-                continue
-            line_indent = len(line) - len(line.lstrip())
-            if block_indent == 0:
-                if re.match(r"def |class ", line):
-                    break
-            elif line_indent < block_indent:
-                break
-            after_lines.append(line)
-
-        if not after_lines:
-            continue
-
-        after_src = "".join(after_lines)
-        try:
-            after_tree = ast.parse(textwrap.dedent(after_src))
-        except SyntaxError:
-            continue
-
-        used_after = {n.id for n in ast.walk(after_tree) if isinstance(n, ast.Name)}
-        escaping |= assigned & used_after
-
+    for per_seq in _find_escaping_vars_per_seq(group, source_lines):
+        escaping |= per_seq
     return escaping
 
 
@@ -2211,6 +3160,10 @@ class DuplicateExtractor(Refactor):
         tool_choice: Optional[str] = None,
         api_timeout: float = 60.0,
         match_functions: bool = True,
+        match_functions_scope: str = "repo",
+        repo_function_index: Optional[Dict[str, List[_RepoFunctionInfo]]] = None,
+        repo_index: Optional["_repo_index.RepoIndex"] = None,
+        changed_modules: FrozenSet[str] = frozenset(),
         timing: str = "detailed",
         current_file: str = "",
         rate_limit_retries: int = 6,
@@ -2231,11 +3184,144 @@ class DuplicateExtractor(Refactor):
         self._api_timeout = api_timeout
         self._hard_timeout = api_timeout + 30
         self._match_functions = match_functions
+        self._match_functions_scope = match_functions_scope
+        self._repo_function_index = repo_function_index or {}
+        self._repo_index = repo_index
+        self._changed_modules = changed_modules
         self._rate_limit_retries = rate_limit_retries
         self._rate_limit_backoff = rate_limit_backoff
         self._new_source: Optional[str] = None
         if source:
             self._analyze(source)
+
+    def _attempt_func_match(
+        self, client, seq: _SeqInfo, func: _FunctionInfo, source: str
+    ) -> Optional[str]:
+        """Veto, generate, and verify a call replacing seq's body with func().
+
+        Returns the call-site replacement text if accepted, or None if the
+        LLM vetoes the match, generation/verification fails, or a call times
+        out. Shared by both the file-local and repo-wide match-function
+        passes — the only difference between them is which candidate
+        functions are considered and (for repo-wide matches) that an import
+        is also added when a match is accepted.
+        """
+        if self.verbose:
+            print(
+                f"crispen: DuplicateExtractor: func-match check — "
+                f"scope '{seq.scope}': lines {seq.start_line}-{seq.end_line}"
+                f" → '{func.name}'",
+                file=sys.stderr,
+                flush=True,
+            )
+        self.stats.llm_veto_calls += 1
+        timing: list = []
+        try:
+            is_valid, reason, _veto_notes = _run_with_timeout(
+                _llm_veto_func_match,
+                self._hard_timeout,
+                client,
+                seq,
+                func,
+                source,
+                self._model,
+                self._provider,
+                tool_choice_override=self._tool_choice,
+                _timing_out=timing,
+                rate_limit_retries=self._rate_limit_retries,
+                rate_limit_backoff=self._rate_limit_backoff,
+            )
+            if timing:
+                lr = timing[0]
+                self.stats.record_llm_call(
+                    lr.elapsed,
+                    lr.input_tokens,
+                    lr.output_tokens,
+                    "veto",
+                    "duplicate_extractor",
+                    self.current_file,
+                )
+        except _ApiTimeout:
+            print(
+                "crispen: DuplicateExtractor:   → func-match veto timed out",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+        if self.verbose:
+            status = "ACCEPTED" if is_valid else "VETOED"
+            timing_suffix = ""
+            if self.timing == "detailed" and timing:
+                lr = timing[0]
+                timing_suffix = (
+                    f" [{lr.elapsed:.2f}s,"
+                    f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
+                )
+            print(
+                f"crispen: DuplicateExtractor:   → {status}: {reason}"
+                f"{timing_suffix}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not is_valid:
+            self.stats.llm_rejected += 1
+            return None
+        timing2: list = []
+        if func.scope == "<module>" and not func.params:
+            replacement = _generate_no_arg_call(seq, func)
+        else:
+            self.stats.llm_edit_calls += 1
+            try:
+                replacement = _run_with_timeout(
+                    _llm_generate_call,
+                    self._hard_timeout,
+                    client,
+                    seq,
+                    func,
+                    source,
+                    self._model,
+                    self._provider,
+                    tool_choice_override=self._tool_choice,
+                    _timing_out=timing2,
+                    rate_limit_retries=self._rate_limit_retries,
+                    rate_limit_backoff=self._rate_limit_backoff,
+                )
+                if timing2:
+                    lr = timing2[0]
+                    self.stats.record_llm_call(
+                        lr.elapsed,
+                        lr.input_tokens,
+                        lr.output_tokens,
+                        "edit",
+                        "duplicate_extractor",
+                        self.current_file,
+                    )
+            except _ApiTimeout:
+                print(
+                    "crispen: DuplicateExtractor:   → call generation timed out",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+            if replacement is None:
+                return None  # pragma: no cover
+        if not _verify_extraction(None, [replacement]):
+            return None
+        if self.verbose:
+            timing_suffix = ""
+            if self.timing == "detailed" and timing2:
+                lr = timing2[0]
+                timing_suffix = (
+                    f" [{lr.elapsed:.2f}s,"
+                    f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
+                )
+            print(
+                f"crispen: DuplicateExtractor:   → replacing '{seq.scope}'"
+                f" with '{func.name}()'{timing_suffix}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return replacement
 
     def _analyze(self, source: str) -> None:
         # 1. Parse tree; early-return on syntax error.
@@ -2294,8 +3380,44 @@ class DuplicateExtractor(Refactor):
             )
         )
 
+        # 9b. Same check against the repo-wide index (built once per run and
+        # passed in). Deliberately approximate — the real dependency-safety
+        # and name-collision checks happen in the match loop itself — this
+        # is only here so the early exit below doesn't skip a file whose
+        # only candidate match is repo-wide.
+        repo_matches_enabled = (
+            self._match_functions
+            and self._match_functions_scope == "repo"
+            and self._repo_function_index
+        )
+        current_module = (
+            self._repo_index.file_to_module.get(str(Path(self.current_file).resolve()))
+            if self.current_file and self._repo_index is not None
+            else None
+        )
+
+        def _repo_candidates(fingerprint: str) -> List[_RepoFunctionInfo]:
+            # Candidates defined in this same file are already reachable (if
+            # called anywhere in-file) via the local match pass above —
+            # counting them here would only add noise, e.g. a block inside
+            # foo() whose fingerprint happens to equal foo()'s own body would
+            # otherwise see foo() itself as a spurious same-file "competing"
+            # candidate.
+            return [
+                c
+                for c in self._repo_function_index.get(fingerprint, [])
+                if c.module != current_module
+            ]
+
+        has_repo_func_matches = repo_matches_enabled and any(
+            _overlaps_diff(seq, self.changed_ranges)
+            and len(_repo_candidates(seq.fingerprint)) == 1
+            and _repo_candidates(seq.fingerprint)[0].func.name != seq.scope
+            for seq in collector.sequences
+        )
+
         # 10. Early exit — nothing to do.
-        if not has_func_matches and not groups:
+        if not has_func_matches and not has_repo_func_matches and not groups:
             return
 
         # 12. Create API client.
@@ -2321,127 +3443,93 @@ class DuplicateExtractor(Refactor):
                 func = func_body_fps[seq.fingerprint]
                 if func.name == seq.scope:
                     continue
-                if self.verbose:
-                    print(
-                        f"crispen: DuplicateExtractor: func-match check — "
-                        f"scope '{seq.scope}': lines {seq.start_line}-{seq.end_line}"
-                        f" → '{func.name}'",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                self.stats.llm_veto_calls += 1
-                timing: list = []
-                try:
-                    is_valid, reason, _veto_notes = _run_with_timeout(
-                        _llm_veto_func_match,
-                        self._hard_timeout,
-                        client,
-                        seq,
-                        func,
-                        source,
-                        self._model,
-                        self._provider,
-                        tool_choice_override=self._tool_choice,
-                        _timing_out=timing,
-                        rate_limit_retries=self._rate_limit_retries,
-                        rate_limit_backoff=self._rate_limit_backoff,
-                    )
-                    if timing:
-                        lr = timing[0]
-                        self.stats.record_llm_call(
-                            lr.elapsed,
-                            lr.input_tokens,
-                            lr.output_tokens,
-                            "veto",
-                            "duplicate_extractor",
-                            self.current_file,
-                        )
-                except _ApiTimeout:
-                    print(
-                        "crispen: DuplicateExtractor:   → func-match veto timed out",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                replacement = self._attempt_func_match(client, seq, func, source)
+                if replacement is None:
                     continue
-                if self.verbose:
-                    status = "ACCEPTED" if is_valid else "VETOED"
-                    timing_suffix = ""
-                    if self.timing == "detailed" and timing:
-                        lr = timing[0]
-                        timing_suffix = (
-                            f" [{lr.elapsed:.2f}s,"
-                            f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
-                        )
-                    print(
-                        f"crispen: DuplicateExtractor:   → {status}: {reason}"
-                        f"{timing_suffix}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                if not is_valid:
-                    self.stats.llm_rejected += 1
-                    continue
-                timing2: list = []
-                if func.scope == "<module>" and not func.params:
-                    replacement = _generate_no_arg_call(seq, func)
-                else:
-                    self.stats.llm_edit_calls += 1
-                    try:
-                        replacement = _run_with_timeout(
-                            _llm_generate_call,
-                            self._hard_timeout,
-                            client,
-                            seq,
-                            func,
-                            source,
-                            self._model,
-                            self._provider,
-                            tool_choice_override=self._tool_choice,
-                            _timing_out=timing2,
-                            rate_limit_retries=self._rate_limit_retries,
-                            rate_limit_backoff=self._rate_limit_backoff,
-                        )
-                        if timing2:
-                            lr = timing2[0]
-                            self.stats.record_llm_call(
-                                lr.elapsed,
-                                lr.input_tokens,
-                                lr.output_tokens,
-                                "edit",
-                                "duplicate_extractor",
-                                self.current_file,
-                            )
-                    except _ApiTimeout:
-                        print(
-                            "crispen: DuplicateExtractor:"
-                            "   → call generation timed out",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        continue
-                    if replacement is None:
-                        continue  # pragma: no cover
-                if not _verify_extraction(None, [replacement]):
-                    continue
-                if self.verbose:
-                    timing_suffix = ""
-                    if self.timing == "detailed" and timing2:
-                        lr = timing2[0]
-                        timing_suffix = (
-                            f" [{lr.elapsed:.2f}s,"
-                            f" {lr.input_tokens:,} in / {lr.output_tokens:,} out]"
-                        )
-                    print(
-                        f"crispen: DuplicateExtractor:   → replacing '{seq.scope}'"
-                        f" with '{func.name}()'{timing_suffix}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
                 edits.append((seq.start_line - 1, seq.end_line, replacement))
                 matched_line_ranges.add((seq.start_line, seq.end_line))
                 pending_changes.append(
                     f"DuplicateExtractor: replaced '{seq.scope}' body"
                     f" with call to '{func.name}'"
+                )
+
+        # 14b. Repo-wide function body match pass — same idea as 14, but the
+        # candidate function lives in a different module, so a match also
+        # needs the dependency-safety veto (no new package coupling) and a
+        # name-collision check (the bare call must actually resolve to the
+        # newly-imported function), plus emits an import for the accepted
+        # call. Skips sequences already matched by the file-local pass above,
+        # and ambiguous fingerprints (matching more than one repo function).
+        if repo_matches_enabled:
+            module_names = _module_level_names(source)
+            import_insert_idx = _first_funcdef_idx(source_lines)
+            for seq in collector.sequences:
+                if (seq.start_line, seq.end_line) in matched_line_ranges:
+                    continue
+                if not _overlaps_diff(seq, self.changed_ranges):
+                    continue
+                candidates = _repo_candidates(seq.fingerprint)
+                if len(candidates) != 1:
+                    continue
+                repo_func = candidates[0]
+                func, target_module = repo_func.func, repo_func.module
+                if func.name == seq.scope or func.name in module_names:
+                    continue
+                # Symmetric-match guard: target_module is only a hazard if
+                # its own file is *also* part of this run's diff — only then
+                # will it get its own independent repo-wide match pass off
+                # the same frozen index. (A target outside the diff is never
+                # itself processed this run, so it can never propose the
+                # mirror-image match — nothing to guard against.) When it
+                # is, check whether target_module's own pass would see
+                # *this* file's function as its sole, unambiguous candidate
+                # for this same fingerprint — accepting the match here would
+                # then risk a mutual pair: two files in the same run each
+                # replacing their identical body with a call into the
+                # other, leaving both as pure delegates calling each other
+                # (circular import, or infinite recursion if the import
+                # happened to resolve). The repo-wide index is a single
+                # snapshot taken before any file in this run is rewritten,
+                # so nothing else would catch this.
+                if target_module in self._changed_modules:
+                    reverse_candidates = [
+                        c
+                        for c in self._repo_function_index.get(seq.fingerprint, [])
+                        if c.module != target_module
+                    ]
+                    if (
+                        len(reverse_candidates) == 1
+                        and reverse_candidates[0].module == current_module
+                        and reverse_candidates[0].func.name == seq.scope
+                    ):
+                        continue
+                if not _target_import_is_proven_safe(
+                    current_module, target_module, self._repo_index
+                ):
+                    continue
+                replacement = self._attempt_func_match(client, seq, func, source)
+                if replacement is None:
+                    continue
+                edits.append((seq.start_line - 1, seq.end_line, replacement))
+                # Two trailing blank lines, not one: _lift_and_dedup_imports
+                # only preserves blank lines that fall *after* the last
+                # import line it collects — since our raw insertion is
+                # itself the last (and typically only nearby) import line,
+                # omitting these would leave zero blank lines between the
+                # rebuilt import block and the following def/class (PEP 8
+                # wants two), rather than merely losing the original
+                # spacing that was there before this insertion.
+                edits.append(
+                    (
+                        import_insert_idx,
+                        import_insert_idx,
+                        f"from {target_module} import {func.name}\n\n\n",
+                    )
+                )
+                matched_line_ranges.add((seq.start_line, seq.end_line))
+                pending_changes.append(
+                    f"DuplicateExtractor: replaced '{seq.scope}' body with call to "
+                    f"'{target_module}.{func.name}' (repo-wide match)"
                 )
 
         # 15. Recompute duplicate groups excluding matched sequences.
@@ -2469,7 +3557,8 @@ class DuplicateExtractor(Refactor):
         for group in groups:
             # Compute escaping vars algorithmically before any LLM call so the
             # extraction prompt can instruct the LLM to return them.
-            escaping_vars = frozenset(_find_escaping_vars(group, source_lines))
+            escaping_vars_per_seq = _find_escaping_vars_per_seq(group, source_lines)
+            escaping_vars = frozenset().union(*escaping_vars_per_seq)
 
             # Skip groups that would leave a function as a trivial proxy wrapper
             # (i.e. the extracted block is the function's entire body).
@@ -3016,6 +4105,157 @@ class DuplicateExtractor(Refactor):
                                 )
                             _check_failed = True
 
+                    # Check 12: helper re-imports an already-module-level name
+                    if not _check_failed:
+                        reimported = _helper_reimports_module_level_name(
+                            helper_source, source
+                        )
+                        if reimported:
+                            _failures.append(
+                                f"helper locally re-imports name(s) already "
+                                f"imported at module level: "
+                                f"{', '.join(sorted(reimported))} -- remove the "
+                                f"local import and use the module-level name "
+                                f"directly (a local re-import bypasses "
+                                f"mock.patch on the module-level name)"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"helper locally re-imports name(s) already "
+                                    f"imported at module level: "
+                                    f"{', '.join(sorted(reimported))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                    # Check 13: helper/replacements drop a linter, formatter,
+                    # or coverage directive comment present in the original
+                    # block(s) (# pragma: no cover, # noqa, # type: ignore,
+                    # # fmt: skip, # pylint: disable, etc.)
+                    if not _check_failed:
+                        original_blocks = [
+                            "".join(source_lines[seq.start_line - 1 : seq.end_line])
+                            for seq in group
+                        ]
+                        dropped = _dropped_directive_comments(
+                            original_blocks, helper_source, call_replacements
+                        )
+                        if dropped:
+                            _failures.append(
+                                f"helper/replacement drops directive comment(s) "
+                                f"present in the original block(s): "
+                                f"{', '.join(sorted(dropped))} -- keep the "
+                                f"comment on whichever line(s) carry the "
+                                f"guarded code in the extracted output"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"helper/replacement drops directive "
+                                    f"comment(s) present in the original "
+                                    f"block(s): {', '.join(sorted(dropped))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                    # Check 14: helper turns a call-time global/stdlib
+                    # singleton keyword argument (e.g. file=sys.stderr) into
+                    # a default parameter value, dropping it from the call
+                    # sites -- binds once at def-time instead of fresh on
+                    # each call.
+                    if not _check_failed:
+                        dropped_defaults = _default_param_drops_call_time_global(
+                            original_blocks, helper_source, call_replacements
+                        )
+                        if dropped_defaults:
+                            _failures.append(
+                                f"helper turns call-time global keyword "
+                                f"argument(s) into a default parameter value: "
+                                f"{', '.join(sorted(dropped_defaults))} -- keep "
+                                f"passing the argument explicitly at each call "
+                                f"site instead of relying on the default "
+                                f"(a default is bound once at def-time, not "
+                                f"fresh on each call)"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"helper turns call-time global keyword "
+                                    f"argument(s) into a default parameter "
+                                    f"value: {', '.join(sorted(dropped_defaults))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                    # Check 15: an occurrence's own original block assigned
+                    # an escaping variable but its replacement no longer
+                    # assigns it anywhere -- surrounding code that reads the
+                    # variable afterward would see a stale value.
+                    if not _check_failed:
+                        dropped_capture = _dropped_escaping_var_capture(
+                            original_blocks,
+                            call_replacements,
+                            escaping_vars_per_seq,
+                        )
+                        if dropped_capture:
+                            _failures.append(
+                                f"replacement drops the reassignment of "
+                                f"escaping variable(s) present in the "
+                                f"original block: "
+                                f"{', '.join(sorted(dropped_capture))} -- "
+                                f"capture the helper's return value into "
+                                f"the same variable at this call site "
+                                f"instead of calling it as a bare statement"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"replacement drops the reassignment of "
+                                    f"escaping variable(s): "
+                                    f"{', '.join(sorted(dropped_capture))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
+                    # Check 16: an occurrence's call site passes an argument
+                    # name that never appears in that occurrence's own
+                    # original block but does appear in a different
+                    # occurrence's block -- the extraction likely crossed
+                    # two call sites' arguments.
+                    if not _check_failed:
+                        crossed_args = _call_site_argument_identity_mismatch(
+                            original_blocks, call_replacements
+                        )
+                        if crossed_args:
+                            _failures.append(
+                                f"call site passes argument(s) that belong "
+                                f"to a different occurrence's original "
+                                f"block, not this one's: "
+                                f"{', '.join(sorted(crossed_args))} -- each "
+                                f"call site's arguments must come from its "
+                                f"own original block's locals"
+                            )
+                            if self.verbose:
+                                print(
+                                    f"crispen: DuplicateExtractor:"
+                                    f" extraction FAILED — "
+                                    f"call site passes argument(s) crossed "
+                                    f"from a different occurrence: "
+                                    f"{', '.join(sorted(crossed_args))}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                            _check_failed = True
+
                 # Retry decision for algorithmic failures
                 if _check_failed:
                     if alg_retries_left > 0:
@@ -3064,14 +4304,13 @@ class DuplicateExtractor(Refactor):
                             self.current_file,
                         )
                 except _ApiTimeout:
-                    if self.verbose:
-                        print(
-                            "crispen: DuplicateExtractor:   → verify timed out,"
-                            " accepting extraction",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    verify_ok, verify_issues = True, []
+                    print(
+                        "crispen: DuplicateExtractor: API call timed out,"
+                        " skipping group",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
 
                 if self.verbose:
                     v_status = "ACCEPTED" if verify_ok else "REJECTED"
@@ -3205,7 +4444,7 @@ class DuplicateExtractor(Refactor):
                 all_pending.append(msg)
 
             if all_edits:
-                _extracted_names = _names_in_edit_texts(extraction_groups)
+                _extracted_names = _names_in_edit_texts(extraction_groups, source)
                 combined = _pyflakes_strip_unused_simple_assigns(
                     combined, _extracted_names
                 )

@@ -16,10 +16,15 @@ from libcst.metadata import MetadataWrapper
 from crispen.config import CrispenConfig
 from crispen.diff_parser import parse_diff
 from crispen.file_limiter.runner import run_file_limiter
-from crispen.refactors.duplicate_extractor import DuplicateExtractor
+from crispen.refactors.cross_file_duplicate import run_cross_file_duplicate_extraction
+from crispen.refactors.duplicate_extractor import (
+    DuplicateExtractor,
+    _build_repo_function_index,
+)
 from crispen.refactors.function_splitter import FunctionSplitter
 from crispen.refactors.if_not_else import IfNotElse
 from crispen.refactors.tuple_dataclass import TupleDataclass
+from crispen.repo_index import build_repo_index
 
 EXAMPLES = Path(__file__).parent.parent / "examples"
 
@@ -291,6 +296,99 @@ def test_duplicate_extraction_below_threshold(monkeypatch):
     mock_client.messages.create.assert_not_called()
 
 
+def test_duplicate_extraction_cross_module(tmp_path, monkeypatch):
+    """Same 4-statement function body duplicated across two files → extracted
+    into a new shared module at their common ancestor package, both call
+    sites rewritten to import and call it. Exercises
+    ``run_cross_file_duplicate_extraction`` directly (the pass
+    ``cross_file_duplicate.py`` runs, not covered by any other example — the
+    existing duplicate_extraction/ examples are all single-file)."""
+    base = EXAMPLES / "duplicate_extraction" / "04_cross_module"
+    a_src = (base / "a_input.py").read_text()
+    a_diff = (base / "a_diff.patch").read_text()
+    b_src = (base / "b_input.py").read_text()
+    b_diff = (base / "b_diff.patch").read_text()
+
+    pkg = tmp_path / "svc"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    a_file = pkg / "orders.py"
+    b_file = pkg / "invoices.py"
+    a_file.write_text(a_src, encoding="utf-8")
+    b_file.write_text(b_src, encoding="utf-8")
+
+    per_file = {
+        str(f): {
+            "original": src,
+            "source": src,
+            "msgs": [],
+            "candidates": {},
+            "ranges": ranges,
+        }
+        for f, src, ranges in (
+            (a_file, a_src, _ranges(a_diff, filename="a_input.py")),
+            (b_file, b_src, _ranges(b_diff, filename="b_input.py")),
+        )
+    }
+
+    helper_dict = {
+        "function_name": "normalize_customer_ref",
+        "helper_source": (
+            "def normalize_customer_ref(payload):\n"
+            '    ref = payload["customer_ref"]\n'
+            "    normalized = ref.strip().upper()\n"
+            '    tag = normalized.replace("-", "")\n'
+            "    return tag\n"
+        ),
+        "call_site_replacements": [
+            "    return normalize_customer_ref(payload)\n",
+            "    return normalize_customer_ref(payload)\n",
+        ],
+    }
+
+    # Cross-file mode's extract tool is named "extract_cross_file_helper",
+    # distinct from same-file DuplicateExtractor's "extract_helper" tool
+    # used by _make_extract_response above.
+    extract_block = MagicMock()
+    extract_block.type = "tool_use"
+    extract_block.name = "extract_cross_file_helper"
+    extract_block.input = helper_dict
+    extract_response = MagicMock()
+    extract_response.content = [extract_block]
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("crispen.llm_client.anthropic.Anthropic") as mock_anthropic_cls:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _make_veto_response(True, "identical customer-ref normalization"),
+            extract_response,
+            _make_verify_response(True, []),
+        ]
+        msgs = list(
+            run_cross_file_duplicate_extraction(
+                per_file, str(tmp_path), CrispenConfig(), verbose=True
+            )
+        )
+
+    assert any("extracted 'normalize_customer_ref'" in m for m in msgs)
+    assert any("across 2 files" in m for m in msgs)
+
+    helper_file = pkg / "common.py"
+    assert helper_file.exists()
+    compile(helper_file.read_text(encoding="utf-8"), "<common.py>", "exec")
+    assert "def normalize_customer_ref(payload):" in helper_file.read_text(
+        encoding="utf-8"
+    )
+
+    for f in (a_file, b_file):
+        new_src = per_file[str(f)]["source"]
+        compile(new_src, f"<{f.name}>", "exec")
+        assert "from svc.common import normalize_customer_ref" in new_src
+        assert "normalize_customer_ref(payload)" in new_src
+        assert 'replace("-", "")' not in new_src  # original block replaced
+
+
 # ===========================================================================
 # match_existing_function examples
 # ===========================================================================
@@ -314,6 +412,51 @@ def test_match_existing_function_no_arg_helper(monkeypatch):
     assert de._new_source is not None
     compile(de._new_source, "<test>", "exec")
     assert "_setup_logger()" in de._new_source
+
+
+def test_match_existing_function_repo_wide(tmp_path, monkeypatch):
+    """Block matches a function defined in a different module, found via a
+    real repo-wide scan (``build_repo_index``/``_build_repo_function_index``
+    over real files on disk, not a hand-built index like the unit tests in
+    test_duplicate_extractor.py use)."""
+    base = EXAMPLES / "match_existing_function" / "02_repo_wide"
+    src = (base / "input.py").read_text()
+    diff = (base / "diff.patch").read_text()
+    helper_src = (base / "helpers.py").read_text()
+    ranges = _ranges(diff)
+
+    pkg = tmp_path / "billing"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    input_file = pkg / "dashboard.py"
+    input_file.write_text(src, encoding="utf-8")
+    (pkg / "helpers.py").write_text(helper_src, encoding="utf-8")
+
+    repo_index = build_repo_index(str(tmp_path))
+    repo_function_index = _build_repo_function_index(repo_index)
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with (
+        patch("crispen.llm_client.anthropic.Anthropic"),
+        patch(
+            "crispen.refactors.duplicate_extractor._run_with_timeout",
+            return_value=(True, "same operation", ""),
+        ),
+    ):
+        de = DuplicateExtractor(
+            ranges,
+            source=src,
+            current_file=str(input_file),
+            match_functions_scope="repo",
+            repo_function_index=repo_function_index,
+            repo_index=repo_index,
+        )
+
+    assert de._new_source is not None
+    compile(de._new_source, "<test>", "exec")
+    assert "from billing.helpers import _summarize_pending_report" in de._new_source
+    assert "_summarize_pending_report()" in de._new_source
+    assert "fetch_pending_rows" not in de._new_source
 
 
 # ===========================================================================

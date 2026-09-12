@@ -3,6 +3,7 @@
 import sys
 import time
 
+from . import llm_client
 from .config import load_config
 from .diff_parser import parse_diff
 from .engine import run_engine
@@ -32,6 +33,7 @@ def main() -> None:
         return
 
     config = load_config()
+    llm_client.set_debug_log(config.debug_llm_log)
     run_stats = RunStats()
     _t0 = time.perf_counter()
     try:

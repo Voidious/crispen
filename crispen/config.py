@@ -17,6 +17,15 @@ class CrispenConfig:
     # DuplicateExtractor: maximum sequence length for duplicate search
     max_duplicate_seq_len: int = 8
 
+    # DuplicateExtractor: module name for a new helper shared across files.
+    # When a duplicate block is found in 2+ files in the diff, the extracted
+    # helper is placed at <common-ancestor-package>/<this>.py — the deepest
+    # package that is an ancestor of every call site, so importing it back
+    # from any call site can never be circular. Deliberately boring/
+    # mechanical rather than LLM-chosen (see README for the placement
+    # options considered and why v1 stays mechanical).
+    cross_file_helper_module: str = "common"
+
     # TupleDataclass: minimum tuple element count to trigger replacement
     min_tuple_size: int = 4
 
@@ -41,6 +50,22 @@ class CrispenConfig:
     api_timeout: float = 60.0
     # Whether to generate docstrings in extracted helper functions
     helper_docstrings: bool = False
+
+    # DuplicateExtractor: scope of the "match existing function" sub-pass
+    # (see "match_function" in enabled_refactors/disabled_refactors below).
+    # "file" — only consider functions defined in the same file being
+    #          processed.
+    # "repo" — also consider free functions and @staticmethods defined
+    #          anywhere else in the repo (default). Instance and class
+    #          methods are never considered repo-wide, since matching one
+    #          would require knowing an instance of the enclosing class is
+    #          in scope at the call site — real type information this pass
+    #          doesn't have. A cross-module match is only proposed when it
+    #          doesn't introduce a new package-level dependency: either the
+    #          call site's file (or another file in its own top-level
+    #          package) already imports the target's top-level package, or
+    #          both share the same top-level package already.
+    match_functions_scope: str = "repo"
 
     # FunctionSplitter: maximum function body lines (excluding docstring)
     max_function_length: int = 75
@@ -188,6 +213,17 @@ class CrispenConfig:
     # "detailed" adds per-call-type, per-refactor, and per-file breakdowns.
     timing: str = "detailed"
 
+    # Opt-in debug log: when set, every LLM tool call (from any refactor)
+    # appends one JSON line to this file with the caller, provider, model,
+    # full prompt messages, and the raw tool_input the model returned.
+    # Off (None) by default — the log captures full file contents on every
+    # call and can grow large fast. Turn it on when you need to diagnose an
+    # LLM-produced result after the fact without reverse-engineering it from
+    # the final diff (crispen's normal stderr output only prints summary
+    # lines, not the raw prompt/response). Best-effort: a write failure
+    # (e.g. unwritable path) is silently ignored rather than failing the run.
+    debug_llm_log: Optional[str] = None
+
 
 def format_header(config: "CrispenConfig") -> List[str]:
     """Return config lines printed to stderr before the first LLM call."""
@@ -209,6 +245,8 @@ def format_header(config: "CrispenConfig") -> List[str]:
         lines.append(f"  {'patch_update_retries:':<{w}}{config.patch_update_retries}")
     if config.base_url is not None:
         lines.append(f"  {'base_url:':<{w}}{config.base_url}")
+    if config.debug_llm_log is not None:
+        lines.append(f"  {'debug_llm_log:':<{w}}{config.debug_llm_log}")
     return lines
 
 

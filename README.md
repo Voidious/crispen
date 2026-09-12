@@ -68,6 +68,14 @@ model = "claude-sonnet-4-6"
 # Raise this when using slow local models.
 # api_timeout = 60.0
 
+# Opt-in debug log path (default: unset). When set, every LLM tool call
+# appends one JSON line with the caller, provider, model, full prompt
+# messages, and the raw tool_input the model returned. Off by default since
+# the log captures full file contents on every call and can grow large fast.
+# Useful for diagnosing an unexpected result after the fact — crispen's
+# normal stderr output only prints summary lines, not the raw prompt/response.
+# debug_llm_log = "crispen-debug.jsonl"
+
 # FunctionSplitter: max function body lines before splitting (default: 75)
 max_function_length = 75
 
@@ -116,8 +124,24 @@ min_duplicate_weight = 3
 # DuplicateExtractor: max sequence length for duplicate search (default: 8)
 max_duplicate_seq_len = 8
 
+# DuplicateExtractor: module name for a new helper shared across files
+# (default: "common"). When a duplicate block is found in 2+ files in the
+# diff, the extracted helper is placed at <common-ancestor-package>/<this>.py
+# — the deepest package that is an ancestor of every call site, so importing
+# it back from any call site can never be circular.
+cross_file_helper_module = "common"
+
 # Whether to generate docstrings in extracted helper functions (default: false)
 helper_docstrings = false
+
+# DuplicateExtractor: scope of the "match_function" sub-pass (default: "repo").
+# "file" — only consider functions defined in the same file being processed.
+# "repo" — also consider free functions and @staticmethods defined anywhere
+#          else in the repo. Instance/class methods are never considered
+#          repo-wide (matching one would need real type information this
+#          pass doesn't have). A cross-module match is only proposed when it
+#          doesn't introduce a new package-level dependency.
+match_functions_scope = "repo"
 
 # Retry counts for extraction and LLM verification failures
 extraction_retries = 2
@@ -394,19 +418,70 @@ Configuration:
 - `extraction_retries` — how many times to retry after an algorithmic check fails (default: 2).
 - `llm_verify_retries` — how many times to retry after the LLM verification step rejects the output (default: 2).
 
+#### Cross-file duplicate extraction
+
+The same detection also runs **across every file in the diff**, not just within one file. When a duplicate block is found in 2+ different files, crispen extracts it into a shared helper placed at the common ancestor package of every call site (the deepest package that's an ancestor of all of them), and imports it into each one.
+
+Placing the helper at the common ancestor makes circularity structurally impossible — an ancestor package never depends on its own descendants — which is why placement stays mechanical (a configurable, boring module name) rather than LLM-chosen. If the target module already exists, the new helper is appended to it rather than overwriting it.
+
+**Before** (`pkg/a.py` and `pkg/b.py`, both in the diff):
+```python
+# pkg/a.py
+def load_settings(path):
+    text = path.read_text(encoding="utf-8")
+    return text.strip().split(",")
+
+# pkg/b.py
+def load_labels(config_path):
+    content = config_path.read_text(encoding="utf-8")
+    return content.strip().split(",")
+```
+
+**After:**
+```python
+# pkg/common.py
+def read_comma_separated(path):
+    text = path.read_text(encoding="utf-8")
+    stripped = text.strip()
+    parts = stripped.split(",")
+    return parts
+
+# pkg/a.py
+from pkg.common import read_comma_separated
+
+def load_settings(path):
+    return read_comma_separated(path)
+
+# pkg/b.py
+from pkg.common import read_comma_separated
+
+def load_labels(config_path):
+    return read_comma_separated(config_path)
+```
+
+Configuration:
+- `cross_file_helper_module` — module name for the shared helper, placed at `<common-ancestor-package>/<this>.py` (default: `"common"`).
+
+Not yet supported (explicitly deferred): LLM-recommended placement (an alternative to the common-ancestor package), and duplicate detection across the whole codebase rather than just the files in the diff — matches FileLimiter's existing diff-only philosophy.
+
 ---
 
 ### 3. Match existing function
 
 **Replaces a code block with a call to an existing function that performs the same operation.**
 
-When a block of code in the diff is semantically equivalent to the body of an existing function in the same file, crispen replaces the inline block with a call to that function. This is the complement of DuplicateExtractor: instead of creating a new helper, it recognises that one already exists.
+When a block of code in the diff is semantically equivalent to the body of an existing function — in the same file, or (by default) anywhere else in the repo — crispen replaces the inline block with a call to that function. This is the complement of DuplicateExtractor: instead of creating a new helper, it recognises that one already exists.
 
 The algorithm:
-1. Fingerprints every function body in the file by its normalised AST structure (ignoring variable names, whitespace, and comments).
-2. For each statement sequence in the diff, checks whether its fingerprint matches any function body.
-3. Asks the LLM to verify the match is semantically valid and not a coincidental structural similarity.
-4. If confirmed, asks the LLM to generate the correct call expression (mapping arguments as needed) and replaces the block.
+1. Fingerprints every candidate function body (in the file, and repo-wide when `match_functions_scope = "repo"`) by its normalised AST structure (ignoring variable names, whitespace, and comments). Repo-wide candidates are restricted to free functions and `@staticmethod`s — instance/class methods are never matched, since replacing a block with a call to one would require knowing an instance of the enclosing class is already in scope, which needs real type information crispen doesn't have.
+2. For each statement sequence in the diff, checks whether its fingerprint matches exactly one candidate function body (an ambiguous fingerprint — matching more than one repo-wide function — is skipped).
+3. For a repo-wide candidate, verifies the match wouldn't introduce a new package-level dependency: the call site's file (or another file already in its own top-level package) must already import the target's top-level package, or both must already share the same top-level package. Otherwise the match is skipped — crispen never adds a new cross-package import on your behalf without that assurance.
+3b. Also for a repo-wide candidate whose file is itself part of the current diff: skips the match if the target's own file, on its own independent pass later in the same run, would symmetrically match back to this file's function as its sole candidate. Without this, two files in the same diff with an identical newly-added function could each replace their body with a call into the other — a circular import (or infinite recursion, if the import happened to resolve).
+4. Asks the LLM to verify the match is semantically valid and not a coincidental structural similarity.
+5. If confirmed, asks the LLM to generate the correct call expression (mapping arguments as needed) and replaces the block. For a repo-wide match, also adds the needed import.
+
+Configuration:
+- `match_functions_scope` — `"file"` (only match functions in the same file) or `"repo"` (also match free functions and `@staticmethod`s anywhere else in the repo, subject to the dependency-safety check above). Default: `"repo"`.
 
 **Before:**
 ```python
@@ -597,6 +672,7 @@ crispen/cli.py         # Entry point: reads stdin, calls parse_diff then run_eng
                 │       ├── tuple_dataclass.py     # Large tuple returns → @dataclass
                 │       ├── caller_updater.py      # Update tuple-unpacking call sites
                 │       ├── duplicate_extractor.py # Extract duplicate blocks
+                │       ├── cross_file_duplicate.py # Extract duplicate blocks across files
                 │       └── function_splitter.py   # Split oversized functions
                 │
                 ├── crispen/file_limiter/
