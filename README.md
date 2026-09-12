@@ -672,6 +672,7 @@ crispen/cli.py         # Entry point: reads stdin, calls parse_diff then run_eng
                 │       ├── tuple_dataclass.py     # Large tuple returns → @dataclass
                 │       ├── caller_updater.py      # Update tuple-unpacking call sites
                 │       ├── duplicate_extractor.py # Extract duplicate blocks
+                │       ├── cross_file_duplicate.py # Extract duplicate blocks across files
                 │       └── function_splitter.py   # Split oversized functions
                 │
                 ├── crispen/file_limiter/
